@@ -8231,6 +8231,7 @@ async fn list_artifacts_with_notice(
     ),
     responses(
         (status = 200, description = "List of artifacts. For a virtual repository whose members the caller cannot read although it holds read on the virtual, the `X-AK-Virtual-Members-Notice` header says why (#4690)", body = ArtifactListResponse),
+        (status = 400, description = "Invalid `cursor`, `sort_by` or `sort_order`, a cursor replayed under another order, or a sort other than `path` ascending on a listing that lists by path only (`group_by`, Remote, a Virtual with more than one member)"),
         (status = 404, description = "Repository not found"),
     )
 )]
@@ -8477,13 +8478,19 @@ pub async fn list_artifacts(
             let after = after_sorted
                 .as_ref()
                 .map(|(value, id)| (value.as_str(), *id));
-            match scope_ids.first() {
-                Some(&repo_id) => {
+            match scope_ids.as_slice() {
+                [] => Vec::new(),
+                [repo_id] => {
                     artifact_service
-                        .list_sorted_page(repo_id, prefix, q, sort, after, offset, fetch)
+                        .list_sorted_page(*repo_id, prefix, q, sort, after, offset, fetch)
                         .await?
                 }
-                None => Vec::new(),
+                // Refused above. Sorting one member of several would drop the
+                // others' rows from the listing.
+                _ => {
+                    path_order_only("A Virtual repository with more than one member")?;
+                    Vec::new()
+                }
             }
         } else if is_virtual {
             artifact_service
@@ -14480,18 +14487,18 @@ pub async fn download_artifact(
                 // #4323: a member whose stored bytes failed verification is
                 // answered as such (502), not as a miss.
                 Err(resp) if crate::storage::verify::is_integrity_failure(&resp) => {
-                    return Ok(resp)
+                    return Ok(resp);
                 }
                 // #5504: no member served and one could not answer: the
                 // walk's retryable 503, not a 404 the client caches.
                 Err(resp) if proxy_helpers::is_member_unavailable_response(&resp) => {
-                    return Ok(resp)
+                    return Ok(resp);
                 }
                 // #5619: a member's download gate refused the artifact (a
                 // hold, a rejection, the scan policy): the refusal the hosted
                 // route answers, not a miss.
                 Err(resp) if proxy_helpers::is_member_policy_block_response(&resp) => {
-                    return Ok(resp)
+                    return Ok(resp);
                 }
                 Err(_) => return Err(not_found()),
             };
@@ -45498,6 +45505,113 @@ mod artifact_sort_5040_tests {
             let (status, body) = list(&fx, repo, &query).await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{query}: {body}");
         }
+        fx.teardown().await;
+    }
+    fn statuses_400(results: &[(String, StatusCode, serde_json::Value)]) {
+        for (query, status, body) in results {
+            assert_eq!(*status, StatusCode::BAD_REQUEST, "{query}: {body}");
+        }
+    }
+
+    async fn all(
+        fx: &tdh::Fixture,
+        key: &str,
+        queries: &[String],
+    ) -> Vec<(String, StatusCode, serde_json::Value)> {
+        let mut out = Vec::new();
+        for query in queries {
+            let (status, body) = list(fx, key, query).await;
+            out.push((query.clone(), status, body));
+        }
+        out
+    }
+
+    /// A virtual that gains a second member while a sorted cursor is out
+    /// refuses the next page, and a descending path order or a sorted cursor
+    /// replayed under the default order is refused like `sort_by`.
+    #[tokio::test]
+    async fn multi_member_virtual_refuses_every_sorted_read_5040() {
+        let Some(fx) = tdh::Fixture::setup("virtual", "generic").await else {
+            return;
+        };
+        let (first, _, _) = tdh::create_repo(&fx.pool, "local", "generic").await;
+        add_member(&fx.pool, fx.repo_id, first, 1).await;
+        for (path, size) in [("a.bin", 3), ("b.bin", 2), ("c.bin", 1)] {
+            seed(&fx.pool, first, path, size, 1).await;
+        }
+        let key = fx.repo_key.clone();
+        let (status, page) = list(&fx, &key, "per_page=1&sort_by=size").await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        assert_eq!(page["items"][0]["path"], "c.bin", "one member sorts");
+        let cursor = page["next_cursor"]
+            .as_str()
+            .expect("sorted cursor")
+            .to_string();
+
+        let (second, _, _) = tdh::create_repo(&fx.pool, "local", "generic").await;
+        add_member(&fx.pool, fx.repo_id, second, 2).await;
+        seed(&fx.pool, second, "d.bin", 0, 1).await;
+
+        let results = all(
+            &fx,
+            &key,
+            &[
+                format!("per_page=1&sort_by=size&cursor={cursor}"),
+                format!("per_page=1&cursor={cursor}"),
+                "sort_order=desc".to_string(),
+                "sort_by=path&sort_order=desc".to_string(),
+                "sort_by=created_at".to_string(),
+            ],
+        )
+        .await;
+        statuses_400(&results);
+        fx.teardown().await;
+    }
+
+    /// A virtual whose only member is a virtual with two leaves reads both
+    /// leaves, so it is refused like a two-member virtual.
+    #[tokio::test]
+    async fn nested_virtual_with_two_leaves_refuses_a_sort_5040() {
+        let Some(fx) = tdh::Fixture::setup("virtual", "generic").await else {
+            return;
+        };
+        let (inner, _, _) = tdh::create_repo(&fx.pool, "virtual", "generic").await;
+        let (first, _, _) = tdh::create_repo(&fx.pool, "local", "generic").await;
+        let (second, _, _) = tdh::create_repo(&fx.pool, "local", "generic").await;
+        add_member(&fx.pool, inner, first, 1).await;
+        add_member(&fx.pool, inner, second, 2).await;
+        add_member(&fx.pool, fx.repo_id, inner, 1).await;
+        seed(&fx.pool, first, "a.bin", 2, 1).await;
+        seed(&fx.pool, second, "b.bin", 1, 1).await;
+
+        let results = all(
+            &fx,
+            &fx.repo_key.clone(),
+            &[
+                "sort_by=size".to_string(),
+                "sort_by=size&sort_order=desc".to_string(),
+            ],
+        )
+        .await;
+        statuses_400(&results);
+        fx.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn docker_tag_grouping_refuses_a_sort_5040() {
+        let Some(fx) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+        let results = all(
+            &fx,
+            &fx.repo_key.clone(),
+            &[
+                "group_by=docker_tag&sort_by=size".to_string(),
+                "group_by=docker_tag&sort_order=desc".to_string(),
+            ],
+        )
+        .await;
+        statuses_400(&results);
         fx.teardown().await;
     }
 }
