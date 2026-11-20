@@ -24647,8 +24647,7 @@ mod tests {
             })),
         )
         .await
-        .err()
-        .expect("a refused path is an error");
+        .expect_err("a refused path is an error");
         let unread = (
             unread.status(),
             String::from_utf8_lossy(
