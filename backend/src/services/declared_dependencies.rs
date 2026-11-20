@@ -383,8 +383,27 @@ pub fn merge_dependencies(
 /// [`crate::services::spdx_licenses::sanitize_license_term`] makes of `raw`
 /// (and `raw` is not itself such a form): the same license text, as two
 /// scanners stored it (#5629).
+///
+/// The wrapping loses detail: a run of characters outside `[A-Za-z0-9.-]`
+/// becomes one `-`, and the body is cut at 64 characters. Two different
+/// texts can therefore wrap alike (`GPL-2.0+ AND MIT` and `GPL-2.0 AND MIT`,
+/// or two long lists that share their first 64 characters), and swapping on
+/// such a match could replace the license Trivy saw with a different one.
+/// So the match only counts when nothing but spaces was rewritten (`raw` is
+/// letters, digits, `.`, `-` and single spaces) and the body was not cut
+/// (shorter than 64 characters). The residual ambiguity is between a space
+/// and a `-` (`MIT AND X` vs `MIT-AND-X`), which names the same terms.
 fn is_wrapped_form_of(wrapped: &str, raw: &str) -> bool {
-    wrapped.starts_with("LicenseRef-")
+    const LICENSEREF_BODY_CAP: usize = 64;
+    let Some(body) = wrapped.strip_prefix("LicenseRef-") else {
+        return false;
+    };
+    let only_spaces_rewritten = raw
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ' '))
+        && !raw.contains("  ");
+    body.chars().count() < LICENSEREF_BODY_CAP
+        && only_spaces_rewritten
         && !raw.starts_with("LicenseRef-")
         && crate::services::spdx_licenses::sanitize_license_term(raw).as_deref() == Some(wrapped)
 }
@@ -859,6 +878,45 @@ mod tests {
             out[0].license.as_deref(),
             Some("MIT AND LicenseRef-Proprietary")
         );
+    }
+
+    #[test]
+    fn merge_never_swaps_on_a_lossy_licenseref_match() {
+        // `GPL-2.0+ AND MIT` and `GPL-2.0 AND MIT` wrap alike; the `+` is lost.
+        let trivy =
+            crate::services::spdx_licenses::sanitize_license_term("GPL-2.0+ AND MIT").unwrap();
+        assert_eq!(
+            crate::services::spdx_licenses::sanitize_license_term("GPL-2.0 AND MIT").as_deref(),
+            Some(trivy.as_str()),
+            "precondition: the two texts collide"
+        );
+        let out = merge_dependencies(
+            vec![
+                licensed("pkg:npm/p@1.0.0", &trivy),
+                licensed("pkg:npm/p@1.0.0", "GPL-2.0 AND MIT"),
+            ],
+            vec![],
+        );
+        assert_eq!(out[0].license.as_deref(), Some(trivy.as_str()));
+
+        // Two long lists sharing their first 64 characters wrap alike.
+        let common = "MIT AND Apache-2.0 AND BSD-3-Clause AND ISC AND Zlib AND Unlicense";
+        let seen = format!("{common} AND GPL-3.0-only");
+        let other = format!("{common} AND 0BSD");
+        let trivy = crate::services::spdx_licenses::sanitize_license_term(&seen).unwrap();
+        assert_eq!(
+            crate::services::spdx_licenses::sanitize_license_term(&other).as_deref(),
+            Some(trivy.as_str()),
+            "precondition: the two texts collide at the 64-character cut"
+        );
+        let out = merge_dependencies(
+            vec![
+                licensed("pkg:npm/q@1.0.0", &trivy),
+                licensed("pkg:npm/q@1.0.0", &other),
+            ],
+            vec![],
+        );
+        assert_eq!(out[0].license.as_deref(), Some(trivy.as_str()));
     }
 
     #[test]
