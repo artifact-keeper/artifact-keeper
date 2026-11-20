@@ -36,6 +36,15 @@
 -- A 10,000-row restore therefore still performs one ordered apply per
 -- repository, not 10,000 row-lock acquisitions on the ledger.
 --
+-- The ordered flush is not a universal lock-ordering fix: quota admission
+-- still takes one ledger row `FOR UPDATE` in statement order (#2523), and a
+-- raw writer now waits for its ledger row at COMMIT instead of at INSERT. A
+-- transaction admitting A then B can still cycle with one admitting B then A,
+-- and an admission holding a ledger row can wait for an artifact row whose
+-- writer is waiting at its commit flush. The known bulk writer retries the
+-- whole transaction on `40P01` (#6321); reordering every entry point up front
+-- is a larger design change than this migration.
+--
 -- `reconcile_usage_ledger_in_tx` continues to write an absolute recompute. It
 -- now also discards that transaction's pending delta for the repository (see
 -- the application change in this PR), so a reconcile inside a transaction that
