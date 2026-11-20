@@ -7176,6 +7176,32 @@ mod tests {
         );
     }
 
+    /// Regression guard for #6160: the shipped and local-dev compose files
+    /// list the backend environment explicitly, so an opt-in switch documented
+    /// in `.env.example` has to be forwarded by name. `LDAP_BASIC_AUTH_PASSTHROUGH`
+    /// was missing, which made setting it in `.env` a no-op for the container
+    /// and left Maven uploads with a directory password at 401.
+    #[test]
+    fn compose_backend_forwards_ldap_basic_auth_passthrough() {
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("backend crate has a parent directory (repo root)");
+
+        for file_name in ["docker-compose.yml", "docker-compose.local-dev.yml"] {
+            let compose = read_compose(repo_root, file_name);
+            let backend = compose_service_block(&compose, "backend");
+            assert!(
+                !backend.is_empty(),
+                "backend service not found in {file_name}"
+            );
+            assert!(
+                backend.contains("LDAP_BASIC_AUTH_PASSTHROUGH:"),
+                "{file_name}'s backend service must forward LDAP_BASIC_AUTH_PASSTHROUGH \
+                 from .env (#6160). Offending block:\n{backend}"
+            );
+        }
+    }
+
     // -----------------------------------------------------------------------
     // #2099: publishing workflows must not cancel themselves
     // -----------------------------------------------------------------------

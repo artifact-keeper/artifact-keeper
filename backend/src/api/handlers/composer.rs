@@ -1779,6 +1779,7 @@ async fn serve_virtual_composer_dist(
         default_content_type: "application/zip",
         disposition: Some(&filename),
         ctx,
+        report_refusals: false,
     };
     let filename = &filename;
     let scanned = |member: crate::models::repository::Repository, policy| async move {
