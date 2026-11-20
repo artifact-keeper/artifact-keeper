@@ -24,7 +24,7 @@ use crate::services::proxy_scan_service::CacheScanGate;
 pub(crate) use crate::services::proxy_service::CachedBody;
 pub use crate::services::proxy_service::StreamingFetchResult;
 use crate::services::proxy_service::{DeferredCommitSlot, DirectUpstreamBody, ProxyService};
-use crate::services::virtual_member_breaker::{fetch_error_trips_breaker, MemberBreaker};
+use crate::services::virtual_member_breaker::MemberBreaker;
 // Re-export the per-format buffered-metadata byte ceilings (#1608 Phase 4b /
 // #2181) so format handlers select a cap via `proxy_helpers::<CONST>`.
 pub use crate::services::proxy_service::{DEFAULT_METADATA_MAX_BYTES, LARGE_METADATA_MAX_BYTES};
@@ -2023,11 +2023,9 @@ async fn proxy_fetch_streaming_member(
         proxy_service.fetch_artifact_streaming(member, path).await
     };
     // #5810: the member's answer, for its download breaker.
-    proxy_service.member_breaker().record(
-        member.id,
-        &member.key,
-        fetched.as_ref().is_err_and(fetch_error_trips_breaker),
-    );
+    proxy_service
+        .member_breaker()
+        .record_fetch(member.id, &member.key, &fetched);
     streaming_fetch_response(
         fetched,
         &member.key,
@@ -4487,11 +4485,9 @@ where
                         None => proxy.fetch_artifact_streaming(member, path).await,
                     };
                     // #5810: the member's answer, for its download breaker.
-                    proxy.member_breaker().record(
-                        member.id,
-                        &member.key,
-                        fetch.as_ref().is_err_and(fetch_error_trips_breaker),
-                    );
+                    proxy
+                        .member_breaker()
+                        .record_fetch(member.id, &member.key, &fetch);
                     classify_stream_upstream(fetch, &member.key, path)
                         .map_hit(|result| (result, VirtualServeOrigin::remote(member)))
                 }
