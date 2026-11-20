@@ -1870,8 +1870,9 @@ impl ScanResultService {
         //
         // Invariant relied upon: scan_findings rows are only ever deleted
         // via the `ON DELETE CASCADE` from scan_results(id) (migration 022),
-        // or by `reopen_failed_scan` (#5942), which first locks the parent
-        // row FOR UPDATE and so conflicts with the FOR SHARE taken here.
+        // or by `clear_retry_leftovers` (#5942, from `create_findings_for_row`
+        // and `convert_to_reused`), which first locks the parent row FOR
+        // UPDATE and so conflicts with the FOR SHARE taken here.
         // Any other direct `DELETE FROM scan_findings WHERE scan_result_id
         // = $X` would NOT be blocked by FOR SHARE on the parent row and would
         // re-open this race. Don't add one without locking the parent too.
@@ -2176,6 +2177,9 @@ impl ScanResultService {
         }
         // Safe: convert_should_noop returned false, so updated is Some.
         let updated = updated.expect("updated row present after no-op check");
+        // #5942: a target a retry reopened still holds its failed attempt's
+        // findings; the copy below replaces them in this transaction.
+        Self::clear_retry_leftovers(&mut tx, target_scan_id, true).await?;
 
         // Copy findings from the source scan into the target scan id. This
         // runs inside the same transaction so a failure here rolls back the
@@ -2277,6 +2281,18 @@ impl ScanResultService {
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
+        // #5942: a row a retry reopened carried the recorded failure until
+        // now; the completion supersedes it.
+        sqlx::query(
+            "UPDATE scan_results SET error_message = NULL \
+             WHERE id = $1 AND status = 'completed' AND starts_with(error_message, $2)",
+        )
+        .bind(scan_id)
+        .bind(crate::services::scan_state::RETRYING_AFTER_FAILURE_PREFIX)
+        .execute(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
         scan_completed();
         Ok(())
     }
@@ -2353,66 +2369,111 @@ impl ScanResultService {
     }
 
     /// Put a trigger's pre-allocated row that an earlier attempt of the same
-    /// queued job left `failed` back to `running` before the retry scans into
-    /// it (#5942). One transaction, so the row is either fully reset or left
-    /// as it was:
+    /// queued job left `failed` back to `running` before the retry uses it
+    /// (#5942):
     ///
-    /// - the row is locked `FOR UPDATE` first, which conflicts with the
-    ///   `FOR SHARE` a concurrent [`Self::copy_scan_results`] takes on its
-    ///   source, so the direct child deletes below cannot reopen the #1058
-    ///   race that copy guards against;
-    /// - the attempt's `scan_findings` and `scan_packages` are deleted, since
-    ///   both are only appended to (an attempt that stored its findings and
-    ///   then failed to complete, #5564, would otherwise be counted twice);
-    /// - the row goes back to `running` with its error, completion time and
-    ///   `failed` inventory cleared and `started_at` set to now, so the
-    ///   stuck-scan janitor (which reaps by `started_at`) times the retry from
-    ///   its own start, not from the first attempt or the queue time.
+    /// - `started_at` moves to now, so the stuck-scan janitor (which reaps by
+    ///   `started_at`) times the retry from its own start, not from the first
+    ///   attempt or the queue time;
+    /// - the `failed` inventory is cleared. The completion time is KEPT (the
+    ///   failed attempt's): the per-scanner "latest row" readers
+    ///   (`LATEST_PER_SCAN_TYPE_SQL`, the repository coverage windows) order
+    ///   by `completed_at DESC NULLS LAST`, and a NULL would let an older
+    ///   completed row of the same scanner outrank the reopened one, hiding
+    ///   the failure below. The retry's own completion or failure sets it to
+    ///   now;
+    /// - the recorded failure is KEPT, under
+    ///   [`RETRYING_AFTER_FAILURE_PREFIX`](crate::services::scan_state::RETRYING_AFTER_FAILURE_PREFIX):
+    ///   the gates count the row as that failure until the retry completes it
+    ///   or fails it again, so `block_on_fail` neither lets the artifact
+    ///   through nor releases its hold while the retry runs;
+    /// - the attempt's `scan_findings` and `scan_packages` stay until the
+    ///   retry writes its own result ([`Self::create_findings_for_row`],
+    ///   [`Self::convert_to_reused`]), which replaces them in one
+    ///   transaction, so a `max_severity` policy keeps seeing them too.
     ///
     /// A row in any other state is left alone. Returns whether it was reopened.
     pub async fn reopen_failed_scan(&self, scan_id: Uuid) -> Result<bool> {
-        let db_err = |e: sqlx::Error| AppError::Database(e.to_string());
-        let mut tx = self.db.begin().await.map_err(db_err)?;
-        // Runtime queries, as in `fail_scan_if_running`.
-        let locked: Option<(Uuid,)> = sqlx::query_as(
-            "SELECT id FROM scan_results WHERE id = $1 AND status = 'failed' FOR UPDATE",
-        )
-        .bind(scan_id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(db_err)?;
-        if locked.is_none() {
-            return Ok(false);
-        }
-        sqlx::query("DELETE FROM scan_findings WHERE scan_result_id = $1")
-            .bind(scan_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(db_err)?;
-        sqlx::query("DELETE FROM scan_packages WHERE scan_result_id = $1")
-            .bind(scan_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(db_err)?;
-        sqlx::query(
+        // Runtime query, as in `fail_scan_if_running`.
+        let reopened = sqlx::query(
             r#"
             UPDATE scan_results
-            SET status = 'running', error_message = NULL, completed_at = NULL,
-                inventory_status = 'complete', started_at = NOW(),
-                findings_count = 0, critical_count = 0, high_count = 0,
-                medium_count = 0, low_count = 0, info_count = 0
+            SET status = 'running',
+                error_message = $2 || COALESCE(error_message, 'no error recorded'),
+                inventory_status = 'complete', started_at = NOW()
             WHERE id = $1 AND status = 'failed'
             "#,
         )
         .bind(scan_id)
-        .execute(&mut *tx)
+        .bind(crate::services::scan_state::RETRYING_AFTER_FAILURE_PREFIX)
+        .execute(&self.db)
         .await
-        .map_err(db_err)?;
-        tx.commit().await.map_err(db_err)?;
-        // A `failed` row moved a block_on_fail decision; drop the cached
-        // listing decisions the same way a terminal transition does.
-        scan_completed();
+        .map_err(|e| AppError::Database(e.to_string()))?
+        .rows_affected();
+        Ok(reopened > 0)
+    }
+
+    /// Inside `tx`, holding the row lock: when `scan_id` is a row reopened for
+    /// a retry (#5942), delete the failed attempt's findings and packages, as
+    /// the retry's own result is written in the same transaction. With
+    /// `drop_marker` the retry marker goes too, for a caller that completes
+    /// the row in that transaction; otherwise the marker stays until the
+    /// completion ([`Self::complete_scan`]) or a new failure replaces it, so
+    /// the row never reads as a plain first run in between. Returns whether
+    /// it was such a row.
+    async fn clear_retry_leftovers(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        scan_id: Uuid,
+        drop_marker: bool,
+    ) -> Result<bool> {
+        let db_err = |e: sqlx::Error| AppError::Database(e.to_string());
+        let marker: Option<(Option<String>,)> =
+            sqlx::query_as("SELECT error_message FROM scan_results WHERE id = $1 FOR UPDATE")
+                .bind(scan_id)
+                .fetch_optional(&mut **tx)
+                .await
+                .map_err(db_err)?;
+        let retrying = marker.and_then(|(m,)| m).is_some_and(|m| {
+            m.starts_with(crate::services::scan_state::RETRYING_AFTER_FAILURE_PREFIX)
+        });
+        if !retrying {
+            return Ok(false);
+        }
+        let drop = "UPDATE scan_results SET error_message = NULL WHERE id = $1";
+        let statements = [
+            "DELETE FROM scan_findings WHERE scan_result_id = $1",
+            "DELETE FROM scan_packages WHERE scan_result_id = $1",
+        ];
+        for sql in statements.into_iter().chain(drop_marker.then_some(drop)) {
+            sqlx::query(sql)
+                .bind(scan_id)
+                .execute(&mut **tx)
+                .await
+                .map_err(db_err)?;
+        }
         Ok(true)
+    }
+
+    /// [`Self::create_findings`] for a trigger's pre-allocated row: when an
+    /// earlier attempt's retry reopened it (#5942), its leftover findings and
+    /// packages are replaced, in one transaction, by this attempt's findings,
+    /// so the row never holds both attempts' and never holds neither.
+    pub async fn create_findings_for_row(
+        &self,
+        scan_result_id: Uuid,
+        artifact_id: Uuid,
+        findings: &[RawFinding],
+    ) -> Result<()> {
+        let mut tx = self
+            .db
+            .begin()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        Self::clear_retry_leftovers(&mut tx, scan_result_id, false).await?;
+        insert_findings(&mut *tx, scan_result_id, artifact_id, findings).await?;
+        tx.commit()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))
     }
 
     /// Mark a scan as `not_applicable` (#1470): the scanner does not apply to

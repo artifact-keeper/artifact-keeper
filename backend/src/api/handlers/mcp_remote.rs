@@ -1924,6 +1924,85 @@ mod tests {
         env.teardown().await;
     }
 
+    /// #6249: a background pass that fails on a database error records the
+    /// failure before it releases the sync lock, so no poll sees
+    /// `running: false` beside the previous pass's state. A trigger makes the
+    /// pass's own start write fail (a database error) and holds the failure
+    /// record for three seconds, which is where the old order showed the lock
+    /// free with nothing recorded.
+    #[tokio::test]
+    async fn manual_sync_failure_is_recorded_before_the_lock_is_released_6249() {
+        let Some(env) = Env::new().await else { return };
+        let func = format!("ak_test_6249_{}", Uuid::new_v4().simple());
+        let pool = env.fx.pool.clone();
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "CREATE FUNCTION {func}() RETURNS trigger LANGUAGE plpgsql AS $f$ \
+             BEGIN \
+               IF NEW.repository_id = '{repo}'::uuid THEN \
+                 IF position('ak-test-6249' IN coalesce(NEW.last_error, '')) = 0 THEN \
+                   RAISE EXCEPTION 'ak-test-6249 injected failure'; \
+                 END IF; \
+                 PERFORM pg_sleep(3); \
+               END IF; \
+               RETURN NEW; \
+             END $f$",
+            repo = env.fx.repo_id
+        )))
+        .execute(&pool)
+        .await
+        .expect("create trigger function");
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "CREATE TRIGGER {func} BEFORE INSERT OR UPDATE ON mcp_remote_sync_state \
+             FOR EACH ROW EXECUTE FUNCTION {func}()"
+        )))
+        .execute(&pool)
+        .await
+        .expect("create trigger");
+
+        let (s, b) = env.admin("POST", "/sync", None).await;
+        let mut ended = None;
+        if s == StatusCode::ACCEPTED {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while std::time::Instant::now() < deadline {
+                let (_, st) = env.admin("GET", "/sync", None).await;
+                if st["running"] == false {
+                    ended = Some(st);
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+        let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP TRIGGER IF EXISTS {func} ON mcp_remote_sync_state"
+        )))
+        .execute(&pool)
+        .await;
+        let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP FUNCTION IF EXISTS {func}()"
+        )))
+        .execute(&pool)
+        .await;
+        let _ = sqlx::query("DELETE FROM mcp_remote_sync_state WHERE repository_id = $1")
+            .bind(env.fx.repo_id)
+            .execute(&pool)
+            .await;
+
+        assert_eq!(s, StatusCode::ACCEPTED, "{b}");
+        let st = ended.expect("the failed pass never released its lock");
+        assert!(
+            st["lastFinishedAt"].is_string(),
+            "the lock was free before the failed pass was recorded: {st}"
+        );
+        assert!(
+            st["lastError"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("ak-test-6249"),
+            "the lock was free before the failed pass was recorded: {st}"
+        );
+        env.teardown().await;
+    }
+
     impl Env {
         /// Create a Remote MCP repository of this test's upstream through
         /// `POST /api/v1/repositories` with the extra create-body fields.

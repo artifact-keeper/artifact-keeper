@@ -7950,6 +7950,101 @@ mod tests {
         rig.teardown().await;
     }
 
+    /// #5766: a release decided for D1 (`expected_digest`) that lands after
+    /// the tag moved to D2 and D2 was held releases D1's row (the hold the
+    /// move carried to it), never the newer hold on the tag row. The answer
+    /// names both digests, and D2 stays refused.
+    #[tokio::test]
+    async fn stale_release_after_a_tag_move_keeps_the_newer_hold_5766() {
+        let Some(rig) = AliasRig::new().await else {
+            return;
+        };
+        let d1 = rig.push("seen").await;
+        let tag_row = rig.row_id("1.0").await;
+        let (s, b) = admin_hold(&rig, tag_row, "quarantine", serde_json::json!({})).await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        let d2 = rig.push("next").await;
+        assert_eq!(rig.row_id("1.0").await, tag_row);
+        // The newer hold, on D2, decided after the release of D1 was.
+        let (s, b) = admin_hold(
+            &rig,
+            tag_row,
+            "quarantine",
+            serde_json::json!({"reason": "newer", "expected_digest": d2}),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+
+        let (status, body) = admin_hold(
+            &rig,
+            tag_row,
+            "release",
+            serde_json::json!({"expected_digest": d1}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["new_status"], "released", "{body}");
+        assert_eq!(body["held_digest"], d1.as_str(), "{body}");
+        assert_eq!(body["moved_to_digest"], d2.as_str(), "{body}");
+        assert_eq!(
+            rig.rows_of(&d1).await,
+            vec![(
+                format!("v2/{ALIAS_IMAGE}/manifests/{d1}"),
+                Some("released".to_string())
+            )],
+            "D1's carried hold is the one released"
+        );
+        assert_eq!(
+            rig.hold_at("1.0").await.map(|h| (h.0, h.2)),
+            Some((Some("quarantined".to_string()), Some("admin".to_string()))),
+            "the newer hold on D2 survives"
+        );
+        assert_eq!(
+            rig.native(&rig.docker.key, "1.0").await,
+            StatusCode::CONFLICT,
+            "D2 stays refused"
+        );
+
+        // A second stale release of D1, whose row is no longer held, changes
+        // nothing; nor does one for a digest that has no row at all, which
+        // must not create one.
+        let ghost = format!("sha256:{}", "a".repeat(64));
+        for digest in [d1.as_str(), ghost.as_str()] {
+            let (s, b) = admin_hold(
+                &rig,
+                tag_row,
+                "release",
+                serde_json::json!({"expected_digest": digest}),
+            )
+            .await;
+            assert_eq!(s, StatusCode::CONFLICT, "{digest}: {b}");
+        }
+        assert!(rig.rows_of(&ghost).await.is_empty(), "no row was created");
+        assert_eq!(
+            rig.hold_at("1.0").await.map(|h| h.0),
+            Some(Some("quarantined".to_string())),
+            "the newer hold still survives"
+        );
+
+        // Bad digest is a 400; an empty body releases the row as it reads now.
+        let (s, b) = admin_hold(
+            &rig,
+            tag_row,
+            "release",
+            serde_json::json!({"expected_digest": "sha256:nothex"}),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+        let (s, b) = admin_hold(&rig, tag_row, "release", serde_json::Value::Null).await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        assert!(b.get("held_digest").is_none(), "{b}");
+        assert_eq!(
+            rig.hold_at("1.0").await.map(|h| h.0),
+            Some(Some("released".to_string()))
+        );
+        rig.teardown().await;
+    }
+
     /// `isLatest` is the newest servable version on every read, and
     /// `version=latest` picks the newest before `updated_since` filters.
     #[tokio::test]
