@@ -265,7 +265,7 @@ pub fn spawn_scan_worker(state: SharedState, shutdown: CancellationToken) {
                 // A rescan beyond the free rescan slots (more claimed in one
                 // batch than are free) goes straight back, before its wait is
                 // recorded: it has not stopped waiting.
-                let rescan_permit = if job.job_kind() == Some(ScanJobKind::Rescan) {
+                let rescan_permit = if job.in_rescan_band() {
                     match Arc::clone(&rescan_permits).try_acquire_owned() {
                         Ok(p) => Some(p),
                         Err(_) => {
@@ -450,6 +450,11 @@ async fn retry_when_scanner_timed_out(
 /// Dispatch to the branch for this job's kind.
 async fn execute(state: &SharedState, job: &ScanJob) -> Result<(), JobFailure> {
     match job.job_kind() {
+        // #6300: a re-grade nobody waits on asks the adapter for the
+        // background band, as a rescan does.
+        Some(ScanJobKind::ProxyFile) if job.in_rescan_band() => {
+            crate::services::scan_queue::in_background(scan_proxy_file(state, job)).await
+        }
         Some(ScanJobKind::ProxyFile) => scan_proxy_file(state, job).await,
         Some(ScanJobKind::HostedArtifact) => scan_hosted_artifact(state, job).await,
         Some(ScanJobKind::HostedUpload) => {

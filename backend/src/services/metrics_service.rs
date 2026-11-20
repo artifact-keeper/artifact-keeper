@@ -324,6 +324,15 @@ pub fn record_proxy_scan_queue_refused(limit: &'static str) {
     counter!("ak_proxy_scan_queue_refused_total", "limit" => limit).increment(1);
 }
 
+/// A re-grade of a proxied file whose verdict, graded against the previous
+/// vulnerability-DB build, decided a pull under the DB-update grace (#6300).
+/// `outcome` is `queued` (a scan-queue job), `started` (scanning in this
+/// process) or `deferred` (this process already runs its share; a later pull
+/// asks again).
+pub fn record_proxy_scan_regrade(outcome: &'static str) {
+    counter!("ak_proxy_scan_regrades_total", "outcome" => outcome).increment(1);
+}
+
 /// A queued `fail_closed` proxy scan dropped because no request wanted it any
 /// more (#5231).
 pub fn record_proxy_scan_abandoned() {

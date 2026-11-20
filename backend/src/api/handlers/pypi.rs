@@ -20844,6 +20844,145 @@ mod tests {
         );
     }
 
+    /// #6300: a vulnerability-DB update no longer re-scans every cached
+    /// package on its next pull. A verdict the same scanner graded against
+    /// the previous DB build decides the pull within the grace (here a
+    /// fail_closed pull served from a `clean` row, with no scan on the
+    /// request path), the pull re-grades the bytes in the background, and
+    /// once the re-grade has found the CVE the live DB knows the next pull is
+    /// blocked from the new row.
+    #[tokio::test]
+    async fn test_db_update_regrades_in_the_background_and_then_blocks_6300() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        const LIVE: &str = "grype-0.84.6300+db-2026-11-19";
+        const PREVIOUS: &str = "grype-0.84.6300+db-2026-11-18";
+
+        let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
+            return;
+        };
+        let project = "regrade";
+        let filename = "regrade-1.0.0-py3-none-any.whl";
+        let wheel: &[u8] = b"PK\x03\x04 regrade-wheel-6300";
+        let digest = sha256_hex(&Bytes::from_static(b"PK\x03\x04 regrade-wheel-6300"));
+
+        // The fleet saw PREVIOUS before LIVE; LIVE is first seen on this run.
+        sqlx::query("DELETE FROM proxy_scan_db_versions WHERE starts_with(scanner_version, 'grype-0.84.6300+')")
+            .execute(&fx.pool)
+            .await
+            .expect("reset versions");
+        sqlx::query(
+            "INSERT INTO proxy_scan_db_versions (scanner_version, first_seen_at) \
+             VALUES ($1, now() - interval '1 day')",
+        )
+        .bind(PREVIOUS)
+        .execute(&fx.pool)
+        .await
+        .expect("seed the previous version");
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_scan_upstream(&upstream, project, filename, wheel).await;
+        enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let (cve, scans) = VersionedCveScanner::counting(Some(LIVE), MockCveRescan::Vulnerable);
+        let state = scan_state_with_supplementary_and_cve(&fx, &storage_path, cve);
+        let mut repo_info = fx.repo_info("remote", Some(&upstream.uri()));
+        repo_info.format = "pypi".to_string();
+        let pull = || async {
+            match super::serve_file(
+                &state,
+                &repo_info,
+                &fx.repo_key,
+                &proj(project),
+                filename,
+                None,
+                &Default::default(),
+            )
+            .await
+            {
+                Ok(r) | Err(r) => (
+                    r.status(),
+                    r.headers()
+                        .get("X-AK-Scan")
+                        .map(|v| v.to_str().unwrap().to_string()),
+                ),
+            }
+        };
+        let row = || async {
+            sqlx::query_as::<_, (String, Option<String>)>(
+                "SELECT verdict, scanner_version FROM proxy_scan_results \
+                 WHERE checksum_sha256 = $1 AND scan_type = 'grype'",
+            )
+            .bind(&digest)
+            .fetch_one(&fx.pool)
+            .await
+            .expect("verdict row")
+        };
+
+        // First pull: graded inline, vulnerable.
+        let first = pull().await;
+        // The same bytes graded clean by the previous DB build.
+        sqlx::query(
+            "UPDATE proxy_scan_results SET verdict = 'clean', findings_count = 0, \
+             critical_count = 0, high_count = 0, medium_count = 0, low_count = 0, \
+             max_severity = NULL, scanner_version = $2 \
+             WHERE checksum_sha256 = $1 AND scan_type = 'grype'",
+        )
+        .bind(&digest)
+        .bind(PREVIOUS)
+        .execute(&fx.pool)
+        .await
+        .expect("age the verdict");
+        let scans_before = scans.load(std::sync::atomic::Ordering::SeqCst);
+
+        let during = pull().await;
+        let scans_on_the_request_path = scans.load(std::sync::atomic::Ordering::SeqCst);
+        let row_after_the_response = row().await;
+
+        // The re-grade runs after the response; give it a few seconds.
+        let mut regraded = row().await;
+        for _ in 0..100 {
+            if regraded.1.as_deref() == Some(LIVE) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            regraded = row().await;
+        }
+        let after = pull().await;
+        let scans_total = scans.load(std::sync::atomic::Ordering::SeqCst);
+
+        tdh::drop_proxy_verdicts(&fx.pool, std::slice::from_ref(&digest)).await;
+        sqlx::query("DELETE FROM proxy_scan_db_versions WHERE starts_with(scanner_version, 'grype-0.84.6300+')")
+            .execute(&fx.pool)
+            .await
+            .expect("cleanup versions");
+        fx.teardown().await;
+
+        assert_eq!(first.0, StatusCode::FORBIDDEN);
+        assert_eq!(scans_before, 1);
+        assert_eq!(
+            during,
+            (StatusCode::OK, Some("clean".to_string())),
+            "within the grace the previous build's verdict decides the pull"
+        );
+        assert_eq!(scans_on_the_request_path, 1, "no scan on the request path");
+        assert_eq!(
+            row_after_the_response,
+            ("clean".to_string(), Some(PREVIOUS.to_string()))
+        );
+        assert_eq!(
+            regraded,
+            ("vulnerable".to_string(), Some(LIVE.to_string())),
+            "the pull re-graded the bytes against the live build"
+        );
+        assert_eq!(after.0, StatusCode::FORBIDDEN, "blocked once re-graded");
+        assert_eq!(
+            scans_total, 2,
+            "one re-grade, and the block is from the row"
+        );
+    }
+
     /// Fail-closed alignment after a version bump: when the invalidating
     /// re-scan is INCONCLUSIVE (scanner error), the pull must 423, never a
     /// 200 of the stale-clean cache (#2976 + #2954 fail-closed contract).

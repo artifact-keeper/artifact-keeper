@@ -12539,6 +12539,110 @@ async fn proxy_cached_object_is_readable(
     }
 }
 
+/// Re-grades this process started or queued in the last ten minutes (#6300), so
+/// a hot digest reused under the DB-update grace queues one, not one per pull.
+static RECENT_REGRADES: once_cell::sync::Lazy<moka::future::Cache<(Uuid, String), ()>> =
+    once_cell::sync::Lazy::new(|| {
+        moka::future::Cache::builder()
+            .max_capacity(100_000)
+            .time_to_live(std::time::Duration::from_secs(600))
+            .build()
+    });
+
+/// Re-grades this process runs itself at once when the durable scan queue is
+/// off or cannot take the job (#6300). A pull that finds none free leaves the
+/// re-grade to a later pull of the same digest.
+const IN_PROCESS_REGRADES: usize = 2;
+
+fn in_process_regrade_permits() -> &'static std::sync::Arc<tokio::sync::Semaphore> {
+    static PERMITS: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
+        std::sync::OnceLock::new();
+    PERMITS.get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(IN_PROCESS_REGRADES)))
+}
+
+/// Re-grade bytes whose stored verdict was graded against the previous
+/// vulnerability-DB build and was reused for this pull under the DB-update
+/// grace (#6300). Nobody waits on it: with the scan queue on it is a
+/// `proxy_file` job at [`PRIORITY_REGRADE`], claimed after all other work and
+/// within the workers' rescan slots; otherwise it runs here, at most
+/// [`IN_PROCESS_REGRADES`] at a time, in the background band. Either way it
+/// reads the bytes already in hand or in the proxy cache, never the upstream,
+/// and records the verdict against the live build like any scan.
+///
+/// [`PRIORITY_REGRADE`]: crate::services::scan_queue::PRIORITY_REGRADE
+#[allow(clippy::too_many_arguments)]
+async fn start_proxy_regrade(
+    state: &crate::api::SharedState,
+    repo_id: Uuid,
+    digest: &str,
+    cache_path: Option<&str>,
+    synthetic: &crate::models::artifact::Artifact,
+    bytes: &Bytes,
+    identity: &ProxyScanIdentity,
+    mode: &ProxyScanMode,
+) {
+    use crate::services::metrics_service::record_proxy_scan_regrade;
+    let expected = match identity {
+        ProxyScanIdentity::Established(e) => Some(e.clone()),
+        ProxyScanIdentity::NotApplicable => None,
+        // A stored verdict never pertains to an unestablished identity.
+        ProxyScanIdentity::Unestablished => return,
+    };
+    let key = (repo_id, digest.to_string());
+    if !RECENT_REGRADES
+        .entry(key.clone())
+        .or_insert(())
+        .await
+        .is_fresh()
+    {
+        return;
+    }
+    if let Some(cache_path) = queued_scan_ref(mode, cache_path, expected.as_ref(), bytes.len())
+        .filter(|_| state.config.scan_queue_enabled)
+    {
+        if enqueue_proxy_file_scan(
+            state,
+            repo_id,
+            cache_path,
+            digest,
+            bytes.len() as i64,
+            expected.as_ref(),
+            crate::services::scan_queue::PRIORITY_REGRADE,
+        )
+        .await
+        {
+            record_proxy_scan_regrade("queued");
+            return;
+        }
+    }
+    let Ok(permit) = std::sync::Arc::clone(in_process_regrade_permits()).try_acquire_owned() else {
+        RECENT_REGRADES.invalidate(&key).await;
+        record_proxy_scan_regrade("deferred");
+        return;
+    };
+    record_proxy_scan_regrade("started");
+    let state = state.clone();
+    let digest = digest.to_string();
+    let synthetic = synthetic.clone();
+    let bytes = bytes.clone();
+    let mode = mode.clone();
+    tokio::spawn(async move {
+        let _permit = permit;
+        let budget = proxy_scan_mode_budget(&mode);
+        let _ = crate::services::scan_queue::in_background(proxy_scan_and_record(
+            &state,
+            repo_id,
+            &digest,
+            &synthetic,
+            &bytes,
+            expected.as_ref(),
+            &mode,
+            budget,
+        ))
+        .await;
+    });
+}
+
 /// Fail-open digests queued in the last minute: a burst on one digest upserts the
 /// same `scan_queue` row per hit, each waiter holding a pool connection on its lock.
 static RECENT_BACKFILL_ENQUEUES: once_cell::sync::Lazy<moka::future::Cache<(Uuid, String), ()>> =
@@ -12750,13 +12854,29 @@ async fn decide_proxy_scan_serve(
         _ => None,
     };
 
-    match decide_serve(
+    let decision = decide_serve(
         row.as_ref(),
         current_version.as_deref(),
         action,
         crate::services::scanner_service::DEDUP_TTL_DAYS as i64,
         Utc::now(),
+    );
+    // #6300: a verdict from the previous vulnerability-DB build decides this
+    // pull only within the DB-update grace; it is re-graded off the request
+    // path, so the next pull after that is decided against the live build.
+    if matches!(
+        decision,
+        ServeDecision::ServeCached | ServeDecision::BlockCached
+    ) && crate::services::proxy_scan_service::verdict_needs_regrade(
+        row.as_ref().and_then(|r| r.scanner_version.as_deref()),
+        current_version.as_deref(),
     ) {
+        start_proxy_regrade(
+            state, repo_id, digest, cache_path, &synthetic, bytes, &identity, &mode,
+        )
+        .await;
+    }
+    match decision {
         ServeDecision::BlockCached => {
             // #3243 stage 3 / #3246: a repo that explicitly opted in via
             // `block_on_policy_violation` applies its `severity_threshold` to
