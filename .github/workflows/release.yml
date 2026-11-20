@@ -1549,6 +1549,23 @@ jobs:
             echo "generate=true" >> "$GITHUB_OUTPUT"
           fi
 
+      # GITHUB_TOKEN gets a 403 on Create Release when the commit is not a
+      # branch tip (#6338, softprops/action-gh-release#411). release-promote
+      # pins `publish/vX.Y.Z` at the commit before it tags; this makes sure
+      # the pin is there (a promote from before #6338, or a pin deleted since)
+      # and only warns when it cannot: a commit that is still a tip releases
+      # without it.
+      - name: Keep the release commit a branch tip
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if ! bash scripts/ci/pin-release-branch.sh pin "$TAG" "$SHA"; then
+            echo "::warning title=publish/${TAG} not pinned::If Create Release fails with 403, create the branch by hand (gh api -X POST repos/${GITHUB_REPOSITORY}/git/refs -f ref=refs/heads/publish/${TAG} -f sha=${SHA}) and re-run the failed jobs (RELEASING.md, step 8)."
+          fi
+
       - name: Create Release
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v2
         with:
@@ -1567,6 +1584,16 @@ jobs:
           files: release-assets/*
           fail_on_unmatched_files: true
           overwrite_files: false
+
+      # The Release exists, so the pin has done its job. Runs only after a
+      # successful Create Release: a failed attempt keeps the branch for the
+      # re-run. Never fails the job.
+      - name: Remove the release pin branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+          SHA: ${{ github.sha }}
+        run: bash scripts/ci/pin-release-branch.sh unpin "$TAG" "$SHA" || true
 
       - name: Notify Windows MSI build
         uses: peter-evans/repository-dispatch@28959ce8df70de7be546dd1250a005dd32156697 # v4.0.1

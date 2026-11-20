@@ -539,6 +539,26 @@ names the same commit.
    and the job then asserts that both tags, on both registries, resolve to
    the digest the gate tested.
 
+   **The `publish/vX.Y.Z` branch (#6338).** `GITHUB_TOKEN` is refused
+   (`403 Resource not accessible by integration`) on Create Release when the
+   release commit is not the tip of any branch, which it stops being as soon
+   as anything merges to the line after certification (1.12.3). So the
+   promote creates `publish/vX.Y.Z` at the commit just before the tag,
+   `release.yml` re-creates it before Create Release if it is missing, and
+   removes it once the Release exists. A failed Create Release keeps the
+   branch for the re-run. If Create Release still gets a 403 (both pin
+   attempts warned), create the branch by hand and re-run the failed jobs:
+
+   ```bash
+   gh api -X POST repos/artifact-keeper/artifact-keeper/git/refs \
+     -f ref=refs/heads/publish/vX.Y.Z -f sha=<the release commit>
+   gh run rerun <release.yml run id> --failed
+   ```
+
+   Then delete the branch after the Release is published. A release from a
+   line whose `release.yml` predates #6338 (`release/1.11.x` until it is
+   backported) does not remove the branch: delete it by hand.
+
    Until the GitHub Release exists, `:latest` and `:X.Y` still point at the
    PREVIOUS release, and that is correct. A failure in a post-gate job
    (signing, the Release object, the floating promotion) is a genuine
