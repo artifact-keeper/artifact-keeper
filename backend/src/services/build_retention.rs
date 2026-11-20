@@ -47,8 +47,13 @@ impl BuildRetentionPolicy {
     }
 }
 
+/// Largest age limit the pass applies, the settings API's own bound. A
+/// larger value stored by hand would put the cutoff before the earliest
+/// timestamp Postgres can hold and fail every pass
+pub const BUILD_RETENTION_MAX_DAYS: i32 = 36_500;
+
 /// Read both settings. A missing, zero, negative or non-numeric value turns
-/// its rule off
+/// its rule off, an age above [`BUILD_RETENTION_MAX_DAYS`] is read as that
 pub async fn configured_policy(db: impl PgExecutor<'_>) -> Result<BuildRetentionPolicy> {
     let rows: Vec<(String, serde_json::Value)> =
         sqlx::query_as("SELECT key, value FROM system_settings WHERE key = ANY($1)")
@@ -65,7 +70,7 @@ pub async fn configured_policy(db: impl PgExecutor<'_>) -> Result<BuildRetention
             .and_then(|(_, v)| retention_days_from_setting(Some(v)))
     };
     Ok(BuildRetentionPolicy {
-        days: value(BUILD_RETENTION_DAYS_SETTING),
+        days: value(BUILD_RETENTION_DAYS_SETTING).map(|d| d.min(BUILD_RETENTION_MAX_DAYS)),
         keep_last: value(BUILD_RETENTION_KEEP_LAST_SETTING),
     })
 }
@@ -453,6 +458,16 @@ mod tests {
         );
         settings(pool, None, None).await;
         assert!(configured_policy(&mut *pool).await.expect("read").is_off());
+
+        // A hand-set age past what a timestamp can reach is read as the API's
+        // upper bound, so the pass runs instead of failing on the cutoff
+        settings(pool, Some(3_000_000), None).await;
+        let huge = configured_policy(&mut *pool).await.expect("read");
+        assert_eq!(huge.days, Some(BUILD_RETENTION_MAX_DAYS));
+        apply_retention(pool, huge, 10, None)
+            .await
+            .expect("pass with a clamped age");
+        assert_eq!(surviving(pool, &p).await, [(p.clone(), 1)]);
 
         tx.rollback().await.expect("rollback");
     }
