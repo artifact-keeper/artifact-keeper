@@ -22,9 +22,9 @@
 //! the wait from what it measures (requests queued ahead x the moving
 //! average of how long a slot is held / slots): a backlog predicted to
 //! outlast the budget is answered at once with the same `503 POOL_EXHAUSTED`
-//! body the pool timeout produces and `Retry-After` set to the predicted
-//! wait (1 to 30 s), so clients come back about when the queue ahead of them
-//! has cleared instead of competing with it every second. A request that
+//! body the pool timeout produces and a `Retry-After` (1 to 30 s) predicted
+//! from the queue plus every client already told to come back, so clients
+//! return spread out over the backlog instead of colliding again. A request that
 //! queues and still gets no slot in time is answered the same way. Sheds are
 //! counted in `ak_db_requests_shed_total`. An admitted request queues behind
 //! at most the other slot holders, so it finishes in a bounded time instead
@@ -85,6 +85,11 @@ pub struct DbAdmission {
     wait: Duration,
     /// Requests queued for a slot right now.
     waiters: AtomicUsize,
+    /// Requests shed with a `Retry-After` that has not run out yet: clients
+    /// that will be back, and that a newcomer's prediction has to count, or
+    /// the gate tells everyone to return at the same short interval and they
+    /// collide again.
+    deferred: Arc<AtomicUsize>,
     /// Moving average of how long a request holds its slot, in microseconds
     /// (0 until the first slot is returned).
     avg_hold_us: AtomicU64,
@@ -123,6 +128,7 @@ impl DbAdmission {
                 capacity: concurrency,
                 wait: Duration::from_millis(wait_ms),
                 waiters: AtomicUsize::new(0),
+                deferred: Arc::new(AtomicUsize::new(0)),
                 avg_hold_us: AtomicU64::new(0),
             })
         })
@@ -161,15 +167,9 @@ impl DbAdmission {
         }
         // Queue only when the queue ahead is predicted to clear within the
         // wait; otherwise say at once how long the backlog is.
-        let predicted = predicted_wait(
-            self.waiters.load(Ordering::Relaxed) + 1,
-            Duration::from_micros(self.avg_hold_us.load(Ordering::Relaxed)),
-            self.capacity,
-        );
-        if predicted > self.wait {
-            return Admission::Shed {
-                retry_after_secs: retry_after_secs(predicted),
-            };
+        let queued = self.waiters.load(Ordering::Relaxed);
+        if predicted_wait(queued + 1, self.avg_hold(), self.capacity) > self.wait {
+            return self.shed();
         }
         self.waiters.fetch_add(1, Ordering::Relaxed);
         let acquired = tokio::time::timeout(self.wait, self.permits.clone().acquire_owned()).await;
@@ -178,10 +178,29 @@ impl DbAdmission {
             Ok(Ok(permit)) => Admission::Run(Some(self.slot(permit))),
             // Out of time: run it anyway if the pool has room by now.
             _ if pool_has_room(&self.pool) => Admission::Run(None),
-            _ => Admission::Shed {
-                retry_after_secs: retry_after_secs(self.wait),
-            },
+            _ => self.shed(),
         }
+    }
+
+    fn avg_hold(&self) -> Duration {
+        Duration::from_micros(self.avg_hold_us.load(Ordering::Relaxed))
+    }
+
+    /// Shed, with a `Retry-After` for when the queue ahead plus everyone
+    /// already told to come back should have been served (at least the wait
+    /// budget), counting the client as deferred until that runs out.
+    fn shed(&self) -> Admission {
+        let backlog =
+            self.waiters.load(Ordering::Relaxed) + self.deferred.load(Ordering::Relaxed) + 1;
+        let predicted = predicted_wait(backlog, self.avg_hold(), self.capacity).max(self.wait);
+        let retry_after_secs = retry_after_secs(predicted);
+        self.deferred.fetch_add(1, Ordering::Relaxed);
+        let deferred = self.deferred.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(retry_after_secs)).await;
+            deferred.fetch_sub(1, Ordering::Relaxed);
+        });
+        Admission::Shed { retry_after_secs }
     }
 }
 
@@ -430,8 +449,9 @@ mod tests {
     }
 
     /// A backlog predicted to outlast the wait is shed at once, with the
-    /// predicted backlog as `Retry-After`, instead of queueing to be shed at
-    /// the end of the wait.
+    /// predicted backlog (the queue ahead plus the clients already deferred)
+    /// as `Retry-After`, instead of queueing to be shed at the end of the
+    /// wait.
     #[tokio::test]
     async fn a_backlog_longer_than_the_wait_sheds_at_once_with_its_length() {
         let Some(pool) = crate::testing::try_pool_with(1).await else {
@@ -454,6 +474,13 @@ mod tests {
         match decision {
             Admission::Shed { retry_after_secs } => assert_eq!(retry_after_secs, 10),
             Admission::Run(_) => panic!("a 10 s backlog over a 2 s wait must shed"),
+        }
+        // The client just told to come back counts toward the next one's
+        // Retry-After, so returning clients are spread out, not bunched.
+        assert_eq!(gate.deferred.load(Ordering::Relaxed), 1);
+        match gate.admit().await {
+            Admission::Shed { retry_after_secs } => assert_eq!(retry_after_secs, 15),
+            Admission::Run(_) => panic!("still over the wait"),
         }
     }
 

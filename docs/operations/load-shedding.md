@@ -107,9 +107,10 @@ request may queue for one for up to `DATABASE_REQUEST_ACQUIRE_WAIT_MS`
 gate predicts its wait from what it measures: the requests queued ahead,
 times the moving average of how long a slot is held, divided by the slots.
 A backlog predicted to outlast the budget is answered at once with the same
-`503 POOL_EXHAUSTED` body and `Retry-After` set to the predicted wait
-(1 to 30 s), so clients that honour it come back about when the queue ahead
-of them has cleared instead of competing with it every second; a request
+`503 POOL_EXHAUSTED` body and a `Retry-After` (1 to 30 s) predicted
+from the queue plus every client already told to come back, so clients that
+honour it return spread out over the backlog instead of all colliding again
+a second later; a request
 that queues and still gets no slot in time is answered the same way. Sheds
 are counted in `ak_db_requests_shed_total`. An admitted
 request queues behind at most the other slot holders, so it finishes in a
