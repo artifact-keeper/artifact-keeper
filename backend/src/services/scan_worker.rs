@@ -478,6 +478,22 @@ async fn execute(state: &SharedState, job: &ScanJob) -> Result<(), JobFailure> {
     }
 }
 
+/// [`scan_proxy_file`] for a job held in memory rather than claimed from the
+/// queue: the in-process re-grade after a vulnerability-DB update when the
+/// queue is off (#6300). The error is the reason no verdict was recorded.
+pub(crate) async fn scan_proxy_file_in_process(
+    state: &SharedState,
+    job: &ScanJob,
+) -> std::result::Result<(), String> {
+    scan_proxy_file(state, job)
+        .await
+        .map_err(|failure| match failure {
+            JobFailure::Retryable(m)
+            | JobFailure::Terminal(m)
+            | JobFailure::EngineUnavailable(m) => m,
+        })
+}
+
 /// Scan a proxy-cached file by reference: the body the rescan endpoint already
 /// proved. The request path enqueues this instead of running it.
 async fn scan_proxy_file(state: &SharedState, job: &ScanJob) -> Result<(), JobFailure> {

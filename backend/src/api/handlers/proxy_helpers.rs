@@ -12549,10 +12549,49 @@ static RECENT_REGRADES: once_cell::sync::Lazy<moka::future::Cache<(Uuid, String)
             .build()
     });
 
-/// Re-grades this process runs itself at once when the durable scan queue is
-/// off or cannot take the job (#6300). A pull that finds none free leaves the
-/// re-grade to a later pull of the same digest.
+/// Re-grades this process runs at once when the durable scan queue is off or
+/// cannot take the job (#6300).
 const IN_PROCESS_REGRADES: usize = 2;
+
+/// Re-grades of proxy-cached files waiting for one of those slots. Each holds
+/// a reference to the cached object, not its bytes, which are read when its
+/// turn comes; past this many a pull leaves its re-grade to a later pull.
+const IN_PROCESS_REGRADE_BACKLOG: usize = 10_000;
+
+static IN_PROCESS_REGRADES_WAITING: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// A `proxy_file` job for the cached object at `cache_path`, held in memory:
+/// the in-process re-grade runs it as the queue worker would (#6300).
+fn in_memory_proxy_file_job(
+    repo_id: Uuid,
+    cache_path: &str,
+    digest: &str,
+    size_bytes: i64,
+    expected: Option<&crate::services::scanner_service::ExpectedComponent>,
+) -> crate::services::scan_queue::ScanJob {
+    crate::services::scan_queue::ScanJob {
+        id: Uuid::new_v4(),
+        kind: crate::services::scan_queue::ScanJobKind::ProxyFile
+            .as_str()
+            .to_string(),
+        priority: crate::services::scan_queue::PRIORITY_REGRADE,
+        repository_id: Some(repo_id),
+        cache_path: Some(cache_path.to_string()),
+        digest: Some(digest.to_string()),
+        content_type: None,
+        size_bytes: Some(size_bytes),
+        expected_ecosystem: expected.map(|e| e.ecosystem.as_db_str().to_string()),
+        expected_name: expected.map(|e| e.name.clone()),
+        expected_version: expected.map(|e| e.version.clone()),
+        artifact_id: None,
+        prepared: None,
+        bypass_dedup: false,
+        attempts: 0,
+        max_attempts: 1,
+        created_at: Utc::now(),
+    }
+}
 
 fn in_process_regrade_permits() -> &'static std::sync::Arc<tokio::sync::Semaphore> {
     static PERMITS: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
@@ -12565,7 +12604,9 @@ fn in_process_regrade_permits() -> &'static std::sync::Arc<tokio::sync::Semaphor
 /// grace (#6300). Nobody waits on it: with the scan queue on it is a
 /// `proxy_file` job at [`PRIORITY_REGRADE`], claimed after all other work and
 /// within the workers' rescan slots; otherwise it runs here, at most
-/// [`IN_PROCESS_REGRADES`] at a time, in the background band. Either way it
+/// [`IN_PROCESS_REGRADES`] at a time, in the background band: a cached file
+/// waits its turn (up to [`IN_PROCESS_REGRADE_BACKLOG`] of them), anything
+/// else (an image, an OS package) runs only if a slot is free. Either way it
 /// reads the bytes already in hand or in the proxy cache, never the upstream,
 /// and records the verdict against the live build like any scan.
 ///
@@ -12597,9 +12638,8 @@ async fn start_proxy_regrade(
     {
         return;
     }
-    if let Some(cache_path) = queued_scan_ref(mode, cache_path, expected.as_ref(), bytes.len())
-        .filter(|_| state.config.scan_queue_enabled)
-    {
+    let cached = queued_scan_ref(mode, cache_path, expected.as_ref(), bytes.len());
+    if let Some(cache_path) = cached.filter(|_| state.config.scan_queue_enabled) {
         if enqueue_proxy_file_scan(
             state,
             repo_id,
@@ -12614,6 +12654,39 @@ async fn start_proxy_regrade(
             record_proxy_scan_regrade("queued");
             return;
         }
+    }
+    use std::sync::atomic::Ordering;
+    if let Some(cache_path) = cached {
+        if IN_PROCESS_REGRADES_WAITING.fetch_add(1, Ordering::AcqRel) < IN_PROCESS_REGRADE_BACKLOG {
+            record_proxy_scan_regrade("started");
+            let job = in_memory_proxy_file_job(
+                repo_id,
+                cache_path,
+                digest,
+                bytes.len() as i64,
+                expected.as_ref(),
+            );
+            let state = state.clone();
+            tokio::spawn(async move {
+                let permit = std::sync::Arc::clone(in_process_regrade_permits())
+                    .acquire_owned()
+                    .await;
+                IN_PROCESS_REGRADES_WAITING.fetch_sub(1, Ordering::AcqRel);
+                let Ok(_permit) = permit else { return };
+                if let Err(why) = crate::services::scan_queue::in_background(
+                    crate::services::scan_worker::scan_proxy_file_in_process(&state, &job),
+                )
+                .await
+                {
+                    tracing::info!(
+                        repo_id = %repo_id, digest = ?job.digest, reason = %why,
+                        "proxy re-grade recorded no verdict; a later pull asks again"
+                    );
+                }
+            });
+            return;
+        }
+        IN_PROCESS_REGRADES_WAITING.fetch_sub(1, Ordering::AcqRel);
     }
     let Ok(permit) = std::sync::Arc::clone(in_process_regrade_permits()).try_acquire_owned() else {
         RECENT_REGRADES.invalidate(&key).await;

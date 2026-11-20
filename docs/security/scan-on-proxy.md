@@ -677,15 +677,19 @@ build:
   rescan slots (half of `SCAN_WORKER_CONCURRENCY`), with the background band
   asked of the scanner adapter. A pull that does wait for the same bytes (a
   `fail_closed` pull past the grace) raises it as usual;
-- otherwise in the serving process, at most two at a time. A pull that finds
-  both running leaves its bytes for a later pull.
+- otherwise in the serving process, at most two at a time. A cached file
+  waits its turn (up to 10,000 waiting, each holding a reference to the cached
+  object rather than its bytes, which are read when it runs); an image or an
+  OS package, which is re-graded from the bytes the pull holds, runs only when
+  a slot is free, and otherwise a later pull asks again.
 
 Each process asks once per digest every ten minutes. The re-grade reads the
 cached object (or the bytes already in hand), never the upstream, and records
 its verdict against the live build, so the next pull is decided by it. Only
 what is pulled is re-graded, most-pulled first in practice, and on spare scan
-capacity. `ak_proxy_scan_regrades_total{outcome}` counts them (`queued`,
-`started`, `deferred`).
+capacity. `ak_proxy_scan_regrades_total{outcome}` counts them (`queued`: a
+queue job; `started`: in process, running or waiting its turn; `deferred`: no
+slot free for an image or OS package).
 
 The grace never covers:
 

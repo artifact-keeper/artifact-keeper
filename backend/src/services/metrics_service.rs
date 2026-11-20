@@ -326,9 +326,9 @@ pub fn record_proxy_scan_queue_refused(limit: &'static str) {
 
 /// A re-grade of a proxied file whose verdict, graded against the previous
 /// vulnerability-DB build, decided a pull under the DB-update grace (#6300).
-/// `outcome` is `queued` (a scan-queue job), `started` (scanning in this
-/// process) or `deferred` (this process already runs its share; a later pull
-/// asks again).
+/// `outcome` is `queued` (a scan-queue job), `started` (in this process,
+/// running or waiting its turn) or `deferred` (an image or OS package
+/// re-grade found no free slot; a later pull asks again).
 pub fn record_proxy_scan_regrade(outcome: &'static str) {
     counter!("ak_proxy_scan_regrades_total", "outcome" => outcome).increment(1);
 }
