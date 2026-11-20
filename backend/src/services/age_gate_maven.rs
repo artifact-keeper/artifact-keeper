@@ -253,6 +253,37 @@ pub async fn remember_listing(key: ListingMemoKey, filtered: bytes::Bytes) -> by
     LISTINGS.entry(key).or_insert(filtered).await.into_value()
 }
 
+/// The passes in flight per memo key (#6284). A pass holds its key's lock
+/// from the memo check to the memo store, so a concurrent pass over the same
+/// document waits and then serves what the first one stored, instead of
+/// running its own pass on the dates the first one is still adding: that
+/// second pass could date every version, store nothing, and serve the whole
+/// upstream document next to the first pass's shorter memoized one. Entries
+/// are weak, so a key with no pass in flight costs nothing.
+static LISTING_PASSES: Lazy<
+    std::sync::Mutex<
+        std::collections::HashMap<ListingMemoKey, std::sync::Weak<tokio::sync::Mutex<()>>>,
+    >,
+> = Lazy::new(Default::default);
+
+/// Wait until no other pass over `key` is in flight, and hold that until the
+/// returned guard is dropped.
+pub async fn serialize_listing_pass(key: &ListingMemoKey) -> tokio::sync::OwnedMutexGuard<()> {
+    let lock = {
+        let mut passes = LISTING_PASSES.lock().unwrap_or_else(|e| e.into_inner());
+        passes.retain(|_, pass| pass.strong_count() > 0);
+        match passes.get(key).and_then(std::sync::Weak::upgrade) {
+            Some(lock) => lock,
+            None => {
+                let lock = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+                passes.insert(key.clone(), std::sync::Arc::downgrade(&lock));
+                lock
+            }
+        }
+    };
+    lock.lock_owned().await
+}
+
 /// Drop every memoized listing of `repo_id`. Called on each age-gate policy
 /// write and review decision (`invalidate_decision_memos`), so an approval,
 /// rejection or reopen shows on the next request instead of after the
@@ -471,6 +502,45 @@ mod tests {
             a
         );
         forget_listing(&key).await;
+    }
+
+    /// A second pass over the same document waits for the first, and a pass
+    /// over another document does not (#6284).
+    #[tokio::test]
+    async fn listing_passes_over_one_document_run_one_at_a_time_6284() {
+        let key = |doc: &[u8]| {
+            ListingMemoKey::new(
+                Uuid::new_v4(),
+                "http://up/",
+                "g/a/maven-metadata.xml",
+                7,
+                "upstream_publish_time",
+                doc,
+            )
+        };
+        let mine = key(b"<metadata>one</metadata>");
+        let other = key(b"<metadata>two</metadata>");
+        let first = serialize_listing_pass(&mine).await;
+        let wait = Duration::from_millis(200);
+        assert!(
+            tokio::time::timeout(wait, serialize_listing_pass(&mine))
+                .await
+                .is_err(),
+            "a second pass over the same document waits"
+        );
+        assert!(
+            tokio::time::timeout(wait, serialize_listing_pass(&other))
+                .await
+                .is_ok(),
+            "a pass over another document does not"
+        );
+        drop(first);
+        assert!(
+            tokio::time::timeout(wait, serialize_listing_pass(&mine))
+                .await
+                .is_ok(),
+            "it runs once the first pass is done"
+        );
     }
 
     /// A review decision or policy write drops the memo of that repository

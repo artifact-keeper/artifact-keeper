@@ -1803,6 +1803,9 @@ async fn maven_filter_listing(
     // could list more (#6284).
     let mut memo_key: Option<gate::ListingMemoKey> = None;
     let mut left_undated = false;
+    // Held from the memo check to the memo store, so concurrent passes over
+    // one document serve one result (#6284).
+    let mut _pass_in_flight: Option<tokio::sync::OwnedMutexGuard<()>> = None;
 
     let versions: Vec<(String, Option<chrono::DateTime<chrono::Utc>>)> = match params.age_gate_mode
     {
@@ -1838,6 +1841,9 @@ async fn maven_filter_listing(
                     params.age_gate_mode.as_str(),
                     &content,
                 );
+                // A concurrent pass over this document finishes first; this
+                // one then reads what it stored, or runs on its dates.
+                _pass_in_flight = Some(gate::serialize_listing_pass(&key).await);
                 if let Some(memoized) = gate::memo_listing(&key).await {
                     if memoized != content {
                         crate::services::metrics_service::record_age_gate_filtered_metadata(
@@ -1930,9 +1936,9 @@ async fn maven_filter_listing(
             None => content.clone(),
         }
     };
-    // First writer wins: a concurrent pass that dated more versions serves
-    // the document already memoized, so every client in the window gets the
-    // same bytes and checksums.
+    // First writer wins (passes over one document are serialized above, so
+    // this is a backstop): every client in the window gets the same bytes and
+    // checksums.
     let served = match memo_key {
         Some(key) if left_undated && probe => gate::remember_listing(key, served).await,
         _ => served,
