@@ -79,8 +79,11 @@ jobs:
 
       - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2
 
+      # Bounded (#6272): scripts/ci/apt-install-bounded.sh caps each download
+      # attempt and retries on azure.archive.ubuntu.com.
       - name: Install protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+        timeout-minutes: 12
+        run: bash scripts/ci/apt-install-bounded.sh protobuf-compiler
 
       - name: Export OpenAPI spec
         env:

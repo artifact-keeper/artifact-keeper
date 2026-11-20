@@ -247,7 +247,10 @@ async fn invalidate_restored_packument(state: &SharedState, restored: &TrashedAr
                 );
                 None
             });
-    if format.as_deref() != Some("npm") {
+    if !format
+        .as_deref()
+        .is_some_and(crate::api::handlers::npm::is_npm_family_format_key)
+    {
         return;
     }
     if let Some(package) =

@@ -590,8 +590,10 @@ Without the queue, the stuck-scan janitor (`STUCK_SCAN_THRESHOLD_SECS`, default
 such pods, set `SCANNER_PROCESS_TIMEOUT_SECS` to match `STUCK_SCAN_THRESHOLD_SECS`
 (1800 by default), or lower, such as `900`, if your slowest scans finish well
 inside that. A retried on-demand scan reuses its rows: between
-attempts they read `failed`, so a `block_on_fail` policy holds the artifact,
-and a retry that succeeds completes the rows and releases the hold.
+attempts they read `failed`, and during the retry `running` with the error
+"retrying after a failed attempt: ...". Either way they still count as that
+failure, so a `block_on_fail` policy holds the artifact until a retry that
+succeeds completes the rows and releases the hold.
 
 **Rescans after a vulnerability-database update.** `SCAN_RESCAN_MAX_PER_DAY`
 (default `0`, off) has the worker look every 15 minutes for stored artifacts
