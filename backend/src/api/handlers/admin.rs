@@ -833,7 +833,7 @@ const SETTING_RANGES: &[(&str, i64, i64)] = &[
     (
         crate::services::build_retention::BUILD_RETENTION_DAYS_SETTING,
         0,
-        36_500,
+        crate::services::build_retention::BUILD_RETENTION_MAX_DAYS as i64,
     ),
     (
         crate::services::build_retention::BUILD_RETENTION_KEEP_LAST_SETTING,
