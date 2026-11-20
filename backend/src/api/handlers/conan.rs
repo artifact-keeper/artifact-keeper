@@ -4054,6 +4054,8 @@ async fn conan_remove(
     if removed == 0 {
         return Err(target.not_found());
     }
+    // #5244: no `artifact.deleted` from here, so refresh the score directly
+    crate::services::scan_result_service::refresh_existing_score(&state.db, repo.id).await;
 
     let _ = sqlx::query("UPDATE repositories SET updated_at = NOW() WHERE id = $1")
         .bind(repo.id)
@@ -11935,6 +11937,38 @@ mod remove_4333 {
         assert_eq!(rm_all, StatusCode::OK);
         assert_eq!(revs, StatusCode::NOT_FOUND);
         assert_eq!(rows, 0);
+    }
+
+    /// #5244: removing a scanned recipe takes its findings out of the
+    /// repository's security score
+    #[tokio::test]
+    async fn remove_recipe_refreshes_security_score_5244() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let (user_id, _u, _p) = create_user(&pool).await;
+        let (repo_id, repo_key, dir) = create_conan_repo(&pool, "local").await;
+        let state = build_state(pool.clone(), dir.to_str().unwrap());
+        let auth = make_auth(user_id, "u");
+        publish(&state, &auth, &repo_key, "rrA", &["pidA"]).await;
+        let artifact_id: uuid::Uuid = sqlx::query_scalar(
+            "SELECT id FROM artifacts WHERE repository_id = $1 AND is_deleted = false \
+             ORDER BY path LIMIT 1",
+        )
+        .bind(repo_id)
+        .fetch_one(&pool)
+        .await
+        .expect("recipe row");
+        tdh::score_one_high_finding(&pool, repo_id, artifact_id).await;
+
+        let app = router_with_auth(state, auth);
+        let (status, _) = send(app, delete(format!("/{repo_key}/v2/conans/rmme/1.0/_/_"))).await;
+        let score = tdh::score_findings(&pool, repo_id).await;
+        cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(score, (0, 0));
     }
 
     /// Removal needs the `delete:artifacts` scope, and is refused on a remote.

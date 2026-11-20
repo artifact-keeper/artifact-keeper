@@ -1311,6 +1311,8 @@ async fn delete_image(
     if result.rows_affected() == 0 {
         return Err((StatusCode::NOT_FOUND, "Image file not found").into_response());
     }
+    // #5244: no `artifact.deleted` from here, so refresh the score directly
+    crate::services::scan_result_service::refresh_existing_score(&state.db, repo.id).await;
 
     Ok(Response::builder()
         .status(StatusCode::NO_CONTENT)
@@ -4608,6 +4610,42 @@ mod cross_repo_session_regression_tests {
 
         cleanup_second_repo(&f.pool, repo_b_id).await;
         f.teardown().await;
+    }
+
+    /// #5244: deleting a scanned image takes its findings out of the
+    /// repository's security score
+    #[tokio::test]
+    async fn delete_image_refreshes_security_score_5244() {
+        let Some(f) = tdh::Fixture::setup("local", "incus").await else {
+            return;
+        };
+        let path = build_artifact_path("ubuntu", "24.04", "incus.tar.xz");
+        let artifact_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO artifacts (repository_id, path, name, size_bytes, checksum_sha256, \
+             content_type, storage_key) \
+             VALUES ($1, $2, 'incus.tar.xz', 1, repeat('0', 64), 'application/x-xz', $3) \
+             RETURNING id",
+        )
+        .bind(f.repo_id)
+        .bind(&path)
+        .bind(build_storage_key(&f.repo_id, &path))
+        .fetch_one(&f.pool)
+        .await
+        .expect("image row");
+        tdh::score_one_high_finding(&f.pool, f.repo_id, artifact_id).await;
+
+        let app = f.router_with_auth(router());
+        let req = axum::http::Request::builder()
+            .method("DELETE")
+            .uri(format!("/{}/images/{}", f.repo_key, path))
+            .body(Body::empty())
+            .expect("build DELETE request");
+        let (status, _) = tdh::send(app, req).await;
+        let score = tdh::score_findings(&f.pool, f.repo_id).await;
+        f.teardown().await;
+
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(score, (0, 0));
     }
 
     /// PUT complete under repo B must be 404; the legitimate session in
