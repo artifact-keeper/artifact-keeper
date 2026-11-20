@@ -23,6 +23,8 @@
 # Usage: scripts/perf/proxy-scan-db-update.sh <backend-image> [N] [CONCURRENCY]
 # Env:   ACTION=fail_closed|fail_open|record_only   (default fail_closed)
 #        REGRADE_WAIT_SECS=900   how long to wait for the re-grades
+#        BACKEND_ENV="K=V ..."   extra backend environment, for example
+#                                "SCAN_QUEUE_ENABLED=true" for the durable queue
 #        KEEP=1                  leave the stack up
 # Needs docker, curl, jq and python3. Prints one JSON summary line last.
 # =============================================================================
@@ -66,6 +68,8 @@ for _ in $(seq 1 60); do
   sleep 1
 done
 docker volume create "${TAG}-data" >/dev/null
+EXTRA_ENV=()
+for kv in ${BACKEND_ENV:-}; do EXTRA_ENV+=(-e "$kv"); done
 docker run -d --name "${TAG}-backend" --network "$TAG" -p 127.0.0.1::8080 \
   -v "${TAG}-data:/data" \
   -e DATABASE_URL=postgresql://registry:registry@${TAG}-db:5432/artifact_registry \
@@ -73,7 +77,7 @@ docker run -d --name "${TAG}-backend" --network "$TAG" -p 127.0.0.1::8080 \
   -e JWT_SECRET=perf-nonprod-6300-cobalt-harbor-lantern-7f3a9c2e5b81 \
   -e ADMIN_PASSWORD="$ADMIN_PASS" -e HOST=0.0.0.0 -e PORT=8080 \
   -e RATE_LIMIT_ENABLED=false -e UPSTREAM_ALLOW_PRIVATE_IPS=true \
-  -e AK_SSRF_ALLOW_PRIVATE_CIDRS=172.16.0.0/12 -e RUST_LOG=warn \
+  -e AK_SSRF_ALLOW_PRIVATE_CIDRS=172.16.0.0/12 -e RUST_LOG=warn "${EXTRA_ENV[@]}" \
   "$IMAGE" >/dev/null
 PORT="$(docker port "${TAG}-backend" 8080/tcp | head -1 | sed 's/.*://')"
 BASE="http://127.0.0.1:${PORT}"
@@ -156,10 +160,10 @@ for i in $(seq 1 "$REGRADE_WAIT_SECS"); do
 done
 FINAL="$(psql_q "SELECT count(*) FROM proxy_scan_results WHERE scan_type='grype' AND scanner_version='${LIVE}'")"
 
-python3 - "${WORK}/burst.txt" "$IMAGE" "$N" "$CONC" "$ACTION" "$T0" "$T1" \
+python3 - "${WORK}/burst.txt" "$IMAGE" "${BACKEND_ENV:-}" "$N" "$CONC" "$ACTION" "$T0" "$T1" \
   "$((HITS1 - HITS0))" "$INLINE" "$AT_LIVE_AFTER_BURST" "$REGRADED_IN" "$FINAL" <<'PY'
 import json, sys
-(path, image, n, conc, action, t0, t1, hits, inline, at_live, regraded_in, final) = sys.argv[1:]
+(path, image, backend_env, n, conc, action, t0, t1, hits, inline, at_live, regraded_in, final) = sys.argv[1:]
 rows = [l.split() for l in open(path) if l.strip()]
 secs = sorted(float(r[2]) for r in rows)
 codes = {}
@@ -167,7 +171,8 @@ for r in rows:
     codes[r[1]] = codes.get(r[1], 0) + 1
 q = lambda p: round(secs[min(len(secs) - 1, int(p * len(secs)))], 3)
 print(json.dumps({
-    "image": image, "artifacts": int(n), "concurrency": int(conc), "action": action,
+    "image": image, "backend_env": backend_env, "artifacts": int(n),
+    "concurrency": int(conc), "action": action,
     "burst_wall_secs": round(float(t1) - float(t0), 2),
     "status_counts": codes,
     "latency_secs": {"p50": q(0.50), "p95": q(0.95), "p99": q(0.99), "max": round(secs[-1], 3)},

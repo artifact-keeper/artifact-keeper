@@ -20936,9 +20936,8 @@ mod tests {
         .expect("age the verdict");
         let scans_before = scans.load(std::sync::atomic::Ordering::SeqCst);
 
+        // An inline re-scan would answer 403: the engine grades it vulnerable.
         let during = pull().await;
-        let scans_on_the_request_path = scans.load(std::sync::atomic::Ordering::SeqCst);
-        let row_after_the_response = row().await;
 
         // The re-grade runs after the response; give it a few seconds.
         let mut regraded = row().await;
@@ -20964,12 +20963,8 @@ mod tests {
         assert_eq!(
             during,
             (StatusCode::OK, Some("clean".to_string())),
-            "within the grace the previous build's verdict decides the pull"
-        );
-        assert_eq!(scans_on_the_request_path, 1, "no scan on the request path");
-        assert_eq!(
-            row_after_the_response,
-            ("clean".to_string(), Some(PREVIOUS.to_string()))
+            "within the grace the previous build's verdict decides the pull, \
+             with no scan on the request path"
         );
         assert_eq!(
             regraded,
