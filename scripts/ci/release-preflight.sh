@@ -416,7 +416,9 @@ else
   #
   # So: among the sha's runs ON THE AUDITED BRANCH, newest first by run id,
   # the first run that BUILT decides, red or green; a run still in flight
-  # ABOVE it blocks (it cannot be classified until it ends). Runs older than
+  # ABOVE it blocks (it cannot be classified until it ends), except a
+  # dispatch that has already skipped every image build job, which can build
+  # nothing and is passed over like a completed PROMOTE (#6166). Runs older than
   # the deciding build do not matter, in flight or not. A completed dispatch "built nothing"
   # when it lists no jobs (cancelled before starting) or when Security Scan
   # skipped and no job failed (PROMOTE). Security Scan is also skipped when an
@@ -476,6 +478,22 @@ else
           end' 2>/dev/null)" || k='?'
     echo "${k:-?}"
   }
+  # An IN-FLIGHT dispatch that has already skipped every image build job
+  # (#6166). A PROMOTE or floating-tag dispatch skips them the moment its
+  # publish-preflight job ends (run 44116256357: 36 s in, then ~2 min of
+  # re-tag jobs), and a skipped job never runs, so the run can build nothing
+  # whatever happens next. "nothing" only then: no build job listed yet
+  # (publish-preflight still running), any build job not completed-skipped,
+  # or an unreadable answer all keep the run blocking as before.
+  inflight_built_nothing() {
+    local k
+    # shellcheck disable=SC2016 # a jq program, not shell
+    k="$(gh run view "$1" --repo "$REPO" --json jobs --jq '
+          [.jobs[] | select(.name | test("^(Backend|Backend Alpine|OpenSCAP|Scanner Adapter) \\("))] as $b
+          | if ($b | length) > 0 and all($b[]; .status == "completed" and .conclusion == "skipped")
+            then "nothing" else "pending" end' 2>/dev/null)" || k=pending
+    [[ "$k" == nothing ]]
+  }
   PICK=""
   pick() { # stdin: runs on ONE branch, newest first -> PICK="<id> <status>" or ""
     local c_id c_status c_event
@@ -483,8 +501,15 @@ else
     while read -r c_id c_status c_event _; do
       [[ -n "$c_id" ]] || continue
       if [[ "$c_status" != "completed" ]]; then
-        # In flight: no verdict yet, and a dispatch cannot be classified
-        # until it ends. Blocks below.
+        # In flight: no verdict yet. Blocks below, unless it is a dispatch
+        # that has already skipped every build job (#6166): a PROMOTE or
+        # floating-tag run on HEAD's sha, which hid the push run's verdict
+        # for its two minutes (candidate 44116177519, preflight 44116420573).
+        # A push run in flight is always this commit's build and blocks.
+        if [[ "$c_event" != push ]] && inflight_built_nothing "$c_id"; then
+          note "run $c_id ($c_event, $c_status) has skipped every image build (a PROMOTE or re-tag run in flight); not this commit's build"
+          continue
+        fi
         PICK="$c_id $c_status"; return
       fi
       if [[ "$c_event" != push ]]; then
