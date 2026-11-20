@@ -281,8 +281,9 @@ fn require_grant_reason(reason: Option<&str>) -> Result<&str> {
 /// keeps its old contract, an admin could always approve any age row.
 ///
 /// `requested_by` is the latest requester, so this stops the plain "ask and
-/// grant it yourself" case. It does not stop a reviewer granting an auto-filed
-/// row for a pull they made, which needs no request at all.
+/// grant it yourself" case, and `exception_queue::has_requested` stops an
+/// earlier requester. It does not stop a reviewer granting an auto-filed row
+/// for a pull they made, which needs no request at all.
 fn require_not_own_request(requested_by: Option<Uuid>, actor: Uuid, age: bool) -> Result<()> {
     if !age && requested_by == Some(actor) {
         return Err(AppError::Authorization(
@@ -641,6 +642,16 @@ async fn apply_review_decision(
     let (review, mut details) = match decision {
         ReviewDecision::Approve => {
             require_not_own_request(current.requested_by, auth.user_id, age)?;
+            if !age
+                && crate::services::exception_queue::has_requested(&state.db, id, auth.user_id)
+                    .await?
+            {
+                return Err(AppError::Authorization(
+                    "Separation of duties: you also requested this exception. \
+                     A different reviewer must decide it."
+                        .to_string(),
+                ));
+            }
             require_scan_digest(current.gate.as_deref(), current.basis_digest.as_deref())?;
             let reason = if age {
                 reason
@@ -749,7 +760,11 @@ fn require_remote_repo_for_age_gate(repo_type: &RepositoryType) -> Result<()> {
         ("page" = Option<u32>, Query),
         ("per_page" = Option<u32>, Query),
     ),
-    responses((status = 200, body = AgeGateReviewListResponse))
+    responses(
+        (status = 200, body = AgeGateReviewListResponse),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "No security_review capability, or a scoped or repository-restricted token"),
+    )
 )]
 pub async fn list_reviews(
     State(state): State<SharedState>,
@@ -782,7 +797,11 @@ pub async fn list_reviews(
         ("page" = Option<u32>, Query),
         ("per_page" = Option<u32>, Query),
     ),
-    responses((status = 200, body = AgeGateReviewListResponse))
+    responses(
+        (status = 200, body = AgeGateReviewListResponse),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "No security_review capability, or a scoped or repository-restricted token"),
+    )
 )]
 pub async fn list_exceptions(
     State(state): State<SharedState>,
@@ -827,7 +846,12 @@ fn resolve_gates(explicit: Option<&str>, default_gates: DefaultGates) -> Option<
     context_path = "/api/v1/admin",
     tag = "age-gate",
     security(("bearer_auth" = [])),
-    responses((status = 200, body = AgeGateReviewResponse))
+    responses(
+        (status = 200, body = AgeGateReviewResponse),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "No security_review capability, or a scoped or repository-restricted token"),
+        (status = 404, description = "Review not found"),
+    )
 )]
 pub async fn get_review(
     State(state): State<SharedState>,
@@ -848,7 +872,14 @@ pub async fn get_review(
     tag = "age-gate",
     security(("bearer_auth" = [])),
     request_body = ApproveReviewRequest,
-    responses((status = 200, body = AgeGateReviewResponse))
+    responses(
+        (status = 200, body = AgeGateReviewResponse),
+        (status = 400, description = "Already approved, a scan or curation grant without a reason, or an invalid expiry"),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "No security_review capability, a narrowed token, the caller requested this exception, or an instance administrator decided it"),
+        (status = 404, description = "Review not found"),
+        (status = 409, description = "A scan exception with no refused download recorded yet, or the review changed concurrently"),
+    )
 )]
 pub async fn approve_review(
     State(state): State<SharedState>,
@@ -876,7 +907,14 @@ pub async fn approve_review(
     tag = "age-gate",
     security(("bearer_auth" = [])),
     request_body = ReviewActionRequest,
-    responses((status = 200, body = AgeGateReviewResponse))
+    responses(
+        (status = 200, body = AgeGateReviewResponse),
+        (status = 400, description = "The review is already in that state"),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "No security_review capability, or a scoped or repository-restricted token"),
+        (status = 404, description = "Review not found"),
+        (status = 409, description = "The review changed concurrently, retry"),
+    )
 )]
 pub async fn reject_review(
     State(state): State<SharedState>,
@@ -904,7 +942,14 @@ pub async fn reject_review(
     tag = "age-gate",
     security(("bearer_auth" = [])),
     request_body = ReviewActionRequest,
-    responses((status = 200, body = AgeGateReviewResponse))
+    responses(
+        (status = 200, body = AgeGateReviewResponse),
+        (status = 400, description = "The review is already in that state"),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "No security_review capability, a scoped or repository-restricted token, or an instance administrator decided it"),
+        (status = 404, description = "Review not found"),
+        (status = 409, description = "The review changed concurrently, retry"),
+    )
 )]
 pub async fn reopen_review(
     State(state): State<SharedState>,
@@ -931,7 +976,12 @@ pub async fn reopen_review(
     context_path = "/api/v1/exceptions",
     tag = "age-gate",
     security(("bearer_auth" = [])),
-    responses((status = 200, body = AgeGateReviewResponse))
+    responses(
+        (status = 200, body = AgeGateReviewResponse),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "No security_review capability, or a scoped or repository-restricted token"),
+        (status = 404, description = "Review not found"),
+    )
 )]
 pub async fn get_exception(
     state: State<SharedState>,
@@ -950,9 +1000,11 @@ pub async fn get_exception(
     request_body = ApproveReviewRequest,
     responses(
         (status = 200, body = AgeGateReviewResponse),
-        (status = 400, description = "A scan or curation grant without a reason, or an invalid expiry"),
-        (status = 403, description = "No security_review capability, a narrowed token, or the caller requested this exception"),
-        (status = 409, description = "A scan exception with no refused download recorded yet, so no digest to bind"),
+        (status = 400, description = "Already approved, a scan or curation grant without a reason, or an invalid expiry"),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "No security_review capability, a narrowed token, the caller requested this exception, or an instance administrator decided it"),
+        (status = 404, description = "Review not found"),
+        (status = 409, description = "A scan exception with no refused download recorded yet, or the review changed concurrently"),
     )
 )]
 pub async fn approve_exception(
@@ -971,7 +1023,14 @@ pub async fn approve_exception(
     tag = "age-gate",
     security(("bearer_auth" = [])),
     request_body = ReviewActionRequest,
-    responses((status = 200, body = AgeGateReviewResponse))
+    responses(
+        (status = 200, body = AgeGateReviewResponse),
+        (status = 400, description = "The review is already in that state"),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "No security_review capability, or a scoped or repository-restricted token"),
+        (status = 404, description = "Review not found"),
+        (status = 409, description = "The review changed concurrently, retry"),
+    )
 )]
 pub async fn reject_exception(
     state: State<SharedState>,
@@ -989,7 +1048,14 @@ pub async fn reject_exception(
     tag = "age-gate",
     security(("bearer_auth" = [])),
     request_body = ReviewActionRequest,
-    responses((status = 200, body = AgeGateReviewResponse))
+    responses(
+        (status = 200, body = AgeGateReviewResponse),
+        (status = 400, description = "The review is already in that state"),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "No security_review capability, a scoped or repository-restricted token, or an instance administrator decided it"),
+        (status = 404, description = "Review not found"),
+        (status = 409, description = "The review changed concurrently, retry"),
+    )
 )]
 pub async fn reopen_exception(
     state: State<SharedState>,
@@ -1010,6 +1076,7 @@ pub async fn reopen_exception(
     responses(
         (status = 200, body = AgeGateReviewResponse),
         (status = 400, description = "Unknown gate, or a missing or oversized field"),
+        (status = 401, description = "Authentication required"),
         (status = 404, description = "Repository not found or not visible to the caller"),
         (status = 409, description = "The caller already has the maximum number of open requests"),
     )
@@ -1067,6 +1134,7 @@ pub async fn request_exception(
 
     let svc = age_gate_service(&state)?;
     let review = svc.get_review_by_id(id).await?;
+    let held_by_caller = review.requested_by == Some(auth.user_id);
 
     let audit = AuditService::new(state.db.clone());
     let _ = audit
@@ -1085,7 +1153,14 @@ pub async fn request_exception(
         )
         .await;
 
-    Ok(Json(review_to_response(review)))
+    let mut response = review_to_response(review);
+    // A granted row keeps its first requester, whose name and reason are not the caller's to read
+    if !held_by_caller {
+        response.requested_by = None;
+        response.requested_by_username = None;
+        response.justification = None;
+    }
+    Ok(Json(response))
 }
 
 /// The caller's own exception requests, for any authenticated user. A row
@@ -1104,7 +1179,10 @@ pub async fn request_exception(
         ("page" = Option<u32>, Query),
         ("per_page" = Option<u32>, Query),
     ),
-    responses((status = 200, body = AgeGateReviewListResponse))
+    responses(
+        (status = 200, body = AgeGateReviewListResponse),
+        (status = 401, description = "Authentication required"),
+    )
 )]
 pub async fn list_my_requests(
     State(state): State<SharedState>,
@@ -1132,6 +1210,7 @@ pub async fn list_my_requests(
     security(("bearer_auth" = [])),
     responses(
         (status = 200, body = AgeGateReviewResponse),
+        (status = 401, description = "Authentication required"),
         (status = 404, description = "No request with this id is held by the caller"),
     )
 )]
@@ -2674,6 +2753,151 @@ mod tests {
         tdh::cleanup(&pool, repo_id, user_id).await;
         tdh::cleanup_user(&pool, user_id).await;
         tdh::cleanup_user(&pool, other_id).await;
+    }
+
+    fn file_request_body(key: &str, package: &str, why: &str) -> bytes::Bytes {
+        bytes::Bytes::from(
+            serde_json::json!({
+                "repository_key": key,
+                "gate": "curation",
+                "package_name": package,
+                "justification": why,
+            })
+            .to_string(),
+        )
+    }
+
+    /// `requested_by` names only the latest requester, so a reviewer who asked
+    /// first could grant it once someone else asked too
+    #[tokio::test]
+    async fn a_co_requester_cannot_grant_the_exception_db() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (reviewer_id, reviewer) = tdh::create_user(&pool).await;
+        let (other_id, other) = tdh::create_user(&pool).await;
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "remote", "npm").await;
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .expect("make the repository public");
+        sqlx::query(
+            "INSERT INTO role_assignments (user_id, role_id, repository_id) \
+             SELECT $1, id, NULL FROM roles WHERE name = 'security-reviewer'",
+        )
+        .bind(reviewer_id)
+        .execute(&pool)
+        .await
+        .expect("grant security-reviewer");
+        let state = gated_state(pool.clone(), &dir);
+        let app = |caller: AuthExtension| {
+            tdh::router_with_auth_ext(exceptions_router(), state.clone(), caller)
+        };
+        let as_reviewer = tdh::make_auth(reviewer_id, &reviewer);
+        let as_other = tdh::make_auth(other_id, &other);
+
+        let (status, first) = tdh::send(
+            app(as_reviewer.clone()),
+            tdh::post(
+                "/requests".to_string(),
+                "application/json",
+                file_request_body(&key, "left-pad", "the reviewer needs it"),
+            ),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let id: serde_json::Value = serde_json::from_slice(&first).unwrap();
+        let id = id["id"].as_str().unwrap().to_string();
+        let (status, _) = tdh::send(
+            app(as_other),
+            tdh::post(
+                "/requests".to_string(),
+                "application/json",
+                file_request_body(&key, "left-pad", "so does someone else"),
+            ),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+
+        let (status, _) = tdh::send(
+            app(as_reviewer),
+            tdh::post(
+                format!("/reviews/{id}/approve"),
+                "application/json",
+                bytes::Bytes::from_static(br#"{"reason":"granting my own ask"}"#),
+            ),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::FORBIDDEN);
+        assert_eq!(review_status(&pool, id.parse().unwrap()).await, "pending");
+
+        let _ = sqlx::query("DELETE FROM role_assignments WHERE user_id = $1")
+            .bind(reviewer_id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup(&pool, repo_id, reviewer_id).await;
+        tdh::cleanup_user(&pool, reviewer_id).await;
+        tdh::cleanup_user(&pool, other_id).await;
+    }
+
+    /// Asking for a package someone was already granted answers with the row,
+    /// but not with the first requester's name and reason
+    #[tokio::test]
+    async fn a_request_on_a_granted_row_hides_the_first_requester_db() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (first_id, first) = tdh::create_user(&pool).await;
+        let (later_id, later) = tdh::create_user(&pool).await;
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "remote", "npm").await;
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .expect("make the repository public");
+        let state = gated_state(pool.clone(), &dir);
+        let app = |caller: AuthExtension| {
+            tdh::router_with_auth_ext(exceptions_router(), state.clone(), caller)
+        };
+
+        let (status, body) = tdh::send(
+            app(tdh::make_auth(first_id, &first)),
+            tdh::post(
+                "/requests".to_string(),
+                "application/json",
+                file_request_body(&key, "left-pad", "private reason of the first requester"),
+            ),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["requested_by_username"], first.as_str());
+        sqlx::query("UPDATE age_gate_reviews SET status = 'approved' WHERE id = $1")
+            .bind(body["id"].as_str().unwrap().parse::<Uuid>().unwrap())
+            .execute(&pool)
+            .await
+            .expect("grant it");
+
+        let (status, body) = tdh::send(
+            app(tdh::make_auth(later_id, &later)),
+            tdh::post(
+                "/requests".to_string(),
+                "application/json",
+                file_request_body(&key, "left-pad", "me too"),
+            ),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["status"], "approved");
+        assert!(body["requested_by"].is_null(), "{body}");
+        assert!(body["requested_by_username"].is_null(), "{body}");
+        assert!(body["justification"].is_null(), "{body}");
+
+        tdh::cleanup(&pool, repo_id, first_id).await;
+        tdh::cleanup_user(&pool, first_id).await;
+        tdh::cleanup_user(&pool, later_id).await;
     }
 
     /// A scan request filed before any refusal has no digest to bind, so it

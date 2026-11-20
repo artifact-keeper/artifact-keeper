@@ -1,5 +1,5 @@
 //! Package-exception queue reads and auto-filing for the non-age gates
-//! (migration 386).
+//! (migration 404).
 //!
 //! The age gate owns its own rows through `age_gate_service`, because its
 //! decisions are bound to an age-specific policy identity (mode + upstream
@@ -371,6 +371,19 @@ pub fn validate_request(
     Ok(())
 }
 
+/// Has `user_id` ever filed a request on this row? `requested_by` only names
+/// the latest requester, so this is what keeps an earlier one from granting it
+pub async fn has_requested(db: &PgPool, id: Uuid, user_id: Uuid) -> Result<bool> {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (SELECT 1 FROM age_gate_reviews WHERE id = $1 AND $2 = ANY(requesters))",
+    )
+    .bind(id)
+    .bind(user_id)
+    .fetch_one(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))
+}
+
 /// Most undecided requests one user may have open at once. Filing is open to
 /// every authenticated user and a request may name a coordinate no gate has
 /// refused, so without a bound one account could fill the reviewer queue.
@@ -445,11 +458,14 @@ pub async fn file_request(
         r#"
         INSERT INTO age_gate_reviews (
             gate, repository_id, package_name, package_version, status,
-            basis_digest, justification, requested_by
+            basis_digest, justification, requested_by, requesters
         )
-        VALUES ($1, $2, $3, $4, 'pending', $5, $6, $7)
+        VALUES ($1, $2, $3, $4, 'pending', $5, $6, $7, ARRAY[$7]::uuid[])
         ON CONFLICT (gate, repository_id, package_name, package_version)
         DO UPDATE SET
+            requesters = CASE WHEN $7 = ANY(age_gate_reviews.requesters)
+                THEN age_gate_reviews.requesters
+                ELSE array_append(age_gate_reviews.requesters, $7) END,
             -- An approved row keeps the justification and requester it was
             -- granted on, so a later request cannot rewrite what the
             -- reviewer and the audit trail saw
