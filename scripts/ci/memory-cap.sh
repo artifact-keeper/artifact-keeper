@@ -7,8 +7,8 @@
 #   The backend crate's own rustc no longer fits a 16 GB GitHub-hosted
 #   runner. Measured in a 16 GiB, 4-CPU, no-swap container with CI's flags
 #   (PR for #6242, Validation section): the instrumented handlers-1 lib-test
-#   rustc needs 18.5 GiB and is OOM-killed at 16; the `ci`-profile lib in the
-#   image build needs 18.0 GiB. The peak is in the front end and the
+#   rustc needs 18.2 GiB and is OOM-killed at 16; the `ci`-profile lib in the
+#   image build needs 17.2 GiB. The peak is in the front end and the
 #   monomorphization collector, BEFORE any LLVM work, so CARGO_BUILD_JOBS,
 #   codegen-units, debuginfo and the linker do not move it.
 #

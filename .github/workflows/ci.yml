@@ -1155,10 +1155,11 @@ jobs:
       #
       # UNDER A MEMORY CAP (#6242). Measured in a 16 GiB, 4-CPU, no-swap
       # container with these flags, the handlers-1 lib-test rustc needs
-      # 18.5 GiB and is OOM-killed; the peak is in the front end and the
-      # monomorphization collector (11.5 GiB after borrow checking, 18.0
-      # after collection), before LLVM, so CARGO_BUILD_JOBS, codegen-units,
-      # debuginfo and the linker do not move it. On this VM the overflow
+      # 18.2 GiB and is OOM-killed; the peak is in the front end and the
+      # monomorphization collector (`-Z time-passes`: 11.5 GB after borrow
+      # checking, 18.0 GB after collection), before LLVM, so
+      # CARGO_BUILD_JOBS, codegen-units, debuginfo and the linker do not
+      # move it. On this VM the overflow
       # goes to the swapfile above, and when the kernel reclaims from every
       # process to make room the runner agent stops answering: main run
       # 44497657482's handlers-1 died "lost communication" 51 minutes into
@@ -3574,7 +3575,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # The `ci`-profile lib rustc in the builder stage needs 18.0 GiB
+      # The `ci`-profile lib rustc in the builder stage needs 17.2 GiB
       # (measured in a 4-CPU container with this Dockerfile's command,
       # #6242); this VM has 15.6 GiB of RAM and a 3 GiB zram device, so the
       # build failed "ResourceExhausted: cannot allocate memory" on main
