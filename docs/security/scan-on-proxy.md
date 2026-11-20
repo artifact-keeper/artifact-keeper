@@ -971,6 +971,26 @@ have no core proxy path to gate.
   there, not through the `pods/` route; the same holds for a Composer
   package installed from `source` (a VCS checkout) instead of its `dist`,
   and for a Go client whose `GOPROXY` falls back to `direct`.
+- **Go: only `GOPROXY` without a fallback fully enforces the gate.** With
+  `GOPROXY=https://<ak>/go/<repo>,direct`, `go` moves on to `direct` when
+  the repository answers 404 or 410. With `GOPROXY=https://<ak>/go/<repo>|direct`
+  it moves on after *any* error, including the `403` `scan_blocked`, the
+  `423` and the 5xx a failing upstream gets. In both cases the client then
+  fetches from the VCS without going through the gate. `@v/list`,
+  `@latest`, `.info`, `.mod` and `.zip` answer with a 5xx, never a 404, when
+  the upstream cannot answer (5xx, 429, no connection, timeout) or refuses
+  the Remote's own credentials, whether they are configured as upstream auth
+  or embedded in the upstream URL as `user:pass@` (#6214). On a Remote that
+  is a 502 or 503 (a scanning Remote's `.zip` can answer 500). Through a
+  Virtual it is a 503 with `Retry-After` when no member served. A 401/403 to
+  a Remote with no credentials stays a 404 on `@v/list`, `@latest` and
+  `.info`, and on every route through a Virtual, because an S3-style
+  upstream answers 403 for a key it does not hold. So `,direct` falls through
+  only for a module the upstream really does not have (or refuses
+  anonymously), or an `@latest` the age gate withholds on purpose. To
+  enforce the gate for every module, set `GOPROXY=https://<ak>/go/<repo>`
+  with no fallback. Modules that match `GOPRIVATE` or `GONOPROXY` also skip
+  the proxy, so keep those patterns limited to modules you trust.
 - **One stored verdict per digest.** A digest holds one verdict row, so
   byte-identical files pulled alternately as two coordinates (see
   [Verdicts and freshness](#verdicts-and-freshness)) are scanned again on
