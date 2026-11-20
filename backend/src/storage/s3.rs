@@ -5071,7 +5071,11 @@ mod tests {
         assert_eq!(url.host_str(), Some(host));
         // Bucket in the host only, never repeated in the path.
         assert_eq!(url.path(), "/artifact-keeper/maven/a.jar");
-        assert!(presigned_signature_valid_for_host(&url, host, PUBLIC_TEST_SK));
+        assert!(presigned_signature_valid_for_host(
+            &url,
+            host,
+            PUBLIC_TEST_SK
+        ));
     }
 
     #[test]
