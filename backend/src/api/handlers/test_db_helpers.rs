@@ -2987,6 +2987,46 @@ pub(crate) async fn artifact_id_at(pool: &PgPool, repo_id: Uuid, path: &str) -> 
     .expect("read artifact id at path")
 }
 
+/// #5244: give `artifact_id` one completed scan with a high finding and score
+/// `repository_id`, so a test can watch a delete take the finding out
+pub(crate) async fn score_one_high_finding(pool: &PgPool, repository_id: Uuid, artifact_id: Uuid) {
+    let scan_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO scan_results (artifact_id, repository_id, scan_type, status, completed_at) \
+         VALUES ($1, $2, 'dependency', 'completed', NOW()) RETURNING id",
+    )
+    .bind(artifact_id)
+    .bind(repository_id)
+    .fetch_one(pool)
+    .await
+    .expect("insert scan");
+    sqlx::query(
+        "INSERT INTO scan_findings (scan_result_id, artifact_id, severity, title, cve_id, \
+                                    affected_component, affected_version) \
+         VALUES ($1, $2, 'high', 't', 'CVE-2031-5244', 'lib', '1')",
+    )
+    .bind(scan_id)
+    .bind(artifact_id)
+    .execute(pool)
+    .await
+    .expect("insert finding");
+    crate::services::scan_result_service::ScanResultService::new(pool.clone())
+        .recalculate_score(repository_id)
+        .await
+        .expect("recalculate_score");
+    assert_eq!(score_findings(pool, repository_id).await, (1, 1));
+}
+
+/// `(total_findings, high_count)` of `repository_id`'s security score row
+pub(crate) async fn score_findings(pool: &PgPool, repository_id: Uuid) -> (i32, i32) {
+    sqlx::query_as(
+        "SELECT total_findings, high_count FROM repo_security_scores WHERE repository_id = $1",
+    )
+    .bind(repository_id)
+    .fetch_one(pool)
+    .await
+    .expect("score row")
+}
+
 /// Bundles all the per-test scaffolding so each handler test body is a
 /// single helper call followed by assertions. Returned `None` indicates
 /// the test should skip (no `DATABASE_URL`).
