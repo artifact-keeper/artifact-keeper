@@ -703,11 +703,12 @@ against the new build:
   the scanner adapter for its background band. A pull that does wait for the
   same bytes raises the job as usual.
 - Otherwise the re-grade runs in the serving process, at most two at a time
-  (fixed). A cached file waits its turn in a backlog of up to 10,000 (fixed).
+  (fixed), from the bytes the pull holds when a slot is free. With both slots
+  busy, a cached file waits its turn in a backlog of up to 10,000 (fixed).
   Each waiting entry holds a reference to the cached object, not its bytes,
-  which are read when it runs. An image or an OS package is re-graded from the
-  bytes the pull holds, so it runs only when a slot is free; if none is, the
-  re-grade is `deferred` and a later pull asks again.
+  which are read when it runs. An image or an OS package cannot wait that
+  way, so with no slot free its re-grade is `deferred` and a later pull asks
+  again.
 
 Each process asks for a digest's re-grade at most once every ten minutes
 (fixed). The re-grade reads the cached object, or the bytes already in hand,

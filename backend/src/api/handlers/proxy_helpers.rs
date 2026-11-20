@@ -12705,9 +12705,10 @@ fn in_process_regrade_permits() -> &'static std::sync::Arc<tokio::sync::Semaphor
 /// grace (#6300). Nobody waits on it: with the scan queue on it is a
 /// `proxy_file` job at [`PRIORITY_REGRADE`], claimed after all other work and
 /// within the workers' rescan slots; otherwise it runs here, at most
-/// [`IN_PROCESS_REGRADES`] at a time, in the background band: a cached file
-/// waits its turn (up to [`IN_PROCESS_REGRADE_BACKLOG`] of them), anything
-/// else (an image, an OS package) runs only if a slot is free. Either way it
+/// [`IN_PROCESS_REGRADES`] at a time, in the background band, from the bytes
+/// in hand when a slot is free. With none free a cached file waits its turn
+/// (up to [`IN_PROCESS_REGRADE_BACKLOG`] of them) and anything else (an
+/// image, an OS package) is deferred to a later pull. Either way it
 /// reads the bytes already in hand or in the proxy cache, never the upstream,
 /// and records the verdict against the live build like any scan.
 ///
@@ -12756,7 +12757,11 @@ async fn start_proxy_regrade(
             return;
         }
     }
-    if let Some(cache_path) = cached {
+    // A free slot re-grades the bytes in hand at once: a fresh fill may not be
+    // in the proxy cache yet. Only a re-grade that has to wait for a slot is
+    // held as a reference to the cached object, which is written by then.
+    let free = std::sync::Arc::clone(in_process_regrade_permits()).try_acquire_owned();
+    if let (Some(cache_path), Err(_)) = (cached, &free) {
         if claim_in_process_regrade(digest) {
             let slot = InProcessRegradeSlot(digest.to_string());
             record_proxy_scan_regrade("started");
@@ -12795,7 +12800,7 @@ async fn start_proxy_regrade(
         record_proxy_scan_regrade("deferred");
         return;
     }
-    let Ok(permit) = std::sync::Arc::clone(in_process_regrade_permits()).try_acquire_owned() else {
+    let Ok(permit) = free else {
         RECENT_REGRADES.invalidate(&key).await;
         record_proxy_scan_regrade("deferred");
         return;
