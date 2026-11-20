@@ -51,10 +51,10 @@ CREATE INDEX IF NOT EXISTS idx_age_gate_reviews_justified
     ON age_gate_reviews (gate, status, last_requested_at DESC)
     WHERE justification IS NOT NULL;
 
--- The per-user open-request cap on POST /api/v1/exceptions/requests
-CREATE INDEX IF NOT EXISTS idx_age_gate_reviews_open_requests
+-- The requested_by foreign key (ON DELETE SET NULL on a user delete), the per-user open-request cap and a requester's own list
+CREATE INDEX IF NOT EXISTS idx_age_gate_reviews_requested_by
     ON age_gate_reviews (requested_by)
-    WHERE status = 'pending' AND justification IS NOT NULL;
+    WHERE requested_by IS NOT NULL;
 
 -- Global capability to decide exceptions, it grants no say over repository scan or age settings
 INSERT INTO roles (name, description, permissions, is_system)
