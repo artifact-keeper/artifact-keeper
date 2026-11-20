@@ -545,6 +545,17 @@ fn endpoint_is_aliyun_oss(endpoint: &str) -> bool {
     })
 }
 
+/// True when `endpoint`'s host does not start with `<bucket>.`. Under
+/// virtual-hosted style a custom endpoint is used as is, so it must already
+/// name the bucket (#6288).
+fn endpoint_host_lacks_bucket(endpoint: &str, bucket: &str) -> bool {
+    let Ok(url) = url::Url::parse(endpoint) else {
+        return true;
+    };
+    !url.host_str()
+        .is_some_and(|host| host.starts_with(&format!("{}.", bucket)))
+}
+
 /// Resolve the provider dialect from the explicit `S3_PROVIDER` setting,
 /// falling back to inferring it from the endpoint host.
 ///
@@ -2151,6 +2162,25 @@ impl S3Backend {
         let bulk_store = Self::build_bulk_store(&config, None, None)?;
 
         let signing_store = Self::build_signing_store(&config)?;
+
+        if config.virtual_hosted_style {
+            for (var, endpoint) in [
+                ("S3_ENDPOINT", &config.endpoint),
+                ("S3_PUBLIC_ENDPOINT", &config.public_endpoint),
+            ] {
+                if let Some(e) = endpoint {
+                    if endpoint_host_lacks_bucket(e, &config.bucket) {
+                        tracing::warn!(
+                            bucket = %config.bucket,
+                            endpoint = %e,
+                            "S3_VIRTUAL_HOSTED_STYLE is on but {} does not start with \
+                             '<bucket>.', requests go to that host as is (#6288)",
+                            var
+                        );
+                    }
+                }
+            }
+        }
 
         if config.redirect_downloads {
             tracing::info!(
@@ -5042,6 +5072,23 @@ mod tests {
         // Bucket in the host only, never repeated in the path.
         assert_eq!(url.path(), "/artifact-keeper/maven/a.jar");
         assert!(presigned_signature_valid_for_host(&url, host, PUBLIC_TEST_SK));
+    }
+
+    #[test]
+    fn test_endpoint_host_lacks_bucket_6288() {
+        assert!(!endpoint_host_lacks_bucket(
+            "https://artifacts.s3.example.com",
+            "artifacts"
+        ));
+        assert!(endpoint_host_lacks_bucket(
+            "https://s3.example.com",
+            "artifacts"
+        ));
+        assert!(endpoint_host_lacks_bucket(
+            "https://artifacts-old.s3.example.com",
+            "artifacts"
+        ));
+        assert!(endpoint_host_lacks_bucket("not a url", "artifacts"));
     }
 
     #[tokio::test]
