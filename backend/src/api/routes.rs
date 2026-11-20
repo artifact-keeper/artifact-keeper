@@ -385,7 +385,7 @@ pub fn create_router(state: SharedState) -> Router {
     // auth), so a shed request has done no work; probes are never gated.
     if let Some(gate) = crate::api::middleware::db_admission::DbAdmission::new(
         state.db.clone(),
-        state.config.database_request_acquire_wait_ms,
+        state.config.database_request_wait_ms(),
         state.config.database_request_slots(),
     ) {
         router = router.layer(middleware::from_fn_with_state(

@@ -5863,7 +5863,7 @@ mod tests {
             database_max_connections: 20,
             database_min_connections: 5,
             database_acquire_timeout_secs: 30,
-            database_request_acquire_wait_ms: 2000,
+            database_request_acquire_wait_ms: None,
             database_probe_connections: 1,
             database_request_concurrency: None,
             database_idle_timeout_secs: 600,

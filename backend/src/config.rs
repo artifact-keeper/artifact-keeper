@@ -1368,13 +1368,13 @@ pub struct Config {
     /// (see `database_request_concurrency`) while every slot is held and the
     /// pool is busy (#4182). A request whose predicted wait (requests queued
     /// ahead x average slot hold time / slots) is longer is answered
-    /// `503 POOL_EXHAUSTED` at once with that prediction as `Retry-After`;
-    /// one that queues and still gets no slot in time is answered the same.
-    /// The wait happens before any authentication or handler work, and stays
-    /// below the pool's own 5 s acquire timeout. Env var:
-    /// `DATABASE_REQUEST_ACQUIRE_WAIT_MS`. Default 2000. `0` turns the gate
-    /// off (every request queues on the pool, as before 1.13).
-    pub database_request_acquire_wait_ms: u64,
+    /// `503 POOL_EXHAUSTED` at once with a predicted `Retry-After`; one that
+    /// queues and still gets no slot in time is answered the same. Env var:
+    /// `DATABASE_REQUEST_ACQUIRE_WAIT_MS`. `None` (unset): the pool's own
+    /// acquire timeout, `DATABASE_ACQUIRE_TIMEOUT_SECS x 1000`, so the gate
+    /// sheds only where a queued acquire would have timed out anyway; see
+    /// [`Config::database_request_wait_ms`]. `0` turns the gate off.
+    pub database_request_acquire_wait_ms: Option<u64>,
 
     /// Connections in the separate pool that `/health` and `/readyz` read
     /// the database through, so a request pool saturated by a burst does not
@@ -2185,7 +2185,7 @@ impl Default for Config {
             database_max_connections: 50,
             database_min_connections: 5,
             database_acquire_timeout_secs: 5,
-            database_request_acquire_wait_ms: 2000,
+            database_request_acquire_wait_ms: None,
             database_probe_connections: 1,
             database_request_concurrency: None,
             database_idle_timeout_secs: 600,
@@ -2276,6 +2276,15 @@ impl Default for Config {
 }
 
 impl Config {
+    /// The database admission gate's wait budget in milliseconds (#4182):
+    /// `DATABASE_REQUEST_ACQUIRE_WAIT_MS` when set, otherwise the pool's own
+    /// acquire timeout, so the gate never sheds a request that would have got
+    /// a connection on the pool before it timed out. `0`: gate off.
+    pub fn database_request_wait_ms(&self) -> u64 {
+        self.database_request_acquire_wait_ms
+            .unwrap_or(self.database_acquire_timeout_secs.saturating_mul(1000))
+    }
+
     /// Database admission slots (#4182): `DATABASE_REQUEST_CONCURRENCY` when
     /// set, otherwise four per pool connection, so a smaller or larger pool
     /// scales the gate with it.
@@ -2605,7 +2614,9 @@ impl Config {
             database_max_connections: env_parse("DATABASE_MAX_CONNECTIONS", 50),
             database_min_connections: env_parse("DATABASE_MIN_CONNECTIONS", 5),
             database_acquire_timeout_secs: env_parse("DATABASE_ACQUIRE_TIMEOUT_SECS", 5),
-            database_request_acquire_wait_ms: env_parse("DATABASE_REQUEST_ACQUIRE_WAIT_MS", 2000),
+            database_request_acquire_wait_ms: env::var("DATABASE_REQUEST_ACQUIRE_WAIT_MS")
+                .ok()
+                .and_then(|v| v.trim().parse().ok()),
             database_probe_connections: env_parse("DATABASE_PROBE_CONNECTIONS", 1),
             database_request_concurrency: env::var("DATABASE_REQUEST_CONCURRENCY")
                 .ok()
@@ -3264,6 +3275,27 @@ mod tests {
             ..derived
         };
         assert_eq!(off.database_request_slots(), 0);
+    }
+
+    /// #4182: the gate's wait follows the pool's acquire timeout unless set.
+    #[test]
+    fn request_wait_defaults_to_the_acquire_timeout_4182() {
+        assert_eq!(Config::default().database_request_wait_ms(), 5_000);
+        let slower = Config {
+            database_acquire_timeout_secs: 12,
+            ..Config::default()
+        };
+        assert_eq!(slower.database_request_wait_ms(), 12_000);
+        let pinned = Config {
+            database_request_acquire_wait_ms: Some(500),
+            ..slower.clone()
+        };
+        assert_eq!(pinned.database_request_wait_ms(), 500);
+        let off = Config {
+            database_request_acquire_wait_ms: Some(0),
+            ..slower
+        };
+        assert_eq!(off.database_request_wait_ms(), 0);
     }
 
     use super::*;

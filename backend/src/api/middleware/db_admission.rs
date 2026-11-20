@@ -17,8 +17,10 @@
 //! hold an admission permit for their handler phase, from the gate until the
 //! response head is ready (a download's body streams after that, without a
 //! permit). When every slot is held and the pool is busy, a request may
-//! queue for one for up to `DATABASE_REQUEST_ACQUIRE_WAIT_MS` (default 2 s,
-//! below the pool's 5 s acquire timeout). Before queueing, the gate predicts
+//! queue for one for up to `DATABASE_REQUEST_ACQUIRE_WAIT_MS` (default: the
+//! pool's own acquire timeout, so it only sheds what would have waited that
+//! long on the pool anyway; a database that is down still fails at the
+//! acquire timeout as before). Before queueing, the gate predicts
 //! the wait from what it measures (requests queued ahead x the moving
 //! average of how long a slot is held / slots): a backlog predicted to
 //! outlast the budget is answered at once with the same `503 POOL_EXHAUSTED`
@@ -68,6 +70,9 @@ pub const SHED_METRIC: &str = "ak_db_requests_shed_total";
 /// show. (The separate `METRICS_PORT` listener has no gate at all.)
 const EXEMPT_PATHS: &[&str] = &["/api/v1/admin/metrics"];
 
+/// At most one shed WARN per this many seconds.
+const SHED_WARN_INTERVAL_SECS: u64 = 300;
+
 /// Longest `Retry-After` the gate sends, in seconds.
 const MAX_RETRY_AFTER_SECS: u64 = 30;
 
@@ -90,6 +95,8 @@ pub struct DbAdmission {
     /// the gate tells everyone to return at the same short interval and they
     /// collide again.
     deferred: DeferredRing,
+    /// [`now_secs`] of the last shed WARN (`u64::MAX`: none yet).
+    last_warn: AtomicU64,
     /// Moving average of how long a request holds its slot, in microseconds
     /// (0 until the first slot is returned).
     avg_hold_us: AtomicU64,
@@ -129,6 +136,7 @@ impl DbAdmission {
                 wait: Duration::from_millis(wait_ms),
                 waiters: AtomicUsize::new(0),
                 deferred: DeferredRing::default(),
+                last_warn: AtomicU64::new(u64::MAX),
                 avg_hold_us: AtomicU64::new(0),
             })
         })
@@ -211,7 +219,31 @@ impl DbAdmission {
         // hammering, and each count expires with its own Retry-After.
         // Per-client accounting is #6344.
         self.deferred.add(now + retry_after_secs);
+        self.warn_shedding(now, retry_after_secs);
         Admission::Shed { retry_after_secs }
+    }
+
+    /// One WARN when shedding starts, then at most one per
+    /// [`SHED_WARN_INTERVAL_SECS`]; the per-request count is the metric.
+    fn warn_shedding(&self, now: u64, retry_after_secs: u64) {
+        let last = self.last_warn.load(Ordering::Relaxed);
+        let due = last == u64::MAX || now.saturating_sub(last) >= SHED_WARN_INTERVAL_SECS;
+        if due
+            && self
+                .last_warn
+                .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            tracing::warn!(
+                wait_ms = self.wait.as_millis() as u64,
+                slots = self.capacity,
+                retry_after_secs,
+                "database admission gate is shedding requests with 503 POOL_EXHAUSTED: the \
+                 request pool is saturated (budget DATABASE_REQUEST_ACQUIRE_WAIT_MS, slots \
+                 DATABASE_REQUEST_CONCURRENCY, pool DATABASE_MAX_CONNECTIONS; see \
+                 ak_db_requests_shed_total). Logged at most every {SHED_WARN_INTERVAL_SECS} s."
+            );
+        }
     }
 }
 
@@ -573,6 +605,29 @@ mod tests {
             );
         }
         pool
+    }
+
+    #[tokio::test]
+    async fn the_shed_warning_is_rate_limited() {
+        let pool = PgPool::connect_lazy("postgres://u:p@127.0.0.1:1/db").unwrap();
+        let gate = DbAdmission::new(pool, 2000, 4).unwrap();
+        gate.warn_shedding(100, 3);
+        assert_eq!(
+            gate.last_warn.load(Ordering::Relaxed),
+            100,
+            "first shed warns"
+        );
+        gate.warn_shedding(100 + SHED_WARN_INTERVAL_SECS - 1, 3);
+        assert_eq!(
+            gate.last_warn.load(Ordering::Relaxed),
+            100,
+            "not again so soon"
+        );
+        gate.warn_shedding(100 + SHED_WARN_INTERVAL_SECS, 3);
+        assert_eq!(
+            gate.last_warn.load(Ordering::Relaxed),
+            100 + SHED_WARN_INTERVAL_SECS
+        );
     }
 
     #[test]

@@ -85,103 +85,143 @@ health check briefly removed the endpoint.
 
 ## Database admission under a burst
 
-Every request needs pooled database connections (credential check,
-repository and artifact lookups), and a replica's pool has
+**Read this first.**
+
+- **Readiness comes from the probe pool, not from the gate.** `/health`
+  and `/readyz` query the database through their own pool of
+  `DATABASE_PROBE_CONNECTIONS` (default 1). They report whether the
+  database answers, not whether the request pool is busy. A replica whose
+  request pool is wedged (every connection held by a stuck query or a lock)
+  therefore **stays Ready while it sheds every request**.
+- **Alerting on the shed rate is required in production.** For example,
+  alert when `sum(rate(ak_db_requests_shed_total[5m])) > 0` holds for 10
+  minutes, together with `ak_db_pool_connection_failures_total{stage="request"}`.
+  A burst sheds for seconds to a minute; a wedged pool sheds until someone
+  steps in. The first shed, and then at most one every 5 minutes, also logs
+  a WARN that names the knobs below.
+- **The gate is for a slow database, not a dead one.** A database that is
+  down, refusing connections or failing over still fails each request at
+  `DATABASE_ACQUIRE_TIMEOUT_SECS` with `503`, exactly as before 1.13.
+
+Every request needs pooled database connections for its credential check
+and its repository and artifact lookups. A replica's pool has
 `DATABASE_MAX_CONNECTIONS` of them. Each query is a separate acquire from a
-FIFO queue, so once a burst puts far more requests in flight than there are
+FIFO queue. Once a burst puts far more requests in flight than there are
 connections, every acquire of every request waits behind the whole crowd
-(#4182). Latency becomes the queue wait times the query count, the same for
-every request, so the whole burst slows down together: past the clients'
-timeouts nothing completes, and a request whose acquire reaches
-`DATABASE_ACQUIRE_TIMEOUT_SECS` (5 s) gets `503 POOL_EXHAUSTED` only then.
-`/readyz`, which queried the same pool, waited out the same timeout and
-reported the replica not ready.
+(#4182). A request's latency becomes the queue wait times its query count,
+the same for every request, so the whole burst slows down together. Past
+the clients' timeouts nothing completes, and timed-out work is thrown away.
 
 Since 1.13 a router-wide admission gate runs before any authentication,
-database or storage work. At most `DATABASE_REQUEST_CONCURRENCY` requests
-(default four per pool connection, 200 with the default pool) run their
-handler phase at once; a download's body streams after the handler phase,
-without holding a slot. When every slot is held and the pool is busy, a
-request may queue for one for up to `DATABASE_REQUEST_ACQUIRE_WAIT_MS`
-(default 2000, below the pool's 5 s acquire timeout). Before it queues, the
-gate predicts its wait from what it measures: the requests queued ahead,
-times the moving average of how long a slot is held (a hold longer than the
-budget counts as the budget, so one stuck request does not skew it),
-divided by the slots. The first request to queue always gets to wait.
-A backlog predicted to outlast the budget is answered at once with the same
-`503 POOL_EXHAUSTED` body and a `Retry-After` (1 to 30 s) predicted
-from the queue plus every client already told to come back, so clients that
-honour it return spread out over the backlog instead of all colliding again
-a second later; a request
-that queues and still gets no slot in time is answered the same way. Sheds
-are counted in `ak_db_requests_shed_total`. An admitted
-request queues behind at most the other slot holders, so it finishes in a
-bounded time; the rest are told to back off instead of waiting. When every
-slot is held but the pool has room (connections not yet opened, or a quarter
-of them idle), a request runs without a slot, so slow uploads or upstream
-fetches holding slots never shed anything on their own.
+database or storage work:
 
-Package clients (pip, npm, Maven, Docker, rattler, conda, mamba) retry a
-503. A shed request has done no work, so it is never let through:
-authentication, authorization and scanning run unchanged for every admitted
-request, and a credential check that cannot reach the database still answers
-`503`, never `2xx`.
+- **Slots.** At most `DATABASE_REQUEST_CONCURRENCY` requests (default four
+  per pool connection, 200 with the default pool) run their handler phase
+  at once. A download's body streams after the handler phase, without
+  holding a slot.
+- **Waiting.** When every slot is held and the pool is busy, a request may
+  queue for a slot for up to `DATABASE_REQUEST_ACQUIRE_WAIT_MS`. Unset, that
+  is the pool's own acquire timeout, `DATABASE_ACQUIRE_TIMEOUT_SECS x 1000`
+  (5000 ms by default), so the gate only sheds what would have waited that
+  long on the pool anyway.
+- **Prediction.** Once someone is queued, the gate predicts a newcomer's
+  wait: the requests queued ahead, times the moving average of how long a
+  slot is held, divided by the slots. A hold longer than the budget counts
+  as the budget, so one stuck request doesn't skew the average.
+- **Shedding.** A backlog predicted to outlast the budget is answered at
+  once with `503 POOL_EXHAUSTED` and a `Retry-After` of 1 to 30 s. The
+  `Retry-After` is predicted from the queue plus every client already told
+  to come back, so clients that honour it return spread out instead of
+  colliding. A request that queues and still gets no slot in time is
+  answered the same way. Sheds are counted in `ak_db_requests_shed_total`.
+- **No shedding while the pool has room.** If every slot is held but the
+  pool has room (connections not yet opened, or a quarter of them idle), a
+  request runs without a slot. Slow uploads or upstream fetches holding
+  slots never shed anything on their own.
 
-`/health`, `/healthz`, `/ready`, `/readyz`, `/livez` and the main-port
-metrics scrape (`/api/v1/admin/metrics`; the `METRICS_PORT` listener has no
-gate) are never gated, so monitoring keeps working during the incident. The
-probes read the database through a
-separate pool of `DATABASE_PROBE_CONNECTIONS` (default 1), so they report
-whether the database answers rather than whether the request pool is busy.
-A replica that is saturated but healthy stays in its Service.
+A shed request has done no work, so it is never let through. Authentication,
+authorization and scanning run unchanged for every admitted request, and a
+credential check that can't reach the database still answers `503`, never
+`2xx`. `/health`, `/healthz`, `/ready`, `/readyz`, `/livez` and the
+main-port metrics scrape (`/api/v1/admin/metrics`) are never gated. The
+`METRICS_PORT` listener has no gate at all.
 
-That also means a request pool that is wedged (every connection held by a
-stuck query or a lock, as in the E2E tier) no longer takes the replica out
-of rotation: readiness reports the database reachable while every request
-is shed. Alert on the shed rate, for example
-`sum(rate(ak_db_requests_shed_total[5m])) > 0` for 10 minutes, together with
-`ak_db_pool_connection_failures_total{stage="request"}`; a burst sheds for
-seconds to a minute, a wedged pool sheds until someone intervenes.
+A shed is answered before the request body is read. A client sending a body
+(an upload or publish) that doesn't wait for `100 Continue` may see the
+connection close mid-send, and report a broken pipe or connection reset
+instead of the `503`.
 
-A shed is answered before the request body is read. Clients sending a body
-(an upload or publish) that do not wait for `100 Continue` may see the
-connection close mid-send and report a broken pipe or connection reset
-rather than the `503`; most package clients treat that as retryable too.
+**Opting out.**
 
-To keep the behaviour before 1.13: `DATABASE_REQUEST_ACQUIRE_WAIT_MS=0` or
-`DATABASE_REQUEST_CONCURRENCY=0` (no gate), `DATABASE_PROBE_CONNECTIONS=0`
-(probes share the request pool).
+- No gate: `DATABASE_REQUEST_ACQUIRE_WAIT_MS=0` or
+  `DATABASE_REQUEST_CONCURRENCY=0`.
+- Probes on the request pool: `DATABASE_PROBE_CONNECTIONS=0`.
 
-Measured with `scripts/perf/db-pool-burst.sh` (24 installers x 50 fetches in
-flight, anonymous downloads from a public generic repository, each client
-retries a 503 after its `Retry-After` at most 5 times, 30 s client timeout per
-attempt). One backend container (4 CPUs, `GLOBAL_MAX_CONCURRENCY=4096` so the
-global limit does not shed first, `DATABASE_MAX_CONNECTIONS=8`), Postgres
-with every round trip delayed by netem to make the burst exhaust the pool.
-Before is 1.12.x (main `5d99629`), after is the gate with its defaults.
+### How package clients retry a 503
+
+The gate relies on clients retrying a `503`. This table gives each
+client's defaults, from its upstream documentation or source as of
+November 2026. Clients that aren't listed weren't confirmed.
+
+| Client | Retries a 503 | Default retries | Back-off | Honours `Retry-After` | Source |
+|---|---|---|---|---|---|
+| npm | yes: 408, 420, 429 and any 5xx; not POST or a streaming body | `fetch-retries` 2 | `fetch-retry-factor` 10, `fetch-retry-mintimeout` 10 s, `fetch-retry-maxtimeout` 60 s | not read in make-fetch-happen's retry path | [npm config](https://docs.npmjs.com/cli/v10/using-npm/config), [make-fetch-happen `lib/remote.js`](https://github.com/npm/make-fetch-happen/blob/main/lib/remote.js) |
+| conda | yes: 413, 429, 500, 502, 503, 504 | `remote_max_retries` 3 | `remote_backoff_factor` 1 | no (`respect_retry_after_header=False`) | [conda configuration](https://docs.conda.io/projects/conda/en/latest/configuration.html), [`conda/gateways/connection/session.py`](https://github.com/conda/conda/blob/main/conda/gateways/connection/session.py) |
+| pixi | yes: any 5xx, plus 408 and 429 | 3 | exponential | no handling found in reqwest-retry | [`pixi_utils/src/reqwest.rs`](https://github.com/prefix-dev/pixi/blob/main/crates/pixi_utils/src/reqwest.rs), [reqwest-retry `retryable_strategy.rs`](https://github.com/TrueLayer/reqwest-middleware/blob/main/reqwest-retry/src/retryable_strategy.rs) |
+| rattler | `default_retry_policy` is 3 retries, exponential | 3 | exponential | not confirmed | [`rattler_networking/src/retry_policies.rs`](https://github.com/conda/rattler/blob/main/crates/rattler_networking/src/retry_policies.rs) |
+| pip | yes: 500, 502, 503, 520, 527 | `--retries` 5 | `backoff_factor` 0.25 | yes, through urllib3's default (`respect_retry_after_header=True` for 413, 429, 503) | [pip options](https://pip.pypa.io/en/stable/cli/pip/), [`pip/_internal/network/session.py`](https://github.com/pypa/pip/blob/main/src/pip/_internal/network/session.py), [urllib3 `Retry`](https://urllib3.readthedocs.io/en/stable/reference/urllib3.util.html) |
+| Maven 3.8 (Wagon transport) | **no** by default: `maven.wagon.http.serviceUnavailableRetryStrategy.class` defaults to `none`; `retryHandler.count` 3 covers I/O errors only | 0 for a 503 | n/a | n/a | [Wagon `AbstractHttpClientWagon.java`](https://github.com/apache/maven-wagon/blob/master/wagon-providers/wagon-http-shared/src/main/java/org/apache/maven/wagon/shared/http/AbstractHttpClientWagon.java), [Wagon HTTP docs](https://maven.apache.org/wagon/wagon-providers/wagon-http/) |
+| Maven 3.9.5+ (Resolver 1.9.16+) | yes: 429 and 503 (`aether.transport.http.retryHandler.serviceUnavailable`) | `retryHandler.count` 3 | `interval` 5 s, growing, capped at `intervalMax` 300 s | yes | [Resolver configuration](https://maven.apache.org/resolver/configuration.html), [Maven 3.9.5 release notes](https://maven.apache.org/docs/3.9.5/release-notes.html) |
+
+Maven 3.8 fails a download on the first `503`. A Maven 3.8 fleet that
+can't move to 3.9.5 or later should set
+`maven.wagon.http.serviceUnavailableRetryStrategy.class=standard`, or run
+with the gate off. conda and the reqwest-retry clients back off on their
+own schedule rather than the `Retry-After`, so they retry sooner than the
+gate suggests. That costs them retries in a long backlog.
+
+### Measured
+
+These runs used `scripts/perf/db-pool-burst.sh`:
+
+- **Load:** 24 installers x 50 fetches in flight, anonymous downloads from
+  a public generic repository.
+- **Client:** retries a 503 after its `Retry-After` at most 5 times, with a
+  30 s timeout per attempt.
+- **Backend:** one container with 4 CPUs, `DATABASE_MAX_CONNECTIONS=8`, and
+  `GLOBAL_MAX_CONCURRENCY=4096` so the global limit doesn't shed first.
+- **Database:** Postgres with every round trip delayed by netem, so the
+  burst exhausts the pool.
+
+Before is 1.12.x (main `5d99629`). After is the gate with its defaults
+(a 5000 ms budget).
 
 | Run | Installs done | Wall | 2xx p50 / p99 | Other answers | `/readyz` during the burst |
 |---|---|---|---|---|---|
 | +2 ms, 200 files each, before | 24 / 24 | 37.4 s | 9.25 s / 9.42 s | none | 13 / 13 ok, slowest 3.5 s |
-| +2 ms, 200 files each, after | 22 to 24 / 24 (5 runs) | 42 to 43 s | 1.96 s / 2.27 s | about 3,300 `503` + `Retry-After` | all ok, slowest 0.41 s |
+| +2 ms, 200 files each, after (5 runs) | 24 / 24 in 5 of 5 | 42.1 to 43.7 s | about 4.5 s / 5.25 to 5.29 s | 1,586 to 1,691 `503` + `Retry-After` | all ok, slowest 0.43 s |
 | +8 ms, 50 files each, before | 24 / 24 | 92.6 s | 28.3 s / 29.7 s | 2,240 client timeouts at 30 s | 8 / 13 ok, 5 timed out at 10 s |
-| +8 ms, 50 files each, after | 24 / 24 | 44.6 s | 0.36 s / 3.17 s | 2,129 `503` + `Retry-After` | 81 / 81 ok, slowest 0.46 s |
+| +8 ms, 50 files each, after (2 runs) | 24 / 24 in 2 of 2 | 36.5 / 38.5 s | 5.0 to 5.3 s / 6.0 s | about 1,600 `503` + `Retry-After` | all ok, slowest 0.45 s |
 
-Throughput is set by the database either way. Where the burst stays inside
-the clients' patience (the first pair), the gate turns a 9 s wait for every
-request into a bounded 2 s one plus a back-off for the rest, at the cost of a
-somewhat longer fleet wall time (+15 % here); readiness stays fast. Where it
-does not (the second pair), every request on 1.12.x slowed to the client
-timeout and timed-out work was thrown away; with the gate the same fleet
-finished in half the time with no timeouts. In the first pair a client
-retrying only 5 times still runs out of retries now and then: across five
-runs 0 to 2 of the 4,800 files gave up, failing that installer (none do with
-30 retries, and none on 1.12.x, where nothing is shed). Raising
-`DATABASE_REQUEST_ACQUIRE_WAIT_MS` to 3000 trades longer served latency
-(3.3 s p99) for fewer of those (0 to 1 in two runs). A gate that told every shed
-client to retry after 1 s did worse: they collided again, and clients with 5
-retries gave up. Give a fleet a pool and server sized for its burst (below)
-and treat the gate as the overload backstop, not the steady state.
+**Where queueing would have cleared within the clients' patience** (the
++2 ms pair):
+
+- Served requests take 5.3 s at p99 instead of 9.4 s.
+- About a quarter of the attempts are told to retry.
+- The fleet takes about 15 % longer (42 to 44 s against 37 s).
+
+**Where it would not** (the +8 ms pair):
+
+- On 1.12.x, every request slowed to the client timeout and that work was
+  thrown away.
+- With the gate, the same fleet finished in about 40 % of the time, with no
+  timeouts and readiness green.
+
+With a 2000 ms budget, clients with 5 retries sometimes ran out of retries
+in the +2 ms run (0 to 2 of 4,800 files). That is why the default budget is
+the pool's acquire timeout. The gate is the overload backstop, not the
+steady state: size the pool and the server for the fleet's burst (below).
+
 
 ## Conda package downloads under an installer fleet
 
