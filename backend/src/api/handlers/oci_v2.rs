@@ -3619,6 +3619,25 @@ fn default_docker_mirror_repo() -> Option<&'static str> {
         .as_deref()
 }
 
+/// Read `AK_OCI_NS_MIRROR_ROUTING` once (opt-in: only `true` / `1` enable
+/// it). Cached for the lifetime of the process; changes require a pod
+/// restart.
+///
+/// When set, a read whose path names no repository and that carries
+/// containerd's `?ns=<registry>` is routed to the Remote of that registry
+/// ([`ns_mirror_repo_key`]). Off by default: like Docker-mirror mode it
+/// answers keys naming no repository from a Remote, which brings back the
+/// #3730 missing-vs-private distinction for anonymous callers (see
+/// [`resolve_repo_for_anonymous_capable_read`]). Off, `ns` routes nothing;
+/// it only keeps another registry's reads off the Docker Hub mirror.
+fn ns_mirror_routing() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        let value = std::env::var("AK_OCI_NS_MIRROR_ROUTING").ok();
+        crate::config::parse_opt_in_flag(value.as_deref())
+    })
+}
+
 tokio::task_local! {
     /// The `ns` query parameter of the `/v2` request being served. containerd's
     /// registry-mirror protocol sends a pull of `<registry>/<image>` to a mirror
@@ -3634,7 +3653,8 @@ async fn scope_mirror_namespace(
 ) -> Response {
     let ns = url::form_urlencoded::parse(req.uri().query().unwrap_or_default().as_bytes())
         .find(|(key, _)| key == "ns")
-        .map(|(_, value)| value.to_ascii_lowercase());
+        .map(|(_, value)| value.to_ascii_lowercase())
+        .filter(|ns| !ns.is_empty());
     MIRROR_NAMESPACE.scope(ns, next.run(req)).await
 }
 
@@ -3656,7 +3676,8 @@ fn upstream_serves_namespace(upstream_url: &str, ns: &str) -> bool {
 }
 
 /// The repository a read carrying `?ns=<registry>` falls back to when its path
-/// names no repository. Docker Hub under Docker-mirror mode keeps the
+/// names no repository and [`ns_mirror_routing`] is on. Docker Hub under
+/// Docker-mirror mode keeps the
 /// configured `AK_DEFAULT_DOCKER_MIRROR_REPO` (a Virtual's members and access
 /// rules included); otherwise it is the one OCI Remote whose upstream is that
 /// registry. `None` (no Remote, or several, for the registry) is answered as
@@ -3742,6 +3763,18 @@ async fn resolve_repo(db: &PgPool, image_name: &str) -> Result<OciRepoInfo, Resp
 /// the challenge -- the discriminator survives in that opt-in, off-by-default
 /// configuration, where the deployment deliberately serves arbitrary keys from
 /// upstream and the key space is no longer this registry's (#3759 review).
+///
+/// containerd mirror routing (`AK_OCI_NS_MIRROR_ROUTING`, [`ns_mirror_routing`])
+/// is the same carve-out, and is opt-in and off by default for that reason. With
+/// it on, a key that misses on a read carrying `?ns=<registry>` is re-resolved
+/// to the Remote of that registry, so an anonymous
+/// `GET /v2/<guess>/x/manifests/latest?ns=<registry>` answers a PUBLIC Remote's
+/// 200/404 for a missing key and the challenge for a private one. With it off,
+/// `ns` re-resolves nothing: a missing key reaches here as `None` (or, under
+/// Docker-mirror mode, as the mirror for a Docker Hub `ns` exactly as without
+/// `ns`; any other registry stays `None` rather than being served by the
+/// Docker Hub mirror), so a missing key and a private one keep answering the
+/// identical challenge whatever `ns` says.
 async fn resolve_repo_for_anonymous_capable_read(
     state: &SharedState,
     is_anon: bool,
@@ -3925,12 +3958,16 @@ async fn resolve_repo_inner_with(
     //    `docker-hub-cache`), and the proxy code path (`is_docker_hub`,
     //    `normalize_docker_image`, blob/manifest cache) takes over with
     //    image="library/postgres". A containerd mirror request names its
-    //    registry in `?ns=` and is routed by it instead
-    //    ([`ns_mirror_repo_key`]).
+    //    registry in `?ns=`: with `AK_OCI_NS_MIRROR_ROUTING` on it is routed
+    //    by it ([`ns_mirror_repo_key`]); with it off, a registry other than
+    //    Docker Hub is a miss, never the Docker Hub mirror.
     if repo.is_none() && mirror_fallback {
         let mirror_key = match MIRROR_NAMESPACE.try_with(Clone::clone).ok().flatten() {
-            Some(ns) => ns_mirror_repo_key(db, &ns).await.map_err(map_db_err)?,
-            None => default_docker_mirror_repo().map(str::to_owned),
+            Some(ns) if ns_mirror_routing() => {
+                ns_mirror_repo_key(db, &ns).await.map_err(map_db_err)?
+            }
+            Some(ns) if !is_docker_hub(&ns) => None,
+            _ => default_docker_mirror_repo().map(str::to_owned),
         };
         if let Some(mirror_key) = mirror_key {
             // Don't infinitely recurse: only attempt the fallback when the
@@ -49024,16 +49061,27 @@ mod oci_read_authz_tests {
         );
     }
 
+    /// Turn `AK_OCI_NS_MIRROR_ROUTING` on for this test process and return
+    /// what [`ns_mirror_routing`] then reads. It caches its first read, so this
+    /// runs before the first resolution; nextest runs each test in its own
+    /// process, and the caller asserts the returned value as a fixture.
+    fn enable_ns_mirror_routing() -> bool {
+        std::env::set_var("AK_OCI_NS_MIRROR_ROUTING", "true");
+        ns_mirror_routing()
+    }
+
     /// containerd's registry-mirror protocol sends `/v2/<image>/...?ns=<registry>`.
-    /// Through the real `/v2` router: a path naming no repository is served by
-    /// the one OCI Remote whose upstream is that registry; a path naming a
-    /// repository is served as addressed; an unknown registry, a registry two
-    /// Remotes proxy, and a write fail closed as a key naming no repository.
+    /// With `AK_OCI_NS_MIRROR_ROUTING` on, through the real `/v2` router: a
+    /// path naming no repository is served by the one OCI Remote whose
+    /// upstream is that registry; a path naming a repository is served as
+    /// addressed; an unknown registry, a registry two Remotes proxy, and a
+    /// write fail closed as a key naming no repository.
     #[tokio::test]
     async fn test_ns_routes_containerd_mirror_reads_to_the_matching_remote() {
         let Some(mut f) = ReadFixture::setup().await else {
             return;
         };
+        let routing = enable_ns_mirror_routing();
         let host = format!("ns-{}.example.test", Uuid::new_v4());
         let shared = format!("ns-shared-{}.example.test", Uuid::new_v4());
         // The fixture repository, with its stored blob, becomes a public
@@ -49088,6 +49136,7 @@ mod oci_read_authz_tests {
         }
         f.teardown().await;
 
+        assert!(routing, "FIXTURE: `ns` routing must be on in this process");
         assert_eq!(
             routed.0,
             StatusCode::OK,
@@ -49148,18 +49197,19 @@ mod oci_read_authz_tests {
             .expect("repository key")
     }
 
-    /// Docker-mirror mode off, two OCI Remotes of Docker Hub under different
-    /// hosts: a Docker Hub `ns`, whichever of its hosts it names, is
-    /// ambiguous and fails closed. (Docker Hub is one registry for the whole
-    /// shared test database, where other suites create Docker Hub Remotes
-    /// concurrently, so a single-Remote match is asserted on a registry of
-    /// this test's own in the router test, and the alias rules in
+    /// `ns` routing on, Docker-mirror mode off, two OCI Remotes of Docker Hub
+    /// under different hosts: a Docker Hub `ns`, whichever of its hosts it
+    /// names, is ambiguous and fails closed. (Docker Hub is one registry for
+    /// the whole shared test database, where other suites create Docker Hub
+    /// Remotes concurrently, so a single-Remote match is asserted on a
+    /// registry of this test's own in the router test, and the alias rules in
     /// `test_upstream_serves_namespace`.)
     #[tokio::test]
     async fn test_ns_docker_hub_without_mirror_mode_fails_closed_on_two_remotes() {
         let Some(pool) = tdh::try_pool().await else {
             return;
         };
+        let routing = enable_ns_mirror_routing();
         let mirror_mode = default_docker_mirror_repo().map(str::to_owned);
         let image = format!("ns-hub-{}/app", Uuid::new_v4());
         let first = create_remote(&pool, "docker", "https://registry-1.docker.io").await;
@@ -49175,18 +49225,20 @@ mod oci_read_authz_tests {
             .await
             .expect("delete remotes");
 
+        assert!(routing, "FIXTURE: `ns` routing must be on in this process");
         assert_eq!(mirror_mode, None, "FIXTURE: Docker-mirror mode must be off");
         for (ns, key) in resolved {
             assert_eq!(key, None, "ns={ns}: several Docker Hub Remotes fail closed");
         }
     }
 
-    /// Docker-mirror mode on (`AK_DEFAULT_DOCKER_MIRROR_REPO` names a Virtual):
-    /// a Docker Hub `ns` keeps resolving to the configured repository with no
-    /// Docker Hub Remote, with one (the Virtual's member), and with two, under
-    /// any of Docker Hub's hosts. A
-    /// `ns` naming another registry is routed by `ns` and, with no Remote for
-    /// it, fails closed rather than reaching the Docker Hub mirror.
+    /// `ns` routing on, Docker-mirror mode on (`AK_DEFAULT_DOCKER_MIRROR_REPO`
+    /// names a Virtual): a Docker Hub `ns` keeps resolving to the configured
+    /// repository with no Docker Hub Remote, with one (the Virtual's member),
+    /// and with two, under any of Docker Hub's hosts. A `ns` naming another
+    /// registry (a host unique to this test, so a panicked run leaves no
+    /// Remote another run could match) is routed by `ns` and, with no Remote
+    /// for it, fails closed rather than reaching the Docker Hub mirror.
     ///
     /// `default_docker_mirror_repo` caches its first read, so the variable is
     /// set before the first resolution (nextest runs each test in its own
@@ -49196,10 +49248,12 @@ mod oci_read_authz_tests {
         let Some(pool) = tdh::try_pool().await else {
             return;
         };
+        let routing = enable_ns_mirror_routing();
         let (mirror, mirror_key, mirror_dir) = tdh::create_repo(&pool, "virtual", "docker").await;
         std::env::set_var("AK_DEFAULT_DOCKER_MIRROR_REPO", &mirror_key);
         let mirror_mode = default_docker_mirror_repo().map(str::to_owned);
         let image = format!("ns-mirror-{}/app", Uuid::new_v4());
+        let other = format!("ns-other-{}.example.test", Uuid::new_v4());
 
         let without_remote = resolve_read_with_ns(&pool, &image, "docker.io").await;
         let member = create_remote(&pool, "docker", "https://registry-1.docker.io").await;
@@ -49218,18 +49272,19 @@ mod oci_read_authz_tests {
         for ns in ["docker.io", "registry-1.docker.io", "index.docker.io"] {
             with_two.push((ns, resolve_read_with_ns(&pool, &image, ns).await));
         }
-        let quay_without_remote = resolve_read_with_ns(&pool, &image, "quay.io").await;
-        let quay = create_remote(&pool, "docker", "https://quay.io").await;
-        let quay_key = repo_key_of(&pool, quay).await;
-        let quay_routed = resolve_read_with_ns(&pool, &image, "quay.io").await;
+        let other_without_remote = resolve_read_with_ns(&pool, &image, &other).await;
+        let other_remote = create_remote(&pool, "docker", &format!("https://{other}")).await;
+        let other_key = repo_key_of(&pool, other_remote).await;
+        let other_routed = resolve_read_with_ns(&pool, &image, &other).await;
 
         sqlx::query("DELETE FROM repositories WHERE id = ANY($1)")
-            .bind(vec![mirror, member, second, quay])
+            .bind(vec![mirror, member, second, other_remote])
             .execute(&pool)
             .await
             .expect("delete repositories");
         let _ = std::fs::remove_dir_all(mirror_dir);
 
+        assert!(routing, "FIXTURE: `ns` routing must be on in this process");
         assert_eq!(
             mirror_mode.as_deref(),
             Some(mirror_key.as_str()),
@@ -49249,10 +49304,183 @@ mod oci_read_authz_tests {
             );
         }
         assert_eq!(
-            quay_without_remote, None,
+            other_without_remote, None,
             "another registry never falls through to the Docker Hub mirror"
         );
-        assert_eq!(quay_routed.as_deref(), Some(quay_key.as_str()));
+        assert_eq!(other_routed.as_deref(), Some(other_key.as_str()));
+    }
+
+    /// `ns` routing off (the default), Docker-mirror mode on: `ns` routes
+    /// nothing. A read with no `ns` or a Docker Hub `ns` takes the configured
+    /// repository exactly as before `ns` existed; any other registry resolves
+    /// as a key naming no repository, even when a Remote of it exists, instead
+    /// of being served the Docker Hub mirror's image.
+    #[tokio::test]
+    async fn test_ns_routing_off_keeps_other_registries_off_the_docker_mirror() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (mirror, mirror_key, mirror_dir) = tdh::create_repo(&pool, "remote", "docker").await;
+        std::env::set_var("AK_DEFAULT_DOCKER_MIRROR_REPO", &mirror_key);
+        let mirror_mode = default_docker_mirror_repo().map(str::to_owned);
+        let routing = ns_mirror_routing();
+        let image = format!("ns-off-{}/app", Uuid::new_v4());
+        let other = format!("ns-other-{}.example.test", Uuid::new_v4());
+        let other_remote = create_remote(&pool, "docker", &format!("https://{other}")).await;
+
+        let without_ns = match resolve_repo_inner(&pool, &image).await {
+            Ok(resolved) => resolved.map(|(repo, _)| repo.key),
+            Err(_) => panic!("resolving {image} without ns failed"),
+        };
+        let mut docker_hub = Vec::new();
+        for ns in ["docker.io", "registry-1.docker.io", "index.docker.io"] {
+            docker_hub.push((ns, resolve_read_with_ns(&pool, &image, ns).await));
+        }
+        let other_resolved = resolve_read_with_ns(&pool, &image, &other).await;
+
+        sqlx::query("DELETE FROM repositories WHERE id = ANY($1)")
+            .bind(vec![mirror, other_remote])
+            .execute(&pool)
+            .await
+            .expect("delete repositories");
+        let _ = std::fs::remove_dir_all(mirror_dir);
+
+        assert!(
+            !routing,
+            "FIXTURE: `ns` routing must be off (AK_OCI_NS_MIRROR_ROUTING unset)"
+        );
+        assert_eq!(
+            mirror_mode.as_deref(),
+            Some(mirror_key.as_str()),
+            "FIXTURE: Docker-mirror mode must be on in this process"
+        );
+        assert_eq!(
+            without_ns.as_deref(),
+            Some(mirror_key.as_str()),
+            "a read without `ns` keeps the Docker mirror"
+        );
+        for (ns, key) in docker_hub {
+            assert_eq!(
+                key.as_deref(),
+                Some(mirror_key.as_str()),
+                "ns={ns}: a Docker Hub `ns` keeps the Docker mirror"
+            );
+        }
+        assert_eq!(
+            other_resolved, None,
+            "with routing off another registry is neither routed to its Remote nor served \
+             by the Docker Hub mirror"
+        );
+    }
+
+    /// #3730 with `ns` routing off (the default): `?ns=` must not turn
+    /// anonymous reads back into an existence oracle. A PUBLIC Remote proxies
+    /// the `ns` registry -- with routing on, a missing key would be answered
+    /// from it (`test_ns_routes_containerd_mirror_reads_to_the_matching_remote`
+    /// serves 200 through exactly this shape) -- yet an anonymous probe of a
+    /// key naming no repository and of a private repository get the identical
+    /// challenge, compared as the full `(status, WWW-Authenticate,
+    /// Content-Type, Docker-Distribution-Api-Version, Content-Length, body)`
+    /// tuple with the client's own key normalised out, for that registry and
+    /// for docker.io.
+    #[tokio::test]
+    async fn test_ns_routing_off_anonymous_probe_of_missing_key_matches_private_repo_challenge() {
+        let Some(f) = ReadFixture::setup().await else {
+            return;
+        };
+        let routing = ns_mirror_routing();
+        let mirror_mode = default_docker_mirror_repo().map(str::to_owned);
+        let other = format!("ns-other-{}.example.test", Uuid::new_v4());
+        let remote = create_remote(&f.pool, "docker", &format!("https://{other}")).await;
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+            .bind(remote)
+            .execute(&f.pool)
+            .await
+            .expect("make the Remote public");
+        let anon = format!("Bearer {ANONYMOUS_TOKEN}");
+        let missing_key = format!("no-such-repo-ns-{}", Uuid::new_v4());
+
+        async fn probe(
+            f: &ReadFixture,
+            method: &str,
+            path: String,
+            key: &str,
+            auth: &str,
+        ) -> (StatusCode, Vec<Option<String>>, String) {
+            let (status, body, headers) = f.call_with_headers(method, path, auth).await;
+            let header = |name: &str| {
+                headers
+                    .get(name)
+                    .map(|v| String::from_utf8_lossy(v.as_bytes()).replace(key, "<key>"))
+            };
+            let headers = vec![
+                header("WWW-Authenticate"),
+                header("Content-Type"),
+                header("Docker-Distribution-Api-Version"),
+                header("Content-Length"),
+            ];
+            let body = String::from_utf8_lossy(&body).replace(key, "<key>");
+            (status, headers, body)
+        }
+
+        let mut pairs = Vec::new();
+        for ns in [other.as_str(), "docker.io"] {
+            for (verb, method, suffix) in [
+                ("GET manifest", "GET", format!("{IMAGE}/manifests/{TAG}")),
+                ("HEAD manifest", "HEAD", format!("{IMAGE}/manifests/{TAG}")),
+                (
+                    "GET blob",
+                    "GET",
+                    format!("{IMAGE}/blobs/{}", f.blob_digest),
+                ),
+                ("GET tags/list", "GET", format!("{IMAGE}/tags/list")),
+            ] {
+                let private = probe(
+                    &f,
+                    method,
+                    format!("/{}/{suffix}?ns={ns}", f.repo_key),
+                    &f.repo_key,
+                    &anon,
+                )
+                .await;
+                let missing = probe(
+                    &f,
+                    method,
+                    format!("/{missing_key}/{suffix}?ns={ns}"),
+                    &missing_key,
+                    &anon,
+                )
+                .await;
+                pairs.push((ns.to_owned(), verb, private, missing));
+            }
+        }
+
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(remote)
+            .execute(&f.pool)
+            .await
+            .expect("delete the Remote");
+        f.teardown().await;
+
+        assert!(
+            !routing,
+            "FIXTURE: `ns` routing must be off (AK_OCI_NS_MIRROR_ROUTING unset)"
+        );
+        assert_eq!(mirror_mode, None, "FIXTURE: Docker-mirror mode must be off");
+        for (ns, verb, private, missing) in &pairs {
+            assert_eq!(
+                private.0,
+                StatusCode::UNAUTHORIZED,
+                "ns={ns} {verb}: a private repository answers the anonymous token with the \
+                 401 challenge"
+            );
+            assert_eq!(
+                private, missing,
+                "#3730, ns={ns} {verb}: with `ns` routing off an anonymous caller must get \
+                 the SAME (status, headers, body) from a private repository as from a key \
+                 naming no repository"
+            );
+        }
     }
 
     /// Verified-bug regression for #3730 — the anonymous half of #3524 on
