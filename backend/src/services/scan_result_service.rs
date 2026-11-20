@@ -2747,7 +2747,11 @@ impl ScanResultService {
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
         let count_sql = format!("SELECT COUNT(*) FROM scan_results WHERE {FILTER}");
+        // Planned per call: after five runs a cached statement can switch to
+        // the generic plan, a nested-loop anti join that probes `artifacts`
+        // once per scan row (2 s instead of 0.4 s for 1.5M scans, #5244)
         let total: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(count_sql))
+            .persistent(false)
             .bind(repository_id)
             .bind(artifact_id)
             .bind(status)
