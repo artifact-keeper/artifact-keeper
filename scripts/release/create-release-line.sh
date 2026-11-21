@@ -8,8 +8,10 @@
 # `refs/heads/release/[0-9]*.[0-9]*.x` with `pull_request`,
 # `required_status_checks` (both contexts pinned to app 15368,
 # `do_not_enforce_on_create: false`), `non_fast_forward`, `deletion`, and NO
-# bypass actors. A required status check cannot exist on a ref that does not
-# exist yet, so the very push that would create a release line is refused:
+# bypass actors. The `pull_request` rule requires one approving review, with
+# stale approvals dismissed on push and the last push approved by someone other
+# than the pusher (#6216). A required status check cannot exist on a ref that
+# does not exist yet, so the very push that would create a release line is refused:
 #
 #   remote: - Required status check "Verify commits trace back to main" is expected.
 #
@@ -110,6 +112,28 @@ die() {
   exit 1
 }
 
+# A line created under a zero-approval ruleset would be just as writable by one
+# person as the topic branches it came from. #6216 found that "pull request
+# required" was set with required_approving_review_count = 0, so refuse to open
+# the ruleset window until the review requirement is actually in place.
+assert_review_requirement() {
+  local ruleset review count stale last_push
+  ruleset="$(gh api "repos/${REPO}/rulesets/${RULESET}")" \
+    || die "could not read ruleset ${RULESET}; cannot check its review requirement."
+  review="$(jq -c '.rules[]? | select(.type == "pull_request") | .parameters' <<< "$ruleset")"
+  [[ -n "$review" && "$review" != "null" ]] \
+    || die "ruleset ${RULESET} has no pull_request rule; a release PR needs a second reviewer (#6216)."
+  count="$(jq -r '.required_approving_review_count // 0' <<< "$review")"
+  [[ "$count" =~ ^[0-9]+$ && "$count" -ge 1 ]] \
+    || die "ruleset ${RULESET} requires ${count} approving review(s); at least 1 is required (#6216)."
+  stale="$(jq -r '.dismiss_stale_reviews_on_push // false' <<< "$review")"
+  [[ "$stale" == "true" ]] \
+    || die "ruleset ${RULESET} does not dismiss stale approvals on push (#6216)."
+  last_push="$(jq -r '.require_last_push_approval // false' <<< "$review")"
+  [[ "$last_push" == "true" ]] \
+    || die "ruleset ${RULESET} does not require the last push to be approved by someone else (#6216)."
+}
+
 args=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -151,6 +175,9 @@ BRANCH="release/${LINE}.x"
 admin="$(gh api "repos/${REPO}" --jq '.permissions.admin' 2> /dev/null || true)"
 [[ "$admin" == "true" ]] \
   || die "gh must be authenticated as an admin of ${REPO} (.permissions.admin = '${admin:-<unreadable>}')."
+
+# 1a. The ruleset restored after the window must still require a second person.
+assert_review_requirement
 
 # 2. A clean fetch. Every ancestry answer below is read from local refs; a
 #    stale origin/main would make them lies rather than checks.

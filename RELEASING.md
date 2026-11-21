@@ -781,12 +781,13 @@ test-branch creation is retried and how an older line gets one.
 ### Why the push is refused, and why that is not a bug
 
 Ruleset 20038606 ("Release branch protection") governs
-`refs/heads/release/[0-9]*.[0-9]*.x` with `pull_request`,
-`required_status_checks` — `✅ CI Complete` and `Verify commits trace back to
-main`, both pinned to app 15368, with `do_not_enforce_on_create: false` —
-`non_fast_forward`, `deletion`, and **no bypass actors**. A required status
-check cannot exist on a ref that does not exist yet, so the very push that
-would create the line is rejected:
+`refs/heads/release/[0-9]*.[0-9]*.x` with `pull_request` requiring one approving
+review (stale approvals are dismissed on push and the last push must be
+approved by someone other than the pusher, #6216), `required_status_checks` —
+`✅ CI Complete` and `Verify commits trace back to main`, both pinned to app
+15368, with `do_not_enforce_on_create: false` — `non_fast_forward`, `deletion`,
+and **no bypass actors**. A required status check cannot exist on a ref that
+does not exist yet, so the very push that would create the line is rejected:
 
 ```
 remote: error: GH013: Repository rule violations found for refs/heads/release/1.10.x.
@@ -817,7 +818,8 @@ same toggle every time, rather than a hand-typed improvisation during a cut.
 1. Refuses unless `gh` is authenticated as an **admin** of the repository and
    `git fetch origin` succeeds — every ancestry answer below is read from
    local refs, so a stale `origin/main` would make them lies rather than
-   checks.
+   checks — and unless ruleset 20038606 still requires one approving review
+   with stale approvals dismissed and last-push approval (#6216).
 2. Derives the branch name as `release/<X.Y>.x` and refuses any other shape
    (see the next subsection), and refuses if it already exists.
 3. Resolves the root commit: by default the commit tagged `v<X.Y>.0`, and if
@@ -847,10 +849,11 @@ same toggle every time, rather than a hand-typed improvisation during a cut.
    seconds the ruleset spent in `evaluate`, and the test branch.
 
 `scripts/ci/test-create-release-line.sh` (in the `shell-tests` job) pins the
-refusals, the "`--dry-run` issues no PUT/POST" property, the restore-on-
-failure trap and the test-branch cases (created at the run's gate commit,
-left alone when it exists, created alone for an existing line), because none
-of them is exercised by a normal CI run.
+refusals, including a ruleset with zero required approvals, the "`--dry-run`
+issues no PUT/POST" property, the restore-on-failure trap and the test-branch
+cases (created at the run's gate commit, left alone when it exists, created
+alone for an existing line), because none of them is exercised by a normal CI
+run.
 
 ### `release/1.9.1-prep` is not a release line
 
@@ -1062,12 +1065,12 @@ certification depends on it:
 
 | write path | `main` | `refs/heads/release/X.Y.x` |
 |---|---|---|
-| direct push | **refused** — a pull request is required (`required_pull_request_reviews`, 0 approvals) | **refused** — a pull request is required |
+| direct push | **refused** — a pull request is required (`required_pull_request_reviews`, 0 approvals) | **refused** — a pull request is required, with one approval (`pull_request`, #6216) |
 | force push / rewrite | blocked (`allow_force_pushes: false`) | blocked (`non_fast_forward`) |
 | deletion | blocked (`allow_deletions: false`) | blocked (`deletion`) |
 | ref creation | n/a (it exists) | **refused** — by the required-status-check rule (`do_not_enforce_on_create: false`, no bypass actor); there is no separate `creation` rule. Use `scripts/release/create-release-line.sh` ("Creating a release line") |
 | required checks | 3 | 2, incl. `Verify commits trace back to main` |
-| required approvals | none configured | none configured |
+| required approvals | none configured | 1, dismissed on push; last push needs someone else's approval (#6216) |
 | admin bypass | **no** — `enforce_admins: true` | **no** — `bypass_actors: []` |
 
 Every required context on both branches is pinned to the GitHub Actions app
@@ -1076,13 +1079,15 @@ and `🦀 Check Rust` on `main`, `✅ CI Complete` and `Verify commits trace bac
 to main` on `release/*` — so a same-named status posted by any other app or by
 a token does not satisfy them.
 
-One thing to fix, and it is bigger than the release flow: on **both**
-branches, a pull request's required checks are defined by workflows the pull
-request itself can edit, and neither branch requires an approval. The real
-floor under a release is therefore *write access*, not review. Raising
-`required_approving_review_count` above 0 on ruleset 20038606, and requiring
-code-owner review on the gate files themselves, would raise it; both are
-deferred to #4071.
+A pull request's required checks are still defined by workflows the pull
+request itself can edit. On `release/*` that is now bounded by one approving
+review, dismissed on push and tied to the last pusher (#6216): a single writer
+cannot land a change to `release.yml`, `scripts/ci/**` or
+`release-candidate.yml` on a maintenance line unseen. `main` still has no
+approval requirement, and neither branch requires code-owner review on the
+gate files themselves; both remain #4071. `create-release-line.sh` refuses to
+open the ruleset's enforcement window if the approval requirement is missing,
+so a line is never restored under a weaker rule than the one documented here.
 
 ## Supply chain: what the release job signs, and what it refuses
 
