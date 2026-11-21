@@ -170,6 +170,7 @@ pub mod trash_service;
 pub mod trivy_fs_scanner;
 pub mod upload_service;
 pub mod upstream_auth;
+pub mod upstream_circuit;
 pub mod upstream_feed;
 pub mod upstream_fetch_audit;
 pub mod upstream_filter;

@@ -613,8 +613,9 @@ jobs:
 
       # rust-toolchain.toml pins the compiler (#3551); this installs exactly
       # that version, with the clippy and rustfmt components the file lists.
-      - uses: dtolnay/rust-toolchain@1.98.0
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master 2026-11-15; the toolchain input picks the compiler
         with:
+          toolchain: 1.98.0
           components: clippy, rustfmt
 
       # The compiler is an input to this job and it used to be an untracked one
@@ -868,8 +869,9 @@ jobs:
 
       # rust-toolchain.toml already lists the target; naming it here as
       # well keeps the job self-describing, as release.yml's leg does.
-      - uses: dtolnay/rust-toolchain@1.98.0
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master 2026-11-15; the toolchain input picks the compiler
         with:
+          toolchain: 1.98.0
           targets: x86_64-pc-windows-gnu
 
       - name: Assert the pinned Rust toolchain is in force
@@ -1036,8 +1038,9 @@ jobs:
 
       # rust-toolchain.toml pins the compiler; this installs exactly that
       # version plus llvm-tools (llvm-profdata / llvm-cov for cargo-llvm-cov).
-      - uses: dtolnay/rust-toolchain@1.98.0
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master 2026-11-15; the toolchain input picks the compiler
         with:
+          toolchain: 1.98.0
           components: llvm-tools-preview
 
       - name: Assert the pinned Rust toolchain is in force
@@ -1054,7 +1057,7 @@ jobs:
         run: npm install --global npm@10.9.9
 
       - name: Install cargo-llvm-cov, cargo-nextest and sqlx-cli
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
         with:
           tool: cargo-llvm-cov,cargo-nextest,sqlx-cli
 
@@ -1187,6 +1190,31 @@ jobs:
             echo "::error title=Test BUILD failed — no test ran (shard ${{ matrix.shard }})::cargo could not build this shard's instrumented test binaries, so none of its tests or coverage ran. A genuine compile error also fails Check Rust on this commit. If the log shows 'signal: 9 (SIGKILL)', the build ran out of memory and was ALREADY retried once (#3856): read the peak RSS in the job summary."
             exit 1
           fi
+
+      # #6329: a test helper used only by another shard's tests (the
+      # `archive_scan_suite` macro in services-1, 2026-11-20) compiles to a
+      # rustc warning in this leg, and `cargo clippy --lib --tests --features
+      # test-shard-<name> -- -D warnings` fails on it locally while CI stayed
+      # green. Re-running the same build is a no-op (seconds: nothing
+      # recompiles) and cargo replays the cached diagnostics, so this reads
+      # the leg's warnings without a second compile and fails on any in the
+      # workspace's own crates.
+      - name: Refuse compiler warnings in this shard's test build
+        if: steps.build.outcome == 'success'
+        env:
+          CARGO_TERM_COLOR: never
+        run: |
+          source <(cargo llvm-cov show-env --sh)
+          out="$(cargo nextest run --workspace --lib --no-run --features "test-shard-${{ matrix.shard }}" 2>&1)"
+          if [ "${{ matrix.shard }}" = "$BIN_SHARD" ]; then
+            out+=$'\n'"$(cargo nextest run --workspace --bins --no-run --features "test-shard-${{ matrix.shard }}" 2>&1)"
+          fi
+          if grep -qE '^warning: `artifact-keeper[^`]*` \(.*\) generated [0-9]+ warnings?' <<<"$out"; then
+            printf '%s\n' "$out" | grep -vE '^ *(Compiling|Finished|Executable|Blocking|Downloaded|Fresh) '
+            echo "::error title=Compiler warnings in shard ${{ matrix.shard }}::this leg's test build has rustc warnings (above). A test helper unused in this shard belongs under lib.rs's shard-subset cfg_attr allow list (#6329); anything else is a real warning to fix."
+            exit 1
+          fi
+          echo "no compiler warnings in the ${{ matrix.shard }} test build"
 
       # See the pool job's history (#3494, #3699, #3479) for the flags:
       # `--bins` on the leg that owns the bin-target tests, `--no-fail-fast`
@@ -1352,13 +1380,15 @@ jobs:
 
       # rust-toolchain.toml pins the compiler (#3551); this installs exactly
       # that version, and the next step proves it is the one in force.
-      - uses: dtolnay/rust-toolchain@1.98.0
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master 2026-11-15; the toolchain input picks the compiler
+        with:
+          toolchain: 1.98.0
 
       - name: Assert the pinned Rust toolchain is in force
         run: ./scripts/ci/check-toolchain-pin.sh --active
 
       - name: Install cargo-nextest and sqlx-cli
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
         with:
           tool: cargo-nextest,sqlx-cli
 
@@ -1855,7 +1885,9 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: dtolnay/rust-toolchain@1.98.0
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master 2026-11-15; the toolchain input picks the compiler
+        with:
+          toolchain: 1.98.0
 
       - name: Assert the pinned Rust toolchain is in force
         run: ./scripts/ci/check-toolchain-pin.sh --active
@@ -1864,7 +1896,7 @@ jobs:
         run: python3 scripts/ci/test-shards.py check
 
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
         with:
           tool: cargo-nextest
 
@@ -2232,6 +2264,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: bash scripts/ci/check-gate-workflow-pins.sh reachable "origin/${GITHUB_BASE_REF}"
 
+      # The CLI cache warm-up dispatch (#6089): a 5xx or 429 is retried and
+      # then only warns, any other error still fails. Stubs `gh`; offline, ~1s.
+      - name: Check the CLI cache warm-up dispatch retries only transient errors
+        run: bash scripts/ci/test-dispatch-cli-cache-warmup.sh
+
       # The nightly release gate (#6073): which lines and images it tests,
       # how it gives way to a release candidate on the shared pool, and the
       # one-issue-per-red-tier tracking plus the verdict record #6075 reads.
@@ -2583,6 +2620,12 @@ jobs:
       - name: Check the post-release dispatch gate catches what it must
         run: bash scripts/ci/test-check-release-downstream-dispatch.sh
 
+      # Create Release gets a 403 from GITHUB_TOKEN when the commit is not a
+      # branch tip (#6338); the promote pins publish/vX.Y.Z and release.yml
+      # removes it. Stub gh, no network, ~1s.
+      - name: Check the release pin branch script and its wiring
+        run: bash scripts/ci/test-pin-release-branch.sh
+
       # The rule the promotion obeys: a floating tag may only name a version
       # with a published GitHub Release, and only if it is newest in that line.
       # Its interesting cases (a backport that moves :X.Y but not :latest, a
@@ -2826,7 +2869,7 @@ jobs:
           sparse-checkout: docker/scanner-adapter
 
       - name: Set up Go
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version-file: docker/scanner-adapter/go.mod
           # Stdlib-only module with no go.sum: nothing to cache.
@@ -3725,7 +3768,7 @@ jobs:
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
 
       - name: Log in to GHCR
-        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -3809,10 +3852,12 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: dtolnay/rust-toolchain@1.98.0
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master 2026-11-15; the toolchain input picks the compiler
+        with:
+          toolchain: 1.98.0
 
       - name: Install cargo-audit
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
         with:
           tool: cargo-audit
 

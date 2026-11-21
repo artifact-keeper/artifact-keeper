@@ -261,7 +261,22 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
 # (read back from the registry for the tag; the build's own CVE gate ran on
 # those exact bytes). docker/scanner-adapter/VERSION stays 1.7.1, still
 # unpublished, so the 1.12.3 cut creates it.
-FROM ghcr.io/artifact-keeper/trivy@sha256:e605c01134a09946b5e3f45e9583a1c1471ad1b59187bfc01371e13ccb0a7248 AS trivy
+#
+# 0.76.0-r5 -> 0.76.0-r6 (#6394): Docker Publish's gate reported HIGH
+# CVE-2026-95839 (containerd image-triggered daemon crash via a malformed
+# digest; github.com/containerd/containerd/v2 v2.4.1, fixed in 2.4.2) in the
+# bundled trivy on main from at least a5ed1433 (run 44839775004), alongside
+# the same advisory in the backend image's buildctl (#6395). Upstream Trivy
+# v0.76.2 pins v2.4.2, but the adapter must run the same Trivy release as its
+# server sidecar, so artifact-keeper/trivy added a containerd override on top
+# of the unchanged v0.76.0 source (trivy#24; it moves no other module), tagged
+# v0.76.0-r6 (build run 44850031351), and this FROM repoints to that published
+# manifest-list digest (read back from the registry for the tag). Go stays
+# 1.27.4; the binary still reports `Version: 0.76.0`.
+# docker/scanner-adapter/VERSION moves 1.7.1 -> 1.7.2, because 1.7.1 shipped
+# with 1.12.3 and exact versions are never republished
+# (scripts/ci/check-version-pin-bump.sh).
+FROM ghcr.io/artifact-keeper/trivy@sha256:7fedaaffb5d8702d312f3361707b2528004c33ae6dc57fc5c96d06492ac32bd8 AS trivy
 
 # ---------- Stage 3: minimal runtime ----------
 # alpine 3.20 reached EOL; 3.24 is the current stable with active security

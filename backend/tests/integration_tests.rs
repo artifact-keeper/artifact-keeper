@@ -406,9 +406,21 @@ require (
 )"#
     }
 
-    /// Sample NuGet package (nupkg is a zip)
+    /// Sample NuGet package: a real .nupkg with the .nuspec the upload
+    /// finalizer reads for the package identity.
     pub fn nuget_package() -> Vec<u8> {
-        maven_jar() // Similar structure to JAR
+        use std::io::Write;
+        let mut archive = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default();
+        archive.start_file("TestPackage.nuspec", options).unwrap();
+        write!(
+            archive,
+            "<package><metadata><id>TestPackage</id><version>1.0.0</version>\
+             <authors>Test Author</authors><description>A test package</description>\
+             </metadata></package>"
+        )
+        .unwrap();
+        archive.finish().unwrap().into_inner()
     }
 
     /// Sample RubyGems gemspec

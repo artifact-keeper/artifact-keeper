@@ -33,7 +33,8 @@ pub const CLAIM_TTL_SECS: f64 = 120.0;
 ///   queued hosted scans at [`PRIORITY_HOSTED_1_12_0`], and those rows (and
 ///   the ones a 1.12.0 pod still queues during a rolling upgrade) must not
 ///   fall behind the backfill.
-/// - `rescan` jobs (#5947), after everything else.
+/// - `rescan` jobs (#5947) and proxy re-grades ([`PRIORITY_REGRADE`], #6300),
+///   after everything else.
 pub const PRIORITY_CLIENT_WAITING: i16 = 100;
 pub const PRIORITY_HOSTED: i16 = 75;
 pub const PRIORITY_BACKFILL: i16 = 50;
@@ -42,8 +43,18 @@ pub const PRIORITY_BACKFILL: i16 = 50;
 pub const PRIORITY_RESCAN: i16 = 5;
 /// What 1.12.0 queued hosted scans at, below the backfill. The claim treats
 /// every non-rescan row between [`PRIORITY_RESCAN`] and [`PRIORITY_BACKFILL`]
-/// as hosted; nothing queues a non-rescan job at or below [`PRIORITY_RESCAN`].
+/// as hosted; the only non-rescan job at or below [`PRIORITY_RESCAN`] is a
+/// proxy re-grade ([`PRIORITY_REGRADE`]), claimed with the rescans.
 pub const PRIORITY_HOSTED_1_12_0: i16 = 10;
+
+/// A `proxy_file` re-grade after a vulnerability-database update (#6300): the
+/// pull that queued it was already decided by the verdict from the previous
+/// database build, so nobody waits on it. Claimed in the rescan band, within
+/// the worker's rescan slots, and raised like any `proxy_file` job if a pull
+/// that does wait queues the same digest. A replica from before 1.13.0 never
+/// claims one (its rescan band is `kind = 'rescan'` only), which leaves it for
+/// one that does.
+pub const PRIORITY_REGRADE: i16 = PRIORITY_RESCAN;
 
 /// The claim CTE splits the bands on these, and getting the order wrong is a
 /// silent latency regression rather than a failure, so assert it at compile
@@ -54,6 +65,7 @@ const _: () = {
     assert!(PRIORITY_BACKFILL > PRIORITY_RESCAN);
     assert!(PRIORITY_BACKFILL > PRIORITY_HOSTED_1_12_0);
     assert!(PRIORITY_HOSTED_1_12_0 > PRIORITY_RESCAN);
+    assert!(PRIORITY_REGRADE <= PRIORITY_RESCAN);
 };
 
 /// Default backfill aging window (#6032): how long a fail-open proxy scan
@@ -355,6 +367,13 @@ impl ScanJob {
         }
     }
 
+    /// Whether this job runs in the rescan band: a `rescan` (#5947) or a
+    /// proxy re-grade at [`PRIORITY_REGRADE`] (#6300). Such a job holds a
+    /// rescan slot and scans in the background band.
+    pub fn in_rescan_band(&self) -> bool {
+        self.job_kind() == Some(ScanJobKind::Rescan) || self.priority <= PRIORITY_RESCAN
+    }
+
     /// Any attempts left after the one about to be recorded.
     pub fn will_retry_after_failure(&self) -> bool {
         self.attempts + 1 < self.max_attempts
@@ -411,6 +430,19 @@ impl ScanQueue {
     pub fn with_backfill_aging(mut self, aging: std::time::Duration) -> Self {
         self.backfill_aging = aging.min(MAX_BACKFILL_AGING);
         self
+    }
+
+    /// Seconds the oldest pending proxy re-grade ([`PRIORITY_REGRADE`]) has
+    /// waited, `0` with none (#6300).
+    pub async fn oldest_pending_regrade_secs(&self) -> Result<f64> {
+        sqlx::query_scalar(
+            "SELECT COALESCE(EXTRACT(EPOCH FROM (NOW() - MIN(created_at)))::float8, 0) \
+             FROM scan_queue WHERE kind = 'proxy_file' AND state = 'pending' AND priority <= $1",
+        )
+        .bind(PRIORITY_REGRADE)
+        .fetch_one(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))
     }
 
     /// Queue a scan of the proxy object cached at `cache_path`. Returns
@@ -681,7 +713,8 @@ impl ScanQueue {
                 FROM scan_queue q
                 WHERE q.state = 'pending'
                   AND q.next_attempt_at <= NOW()
-                  AND q.kind = 'rescan'
+                  -- #6300: proxy re-grades share the band.
+                  AND (q.kind = 'rescan' OR q.priority <= $9)
                 ORDER BY q.priority DESC, q.created_at ASC
                 LIMIT GREATEST($4, 0)
                 FOR UPDATE OF q SKIP LOCKED
@@ -2516,6 +2549,73 @@ mod tests {
             q.claim(10, "w", CLAIM_TTL_SECS).await.expect("claim").len(),
             2
         );
+        sqlx::query("DELETE FROM scan_queue")
+            .execute(&pool)
+            .await
+            .unwrap();
+        drop_repo(&pool, repo).await;
+    }
+
+    /// #6300: a proxy re-grade after a DB update is claimed in the rescan
+    /// band: after every other band, only within the free rescan slots, and
+    /// as a rescan-band job. A pull that waits for the same bytes raises it
+    /// into the waiting band.
+    #[tokio::test]
+    async fn a_proxy_regrade_is_claimed_in_the_rescan_band() {
+        let Some(pool) = try_pool().await else { return };
+        let repo = fresh_queue(&pool).await;
+        let q = ScanQueue::new(pool.clone());
+        // Oldest first, so age alone would pick it.
+        q.enqueue_proxy_file(repo, "r", "regr01", None, 1, None, PRIORITY_REGRADE)
+            .await
+            .expect("regrade");
+        sqlx::query("UPDATE scan_queue SET created_at = NOW() - interval '1 day'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        q.enqueue_proxy_file(repo, "b", "back02", None, 1, None, PRIORITY_BACKFILL)
+            .await
+            .expect("backfill");
+
+        let none_free = q
+            .claim_filtered(10, "w", CLAIM_TTL_SECS, 0)
+            .await
+            .expect("claim");
+        assert_eq!(
+            none_free
+                .iter()
+                .map(|j| j.digest.clone())
+                .collect::<Vec<_>>(),
+            vec![Some("back02".to_string())],
+            "no rescan slot free: the re-grade waits"
+        );
+        let one_free = q
+            .claim_filtered(10, "w", CLAIM_TTL_SECS, 1)
+            .await
+            .expect("claim");
+        assert_eq!(one_free.len(), 1);
+        assert_eq!(one_free[0].digest.as_deref(), Some("regr01"));
+        assert!(one_free[0].in_rescan_band());
+
+        // Raised by a waiting pull of the same digest, it is ordinary work.
+        sqlx::query("DELETE FROM scan_queue")
+            .execute(&pool)
+            .await
+            .unwrap();
+        q.enqueue_proxy_file(repo, "r", "regr02", None, 1, None, PRIORITY_REGRADE)
+            .await
+            .expect("regrade");
+        q.enqueue_proxy_file(repo, "r", "regr02", None, 1, None, PRIORITY_CLIENT_WAITING)
+            .await
+            .expect("waiting");
+        let raised = q
+            .claim_filtered(10, "w", CLAIM_TTL_SECS, 0)
+            .await
+            .expect("claim");
+        assert_eq!(raised.len(), 1);
+        assert_eq!(raised[0].priority, PRIORITY_CLIENT_WAITING);
+        assert!(!raised[0].in_rescan_band());
+
         sqlx::query("DELETE FROM scan_queue")
             .execute(&pool)
             .await

@@ -5562,28 +5562,45 @@ mod tests {
         .execute(&mut *reset)
         .await
         .expect("reset");
+        let reset_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *reset)
+            .await
+            .expect("reset backend pid");
 
         let demotion = tokio::spawn({
             let pool = pool.clone();
             async move { demote_failing_peer(&pool, peer_id, 3).await }
         });
         // Let the demotion reach the locked row before the reset commits.
+        // Only a session blocked by THIS reset counts, so a parallel test's
+        // peer update cannot stand in for it (#6252).
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
+        let blocked = loop {
             let waiting: i64 = sqlx::query_scalar(
                 "SELECT COUNT(*) FROM pg_stat_activity \
-                 WHERE wait_event_type = 'Lock' \
-                   AND query LIKE 'UPDATE peer_instances SET status%'",
+                 WHERE $1 = ANY(pg_blocking_pids(pid))",
             )
+            .bind(reset_pid)
             .fetch_one(&pool)
             .await
             .expect("pg_stat_activity");
-            if waiting > 0 || std::time::Instant::now() > deadline {
-                break;
+            if waiting > 0 {
+                break true;
+            }
+            if std::time::Instant::now() > deadline {
+                break false;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
+        };
+        // #6252: without this the test passed after 5 s without exercising
+        // the race when the demotion never waited on the reset's row lock.
+        let finished_early = demotion.is_finished();
         reset.commit().await.expect("commit reset");
+        assert!(
+            blocked && !finished_early,
+            "the demotion must wait on the reset's row lock (blocked={blocked}, \
+             finished before the commit={finished_early})"
+        );
 
         let demoted = demotion.await.expect("join").expect("demote");
         let after = peer_state(&pool, peer_id).await;

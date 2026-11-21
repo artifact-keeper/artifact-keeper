@@ -189,6 +189,25 @@ impl MemberBreaker {
         })
     }
 
+    /// Record how a fetch from `member` (key `member_key`) went: a failure
+    /// when [`fetch_error_trips_breaker`], otherwise a success. A request the
+    /// member's upstream circuit refused (#5013) is neither: the upstream was
+    /// not asked, and the circuit admits its own probe, so recording it would
+    /// only keep this breaker open after the upstream has recovered.
+    pub fn record_fetch<T>(&self, member: Uuid, member_key: &str, fetched: &Result<T, AppError>) {
+        if fetched
+            .as_ref()
+            .is_err_and(crate::services::upstream_circuit::is_upstream_circuit_open)
+        {
+            return;
+        }
+        self.record(
+            member,
+            member_key,
+            fetched.as_ref().is_err_and(fetch_error_trips_breaker),
+        );
+    }
+
     /// Record how `member` (key `member_key`, for the metric and the log)
     /// answered: `tripped` is a deadline miss, a connect error or a `5xx`;
     /// anything else (including a `404`) is a success and closes the
@@ -335,6 +354,33 @@ mod tests {
             b.open_for,
             Some(Duration::from_secs(DEFAULT_BREAKER_OPEN_SECS))
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_upstream_circuit_refusal_is_not_recorded_5013() {
+        let b = MemberBreaker::new(1, OPEN);
+        let id = Uuid::new_v4();
+        trip(&b, id, 1);
+        tokio::time::advance(OPEN).await;
+        let refused: Result<(), AppError> = Err(crate::services::upstream_circuit::CircuitOpen {
+            host: "up.example:443".into(),
+            retry_in: Duration::from_secs(3),
+        }
+        .into_app_error());
+        let probe = b.admit(id).expect("probe");
+        b.record_fetch(id, "m", &refused);
+        drop(probe);
+        let probe = b.admit(id).expect("the refused probe left the slot free");
+        assert!(
+            probe.is_probe(),
+            "and the breaker neither closed nor reopened"
+        );
+        b.record_fetch(id, "m", &Ok::<(), AppError>(()));
+        drop(probe);
+        assert!(b.admit(id).is_some_and(|a| !a.is_probe()));
+        let failed: Result<(), AppError> = Err(AppError::BadGateway("connection refused".into()));
+        b.record_fetch(id, "m", &failed);
+        assert!(b.admit(id).is_none(), "a real failure still trips it");
     }
 
     #[test]
