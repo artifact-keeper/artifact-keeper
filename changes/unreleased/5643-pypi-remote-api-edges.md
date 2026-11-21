@@ -1,5 +1,0 @@
----
-section: Fixed
-issues: [#5643]
----
-- **PyPI Remote and token-API rough edges** (#5643). A proxy `502 Failed to fetch from upstream` now carries an `X-AK-Upstream-Status` header with the HTTP status the upstream answered (its body is unchanged), so a PyPI Remote whose index path does not match its upstream (a `403` from `https://download.pytorch.org/whl/cpu/simple/...`) shows the cause without the backend log; the `pypi_upstream_index_path` setting that fixes it is documented in `docs/pypi-remote.md`. PEP 691 content negotiation reads `q` values and the `application/vnd.pypi.simple.latest+json` alias, so `latest+json` gets JSON and a client that ranks HTML above JSON gets HTML; pip and uv are unaffected. `POST /api/v1/users/{id}/tokens` and `POST /api/v1/users/me/tokens` accept a `repo_selector`, stored and enforced exactly as on `POST /api/v1/auth/tokens`, instead of refusing it as an unknown field. The token API documentation now says a repository created after the token is matched within about five minutes, when the token's cached authentication expires.
