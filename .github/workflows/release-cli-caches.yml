@@ -132,8 +132,9 @@ jobs:
           persist-credentials: false
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@1.98.0
+        uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master 2026-11-15; the toolchain input picks the compiler
         with:
+          toolchain: 1.98.0
           targets: ${{ matrix.target }}
 
       # Bounded (#6272): each download attempt is capped and retried on
@@ -189,9 +190,10 @@ jobs:
           shared-key: cli-${{ matrix.target }}
 
       - name: Install SBOM tooling
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
         with:
-          tool: cargo-auditable,cargo-cyclonedx,cargo-audit
+          # Exact versions, equal to release.yml's (#6178).
+          tool: cargo-auditable@0.7.7,cargo-cyclonedx@0.5.10,cargo-audit@0.23.0
 
       # No "Set version from tag" step: the workspace crates are not saved, and
       # the cache key normalises their versions, so the version main's tip
