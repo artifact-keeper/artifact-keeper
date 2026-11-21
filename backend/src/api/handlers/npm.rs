@@ -2802,7 +2802,12 @@ async fn attestation_cached_meta_fetch(
 ///
 /// Implements the npm registry `/-/<endpoint>` meta namespace:
 ///
-/// - **Remote / Virtual repos** — forwards the request transparently to the
+/// - **Every repository type** — `/-/ping` → `200 {}` and `/-/whoami` →
+///   `200 {"username":"<name>"}` when authenticated, `401
+///   {"error":"unauthenticated"}` otherwise. Both describe this registry and
+///   the caller, so they are never forwarded upstream (#5634).
+///
+/// - **Remote / Virtual repos** — forwards any other request transparently to the
 ///   configured upstream (or the first reachable Remote member, for Virtual).
 ///   This is the correct behaviour for proxy/group repos: the upstream already
 ///   handles these endpoints correctly, so AK acts as a pass-through.
@@ -2813,17 +2818,12 @@ async fn attestation_cached_meta_fetch(
 ///     a cached attestation answer exists, which is served instead;
 ///   - upstream unreachable → `503 upstream unreachable`.
 ///
-///   `/-/ping` and `/-/whoami` on an unreachable upstream (and on a Virtual
-///   whose members cannot answer) are still answered locally, as before.
-///
 /// - **Local / Staging repos** — the registry is self-contained; no upstream
-///   to forward to. Minimal built-in responses:
-///   - `/-/ping` → `200 {}` (standard liveness probe)
-///   - `/-/whoami` → `200 {"username":"<name>"}` when authenticated,
-///     `401 {"error":"unauthenticated"}` otherwise
+///   to forward to:
 ///   - `/-/npm/v1/attestations/{pkg}@{ver}` → `404` (hosted versions carry no
 ///     attestations; also on a Virtual with no Remote member)
-///   - All other `/-/` paths → `501 Not Implemented`
+///   - All other `/-/` paths → `501 Not Implemented`, an expected answer
+///     that is not logged as an error
 ///
 /// Without this route, the `/:package/:version` catch-all previously matched
 /// `/-/ping` with `package="-"` and `version="ping"`, producing a confusing
@@ -2838,13 +2838,19 @@ async fn npm_meta_get(
     let query = raw_query.0;
     let endpoint = rest.trim_start_matches('/');
 
+    // `/-/ping` and `/-/whoami` ask about this registry and the caller's
+    // identity here, on every repository type (#5634). Forwarded to a Remote's
+    // upstream they were sent anonymously: whoami answered the upstream's 401
+    // (or a username the client never logged in as) and each ping paid an
+    // upstream round trip.
+    if let Some(resp) = npm_meta_local_stub(endpoint, auth.as_ref()) {
+        return resp;
+    }
+
     // Remote: proxy the whole request to upstream, filtered by this repo's own
     // scope policy (#2424) so search cannot list out-of-scope packages.
     if repo.repo_type == RepositoryType::Remote {
         let Some(ref upstream_url) = repo.upstream_url else {
-            if let Some(resp) = npm_meta_local_stub(endpoint, auth.as_ref()) {
-                return resp;
-            }
             return Err(npm_meta_error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 format!(
@@ -2872,9 +2878,6 @@ async fn npm_meta_get(
                 return Err(npm_meta_error(StatusCode::NOT_FOUND, reason));
             }
             MetaUpstreamOutcome::Unreachable => {
-                if let Some(resp) = npm_meta_local_stub(endpoint, auth.as_ref()) {
-                    return resp;
-                }
                 return Err(npm_meta_error(
                     StatusCode::SERVICE_UNAVAILABLE,
                     format!(
@@ -2929,9 +2932,6 @@ async fn npm_meta_get(
                 MetaUpstreamOutcome::Unreachable => any_unreachable = true,
             }
         }
-        if let Some(resp) = npm_meta_local_stub(endpoint, auth.as_ref()) {
-            return resp;
-        }
         if tried_remote {
             return Err(virtual_meta_failure(
                 &repo_key,
@@ -2953,11 +2953,7 @@ async fn npm_meta_get(
         ));
     }
 
-    // Local / Staging: serve minimal built-in responses for the standard meta
-    // endpoints.
-    if let Some(resp) = npm_meta_local_stub(endpoint, auth.as_ref()) {
-        return resp;
-    }
+    // Local / Staging: `/-/ping` and `/-/whoami` were answered above.
     if let Some(resp) = npm_meta_no_attestations(endpoint, &repo_key) {
         return Err(resp);
     }
@@ -2970,8 +2966,20 @@ async fn npm_meta_get(
 }
 
 /// The `{"error": ...}` body every `/-/` meta failure answers with.
+///
+/// A `501` is the documented answer for a `/-/` endpoint this repository
+/// cannot serve (search on a Local, say), not a server fault, so it is marked
+/// [`crate::error::ExpectedOutcome`] and the HTTP trace layer does not log it
+/// as an ERROR `response failed` line (#5634).
 fn npm_meta_error(status: StatusCode, message: String) -> Response {
-    (status, axum::Json(serde_json::json!({ "error": message }))).into_response()
+    let mut response =
+        (status, axum::Json(serde_json::json!({ "error": message }))).into_response();
+    if status == StatusCode::NOT_IMPLEMENTED {
+        response
+            .extensions_mut()
+            .insert(crate::error::ExpectedOutcome);
+    }
+    response
 }
 
 /// `/-/npm/v1/attestations/{pkg}@{ver}` on a repository with no upstream to
@@ -17621,10 +17629,80 @@ mod tests {
         );
     }
 
-    /// Remote repo: `/-/ping` is forwarded to the upstream registry and the
-    /// upstream response (200 `{}`) is returned verbatim to the client.
+    /// #5634: on a Remote, `/-/ping` and `/-/whoami` are answered here and
+    /// never sent upstream; whoami names the AK caller (or is 401 without
+    /// one), not whatever the upstream says about an anonymous request.
     #[tokio::test]
-    async fn test_remote_repo_meta_ping_proxied_to_upstream() {
+    async fn test_remote_repo_meta_ping_and_whoami_answered_locally_5634() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+            return;
+        };
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(401).set_body_string(r#"{"error":"upstream"}"#))
+            .mount(&mock_server)
+            .await;
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(mock_server.uri())
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("update upstream_url");
+
+        let anon = tdh::router_anon(super::router(), fx.state.clone());
+        let authed = fx.router_with_auth(super::router());
+        let (ping, ping_body) =
+            tdh::send(anon.clone(), tdh::get(format!("/{}/-/ping", fx.repo_key))).await;
+        let (anon_who, _) = tdh::send(anon, tdh::get(format!("/{}/-/whoami", fx.repo_key))).await;
+        let (who, who_body) =
+            tdh::send(authed, tdh::get(format!("/{}/-/whoami", fx.repo_key))).await;
+        let upstream_calls = mock_server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .len();
+        let username = fx.username.clone();
+        fx.teardown().await;
+
+        assert_eq!(ping, StatusCode::OK);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&ping_body).unwrap(),
+            serde_json::json!({})
+        );
+        assert_eq!(anon_who, StatusCode::UNAUTHORIZED);
+        assert_eq!(who, StatusCode::OK);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&who_body).unwrap(),
+            serde_json::json!({ "username": username })
+        );
+        assert_eq!(upstream_calls, 0, "ping/whoami must not reach the upstream");
+    }
+
+    /// #5634: the documented `501` for a `/-/` endpoint a Local cannot serve
+    /// is an expected answer, so the trace layer does not log it as an ERROR.
+    #[test]
+    fn test_meta_501_is_an_expected_outcome_5634() {
+        let r = npm_meta_error(StatusCode::NOT_IMPLEMENTED, "x".into());
+        assert!(r
+            .extensions()
+            .get::<crate::error::ExpectedOutcome>()
+            .is_some());
+        let r = npm_meta_error(StatusCode::SERVICE_UNAVAILABLE, "x".into());
+        assert!(r
+            .extensions()
+            .get::<crate::error::ExpectedOutcome>()
+            .is_none());
+    }
+
+    /// Remote repo: a `/-/` meta request other than ping/whoami is forwarded
+    /// to the upstream registry and the upstream response (200 `{}`) is
+    /// returned verbatim to the client.
+    #[tokio::test]
+    async fn test_remote_repo_meta_search_proxied_to_upstream() {
         use crate::api::handlers::test_db_helpers as tdh;
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -17638,7 +17716,7 @@ mod tests {
         // The `/-/` meta passthrough goes through `send_upstream` (#4455).
         let _otel = crate::testing::otel::trace_upstream_sends();
         Mock::given(method("GET"))
-            .and(path("/-/ping"))
+            .and(path("/-/v1/search"))
             .and(wiremock::matchers::header_exists("traceparent"))
             .respond_with(
                 ResponseTemplate::new(200)
@@ -17656,7 +17734,7 @@ mod tests {
             .expect("update upstream_url");
 
         let app = tdh::router_anon(super::router(), fx.state.clone());
-        let uri = format!("/{}/-/ping", fx.repo_key);
+        let uri = format!("/{}/-/v1/search?text=x", fx.repo_key);
         let req = tdh::get(uri);
         let (status, bytes) = tdh::send(app, req).await;
 
@@ -17665,13 +17743,13 @@ mod tests {
         assert_eq!(
             status,
             StatusCode::OK,
-            "Remote /-/ping must be proxied; got {status}"
+            "Remote /-/v1/search must be proxied; got {status}"
         );
         let parsed: serde_json::Value =
-            serde_json::from_slice(&bytes).expect("upstream ping body must be JSON");
+            serde_json::from_slice(&bytes).expect("upstream search body must be JSON");
         assert!(
             parsed.is_object() && parsed.as_object().unwrap().is_empty(),
-            "proxied /-/ping must return the upstream payload, got {parsed:?}"
+            "proxied /-/v1/search must return the upstream payload, got {parsed:?}"
         );
     }
 
@@ -17748,7 +17826,7 @@ mod tests {
             .await
             .unwrap_or_default()
             .len();
-        let (ping_status, _) = tdh::send(app, tdh::get(format!("/{}/-/ping", fx.repo_key))).await;
+        let (ping_status, _) = tdh::send(app, tdh::get(format!("/{}/-/all", fx.repo_key))).await;
         let after_ping = mock_server
             .received_requests()
             .await

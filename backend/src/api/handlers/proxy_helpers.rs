@@ -722,6 +722,24 @@ fn proxy_fetch_failure_level(
     }
 }
 
+/// Response header naming the HTTP status the upstream answered, on a generic
+/// proxy `502` (#5643). The body stays "Failed to fetch from upstream"; the
+/// header lets an operator see the cause (a `403` from a flat-layout index
+/// asked for `/simple/...`, say) without the backend log. Only the status is
+/// carried, never the upstream URL or body.
+pub(crate) const UPSTREAM_STATUS_HEADER: &str = "x-ak-upstream-status";
+
+/// Set [`UPSTREAM_STATUS_HEADER`] on `response` when `e` carries the
+/// upstream's non-success status.
+fn insert_upstream_status_header(response: &mut Response, e: &crate::error::AppError) {
+    if let Some(status) = crate::services::proxy_service::upstream_error_status(e) {
+        response.headers_mut().insert(
+            UPSTREAM_STATUS_HEADER,
+            axum::http::HeaderValue::from(status.as_u16()),
+        );
+    }
+}
+
 /// [`map_proxy_error`] for a caller that already knows whether `e` is an
 /// upstream refusal of an anonymous request ([`proxy_fetch_failure_level`]).
 fn map_proxy_error_classified(
@@ -862,6 +880,7 @@ fn map_proxy_error_classified(
             }
             let mut response =
                 (StatusCode::BAD_GATEWAY, "Failed to fetch from upstream").into_response();
+            insert_upstream_status_header(&mut response, &e);
             if let Some(status) = crate::services::proxy_service::upstream_refusal_status(&e) {
                 let hub_code = crate::services::proxy_service::upstream_hub_error_code(&e);
                 response
@@ -20766,6 +20785,37 @@ mod tests {
         let err = crate::error::AppError::Storage("disk full".to_string());
         let response = map_proxy_error("repo-key", "some/path", err);
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    /// #5643: the generic 502 names the upstream's status in a header, and
+    /// only when there was one; the body is unchanged.
+    #[test]
+    fn test_map_proxy_error_names_upstream_status_on_generic_502_5643() {
+        let err = crate::error::AppError::BadGateway(
+            "Upstream returned error status 403 Forbidden: https://u.example/simple/x/".into(),
+        );
+        let response = map_proxy_error("repo-key", "simple/x/", err);
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            response.headers().get(UPSTREAM_STATUS_HEADER).unwrap(),
+            "403"
+        );
+        let err = crate::error::AppError::BadGateway(
+            "Upstream returned error status 400 Bad Request: u".into(),
+        );
+        let response = map_proxy_error("repo-key", "pkg", err);
+        assert_eq!(
+            response.headers().get(UPSTREAM_STATUS_HEADER).unwrap(),
+            "400"
+        );
+        for err in [
+            crate::error::AppError::BadGateway("upstream timeout".into()),
+            crate::error::AppError::Storage("connection reset".into()),
+        ] {
+            let response = map_proxy_error("repo-key", "pkg", err);
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+            assert!(response.headers().get(UPSTREAM_STATUS_HEADER).is_none());
+        }
     }
 
     #[test]
