@@ -152,7 +152,7 @@ pub struct CompleteResponse {
     responses(
         (status = 200, description = "`skip_if_present` was set and the artifact is already stored; no session was opened", body = super::artifact_presence::AlreadyPresentResponse),
         (status = 201, description = "Upload session created", body = CreateSessionResponse),
-        (status = 400, description = "Invalid request, or the repository is virtual (direct uploads are not accepted)", body = crate::api::openapi::ErrorResponse),
+        (status = 400, description = "Invalid request, the repository is virtual (direct uploads are not accepted), or the repository's Maven version policy refuses the path", body = crate::api::openapi::ErrorResponse),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden", body = crate::api::openapi::ErrorResponse),
         (status = 404, description = "Repository not found", body = crate::api::openapi::ErrorResponse),
@@ -224,6 +224,17 @@ async fn create_session(
     crate::services::rpm_layout::validate_upload(&state.db, repo_id, &req.artifact_path)
         .await
         .map_err(IntoResponse::into_response)?;
+    // #5872: a chunked session (large uploads, and peer replication above
+    // its chunked threshold) holds the Maven version policy like a single PUT
+    crate::services::maven_version_policy::check_write(
+        &state.db,
+        repo_id,
+        &req.repository_key,
+        repo_record.format.as_key(),
+        &req.artifact_path,
+    )
+    .await
+    .map_err(IntoResponse::into_response)?;
 
     // Promotion-only gate (#817 parity with the direct upload path).
     //
@@ -588,7 +599,7 @@ async fn session_status_response(
     responses(
         (status = 200, description = "Upload finalized, artifact created. In a format repository (Maven, Gradle, npm, PyPI, RPM, Incus, Debian, Alpine) the artifact is named, versioned and indexed as the format's own upload route indexes it (#1846)", body = CompleteResponse),
         (status = 202, description = "`Prefer: respond-async` was sent: the completion lease is held and the commit runs in the background. `Location` is the session status to poll", body = SessionStatusResponse),
-        (status = 400, description = "Incomplete chunks or invalid state, or the session's repository is virtual (the session is failed), or the format's own upload route would refuse the package: a `package.json`, wheel `METADATA` or Debian control file that names another package or version than the path (the session is failed, nothing is stored)", body = crate::api::openapi::ErrorResponse),
+        (status = 400, description = "Incomplete chunks or invalid state, or the session's repository is virtual (the session is failed), or the repository's Maven version policy refuses the path (the session is failed), or the format's own upload route would refuse the package: a `package.json`, wheel `METADATA` or Debian control file that names another package or version than the path (the session is failed, nothing is stored)", body = crate::api::openapi::ErrorResponse),
         (status = 404, description = "Session not found", body = crate::api::openapi::ErrorResponse),
         (status = 405, description = "The session's repository is remote (proxy); direct uploads are not accepted and the session is failed", body = crate::api::openapi::ErrorResponse),
         (status = 409, description = "Conflict, for one of two reasons that the status code alone does not distinguish; read the response body to tell them apart. \
@@ -812,6 +823,21 @@ async fn complete_session_commit(
     if let Err(rejection) = proxy_helpers::reject_write_if_not_hosted(repo.repo_type.as_str()) {
         UploadService::fail_committing(&state.db, &session, NOT_HOSTED_SESSION_ERROR).await;
         return Err(rejection);
+    }
+    // #5872: the version policy can change while a session is open, so the
+    // commit holds it again. Terminal like the hosted-only gate above
+    if let Err(e) = crate::services::maven_version_policy::check_write(
+        &state.db,
+        repo.id,
+        &repo.key,
+        repo.format.as_key(),
+        &session.artifact_path,
+    )
+    .await
+    {
+        let reason = e.to_string();
+        UploadService::fail_committing(&state.db, &session, &reason).await;
+        return Err(e.into_response());
     }
     let storage = match state.storage_for_repo(&repo.storage_location()) {
         Ok(storage) => storage,
@@ -4418,6 +4444,150 @@ mod tests {
             .execute(&f.pool)
             .await;
         f.teardown().await;
+    }
+
+    /// #5872: a chunked session, the large-upload and large-replication path,
+    /// holds the Maven version policy before any session row exists
+    #[tokio::test]
+    async fn create_session_honours_version_policy_5872() {
+        let Some(f) = tdh::Fixture::setup("local", "maven").await else {
+            return;
+        };
+        sqlx::query("UPDATE repositories SET version_policy = 'release' WHERE id = $1")
+            .bind(f.repo_id)
+            .execute(&f.pool)
+            .await
+            .expect("set version_policy");
+        let open = |path: &str| {
+            let app =
+                upload_router_with_auth(f.state.clone(), tdh::make_auth(f.user_id, &f.username));
+            tdh::send(
+                app,
+                create_session_req(&serde_json::json!({
+                    "repository_key": f.repo_key,
+                    "artifact_path": path,
+                    "total_size": 1024_i64,
+                    "checksum_sha256": "deadbeef0123456789abcdef0123456789abcdef0123456789abcdef01234567",
+                })),
+            )
+        };
+        let (snap_status, snap_body) =
+            open("com/acme/lib/1.0-SNAPSHOT/lib-1.0-20260101.120000-1.jar").await;
+        let (rel_status, rel_body) = open("com/acme/lib/1.0/lib-1.0.jar").await;
+        let _ = sqlx::query(
+            "DELETE FROM upload_chunks WHERE session_id IN \
+             (SELECT id FROM upload_sessions WHERE repository_id = $1)",
+        )
+        .bind(f.repo_id)
+        .execute(&f.pool)
+        .await;
+        let sessions: i64 = sqlx::query_scalar(
+            "WITH gone AS (DELETE FROM upload_sessions WHERE repository_id = $1 RETURNING artifact_path) \
+             SELECT COUNT(*) FROM gone WHERE artifact_path LIKE '%SNAPSHOT%'",
+        )
+        .bind(f.repo_id)
+        .fetch_one(&f.pool)
+        .await
+        .expect("count sessions");
+        f.teardown().await;
+
+        let snap_body = String::from_utf8_lossy(&snap_body);
+        assert_eq!(snap_status, StatusCode::BAD_REQUEST, "{snap_body}");
+        assert!(
+            snap_body.contains("accepts release versions only"),
+            "{snap_body}"
+        );
+        assert_eq!(
+            rel_status,
+            StatusCode::CREATED,
+            "{}",
+            String::from_utf8_lossy(&rel_body)
+        );
+        assert_eq!(sessions, 0, "the refused path opened no session");
+    }
+
+    /// #5872: a policy set while a session is open holds at commit, the
+    /// session fails and no artifact row is written
+    #[tokio::test]
+    async fn complete_honours_version_policy_set_after_create_5872() {
+        let Some(f) = tdh::Fixture::setup("local", "maven").await else {
+            return;
+        };
+        let path = "com/acme/lib/1.0-SNAPSHOT/lib-1.0-20260101.120000-1.jar";
+        let payload: &[u8] = b"snapshot-bytes-5872";
+        let checksum = {
+            use sha2::{Digest, Sha256};
+            hex::encode(Sha256::digest(payload))
+        };
+        let app =
+            || upload_router_with_auth(f.state.clone(), tdh::make_auth(f.user_id, &f.username));
+        let (status, body) = tdh::send(
+            app(),
+            create_session_req(&serde_json::json!({
+                "repository_key": f.repo_key,
+                "artifact_path": path,
+                "total_size": payload.len() as i64,
+                "checksum_sha256": checksum,
+                "chunk_size": 1024 * 1024_i64,
+            })),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        let session_id: Uuid = serde_json::from_value(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()["session_id"].clone(),
+        )
+        .expect("session_id");
+        let chunk = axum::http::Request::builder()
+            .method("PATCH")
+            .uri(format!("/{session_id}"))
+            .header(
+                "content-range",
+                format!("bytes 0-{}/{}", payload.len() - 1, payload.len()),
+            )
+            .header("content-type", "application/octet-stream")
+            .body(axum::body::Body::from(payload.to_vec()))
+            .unwrap();
+        let (status, body) = tdh::send(app(), chunk).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+
+        sqlx::query("UPDATE repositories SET version_policy = 'release' WHERE id = $1")
+            .bind(f.repo_id)
+            .execute(&f.pool)
+            .await
+            .expect("set version_policy");
+        let complete = axum::http::Request::builder()
+            .method("PUT")
+            .uri(format!("/{session_id}/complete"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let (status, body) = tdh::send(app(), complete).await;
+        let rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM artifacts WHERE repository_id = $1 AND path = $2",
+        )
+        .bind(f.repo_id)
+        .bind(path)
+        .fetch_one(&f.pool)
+        .await
+        .expect("count artifacts");
+        let _ = sqlx::query("DELETE FROM upload_chunks WHERE session_id = $1")
+            .bind(session_id)
+            .execute(&f.pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM upload_sessions WHERE id = $1")
+            .bind(session_id)
+            .execute(&f.pool)
+            .await;
+        f.teardown().await;
+
+        let body = String::from_utf8_lossy(&body);
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("accepts release versions only"), "{body}");
+        assert_eq!(rows, 0, "the refused commit writes no artifact row");
     }
 
     /// #2474: the session-create quota preflight also enforces the

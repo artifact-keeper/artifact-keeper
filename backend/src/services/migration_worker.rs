@@ -2250,6 +2250,25 @@ impl MigrationWorker {
         // writes below (repo-id lookup, stored path) use keys.target.
         let repo_key = keys.source.as_str();
 
+        // #5872: a version the destination's Maven policy refuses fails the
+        // item before its bytes are downloaded. Only Maven and Gradle
+        // destinations carry a policy, so other formats skip the lookup
+        let destination_format =
+            crate::services::migration_service::MigrationService::target_repository_format(
+                package_type,
+            );
+        if crate::services::maven_version_policy::applies_to_format(&destination_format) {
+            if let Some(reason) = crate::services::maven_version_policy::refusal_by_key(
+                &self.db,
+                keys.target.as_str(),
+                artifact_path,
+            )
+            .await?
+            {
+                return Err(MigrationError::Other(reason));
+            }
+        }
+
         // Open the source as a chunked stream rather than `download_artifact`,
         // which buffers the whole body in memory (#1422).
         let mut stream = client
@@ -9845,6 +9864,47 @@ mod tests {
                 .await
                 .expect("count artifacts under target repo");
         assert_eq!(count, 1);
+    }
+
+    /// #5872: the migration import fails an item the destination's Maven
+    /// version policy refuses, before its bytes are downloaded, and still
+    /// imports the versions the policy accepts
+    #[tokio::test]
+    async fn test_transfer_honours_destination_version_policy_5872() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (worker, storage, _tmp, repo_id, repo_key) =
+            setup_repo_for_import(&pool, "mig5872", "maven").await;
+        sqlx::query("UPDATE repositories SET version_policy = 'release' WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .expect("set version_policy");
+        let snapshot = "com/acme/lib/1.0-SNAPSHOT/lib-1.0-20260101.120000-1.jar";
+        let release = "com/acme/lib/1.0/lib-1.0.jar";
+        let mut files = std::collections::HashMap::new();
+        files.insert(snapshot.to_string(), bytes::Bytes::from_static(b"snap"));
+        files.insert(release.to_string(), bytes::Bytes::from_static(b"rel"));
+
+        let refused = transfer_one(&worker, &storage, &files, &repo_key, "maven", snapshot).await;
+        let accepted = transfer_one(&worker, &storage, &files, &repo_key, "maven", release).await;
+        let _ = sqlx::query("DELETE FROM artifacts WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+
+        assert!(
+            matches!(&refused, Err(MigrationError::Other(m)) if m.contains("accepts release versions only")),
+            "{:?}",
+            refused.as_ref().err()
+        );
+        assert!(accepted.is_ok(), "{:?}", accepted.as_ref().err());
     }
 
     /// A Nexus repository of plain files has no components, only assets. The
