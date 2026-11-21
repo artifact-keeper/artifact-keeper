@@ -249,21 +249,29 @@ pub(crate) async fn enforce_path_immutability_with(
     Ok(())
 }
 
+/// Whether a format can append immutable revisions on upload at all (#6063).
+///
+/// This is the single enumeration of versioning-capable formats. The repository
+/// API uses it to refuse a `versioning_enabled` opt-in that uploads could never
+/// honour, and [`versioning_applies`] uses it to decide the upload path.
+pub(crate) fn versioning_supported(format: &RepositoryFormat) -> bool {
+    matches!(
+        format,
+        RepositoryFormat::Generic | RepositoryFormat::Mlmodel
+    )
+}
+
 /// Whether uploads to a repository append immutable revisions to
 /// `artifact_versions` instead of overwriting/rejecting the prior content at
 /// the same path (#2367).
 ///
 /// The versioning branch is deliberately narrow: it requires BOTH the
-/// per-repo `versioning_enabled` opt-in (DEFAULT false) AND a Generic or
-/// Mlmodel format. Every other format — and every repo that has not opted in
-/// — keeps the exact pre-existing `ON CONFLICT` overwrite semantics and the
+/// per-repo `versioning_enabled` opt-in (DEFAULT false) AND a format that
+/// supports it. Every other format — and every repo that has not opted in —
+/// keeps the exact pre-existing `ON CONFLICT` overwrite semantics and the
 /// release-immutability backstop.
 pub(crate) fn versioning_applies(format: &RepositoryFormat, versioning_enabled: bool) -> bool {
-    versioning_enabled
-        && matches!(
-            format,
-            RepositoryFormat::Generic | RepositoryFormat::Mlmodel
-        )
+    versioning_enabled && versioning_supported(format)
 }
 
 /// Next auto-increment revision for a (repository_id, path) coordinate given
@@ -6276,6 +6284,28 @@ mod tests {
         assert!(!versioning_applies(&RepositoryFormat::Npm, true));
         assert!(!versioning_applies(&RepositoryFormat::Debian, true));
         assert!(!versioning_applies(&RepositoryFormat::Docker, true));
+    }
+
+    /// #6063: the API refuses an opt-in on formats that cannot version
+    /// artifacts, so this list and `versioning_applies` must not drift apart.
+    #[test]
+    fn test_versioning_supported_lists_exactly_the_versioned_formats_6063() {
+        let supported: Vec<_> = RepositoryFormat::ALL
+            .iter()
+            .filter(|format| versioning_supported(format))
+            .cloned()
+            .collect();
+        assert_eq!(
+            supported,
+            vec![RepositoryFormat::Generic, RepositoryFormat::Mlmodel]
+        );
+        for format in RepositoryFormat::ALL {
+            assert_eq!(
+                versioning_applies(format, true),
+                versioning_supported(format),
+                "an opt-in must apply exactly where the format supports it: {format:?}"
+            );
+        }
     }
 
     #[test]

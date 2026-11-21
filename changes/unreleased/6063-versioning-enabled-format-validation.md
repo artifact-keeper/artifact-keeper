@@ -1,0 +1,5 @@
+---
+section: Fixed
+issues: [#6063]
+---
+- **Repository create and update now refuse turning `versioning_enabled` on for formats that cannot version artifacts** (#6063). The flag was accepted and echoed back for every format, but uploads only append immutable revisions for Generic and Mlmodel repositories, so a hosted Debian repository could report versioning as enabled and still answer `409 Package already exists` on a re-upload. `POST /api/v1/repositories` with `versioning_enabled: true` on any other format, and `PATCH /api/v1/repositories/{key}` that turns it on for one, now answer `400 VALIDATION_ERROR`. Omitting the flag or setting it to `false` remains valid for every format, and an existing repository that already holds `true` on an unsupported format keeps it: a `PATCH` that re-sends the unchanged `true` is accepted, so it can still be edited and turned back off. A config-as-code import of an export that holds such a repository fails when it has to create it, since the create carries the flag. Clients that send the flag unconditionally across formats must stop sending `true` for the unsupported ones.
