@@ -37,7 +37,7 @@
 #     https://daniel.haxx.se/mykey.asc), then put the tarball's sha256sum in
 #     CURL_SHA256. The build refuses a tarball whose hash does not match.
 # ---------------------------------------------------------------------------
-FROM registry.access.redhat.com/ubi9/ubi:9.8 AS curl-builder
+FROM registry.access.redhat.com/ubi9/ubi:9.9 AS curl-builder
 
 ARG CURL_VERSION=8.23.0
 ARG CURL_SHA256=8dadd7d2536a314f982ad05a651b713f426bf7d02cc2c76cffb9796f2218e6c5
@@ -73,7 +73,7 @@ RUN grep -q "^#define LIBCURL_VERSION \"${CURL_VERSION}\"" /src/include/curl/cur
         /usr/lib64/libcurl.so.4 > /out/sbom/curl.cdx.json
 
 # ---------- Stage 1: Build minimal rootfs with OpenSCAP ----------
-FROM registry.access.redhat.com/ubi9/ubi:9.8 AS rootfs-builder
+FROM registry.access.redhat.com/ubi9/ubi:9.9 AS rootfs-builder
 
 # CentOS Stream 9 AppStream supplies scap-security-guide, which is not in the
 # UBI repositories. `includepkgs` limits that repository to the one data
@@ -210,7 +210,7 @@ RUN rm -rf /mnt/rootfs/var/cache/* /mnt/rootfs/var/log/* /mnt/rootfs/tmp/*
 RUN find /mnt/rootfs -xdev -perm /6000 -type f -exec chmod a-s {} +
 
 # ---------- Stage 2: UBI 9 Micro runtime ----------
-FROM registry.access.redhat.com/ubi9/ubi-micro:9.8
+FROM registry.access.redhat.com/ubi9/ubi-micro:9.9
 
 # Copy minimal rootfs (oscap, scap-security-guide, python3, libs)
 COPY --from=rootfs-builder /mnt/rootfs /
