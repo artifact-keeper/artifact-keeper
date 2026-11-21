@@ -2271,12 +2271,14 @@ jobs:
 
       # The nightly release gate (#6073): which lines and images it tests,
       # how it gives way to a release candidate on the shared pool, and the
-      # one-issue-per-red-tier tracking plus the verdict record #6075 reads.
-      # Stubs `gh`; offline, ~2s.
-      - name: Check the nightly release gate's line resolver, sentinel and report
+      # one-issue-per-red-tier tracking plus the verdict record #6075 reads,
+      # and (#6155) the guard that keeps its scheduled triggers to one gate a
+      # night. Stubs `gh`; offline, ~2s.
+      - name: Check the nightly release gate's line resolver, sentinel, once-a-night guard and report
         run: |
           bash scripts/ci/test-nightly-gate-lines.sh
           bash scripts/ci/test-nightly-gate-sentinel.sh
+          bash scripts/ci/test-nightly-gate-once.sh
           bash scripts/ci/test-nightly-gate-report.sh
 
       # #6080: no merge freeze during a candidate. The stale-run finder

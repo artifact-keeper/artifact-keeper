@@ -672,8 +672,11 @@ time a commit met that gate, so drift merged since the last cut (stale tests,
 timing races in tiers, runner tooling gaps) showed up one red candidate at a
 time: 8 of 10 candidates went red on 2026-11-15/16 (#6081). The **Nightly
 Release Gate** (`.github/workflows/nightly-release-gate.yml`, #6073) runs the
-same gate every night at 08:00 UTC on `main` and on every `release/X.Y.x`
-with a commit in the last 30 days, against the newest Docker Publish image
+same gate once a night on `main` and on every `release/X.Y.x` with a commit
+in the last 30 days (#6155: three scheduled triggers, 23:17, 03:17 and
+07:17 UTC, the first to arrive runs the gate and the others are backstops;
+GitHub has been starting them 7-9 hours late, so the gate usually starts
+around 07:00-08:40 UTC and finishes within about an hour), against the newest Docker Publish image
 of each, with the tests ref a candidate would use (`switch-tests-ref.sh`:
 the tests' `release/X.Y.x` when it exists, else the tests' `main`). Each red
 tier has one open issue (label `release-gate`, title `Nightly gate [<line>]:
@@ -720,7 +723,9 @@ either as one. Only the candidate's signed attestation certifies.
 - *No result.* Either the commit is newer than the last nightly run (cut
   from the commit check 8 names, or wait a night), or the nightly was
   pre-empted that night. The nightly gives way to any Release Candidate in
-  flight and records nothing for a night it did not finish.
+  flight and records nothing for a trigger it did not finish; the night's
+  next trigger, if any is left, tries again. Each scheduled run's `resolve`
+  job summary says how late GitHub started it.
 - To get a result sooner, dispatch the nightly by hand once no candidate is
   in flight: `gh workflow run nightly-release-gate.yml -f lines=<main|X.Y.x>
   -f track_issues=true`. It writes the status only for `test_suite=all`.
