@@ -13,7 +13,12 @@
 # crate, so every commit reran it and recompiled the whole backend (lib, both
 # binaries). After it, the empty commit leaves every unit Fresh.
 #
-# Usage (from the work tree, which it commits to):
+# IT COMMITS. Each run adds RUNS empty commits to HEAD, so it refuses to run
+# on a branch: use a throwaway worktree on a detached HEAD, e.g.
+#   git worktree add --detach /tmp/ak-perf origin/main && cd /tmp/ak-perf
+# or set EMPTY_COMMIT_REBUILD_ALLOW_BRANCH=1 in a clone you will throw away.
+#
+# Usage (from that work tree):
 #   scripts/perf/empty-commit-rebuild.sh [label]
 # Env:
 #   RUNS          empty commits to time (default 3)
@@ -24,7 +29,7 @@
 # recompiled, first dirty reason) in the current directory. Logs go to
 # <label>-<step>.log. Needs bash 5 (EPOCHREALTIME), git and cargo.
 # The commits it makes are left in place; drop them with
-#   git reset --hard HEAD~<RUNS>
+#   git reset --hard HEAD~<RUNS>   (or just remove the worktree)
 # =============================================================================
 set -euo pipefail
 
@@ -41,6 +46,12 @@ if [[ -z "${EPOCHREALTIME:-}" ]]; then
   exit 2
 fi
 git rev-parse --is-inside-work-tree >/dev/null
+if branch="$(git symbolic-ref -q --short HEAD)" && [[ "${EMPTY_COMMIT_REBUILD_ALLOW_BRANCH:-0}" != 1 ]]; then
+  echo "empty-commit-rebuild: HEAD is branch '${branch}', and this script commits to HEAD." >&2
+  echo "  Run it in a throwaway worktree on a detached HEAD (git worktree add --detach <dir> origin/main)," >&2
+  echo "  or set EMPTY_COMMIT_REBUILD_ALLOW_BRANCH=1 in a clone you will throw away." >&2
+  exit 2
+fi
 if ! [[ "$RUNS" =~ ^[0-9]+$ ]]; then
   echo "empty-commit-rebuild: RUNS must be a number" >&2
   exit 2

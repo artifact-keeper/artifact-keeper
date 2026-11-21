@@ -3707,6 +3707,7 @@ jobs:
           build-args: |
             CARGO_BUILD_JOBS=4
             CARGO_PROFILE=ci
+            GIT_SHA=${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Verify image starts
         run: |
