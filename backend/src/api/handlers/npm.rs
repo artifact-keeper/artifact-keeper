@@ -4602,6 +4602,11 @@ async fn merge_virtual_member_packuments(
         .map_err(IntoResponse::into_response)?;
 
     let mut merged: Option<serde_json::Value> = None;
+    // #5620: a member that could not answer (upstream 5xx, transport failure,
+    // an open breaker) is passed over like a miss, but when no member
+    // contributes the packument is unknowable: 503 + Retry-After, as the
+    // tarball walk answers (#5504), not a 404 npm reports as E404.
+    let mut unavailable = false;
     for batch in members.chunks(packument_member_fanout()) {
         let contributions = futures::future::join_all(batch.iter().map(|member| {
             virtual_member_packument_contribution(
@@ -4616,18 +4621,31 @@ async fn merge_virtual_member_packuments(
         }))
         .await;
         for contribution in contributions {
-            if let Some(value) = contribution? {
-                match merged.as_mut() {
+            match contribution {
+                Ok(Some(value)) => match merged.as_mut() {
                     Some(acc) => merge_packument_into(acc, value),
                     None => merged = Some(value),
+                },
+                Ok(None) => {}
+                Err(resp) if proxy_helpers::is_member_unavailable_response(&resp) => {
+                    unavailable = true;
                 }
+                Err(resp) => return Err(resp),
             }
         }
     }
 
-    merged.ok_or_else(|| {
+    merged.ok_or_else(|| packument_walk_miss(unavailable))
+}
+
+/// The answer of a virtual packument walk no member contributed to (#5620):
+/// the retryable 503 when a member could not answer, the 404 otherwise.
+fn packument_walk_miss(unavailable: bool) -> Response {
+    if unavailable {
+        proxy_helpers::member_unavailable_response()
+    } else {
         AppError::NotFound("Package not found in any member repository".to_string()).into_response()
-    })
+    }
 }
 
 /// How many virtual members one npm packument request fetches at once (#4240).
@@ -4760,6 +4778,11 @@ async fn virtual_member_packument_contribution(
                 member_key = %member.key,
                 "npm metadata proxy fetch missed for virtual member"
             );
+            // #5620: an unavailable member is reported, so the merge can tell
+            // "nobody has it" from "a member could not say".
+            if proxy_helpers::is_member_unavailable_response(&e) {
+                return Err(e);
+            }
             Ok(None)
         }
     }
@@ -18470,6 +18493,18 @@ mod tests {
             "a 304 must not carry a body, got {} bytes",
             received.len()
         );
+    }
+
+    /// #5620: a virtual packument no member contributed to is the walk's
+    /// retryable 503 when a member could not answer (so the cached packument
+    /// is not evicted either), and the 404 otherwise.
+    #[test]
+    fn test_packument_walk_miss_5620() {
+        let down = packument_walk_miss(true);
+        assert_eq!(down.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(down.headers().contains_key(axum::http::header::RETRY_AFTER));
+        assert!(!is_definitive_missing_status(down.status()));
+        assert_eq!(packument_walk_miss(false).status(), StatusCode::NOT_FOUND);
     }
 
     #[test]

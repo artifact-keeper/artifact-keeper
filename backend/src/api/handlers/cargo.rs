@@ -3256,6 +3256,7 @@ async fn try_virtual_index(
     //   from their rows exactly as we do for the top-level hosted case.
     let mut aggregated: Vec<String> = Vec::new();
     let mut seen_versions: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut member_unavailable = false;
 
     // Visit non-Remote (Local/Staging) members before Remote members so a
     // locally-published crate version cannot be shadowed by an upstream
@@ -3328,12 +3329,7 @@ async fn try_virtual_index(
                 // (matching `gated_member_index_contribution` and npm's
                 // `remote_member_packument_value`) rather than failing the
                 // whole aggregate.
-                if let Ok(proxy_helpers::CachedBody {
-                    content,
-                    content_type: _,
-                    content_encoding,
-                    ..
-                }) = proxy_helpers::proxy_fetch_capped_encoded(
+                let fetched = proxy_helpers::proxy_fetch_capped_encoded(
                     proxy,
                     member.id,
                     &member.key,
@@ -3341,7 +3337,19 @@ async fn try_virtual_index(
                     &index_path,
                     proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
                 )
-                .await
+                .await;
+                // #5620: a member that could not answer (as opposed to one
+                // that does not have the crate) is remembered, so an empty
+                // aggregate answers 503 + Retry-After instead of a 404.
+                if let Err(ref e) = fetched {
+                    member_unavailable |= proxy_helpers::is_member_unavailable_response(e);
+                }
+                if let Ok(proxy_helpers::CachedBody {
+                    content,
+                    content_type: _,
+                    content_encoding,
+                    ..
+                }) = fetched
                 {
                     match decode_cargo_index_body(&content, content_encoding.as_deref()) {
                         Ok(decoded) => {
@@ -3401,7 +3409,7 @@ async fn try_virtual_index(
         }
     }
 
-    match finalize_virtual_index_aggregation(aggregated) {
+    match finalize_virtual_index_aggregation(aggregated, member_unavailable) {
         Some(Ok(body)) => {
             // Only memoize a document that is the SAME for every caller
             // (#3323) AND is not a policy-dependent view (#3480). The index
@@ -3477,8 +3485,15 @@ fn resolve_remote_index_base_url(
 /// "skip the virtual path entirely" pre-check before aggregation; this
 /// helper does not produce it.
 #[allow(clippy::result_large_err)]
-fn finalize_virtual_index_aggregation(aggregated: Vec<String>) -> Option<Result<Bytes, Response>> {
+fn finalize_virtual_index_aggregation(
+    aggregated: Vec<String>,
+    member_unavailable: bool,
+) -> Option<Result<Bytes, Response>> {
     if aggregated.is_empty() {
+        // #5620: "not found" is unknowable while a member could not answer.
+        if member_unavailable {
+            return Some(Err(proxy_helpers::member_unavailable_response()));
+        }
         return Some(Err(AppError::NotFound(
             "Artifact not found in any member repository".to_string(),
         )
@@ -5070,7 +5085,7 @@ mod tests {
             r#"{"name":"foo","vers":"1.0.0"}"#.to_string(),
             r#"{"name":"foo","vers":"1.0.1"}"#.to_string(),
         ];
-        let out = finalize_virtual_index_aggregation(lines)
+        let out = finalize_virtual_index_aggregation(lines, true)
             .expect("Some(_) when called from aggregation path");
         let body = out.expect("Ok(body) when lines were aggregated");
         // Lines are joined with `\n` (no trailing newline added).
@@ -5082,9 +5097,21 @@ mod tests {
 
     #[test]
     fn test_finalize_virtual_index_aggregation_returns_404_when_empty() {
-        let out = finalize_virtual_index_aggregation(Vec::new()).expect("Some(_)");
+        let out = finalize_virtual_index_aggregation(Vec::new(), false).expect("Some(_)");
         let resp = out.expect_err("empty aggregation must surface as 404");
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// #5620: an empty aggregate with a member that could not answer is the
+    /// walk's retryable 503, not a 404 cargo reports as "no matching package".
+    #[test]
+    fn test_finalize_virtual_index_aggregation_returns_503_when_a_member_was_unavailable() {
+        let resp = finalize_virtual_index_aggregation(Vec::new(), true)
+            .expect("Some(_)")
+            .expect_err("an empty aggregate is an error");
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(proxy_helpers::is_member_unavailable_response(&resp));
+        assert!(resp.headers().contains_key(axum::http::header::RETRY_AFTER));
     }
 
     // -----------------------------------------------------------------------

@@ -1106,6 +1106,10 @@ async fn simple_project(
 
             // Second pass: fetch a remote index from every remote member, but
             // narrow a suppressed member's contribution to its Case-A unions.
+            // #5620: whether a remote member could not answer, so an empty
+            // union answers 503 + Retry-After instead of a 404 pip reports as
+            // "no matching distribution".
+            let mut remote_unavailable = false;
             for member in &members {
                 if member.repo_type != RepositoryType::Remote {
                     continue;
@@ -1234,11 +1238,12 @@ async fn simple_project(
                         };
                         remote_response = Some((content, content_type));
                     }
-                    Err(_e) => {
+                    Err(e) => {
                         debug!(
                             member_key = %member.key,
                             "simple index proxy fetch missed for virtual member"
                         );
+                        remote_unavailable |= proxy_helpers::is_member_unavailable_response(&e);
                     }
                 }
             }
@@ -1255,6 +1260,9 @@ async fn simple_project(
 
             // Render the union.
             match (local_artifacts.is_empty(), remote_response) {
+                (true, None) if remote_unavailable => {
+                    return Err(proxy_helpers::member_unavailable_response());
+                }
                 (true, None) => {
                     return Err(AppError::NotFound(
                         "Package not found in any member repository".to_string(),
