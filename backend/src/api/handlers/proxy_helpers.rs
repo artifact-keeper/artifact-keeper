@@ -3286,6 +3286,23 @@ pub async fn proxy_fetch_uncached(
     .await
 }
 
+/// [`proxy_fetch_uncached`] for a body that is only parsed: fetched with
+/// `Accept-Encoding: gzip` and decoded under a cap (#5983)
+pub async fn proxy_fetch_uncached_decoded(
+    proxy_service: &ProxyService,
+    repo_id: Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    path: &str,
+) -> Result<(Bytes, Option<String>, String), Response> {
+    with_proxy_repo(repo_id, repo_key, upstream_url, path, |repo| async move {
+        proxy_service
+            .fetch_upstream_direct_decoded(&repo, path)
+            .await
+    })
+    .await
+}
+
 /// How long the age gate may reuse one upstream read. This is the longest a
 /// "not hosted" answer can outlive a publish, so it stays in seconds: long
 /// enough that a burst for one project costs one read, short enough that it is
