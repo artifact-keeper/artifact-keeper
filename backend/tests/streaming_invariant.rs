@@ -579,7 +579,6 @@ fn streaming_invariant_exempt_sites_match_allowlist() {
 const RAW_BODY_BLOB_ALLOWLIST: &[(&str, usize)] = &[
     ("src/api/handlers/cocoapods.rs", 1),
     ("src/api/handlers/composer.rs", 1),
-    ("src/api/handlers/debian.rs", 1),
     ("src/api/handlers/goproxy.rs", 2),
     ("src/api/handlers/protobuf.rs", 1),
     ("src/api/handlers/proxy_helpers.rs", 1),
