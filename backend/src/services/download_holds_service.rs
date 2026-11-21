@@ -223,7 +223,7 @@ impl DownloadHoldsService {
 
     pub async fn summary(&self) -> Result<HoldsSummary> {
         let age_gate_pending = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*)::bigint FROM age_gate_reviews WHERE status = 'pending'",
+            "SELECT COUNT(*)::bigint FROM age_gate_reviews WHERE gate = 'age' AND status = 'pending'",
         )
         .fetch_one(&self.db)
         .await

@@ -1515,6 +1515,10 @@ fn api_v1_routes(
             // Maintenance banner CRUD (#2155); the public read is `/banners`.
             .nest("/banners", handlers::banners::admin_router())
             .nest("/age-gate", handlers::age_gate::admin_router())
+            .nest(
+                "/security-reviewers",
+                handlers::security_reviewers::router(),
+            )
             .nest("/holds", handlers::download_holds::admin_router())
             // Admin quality-checks list-all (#2419). Kept inside the `/admin`
             // block so `admin_middleware` gates it; the artifact-scoped
@@ -1658,6 +1662,14 @@ fn api_v1_routes(
         .nest(
             "/mcp/introspection",
             handlers::mcp_capabilities::worker_router().layer(middleware::from_fn_with_state(
+                auth_service.clone(),
+                auth_middleware,
+            )),
+        )
+        // Plain auth, not admin: a non-admin security reviewer decides exceptions, each handler checks it
+        .nest(
+            "/exceptions",
+            handlers::age_gate::exceptions_router().layer(middleware::from_fn_with_state(
                 auth_service.clone(),
                 auth_middleware,
             )),

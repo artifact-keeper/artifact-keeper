@@ -2057,7 +2057,7 @@ async fn review_view(
     (),
 > {
     use crate::services::age_gate_service::{
-        review_identity_match, upstream_fingerprint, ReviewPolicyView,
+        exception_expired, review_identity_match, upstream_fingerprint, ReviewPolicyView,
     };
     let review = svc
         .get_review(params.id, package, version)
@@ -2079,6 +2079,7 @@ async fn review_view(
             status: r.status.clone(),
             is_automatic: r.reviewed_by.is_none(),
             identity,
+            expired: exception_expired(r.expires_at, chrono::Utc::now()),
         });
     Ok((review, identity, view))
 }
