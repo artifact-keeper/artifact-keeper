@@ -140,6 +140,13 @@ cargo run
 cargo nextest run --workspace --lib --test-threads 8
 ```
 
+## Getting Help
+
+- **Quick questions and setup help**: the `#help` forum on [Discord](https://discord.gg/8T7NW2PeS2)
+- **Working on a contribution**: say hello in `#contributing` on Discord, or comment on the issue you are picking up
+- **Ideas and design proposals**: [GitHub Discussions](https://github.com/artifact-keeper/artifact-keeper/discussions)
+- **Security issues**: report privately as described in [SECURITY.md](SECURITY.md)
+
 ## What to Contribute
 
 - **Bug reports** — File an issue with steps to reproduce
