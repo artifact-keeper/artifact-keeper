@@ -14,6 +14,7 @@ unset value or `0` turns it off.
 | `TRANSFER_QUOTA_GRACE_PERCENT` | `0` | How far above the quota downloads keep working (0-1000) |
 | `MAX_UPLOAD_SIZE` | 10 GiB | Largest single upload (existing setting) |
 | `QUOTA_HELP_URL` | none | An `http(s)` link added to refusals and shown in the web UI |
+| `QUOTA_PRECHECK_BUDGET_MS` | `500` | How long the check before the body is read may wait on the database (`0` skips its lookups) |
 
 Every value is in bytes. The messages use binary units (1 GiB = 1024^3 bytes).
 
@@ -37,6 +38,11 @@ At the quota the instance is **read-only for writes**:
   read**, both when the instance is already at the quota and when the declared
   length would take it over. A body sent without a length is admitted, then
   checked once its size is known, before anything is recorded.
+- The check before the body is read gets `QUOTA_PRECHECK_BUDGET_MS` for its
+  database lookups. When the connection pool is exhausted and the budget runs
+  out, the request is admitted with one `warn` line and a
+  `ak_quota_precheck_skipped_total` increment, and the quota is enforced once
+  the body is read.
 - A remote (proxy) repository keeps serving content from upstream at the
   quota. It only stops caching it.
 - Downloads, deletes, listing, search, sign-in and settings are never refused.
@@ -197,6 +203,7 @@ Storage `state` is `ok`, `warning` or `exceeded`. Transfer `state` is `ok`,
 | `ak_transfer_quota_bytes` | gauge | `TRANSFER_QUOTA_BYTES` (0 when off) |
 | `ak_transfer_used_bytes` | gauge | Download bytes of the current month, all replicas |
 | `ak_quota_refusals_total{kind}` | counter | Refusals by `kind`: `storage`, `repository`, `transfer`, `upload_size` |
+| `ak_quota_precheck_skipped_total` | counter | Uploads admitted unchecked before the body was read because the pre-check ran out of `QUOTA_PRECHECK_BUDGET_MS` |
 
 A useful alert is
 `ak_storage_used_bytes / ak_storage_quota_bytes > 0.8 and ak_storage_quota_bytes > 0`.

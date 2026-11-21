@@ -697,6 +697,9 @@ impl ProxyUpstreamSettings {
 ///   the warning threshold.
 /// * `QUOTA_HELP_URL`: an optional `http(s)` link added to every quota
 ///   refusal and shown in the web UI.
+/// * `QUOTA_PRECHECK_BUDGET_MS` (default 500): how long the check before an
+///   upload body is read may wait on the database before it admits the
+///   request unchecked (#6316).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct QuotaSettings {
     /// `STORAGE_QUOTA_BYTES`; `0` = off.
@@ -711,6 +714,8 @@ pub struct QuotaSettings {
     pub transfer_grace_percent: u32,
     /// `QUOTA_HELP_URL`, kept only when it is an `http://` or `https://` URL.
     pub help_url: Option<String>,
+    /// `QUOTA_PRECHECK_BUDGET_MS`. Default 500.
+    pub precheck_budget_ms: u64,
 }
 
 impl Default for QuotaSettings {
@@ -722,6 +727,7 @@ impl Default for QuotaSettings {
             transfer_warn_percent: 80,
             transfer_grace_percent: 0,
             help_url: None,
+            precheck_budget_ms: 500,
         }
     }
 }
@@ -745,6 +751,7 @@ impl QuotaSettings {
             )
             .min(1000),
             help_url: Self::parse_help_url(env::var("QUOTA_HELP_URL").ok().as_deref()),
+            precheck_budget_ms: env_parse("QUOTA_PRECHECK_BUDGET_MS", d.precheck_budget_ms),
         }
     }
 
