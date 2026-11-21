@@ -339,11 +339,19 @@ pub fn helm_deps_from_chart(chart: &Value) -> Vec<DependencyInfo> {
 /// rows are kept first and win on collision: they carry license, purl, and
 /// scanner-resolved exact versions that the declared manifest lacks. Declared
 /// rows then fill in dependencies the scanner did not enumerate.
+///
+/// Two scanners can catalog the same component (#5629): the Trivy filesystem
+/// scan stores a license it cannot parse as a single SPDX id wrapped as
+/// `LicenseRef-<sanitised>` (#1152), while Grype stores the same text as
+/// found, e.g. `MIT AND PSF-2.0`. When the kept row's license is exactly the
+/// wrapped form of the colliding row's, the unwrapped text is kept, so the
+/// SBOM can emit it as an expression whichever row the query returned first.
+/// Licenses that differ in substance are never swapped.
 pub fn merge_dependencies(
     scanner: Vec<DependencyInfo>,
     declared: Vec<DependencyInfo>,
 ) -> Vec<DependencyInfo> {
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let mut out: Vec<DependencyInfo> = Vec::with_capacity(scanner.len() + declared.len());
     for dep in scanner.into_iter().chain(declared) {
         let key = match &dep.purl {
@@ -354,11 +362,56 @@ pub fn merge_dependencies(
                 dep.version.as_deref().unwrap_or("")
             ),
         };
-        if seen.insert(key) {
-            out.push(dep);
+        match seen.get(&key) {
+            Some(&i) => {
+                if let (Some(kept), Some(other)) = (&out[i].license, &dep.license) {
+                    if is_wrapped_form_of(kept, other) {
+                        out[i].license = dep.license;
+                    }
+                }
+            }
+            None => {
+                seen.insert(key, out.len());
+                out.push(dep);
+            }
         }
     }
     out
+}
+
+/// Whether `wrapped` is the `LicenseRef-` form that
+/// [`crate::services::spdx_licenses::sanitize_license_term`] makes of `raw`
+/// (and `raw` is not itself such a form): the same license text, as two
+/// scanners stored it (#5629).
+///
+/// The wrapping loses detail: a run of characters outside `[A-Za-z0-9.-]`
+/// becomes one `-`, and the body is cut at 64 characters. Two different
+/// texts can therefore wrap alike (`GPL-2.0+ AND MIT` and `GPL-2.0 AND MIT`,
+/// or two long lists that share their first 64 characters), and swapping on
+/// such a match could replace the license Trivy saw with a different one.
+/// So the match does not count when the body may have been cut (64
+/// characters or more), or when `raw` itself has anything the wrapping
+/// rewrites other than single spaces.
+///
+/// Residual: Trivy's original text is not stored, only its wrapped form, so
+/// a lossy character on Trivy's side cannot be seen. If Trivy read
+/// `GPL-2.0+ AND MIT` and Grype `GPL-2.0 AND MIT`, Grype's text is kept. The
+/// two scanners read the same package file, so that disagreement means one
+/// of them misparsed it; the swap never introduces a license term neither
+/// scanner reported.
+fn is_wrapped_form_of(wrapped: &str, raw: &str) -> bool {
+    const LICENSEREF_BODY_CAP: usize = 64;
+    let Some(body) = wrapped.strip_prefix("LicenseRef-") else {
+        return false;
+    };
+    let only_spaces_rewritten = raw
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ' '))
+        && !raw.contains("  ");
+    body.chars().count() < LICENSEREF_BODY_CAP
+        && only_spaces_rewritten
+        && !raw.starts_with("LicenseRef-")
+        && crate::services::spdx_licenses::sanitize_license_term(raw).as_deref() == Some(wrapped)
 }
 
 /// Extract declared dependencies from already-loaded manifest metadata for a
@@ -771,6 +824,117 @@ mod tests {
         )];
         let merged = merge_dependencies(scanner, declared);
         assert_eq!(merged.len(), 1);
+    }
+
+    fn licensed(purl: &str, license: &str) -> DependencyInfo {
+        DependencyInfo {
+            license: Some(license.to_string()),
+            ..dep("p", Some("1.0.0"), Some(purl))
+        }
+    }
+
+    #[test]
+    fn merge_keeps_unwrapped_license_whichever_scanner_row_comes_first() {
+        // #5629: Trivy stores `LicenseRef-MIT-AND-PSF-2.0`, Grype the text.
+        for (first, second) in [
+            ("LicenseRef-MIT-AND-PSF-2.0", "MIT AND PSF-2.0"),
+            ("MIT AND PSF-2.0", "LicenseRef-MIT-AND-PSF-2.0"),
+        ] {
+            let out = merge_dependencies(
+                vec![
+                    licensed("pkg:npm/p@1.0.0", first),
+                    licensed("pkg:npm/p@1.0.0", second),
+                ],
+                vec![],
+            );
+            assert_eq!(out.len(), 1);
+            assert_eq!(out[0].license.as_deref(), Some("MIT AND PSF-2.0"));
+        }
+        let out = merge_dependencies(
+            vec![
+                licensed("pkg:npm/q@1.0.0", "LicenseRef-Public-Domain"),
+                licensed("pkg:npm/q@1.0.0", "Public Domain"),
+            ],
+            vec![],
+        );
+        assert_eq!(out[0].license.as_deref(), Some("Public Domain"));
+    }
+
+    #[test]
+    fn merge_never_swaps_a_different_license_for_a_licenseref() {
+        // A Trivy `LicenseRef-Proprietary` must not be laundered into the
+        // other scanner's `MIT` (#1152).
+        let out = merge_dependencies(
+            vec![
+                licensed("pkg:npm/p@1.0.0", "LicenseRef-Proprietary"),
+                licensed("pkg:npm/p@1.0.0", "MIT"),
+            ],
+            vec![],
+        );
+        assert_eq!(out[0].license.as_deref(), Some("LicenseRef-Proprietary"));
+        // Nor a joined Trivy expression for a narrower one.
+        let out = merge_dependencies(
+            vec![
+                licensed("pkg:npm/p@1.0.0", "MIT AND LicenseRef-Proprietary"),
+                licensed("pkg:npm/p@1.0.0", "MIT"),
+            ],
+            vec![],
+        );
+        assert_eq!(
+            out[0].license.as_deref(),
+            Some("MIT AND LicenseRef-Proprietary")
+        );
+    }
+
+    #[test]
+    fn merge_never_swaps_on_a_lossy_licenseref_match() {
+        // `GPL-2.0+ AND MIT` and `GPL-2.0 AND MIT` wrap alike; the `+` is lost.
+        let trivy =
+            crate::services::spdx_licenses::sanitize_license_term("GPL-2.0+ AND MIT").unwrap();
+        assert_eq!(
+            crate::services::spdx_licenses::sanitize_license_term("GPL-2.0 AND MIT").as_deref(),
+            Some(trivy.as_str()),
+            "precondition: the two texts collide"
+        );
+        // The other scanner's text has the lossy `+`: no swap.
+        let out = merge_dependencies(
+            vec![
+                licensed("pkg:npm/p@1.0.0", &trivy),
+                licensed("pkg:npm/p@1.0.0", "GPL-2.0+ AND MIT"),
+            ],
+            vec![],
+        );
+        assert_eq!(out[0].license.as_deref(), Some(trivy.as_str()));
+        // The documented residual (see `is_wrapped_form_of`): when the `+`
+        // was on Trivy's side, which only its wrapped form records, the other
+        // scanner's `GPL-2.0 AND MIT` is kept.
+        let out = merge_dependencies(
+            vec![
+                licensed("pkg:npm/p@1.0.0", &trivy),
+                licensed("pkg:npm/p@1.0.0", "GPL-2.0 AND MIT"),
+            ],
+            vec![],
+        );
+        assert_eq!(out[0].license.as_deref(), Some("GPL-2.0 AND MIT"));
+
+        // Two long lists sharing their first 64 characters wrap alike.
+        let common = "MIT AND Apache-2.0 AND BSD-3-Clause AND ISC AND Zlib AND Unlicense";
+        let seen = format!("{common} AND GPL-3.0-only");
+        let other = format!("{common} AND 0BSD");
+        let trivy = crate::services::spdx_licenses::sanitize_license_term(&seen).unwrap();
+        assert_eq!(
+            crate::services::spdx_licenses::sanitize_license_term(&other).as_deref(),
+            Some(trivy.as_str()),
+            "precondition: the two texts collide at the 64-character cut"
+        );
+        let out = merge_dependencies(
+            vec![
+                licensed("pkg:npm/q@1.0.0", &trivy),
+                licensed("pkg:npm/q@1.0.0", &other),
+            ],
+            vec![],
+        );
+        assert_eq!(out[0].license.as_deref(), Some(trivy.as_str()));
     }
 
     #[test]

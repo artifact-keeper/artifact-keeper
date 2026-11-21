@@ -1092,6 +1092,17 @@ async fn complete_session_commit(
                 return Err(map_err(StatusCode::BAD_REQUEST, reason));
             }
         }
+        if let Err(rejection) = format_finalize::ensure_unique_nuget(
+            &state.db,
+            repo.id,
+            &session.artifact_path,
+            staged_native.as_ref(),
+        )
+        .await
+        {
+            UploadService::fail_committing(&state.db, &session, &rejection.to_string()).await;
+            return Err(rejection.into_response());
+        }
     }
 
     if stream_assembly {
@@ -1134,6 +1145,20 @@ async fn complete_session_commit(
                     UploadService::fail_committing(&state.db, &session, &reason).await;
                     return Err(map_err(StatusCode::BAD_REQUEST, reason));
                 }
+            }
+            if let Err(rejection) = format_finalize::ensure_unique_nuget(
+                &state.db,
+                repo.id,
+                &session.artifact_path,
+                staged_native.as_ref(),
+            )
+            .await
+            {
+                if let Some(staged_key) = &staged_key {
+                    let _ = storage.delete(staged_key).await;
+                }
+                UploadService::fail_committing(&state.db, &session, &rejection.to_string()).await;
+                return Err(rejection.into_response());
             }
         }
         if let Some(staged_key) = staged_key {
