@@ -4432,20 +4432,26 @@ async fn try_resolve_virtual_blob(
                     let fetched = match proxy_helpers::virtual_member_download_deadline(
                         proxy.upstream_read_timeout(),
                     ) {
-                        Some(deadline) => match tokio::time::timeout(deadline, fetch).await {
-                            Ok(fetched) => fetched,
-                            Err(_) => {
-                                proxy_helpers::record_virtual_member_download_deadline_miss(
-                                    &member.key,
-                                    &upstream_path,
-                                    deadline,
-                                );
-                                breaker.record(member.id, &member.key, true);
-                                // Not evidence the blob is absent (#3836).
-                                indeterminate = true;
-                                break;
+                        Some(deadline) => {
+                            match crate::services::upstream_circuit::within_own_deadline(
+                                deadline, fetch,
+                            )
+                            .await
+                            {
+                                Ok(fetched) => fetched,
+                                Err(_) => {
+                                    proxy_helpers::record_virtual_member_download_deadline_miss(
+                                        &member.key,
+                                        &upstream_path,
+                                        deadline,
+                                    );
+                                    breaker.record(member.id, &member.key, true);
+                                    // Not evidence the blob is absent (#3836).
+                                    indeterminate = true;
+                                    break;
+                                }
                             }
-                        },
+                        }
                         None => fetch.await,
                     };
                     // Only a deadline miss trips the breaker here: the error
@@ -12170,8 +12176,7 @@ pub(crate) fn manifest_gate_serves_referrer(
     now: chrono::DateTime<chrono::Utc>,
 ) -> bool {
     use crate::services::proxy_scan_service::{
-        decide_serve, verdict_is_reusable, ProxyScanAction, ProxyScanRow, ServeDecision,
-        VERDICT_CLEAN,
+        decide_serve, ProxyScanAction, ProxyScanRow, ServeDecision, VERDICT_CLEAN,
     };
     let ttl = crate::services::scanner_service::DEDUP_TTL_DAYS as i64;
     let row = match (&referrer.verdict, referrer.scanned_at) {
@@ -12192,9 +12197,11 @@ pub(crate) fn manifest_gate_serves_referrer(
     };
     match posture {
         ReferrerPosture::Unknown => false,
+        // No DB-update grace (#6300) for hosted content: nothing queues a
+        // re-grade of it, so only a verdict from the live build counts.
         ReferrerPosture::Hosted => row.is_some_and(|r| {
             r.verdict == VERDICT_CLEAN
-                && verdict_is_reusable(
+                && crate::services::proxy_scan_service::verdict_is_reusable_under(
                     &r.verdict,
                     r.scanned_at,
                     r.scanner_version.as_deref(),
@@ -12202,6 +12209,8 @@ pub(crate) fn manifest_gate_serves_referrer(
                     ProxyScanAction::FailClosed,
                     ttl,
                     now,
+                    None,
+                    false,
                 )
         }),
         ReferrerPosture::Proxy(action) => {

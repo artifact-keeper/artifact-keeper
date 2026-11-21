@@ -69,6 +69,10 @@ fails, the breaker opens for another period.
 - `AK_VIRTUAL_MEMBER_BREAKER_OPEN_SECS=0` disables the breaker.
 - `ak_virtual_member_breaker_open{member}` is `1` while a member's breaker is
   open and `0` once it closes. Opening is logged at `WARN`, closing at `INFO`.
+- Below this breaker, every upstream request of a Remote also goes through
+  its [upstream circuit breaker](operations/upstream-circuit-breaker.md),
+  which covers metadata and direct Remote requests too. A download that
+  circuit refuses does not count against the member breaker.
 
 ## Strict member fallback
 

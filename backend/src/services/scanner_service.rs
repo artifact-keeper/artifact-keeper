@@ -9994,8 +9994,13 @@ impl ScannerService {
     /// proxy serve path threads this into `verdict_is_fresh` as
     /// `current_version` so a cached verdict from an older scanner / CVE-DB
     /// forces a re-scan instead of serving stale-clean until the TTL expires.
+    ///
+    /// Also records the version's first sighting for the vulnerability-DB
+    /// update grace (#6300), once per version per process.
     pub async fn cve_scanner_version(&self) -> Option<String> {
-        cve_authoritative_scanner_version(&self.scanners).await
+        let version = cve_authoritative_scanner_version(&self.scanners).await?;
+        crate::services::proxy_scan_service::observe_live_scanner_version(&self.db, &version).await;
+        Some(version)
     }
 
     /// Test-only constructor with injected leaf scanners, for handler tests

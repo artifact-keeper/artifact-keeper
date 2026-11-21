@@ -127,24 +127,29 @@ fn connection_budget(config: &Config) -> String {
     format!(
         "connection budget: DATABASE_MAX_CONNECTIONS={} pool connections per replica \
          (DATABASE_ACQUIRE_TIMEOUT_SECS={}), plus single-flight lock/wait connections \
-         held outside the pool (capped per replica by PROXY_SINGLEFLIGHT_MAX_LOCK_WAITERS), \
+         held outside the pool (capped per replica by PROXY_SINGLEFLIGHT_LOCK_MAX_CONNECTIONS), \
+         plus DATABASE_PROBE_CONNECTIONS={} for health and readiness probes, \
          plus one rolling-update surge replica, must stay below Postgres max_connections \
          (see the Database section of .env.example)",
-        config.database_max_connections, config.database_acquire_timeout_secs
+        config.database_max_connections,
+        config.database_acquire_timeout_secs,
+        config.database_probe_connections
     )
 }
 
-/// One startup connect attempt: build the pool and establish its first
-/// connection(s). Kept separate from [`create_pool`] so the retry loop can be
-/// exercised without a live database.
-async fn build_pool(
+/// The pool options every pool this process opens shares: the idle-liveness
+/// probe (#1877), the keepalive hook (#4549), and the idle/lifetime recycling
+/// from `config`, with the size and acquire timeout given.
+fn pool_options(
     config: &Config,
-    options: &PgConnectOptions,
-) -> std::result::Result<PgPool, sqlx::Error> {
+    max_connections: u32,
+    min_connections: u32,
+    acquire_timeout: Duration,
+) -> PgPoolOptions {
     let mut pool_options = PgPoolOptions::new()
-        .max_connections(config.database_max_connections)
-        .min_connections(config.database_min_connections)
-        .acquire_timeout(Duration::from_secs(config.database_acquire_timeout_secs))
+        .max_connections(max_connections)
+        .min_connections(min_connections)
+        .acquire_timeout(acquire_timeout)
         .idle_timeout(Duration::from_secs(config.database_idle_timeout_secs))
         .max_lifetime(Duration::from_secs(config.database_max_lifetime_secs))
         .before_acquire(|conn, meta| {
@@ -178,7 +183,54 @@ async fn build_pool(
             })
         });
     }
-    pool_options.connect_with(options.clone()).await
+    pool_options
+}
+
+/// One startup connect attempt: build the pool and establish its first
+/// connection(s). Kept separate from [`create_pool`] so the retry loop can be
+/// exercised without a live database.
+async fn build_pool(
+    config: &Config,
+    options: &PgConnectOptions,
+) -> std::result::Result<PgPool, sqlx::Error> {
+    pool_options(
+        config,
+        config.database_max_connections,
+        config.database_min_connections,
+        Duration::from_secs(config.database_acquire_timeout_secs),
+    )
+    .connect_with(options.clone())
+    .await
+}
+
+/// How long a health or readiness probe waits for the probe pool's
+/// connection before reporting the database unhealthy. Shorter than the
+/// request pool's acquire timeout: the probe pool is only ever contended by
+/// other probes, each a single short query.
+const PROBE_POOL_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// The separate pool `/health` and `/readyz` read the database through
+/// (#4182), or `None` when `DATABASE_PROBE_CONNECTIONS=0` (probes share the
+/// request pool, as before 1.13).
+///
+/// Under a burst the request pool is fully in use by design, and the
+/// admission gate sheds what it cannot serve. A readiness probe queued on
+/// that pool waited out the acquire timeout and reported the database
+/// unhealthy, so the orchestrator took a replica that was merely busy out of
+/// service, moving its load onto the others. With its own connection the
+/// probe answers whether the database is reachable, which is the question it
+/// is asked. The connection is opened lazily on the first probe and then kept
+/// (`min_connections` = size), so it is not lost to a server whose
+/// `max_connections` fills up later. It counts toward the connection budget.
+pub fn create_probe_pool(config: &Config) -> Result<Option<PgPool>> {
+    let size = config.database_probe_connections;
+    if size == 0 {
+        return Ok(None);
+    }
+    let options = PgConnectOptions::from_str(&config.database_url)?;
+    Ok(Some(
+        pool_options(config, size, size, PROBE_POOL_ACQUIRE_TIMEOUT).connect_lazy_with(options),
+    ))
 }
 
 /// Run `connect` up to `attempts` times with the jittered doubling backoff of
@@ -559,7 +611,8 @@ mod tests {
         for needle in [
             "DATABASE_MAX_CONNECTIONS=20",
             "DATABASE_ACQUIRE_TIMEOUT_SECS=7",
-            "PROXY_SINGLEFLIGHT_MAX_LOCK_WAITERS",
+            "DATABASE_PROBE_CONNECTIONS=1",
+            "PROXY_SINGLEFLIGHT_LOCK_MAX_CONNECTIONS",
             "max_connections",
             "surge",
             ".env.example",
@@ -569,6 +622,35 @@ mod tests {
                 "the budget must name {needle:?}: {budget}"
             );
         }
+    }
+
+    /// #4182: health and readiness get their own pool, sized by
+    /// `DATABASE_PROBE_CONNECTIONS`, built lazily (no connect at startup) and
+    /// bounded by its own short acquire timeout; `0` means none (the probes
+    /// share the request pool).
+    #[tokio::test]
+    async fn probe_pool_is_separate_lazy_and_optional_4182() {
+        let config = Config {
+            database_url: "postgres://u:p@127.0.0.1:1/db".to_string(),
+            database_probe_connections: 2,
+            ..Config::default()
+        };
+        let pool = create_probe_pool(&config)
+            .expect("valid url")
+            .expect("2 connections build a pool");
+        assert_eq!(pool.options().get_max_connections(), 2);
+        assert_eq!(pool.options().get_min_connections(), 2);
+        assert_eq!(
+            pool.options().get_acquire_timeout(),
+            PROBE_POOL_ACQUIRE_TIMEOUT
+        );
+        assert_eq!(pool.size(), 0, "lazy: nothing opened at startup");
+
+        let off = Config {
+            database_probe_connections: 0,
+            ..config
+        };
+        assert!(create_probe_pool(&off).expect("valid url").is_none());
     }
 
     /// #4549: the initial connect is retried a bounded number of times, every

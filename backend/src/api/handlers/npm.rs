@@ -2369,7 +2369,7 @@ async fn remote_npm_audit(
             "the proxy service is not configured".to_string(),
         ));
     };
-    let sent = tokio::time::timeout(
+    let sent = crate::services::upstream_circuit::within_own_deadline(
         NPM_AUDIT_UPSTREAM_TIMEOUT,
         proxy.post_json_uncached_capped(remote, path, body, MAX_AUDIT_RESPONSE_BYTES),
     )
@@ -6261,7 +6261,10 @@ async fn npm_lookup_within<T>(
     limit: std::time::Duration,
     lookup: impl std::future::Future<Output = Option<T>>,
 ) -> Option<T> {
-    tokio::time::timeout(limit, lookup).await.ok().flatten()
+    crate::services::upstream_circuit::within_own_deadline(limit, lookup)
+        .await
+        .ok()
+        .flatten()
 }
 
 /// Cache-only sibling of [`resolve_npm_tarball_upstream`]'s source lookup:
