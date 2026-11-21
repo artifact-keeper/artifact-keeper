@@ -376,6 +376,25 @@ jobs:
           exit "$bad"
 
       # ── 6. the tag, last ────────────────────────────────────────────────────
+      # First pin `publish/vX.Y.Z` at the commit (#6338). GITHUB_TOKEN is
+      # refused (403) on Create Release in release.yml when the commit is not
+      # a branch tip, which it stops being as soon as anything merges after
+      # the certification (1.12.3). The pin keeps it a tip until release.yml
+      # has created the Release and removed the branch. It runs on a
+      # re-dispatch too (idempotent). A failure warns and goes on: the release
+      # still succeeds whenever the commit is a tip, and release.yml tries the
+      # pin again before Create Release.
+      - name: Pin a branch at the release commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.resolve.outputs.tag }}
+          SHA: ${{ steps.resolve.outputs.sha }}
+        run: |
+          set -euo pipefail
+          if ! bash scripts/ci/pin-release-branch.sh pin "$TAG" "$SHA"; then
+            echo "::warning title=publish/${TAG} not pinned::Create Release in release.yml gets a 403 if ${SHA} is not a branch tip by then. release.yml tries the pin again; if that fails too, create the branch by hand (gh api -X POST repos/${GITHUB_REPOSITORY}/git/refs -f ref=refs/heads/publish/${TAG} -f sha=${SHA}) and re-run its failed jobs."
+          fi
+
       - name: Create the annotated release tag
         if: steps.tag.outputs.exists != 'true'
         env:

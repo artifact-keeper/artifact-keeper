@@ -197,6 +197,7 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     // needs nothing from the database or the rest of startup.
     let metrics_handle = metrics_service::init_metrics();
     tracing::info!("Prometheus metrics recorder initialized");
+    artifact_keeper_backend::services::proxy_scan_service::publish_db_grace_window_gauges();
 
     // Connect to database
     let db_pool = db::create_pool(&config).await?;
@@ -227,26 +228,23 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         // or backfill UPDATEs) take longer than the per-query
         // `statement_timeout` that operators commonly set on their Postgres
         // parameter group as an app-query safeguard (10 s on AWS RDS for many
-        // tunings). Acquire a dedicated connection and raise the timeouts
-        // session-locally so the migration runner doesn't share fate with
-        // production query limits. The SET is per-session and is wiped when
-        // the connection is dropped — global limits for normal app queries
-        // are unaffected.
-        let mut conn = db_pool.acquire().await?;
-        sqlx::query("SET statement_timeout = '30min'")
-            .execute(&mut *conn)
-            .await?;
-        sqlx::query("SET lock_timeout = '5min'")
-            .execute(&mut *conn)
-            .await?;
+        // tunings). `with_migration_session` marks the startup connection
+        // close-on-drop before raising the timeouts and closes it afterwards
+        // (keeping its pool slot until then), so these session-local settings
+        // cannot leak into normal app queries (#6319).
         // Takes the migration lock without blocking in pg_advisory_lock (a
         // blocked waiter deadlocks a CREATE INDEX CONCURRENTLY in the holder,
         // #5993), repairs INVALID concurrent index leftovers under that lock
         // (#4426, #5993), then applies pending migrations.
-        artifact_keeper_backend::migration_repair::run_startup_migrations(
-            &mut conn,
-            &artifact_keeper_backend::MIGRATOR,
-        )
+        db::with_migration_session(&db_pool, |conn| {
+            Box::pin(async move {
+                artifact_keeper_backend::migration_repair::run_startup_migrations(
+                    conn,
+                    &artifact_keeper_backend::MIGRATOR,
+                )
+                .await
+            })
+        })
         .await?;
         tracing::info!("Database migrations complete");
     }
@@ -957,6 +955,9 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     };
     app_state.set_scanner_service(scanner_service);
     app_state.shutdown_token = runtime_shutdown_token.clone();
+    // Health and readiness probes read the database through their own small
+    // pool, so a burst that fills the request pool cannot fail them (#4182).
+    app_state.probe_pool = db::create_probe_pool(&config)?;
 
     // Initialize quality check service for health scoring and quality gates
     let quality_check_service = Arc::new(

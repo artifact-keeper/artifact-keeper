@@ -5216,7 +5216,7 @@ fn base64_standard(bytes: &[u8]) -> String {
 ///
 /// Best-effort like the catalog writes it feeds: a failed lookup falls back to
 /// the `.nuspec` casing rather than failing the push.
-async fn existing_catalog_name(
+pub(crate) async fn existing_catalog_name(
     db: &PgPool,
     repository_id: uuid::Uuid,
     lowercased_id: &str,
@@ -5471,19 +5471,20 @@ async fn push_package(
 // ---------------------------------------------------------------------------
 
 /// Metadata extracted from a .nuspec file.
-struct NuspecInfo {
-    id: String,
-    version: String,
-    description: String,
-    authors: String,
+pub(crate) struct NuspecInfo {
+    pub(crate) id: String,
+    pub(crate) version: String,
+    pub(crate) description: String,
+    pub(crate) authors: String,
 }
 
 /// Parse the .nuspec XML from inside a .nupkg (ZIP) archive.
 ///
-/// Reads directly from any `Read + Seek` source — the streaming push path passes
-/// the SEEKABLE staged scratch `File` so the archive is never re-buffered in
-/// memory. Uses simple string matching rather than a full XML parser.
-fn parse_nuspec_from_reader<R: std::io::Read + std::io::Seek>(
+/// Reads directly from any `Read + Seek` source — the push and generic-upload
+/// paths pass the SEEKABLE staged scratch `File` so the archive is never
+/// re-buffered in memory. Uses simple string matching rather than a full XML
+/// parser.
+pub(crate) fn parse_nuspec_from_reader<R: std::io::Read + std::io::Seek>(
     reader: R,
 ) -> Result<NuspecInfo, String> {
     // Bound the decompression: entry-count cap + per-metadata-entry cap so a
@@ -5562,7 +5563,7 @@ fn build_nuget_artifact_path(package_id: &str, version: &str) -> String {
 }
 
 /// Build the NuGet push metadata JSON.
-fn build_nuget_push_metadata(info: &NuspecInfo) -> serde_json::Value {
+pub(crate) fn build_nuget_push_metadata(info: &NuspecInfo) -> serde_json::Value {
     serde_json::json!({
         "id": info.id,
         "version": info.version,
@@ -11427,6 +11428,111 @@ mod virtual_federation_tests {
             );
             assert_eq!(&body[..], HOSTED_BYTES, "upstream {upstream_status}");
         }
+    }
+
+    /// #5574 (#6252): a hosted member whose stored package cannot be read is an
+    /// unavailable member, not a miss. A later Remote member that has the
+    /// coordinate still serves it.
+    #[tokio::test]
+    async fn virtual_download_passes_an_unreadable_hosted_member_for_a_remote_5574() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        const UPSTREAM_BYTES: &[u8] = b"upstream nupkg 5574";
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "nuget").await else {
+            return;
+        };
+        let upstream = upstream_with_versions("pkg5574h", &["1.0.0"]).await;
+        Mock::given(method("GET"))
+            .and(path("/flat/pkg5574h/1.0.0/pkg5574h.1.0.0.nupkg"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(UPSTREAM_BYTES))
+            .mount(&upstream)
+            .await;
+
+        let (hosted_id, _hosted_key, hosted_dir) =
+            tdh::create_repo(&fx.pool, "local", "nuget").await;
+        let (remote_id, _remote_key, remote_dir) =
+            tdh::create_repo(&fx.pool, "remote", "nuget").await;
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(format!("{}/v3/index.json", upstream.uri()))
+            .bind(remote_id)
+            .execute(&fx.pool)
+            .await
+            .expect("set member upstream");
+        tdh::link_virtual_member(&fx.pool, fx.repo_id, hosted_id, 1).await;
+        tdh::link_virtual_member(&fx.pool, fx.repo_id, remote_id, 2).await;
+        tdh::grant_repo_access(&fx.pool, hosted_id, fx.user_id).await;
+        tdh::grant_repo_access(&fx.pool, remote_id, fx.user_id).await;
+        // The row exists but no object is stored under its key: every read of
+        // the bytes fails, as on a storage outage.
+        seed_local_version(&fx.pool, hosted_id, "pkg5574h", "1.0.0", fx.user_id).await;
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), &storage_path);
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), &storage_path, proxy);
+        let auth = tdh::make_auth(fx.user_id, &fx.username);
+        let (status, body) = tdh::send(
+            tdh::router_with_auth(super::router(), state, auth),
+            tdh::get(format!(
+                "/{}/v3/flatcontainer/pkg5574h/1.0.0/pkg5574h.1.0.0.nupkg",
+                fx.repo_key
+            )),
+        )
+        .await;
+
+        tdh::cleanup_member_repo(&fx.pool, hosted_id, &hosted_dir).await;
+        tdh::cleanup_member_repo(&fx.pool, remote_id, &remote_dir).await;
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK, "the Remote member must still serve");
+        assert_eq!(&body[..], UPSTREAM_BYTES);
+    }
+
+    /// #5574 (#6252): when the only member that has the coordinate is a hosted
+    /// member whose storage fails, nothing serves, and the walk answers a
+    /// retryable 503 instead of the 404 a client caches. A missing row is
+    /// still a plain 404.
+    #[tokio::test]
+    async fn virtual_download_503s_when_only_an_unreadable_hosted_member_has_it_5574() {
+        let Some(fx) = tdh::Fixture::setup("virtual", "nuget").await else {
+            return;
+        };
+        let (hosted_id, _hosted_key, hosted_dir) =
+            tdh::create_repo(&fx.pool, "local", "nuget").await;
+        tdh::link_virtual_member(&fx.pool, fx.repo_id, hosted_id, 1).await;
+        tdh::grant_repo_access(&fx.pool, hosted_id, fx.user_id).await;
+        seed_local_version(&fx.pool, hosted_id, "pkg5574u", "1.0.0", fx.user_id).await;
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), &storage_path);
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), &storage_path, proxy);
+        let auth = tdh::make_auth(fx.user_id, &fx.username);
+        let send = || {
+            tdh::send(
+                tdh::router_with_auth(super::router(), state.clone(), auth.clone()),
+                tdh::get(format!(
+                    "/{}/v3/flatcontainer/pkg5574u/1.0.0/pkg5574u.1.0.0.nupkg",
+                    fx.repo_key
+                )),
+            )
+        };
+        let (unreadable, _) = send().await;
+        sqlx::query("DELETE FROM artifacts WHERE repository_id = $1")
+            .bind(hosted_id)
+            .execute(&fx.pool)
+            .await
+            .expect("drop the hosted row");
+        let (missing, _) = send().await;
+
+        tdh::cleanup_member_repo(&fx.pool, hosted_id, &hosted_dir).await;
+        fx.teardown().await;
+
+        assert_eq!(
+            (unreadable, missing),
+            (StatusCode::SERVICE_UNAVAILABLE, StatusCode::NOT_FOUND),
+            "a hosted member's storage fault must answer 503, a missing row 404"
+        );
     }
 
     /// A virtual must resolve imported mixed-case names in both URL spellings (#5147).

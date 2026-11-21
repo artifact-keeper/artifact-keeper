@@ -397,7 +397,9 @@ where
             // make every caller's future (and stack frame) that large too.
             let fill = Box::pin(produce());
             let bounded = async move {
-                match tokio::time::timeout(deadline, fill).await {
+                // #5013: the fill deadline is our own: an upstream request
+                // still waiting inside counts against its circuit.
+                match crate::services::upstream_circuit::within_own_deadline(deadline, fill).await {
                     Ok(outcome) => outcome,
                     Err(_) => {
                         tracing::warn!(
