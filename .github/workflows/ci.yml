@@ -1659,6 +1659,7 @@ jobs:
             --test conda_environment_tests \
             --test conda_promotion_predicate_tests \
             --test conda_upload_scan_grading_tests \
+            --test homebrew_upload_tests \
             --test generic_put_format_parity_tests \
             --test gitlfs_locks_tests \
             --test grouped_listing_keyset_tests \
@@ -1750,6 +1751,7 @@ jobs:
             --test conda_environment_tests \
             --test conda_promotion_predicate_tests \
             --test conda_upload_scan_grading_tests \
+            --test homebrew_upload_tests \
             --test generic_put_format_parity_tests \
             --test gitlfs_locks_tests \
             --test grouped_listing_keyset_tests \

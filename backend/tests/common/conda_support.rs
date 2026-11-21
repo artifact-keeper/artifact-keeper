@@ -163,11 +163,19 @@ fn vis_state(state: &SharedState) -> RepoVisibilityState {
 /// The production conda composition: `conda::router()` mounted at `/conda`
 /// under `repo_visibility_middleware`, exactly as `api::routes` nests it.
 pub fn conda_full_stack(state: SharedState) -> Router {
+    format_full_stack(
+        state,
+        "/conda",
+        artifact_keeper_backend::api::handlers::conda::router(),
+    )
+}
+
+/// The production composition of any native format router: `router` nested
+/// at `mount` under `repo_visibility_middleware`, as `api::routes` nests every
+/// `/{format}/{repo_key}/...` mount.
+pub fn format_full_stack(state: SharedState, mount: &str, router: Router<SharedState>) -> Router {
     Router::new()
-        .nest(
-            "/conda",
-            artifact_keeper_backend::api::handlers::conda::router(),
-        )
+        .nest(mount, router)
         .layer(middleware::from_fn_with_state(
             vis_state(&state),
             repo_visibility_middleware,
