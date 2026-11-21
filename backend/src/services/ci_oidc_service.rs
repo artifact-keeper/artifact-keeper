@@ -4134,18 +4134,13 @@ mod tests {
     }
 
     async fn allow_membership_writes(pool: &sqlx::PgPool, name: &str) {
-        sqlx::query(sqlx::AssertSqlSafe(&*format!(
-            "DROP TRIGGER IF EXISTS {name} ON user_group_members"
-        )))
-        .execute(pool)
-        .await
-        .unwrap();
-        sqlx::query(sqlx::AssertSqlSafe(&*format!(
-            "DROP FUNCTION IF EXISTS {name}()"
-        )))
-        .execute(pool)
-        .await
-        .unwrap();
+        crate::api::handlers::test_db_helpers::drop_test_trigger(
+            pool,
+            "user_group_members",
+            name,
+            name,
+        )
+        .await;
     }
 
     /// Design D7, spec "A mapping update that cannot reconcile changes

@@ -24850,7 +24850,7 @@ mod publish_race_5399_tests {
             .execute(&pool)
             .await
             .expect("create sequence");
-        let drop_sql = tdh::install_artifact_row_fault(
+        let fault = tdh::install_artifact_row_fault(
             &pool,
             &suffix,
             &sha_hex(&tarballs[0]),
@@ -24888,12 +24888,7 @@ mod publish_race_5399_tests {
             statuses.push(h.await.expect("join").expect("publish").status());
         }
 
-        for stmt in drop_sql.split("; ") {
-            sqlx::query(sqlx::AssertSqlSafe(stmt.to_string()))
-                .execute(&pool)
-                .await
-                .expect("drop fault");
-        }
+        tdh::drop_test_trigger(&pool, "artifacts", &fault, &fault).await;
         let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
             "DROP SEQUENCE IF EXISTS {seq}"
         )))

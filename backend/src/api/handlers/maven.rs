@@ -9076,7 +9076,7 @@ mod tests {
     /// runs `body` (PL/pgSQL statements) for rows whose metadata mentions
     /// `artifact_id`, so a test can fail or delay the ledger write of exactly
     /// one coordinate without touching any other test sharing the database
-    /// (#4837). Returns the SQL that removes it again.
+    /// (#4837). Returns the trigger's name, which is also its function's.
     async fn install_maven_metadata_fault_4837(
         pool: &sqlx::PgPool,
         suffix: &str,
@@ -9102,16 +9102,14 @@ mod tests {
         .execute(pool)
         .await
         .expect("create fault trigger");
-        format!(
-            "DROP TRIGGER IF EXISTS {func} ON artifact_metadata; DROP FUNCTION IF EXISTS {func}()"
-        )
+        func
     }
 
     /// Install a BEFORE INSERT OR UPDATE trigger on `artifacts` that runs
     /// `body` for the row whose SHA-256 is `checksum_sha256` (#4892). A test
     /// uses it to park one upload inside its publish transaction -- after the
     /// upsert and therefore while it holds the per-key publish lock -- without
-    /// delaying any other artifact. Returns the SQL that removes it again.
+    /// delaying any other artifact. Returns the trigger's name.
     async fn install_maven_artifact_fault_4892(
         pool: &sqlx::PgPool,
         suffix: &str,
@@ -9158,7 +9156,7 @@ mod tests {
 
         let suffix = uuid::Uuid::new_v4().simple().to_string();
         let aid = format!("orphan4837x{}", &suffix[..12]);
-        let drop_sql = install_maven_metadata_fault_4837(
+        let fault = install_maven_metadata_fault_4837(
             &pool,
             &suffix,
             &aid,
@@ -9175,12 +9173,7 @@ mod tests {
             tdh::put(format!("/{repo_key}/{path}"), jar.clone()),
         )
         .await;
-        for stmt in drop_sql.split("; ") {
-            sqlx::query(sqlx::AssertSqlSafe(stmt.to_string()))
-                .execute(&pool)
-                .await
-                .expect("drop fault");
-        }
+        tdh::drop_test_trigger(&pool, "artifact_metadata", &fault, &fault).await;
         let object_left = mem.objects.lock().unwrap().contains_key(&scoped_key);
         let live_rows: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM artifacts \
@@ -9361,7 +9354,7 @@ mod tests {
             .execute(&pool)
             .await
             .expect("create sequence");
-        let drop_sql = install_maven_metadata_fault_4837(
+        let fault = install_maven_metadata_fault_4837(
             &pool,
             &suffix,
             &aid,
@@ -9393,12 +9386,7 @@ mod tests {
         let status1 = put1.await.expect("join put 1").expect("put 1").status();
         let status2 = put2.await.expect("join put 2").expect("put 2").status();
 
-        for stmt in drop_sql.split("; ") {
-            sqlx::query(sqlx::AssertSqlSafe(stmt.to_string()))
-                .execute(&pool)
-                .await
-                .expect("drop fault");
-        }
+        tdh::drop_test_trigger(&pool, "artifact_metadata", &fault, &fault).await;
         let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
             "DROP SEQUENCE IF EXISTS {seq}"
         )))
@@ -9683,7 +9671,7 @@ mod tests {
         let second = bytes::Bytes::from_static(b"loser-release-bytes-4892");
         let first_sha = proxy_helpers::sha256_hex(&first);
 
-        let drop_sql = install_maven_artifact_fault_4892(
+        let fault = install_maven_artifact_fault_4892(
             &pool,
             &suffix,
             &first_sha,
@@ -9734,12 +9722,7 @@ mod tests {
         let status1 = put1.await.expect("join put 1").expect("put 1").status();
         let status2 = put2.await.expect("join put 2").expect("put 2").status();
 
-        for stmt in drop_sql.split("; ") {
-            sqlx::query(sqlx::AssertSqlSafe(stmt.to_string()))
-                .execute(&pool)
-                .await
-                .expect("drop fault");
-        }
+        tdh::drop_test_trigger(&pool, "artifacts", &fault, &fault).await;
         let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
             "DROP SEQUENCE IF EXISTS {seq}"
         )))

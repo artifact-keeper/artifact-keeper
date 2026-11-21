@@ -26160,11 +26160,15 @@ mod tests {
 
         // Drop first, unconditionally, so a previously panicked run cannot leak
         // the trigger into this one.
-        let drop_trigger = "DROP TRIGGER IF EXISTS ak_test_block_delete_3475 ON artifacts";
-        sqlx::query(sqlx::AssertSqlSafe(drop_trigger))
-            .execute(&rig.pool)
-            .await
-            .ok();
+        let drop_trigger = || {
+            crate::api::handlers::test_db_helpers::drop_test_trigger(
+                &rig.pool,
+                "artifacts",
+                "ak_test_block_delete_3475",
+                "ak_test_block_delete_3475",
+            )
+        };
+        drop_trigger().await;
         sqlx::query(
             "CREATE OR REPLACE FUNCTION ak_test_block_delete_3475() RETURNS trigger AS \
              $$ BEGIN RAISE EXCEPTION 'ak-test-3475 injected failure'; END $$ LANGUAGE plpgsql",
@@ -26183,14 +26187,7 @@ mod tests {
 
         let result = rig.delete(path).await;
 
-        sqlx::query(sqlx::AssertSqlSafe(drop_trigger))
-            .execute(&rig.pool)
-            .await
-            .ok();
-        sqlx::query("DROP FUNCTION IF EXISTS ak_test_block_delete_3475()")
-            .execute(&rig.pool)
-            .await
-            .ok();
+        drop_trigger().await;
 
         assert!(
             result.is_err(),
@@ -31388,16 +31385,13 @@ mod tests {
         );
 
         // Drop the trigger (and function) so the fixture can tear down cleanly.
-        sqlx::query(sqlx::AssertSqlSafe(&*format!(
-            "DROP TRIGGER {trg_name} ON repositories"
-        )))
-        .execute(&fx.pool)
-        .await
-        .expect("drop blocking trigger");
-        sqlx::query(sqlx::AssertSqlSafe(&*format!("DROP FUNCTION {fn_name}()")))
-            .execute(&fx.pool)
-            .await
-            .expect("drop blocking trigger function");
+        crate::api::handlers::test_db_helpers::drop_test_trigger(
+            &fx.pool,
+            "repositories",
+            &trg_name,
+            &fn_name,
+        )
+        .await;
         let _ = storage.delete(&temp_key).await;
         fx.teardown().await;
     }

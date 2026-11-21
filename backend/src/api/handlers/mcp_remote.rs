@@ -1977,15 +1977,12 @@ mod tests {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
         }
-        let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
-            "DROP TRIGGER IF EXISTS {func} ON mcp_remote_sync_state"
-        )))
-        .execute(&pool)
-        .await;
-        let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
-            "DROP FUNCTION IF EXISTS {func}()"
-        )))
-        .execute(&pool)
+        crate::api::handlers::test_db_helpers::drop_test_trigger(
+            &pool,
+            "mcp_remote_sync_state",
+            &func,
+            &func,
+        )
         .await;
         let _ = sqlx::query("DELETE FROM mcp_remote_sync_state WHERE repository_id = $1")
             .bind(env.fx.repo_id)
