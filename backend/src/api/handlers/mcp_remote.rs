@@ -663,10 +663,15 @@ pub async fn sync_status(
 ) -> Result<Json<SyncStatusResponse>> {
     let auth = require_auth(auth)?;
     let repo = readable_repo(&state, &auth, &key).await?;
-    let stored = mcp_remote::load_state(&state.db, repo.id)
+    // The lock first, then the state. A pass commits its outcome before it
+    // releases the lock, so a `running: false` read here is followed by a
+    // state read that already holds that outcome. Read the other way round,
+    // a pass could record and release between the two reads, and the poll
+    // would pair the previous pass's state with `running: false` (#6249).
+    let running = mcp_remote::sync_running(&state.db, repo.id)
         .await
         .map_err(AppError::Database)?;
-    let running = mcp_remote::sync_running(&state.db, repo.id)
+    let stored = mcp_remote::load_state(&state.db, repo.id)
         .await
         .map_err(AppError::Database)?;
     Ok(Json(SyncStatusResponse {

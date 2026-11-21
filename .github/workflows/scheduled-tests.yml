@@ -169,7 +169,9 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@1.98.0
+        uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master 2026-11-15; the toolchain input picks the compiler
+        with:
+          toolchain: 1.98.0
 
       - name: Check for outdated Rust dependencies
         run: |
@@ -193,7 +195,9 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@1.98.0
+        uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master 2026-11-15; the toolchain input picks the compiler
+        with:
+          toolchain: 1.98.0
 
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked || true
@@ -236,8 +240,9 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@1.98.0
+        uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master 2026-11-15; the toolchain input picks the compiler
         with:
+          toolchain: 1.98.0
           targets: x86_64-pc-windows-gnu
 
       # Bounded (#6272): each download attempt is capped and retried on
