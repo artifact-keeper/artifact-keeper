@@ -2580,6 +2580,7 @@ pub fn make_repo_info(
         age_gate_mode: "upstream_publish_time".to_string(),
         curation_enabled: false,
         curation_default_action: "allow".to_string(),
+        allow_overwrite: false,
     }
 }
 
@@ -3266,6 +3267,7 @@ pub fn fresh_cache_sidecar_bytes() -> Bytes {
         upstream_commit_sha: None,
         size_bytes: 11,
         checksum_sha256: String::new(),
+        revalidate: false,
     };
     Bytes::from(serde_json::to_vec(&meta).expect("serialize fresh sidecar"))
 }

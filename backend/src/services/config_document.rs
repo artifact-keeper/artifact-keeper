@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use crate::error::{AppError, Result};
-use crate::models::repository::RepositoryVisibility;
+use crate::models::repository::{RepositoryImmutability, RepositoryVisibility};
 use crate::services::routing_rules::RoutingRule;
 use crate::services::upstream_filter::UpstreamFilter;
 use crate::services::upstream_mode::UpstreamMode;
@@ -38,7 +38,7 @@ pub const SECRET_EGRESS_PROXY: &str = "egress_proxy";
 const IMMUTABLE_FIELDS: [&str; 3] = ["format", "format_key", "repo_type"];
 
 /// Fields `apply` writes through `PATCH /api/v1/repositories/{key}`.
-const PATCH_FIELDS: [&str; 13] = [
+const PATCH_FIELDS: [&str; 14] = [
     "name",
     "description",
     "visibility",
@@ -48,6 +48,7 @@ const PATCH_FIELDS: [&str; 13] = [
     "quota_bytes",
     "promotion_only",
     "versioning_enabled",
+    "immutability",
     "custom_user_agent",
     "curation_enabled",
     "curation_default_action",
@@ -119,6 +120,10 @@ pub struct ConfigRepository {
     pub promotion_only: bool,
     #[serde(default)]
     pub versioning_enabled: bool,
+    /// `write_once` (omitted) or `mutable` (#5188). Same name and values as
+    /// the repositories API field.
+    #[serde(default, skip_serializing_if = "is_write_once")]
+    pub immutability: RepositoryImmutability,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_user_agent: Option<String>,
     #[serde(default)]
@@ -160,6 +165,10 @@ pub struct ConfigRepository {
 
 fn is_false(b: &bool) -> bool {
     !*b
+}
+
+fn is_write_once(m: &RepositoryImmutability) -> bool {
+    *m == RepositoryImmutability::WriteOnce
 }
 
 fn default_curation_action() -> String {
@@ -625,6 +634,9 @@ pub fn create_body(
     if let Some(ua) = &desired.custom_user_agent {
         set("custom_user_agent", ua.clone().into());
     }
+    if !is_write_once(&desired.immutability) {
+        set("immutability", serde_json::json!(desired.immutability));
+    }
     for (field, value) in [
         ("promotion_only", desired.promotion_only),
         ("versioning_enabled", desired.versioning_enabled),
@@ -672,6 +684,12 @@ pub fn patch_body(
     if changed("custom_user_agent") {
         let ua = desired.custom_user_agent.clone().unwrap_or_default();
         map.insert("custom_user_agent".into(), ua.into());
+    }
+    if changed("immutability") {
+        map.insert(
+            "immutability".into(),
+            serde_json::json!(desired.immutability),
+        );
     }
     if changed("curation_default_action") {
         map.insert(
@@ -1037,6 +1055,43 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    /// #5188: the immutability mode round-trips through the document under
+    /// its API name: absent reads as `write_once`, a change is planned and
+    /// written by `PATCH` both ways, and a create carries it when `mutable`.
+    #[test]
+    fn immutability_is_planned_patched_and_created() {
+        let current: ConfigRepository = serde_json::from_value(serde_json::json!({
+            "key": "pypi-dev", "name": "pypi-dev", "format": "pypi",
+            "repo_type": "local", "visibility": "private",
+        }))
+        .expect("fixture");
+        assert_eq!(current.immutability, RepositoryImmutability::WriteOnce);
+        assert!(!serde_json::to_string(&current)
+            .unwrap()
+            .contains("immutability"));
+        let mut desired = current.clone();
+        desired.immutability = RepositoryImmutability::Mutable;
+
+        let changes: BTreeSet<String> = changed_fields(&desired, &current).into_iter().collect();
+        assert_eq!(changes, keys(&["immutability"]));
+        let patch = patch_body(&desired, &changes, &BTreeMap::new())
+            .unwrap()
+            .expect("a PATCH");
+        assert_eq!(patch["immutability"], "mutable");
+        let back = patch_body(&current, &changes, &BTreeMap::new())
+            .unwrap()
+            .expect("a PATCH");
+        assert_eq!(back["immutability"], "write_once");
+        assert_eq!(
+            create_body(&desired, &BTreeMap::new()).unwrap()["immutability"],
+            "mutable"
+        );
+        assert!(create_body(&current, &BTreeMap::new())
+            .unwrap()
+            .get("immutability")
+            .is_none());
     }
 
     /// #5207: the curation source round-trips through the document. It is

@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT r.immutability = 'mutable' AS \"mutable!\" FROM repositories r WHERE r.id = $1 AND EXISTS (SELECT 1 FROM artifacts a WHERE a.repository_id = $1 AND a.path = $2 AND a.is_deleted = false)",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "mutable!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "db1ad7968e282d00395c49cfd64bf49066bca83103bccd32ed742659bf51f5e3"
+}

@@ -405,6 +405,9 @@ pub struct RepoInfo {
     pub age_gate_mode: String,
     pub curation_enabled: bool,
     pub curation_default_action: String,
+    /// Per-repository mutability (#5188). When true, a file-drop upload to an
+    /// occupied path replaces the content instead of returning 409.
+    pub allow_overwrite: bool,
 }
 
 impl RepoInfo {
@@ -425,6 +428,50 @@ impl RepoInfo {
     pub fn reject_if_promotion_only(&self, is_admin: bool) -> Result<(), Response> {
         reject_direct_upload_if_promotion_only(self.promotion_only, is_admin)
     }
+
+    /// Whether an upload may replace the live file at its path (#5188): the
+    /// repository opted in and its format and type pass
+    /// [`overwrite_supported`](crate::services::artifact_service::overwrite_supported),
+    /// the gate `overwrite_applies` puts on the generic upload paths. A flag
+    /// left on a repository the allowlist rejects (a Poetry or Conda repo on
+    /// the PyPI route) is ignored.
+    pub fn overwrite_allowed(&self) -> bool {
+        self.allow_overwrite
+            && matches!(
+                (
+                    crate::services::repository_service::parse_format_str(&self.format),
+                    RepositoryType::from_db_str(&self.repo_type),
+                ),
+                (Some(format), Some(repo_type))
+                    if crate::services::artifact_service::overwrite_supported(&format, &repo_type)
+            )
+    }
+}
+
+/// Mark a file served from a mutable repository (#5188) as revalidate-before-
+/// reuse: `Cache-Control: no-cache` and its SHA-256 as a strong `ETag`. A
+/// Remote or HTTP cache in front of the repository then checks the ETag
+/// before reusing its copy, instead of keeping a replaced file forever. A
+/// write-once repository's response is returned unchanged.
+pub(crate) fn revalidate_if_mutable(
+    repo: &RepoInfo,
+    checksum_sha256: &str,
+    mut resp: Response,
+) -> Response {
+    if !repo.overwrite_allowed() {
+        return resp;
+    }
+    let headers = resp.headers_mut();
+    headers.insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-cache"),
+    );
+    if let Ok(etag) = axum::http::HeaderValue::from_str(
+        &crate::api::handlers::repositories::artifact_etag(checksum_sha256),
+    ) {
+        headers.insert(axum::http::header::ETAG, etag);
+    }
+    resp
 }
 
 /// Look up a repository by key and verify that its format matches one of the
@@ -452,7 +499,8 @@ pub async fn resolve_repo_by_key(
         "SELECT id, key, storage_backend, storage_path, format::text as format, \
          repo_type::text as repo_type, upstream_url, promotion_only, \
          age_gate_enabled, age_gate_min_age_days, age_gate_mode, \
-         curation_enabled, curation_default_action \
+         curation_enabled, curation_default_action, \
+         (immutability = 'mutable') AS allow_overwrite \
          FROM repositories WHERE key = $1",
     )
     .bind(repo_key)
@@ -495,6 +543,7 @@ pub async fn resolve_repo_by_key(
         curation_default_action: repo
             .try_get("curation_default_action")
             .unwrap_or_else(|_| "allow".to_string()),
+        allow_overwrite: repo.try_get("allow_overwrite").unwrap_or(false),
     })
 }
 
@@ -2227,6 +2276,9 @@ pub(crate) fn build_streaming_response_with_disposition(
     }
     if let Some(ref etag) = result.etag {
         builder = builder.header("etag", etag);
+    }
+    if result.revalidate {
+        builder = builder.header("cache-control", "no-cache");
     }
     // The proxy no longer decodes upstream bodies (see
     // `http_client::base_client_builder`), so a content-coded body must be
@@ -5911,6 +5963,8 @@ pub fn repo_info_from_member(m: &crate::models::repository::Repository) -> RepoI
         age_gate_mode: "upstream_publish_time".to_string(),
         curation_enabled: m.curation_enabled,
         curation_default_action: m.curation_default_action.clone(),
+        allow_overwrite: m.immutability
+            == crate::models::repository::RepositoryImmutability::Mutable,
     }
 }
 
@@ -6126,7 +6180,7 @@ const VIRTUAL_MEMBER_EDGES_SQL: &str = r#"
         r.replication_priority,
         r.curation_enabled, r.curation_source_repo_id, r.curation_target_repo_id,
         r.curation_default_action, r.curation_sync_interval_secs, r.curation_auto_fetch,
-        r.age_gate_enabled, r.age_gate_min_age_days, r.versioning_enabled,
+        r.age_gate_enabled, r.age_gate_min_age_days, r.versioning_enabled, r.immutability,
         r.project_id, r.created_at, r.updated_at
       FROM reach
       JOIN repositories r ON r.id = reach.member_repo_id
@@ -7137,6 +7191,11 @@ pub(crate) struct LocalArtifactRow {
     pub checksum_sha256: String,
     #[sqlx(default)]
     pub path: String,
+    /// The row's repository is mutable (#5188): its file is served as
+    /// `no-cache` with its SHA-256 as `ETag`. A query that does not select it
+    /// reads as write-once.
+    #[sqlx(default)]
+    pub mutable: bool,
 }
 
 /// Check quarantine status on a fetched artifact row of `repo_id`, mapping
@@ -7189,25 +7248,29 @@ impl LocalLookup<'_> {
     pub(crate) fn select_sql(&self) -> &'static str {
         match self {
             LocalLookup::Path(_) => {
-                "SELECT id, storage_key, content_type, size_bytes, quarantine_status, quarantine_until, checksum_sha256, path \
+                "SELECT id, storage_key, content_type, size_bytes, quarantine_status, quarantine_until, checksum_sha256, path, \
+                 (SELECT immutability = 'mutable' FROM repositories WHERE id = $1) AS mutable \
                  FROM artifacts \
                  WHERE repository_id = $1 AND path = $2 AND is_deleted = false \
                  LIMIT 1"
             }
             LocalLookup::NameVersion(_, _) => {
-                "SELECT id, storage_key, content_type, size_bytes, quarantine_status, quarantine_until, checksum_sha256, path \
+                "SELECT id, storage_key, content_type, size_bytes, quarantine_status, quarantine_until, checksum_sha256, path, \
+                 (SELECT immutability = 'mutable' FROM repositories WHERE id = $1) AS mutable \
                  FROM artifacts \
                  WHERE repository_id = $1 AND name = $2 AND version = $3 AND is_deleted = false \
                  LIMIT 1"
             }
             LocalLookup::NameVersionSuffix(_, _, _) => {
-                "SELECT id, storage_key, content_type, size_bytes, quarantine_status, quarantine_until, checksum_sha256, path \
+                "SELECT id, storage_key, content_type, size_bytes, quarantine_status, quarantine_until, checksum_sha256, path, \
+                 (SELECT immutability = 'mutable' FROM repositories WHERE id = $1) AS mutable \
                  FROM artifacts \
                  WHERE repository_id = $1 AND name = $2 AND version = $3 AND path LIKE $4 AND is_deleted = false \
                  LIMIT 1"
             }
             LocalLookup::NameVersionCaseInsensitive(_, _) => {
-                "SELECT id, storage_key, content_type, size_bytes, quarantine_status, quarantine_until, checksum_sha256, path \
+                "SELECT id, storage_key, content_type, size_bytes, quarantine_status, quarantine_until, checksum_sha256, path, \
+                 (SELECT immutability = 'mutable' FROM repositories WHERE id = $1) AS mutable \
                  FROM artifacts \
                  WHERE repository_id = $1 AND LOWER(name) = $2 AND version = $3 AND is_deleted = false \
                  LIMIT 1"
@@ -7374,7 +7437,10 @@ async fn open_local_stream(
         // Local artifact row resolved: surface its id so the virtual-member
         // streaming resolver can record the download exactly once (#2260).
         artifact_id: Some(artifact.id),
-        etag: None,
+        etag: artifact
+            .mutable
+            .then(|| crate::api::handlers::repositories::artifact_etag(&artifact.checksum_sha256)),
+        revalidate: artifact.mutable,
         stale_since: None,
     })
 }
@@ -10023,11 +10089,51 @@ pub struct NewArtifact<'a> {
 /// 500 "Database error" response.
 #[allow(clippy::result_large_err)]
 pub async fn insert_artifact(db: &PgPool, art: NewArtifact<'_>) -> Result<Uuid, Response> {
+    insert_artifact_replacing(db, art, None)
+        .await
+        .map(|(id, _)| id)
+}
+
+/// [`insert_artifact`] for a mutable-repository overwrite (#5188). With
+/// `replace` set (the repository's storage location), the row at the path is
+/// retired in the same transaction as the quota admission and the INSERT, so
+/// the replacement gets a new id and a failed publish leaves the old row (and
+/// everything recorded against it) in place. Returns the retired row so the
+/// caller can drop it from the search index once committed.
+#[allow(clippy::result_large_err)]
+pub async fn insert_artifact_replacing(
+    db: &PgPool,
+    art: NewArtifact<'_>,
+    replace: Option<&crate::storage::StorageLocation>,
+) -> Result<
+    (
+        Uuid,
+        Option<crate::services::artifact_service::RetiredArtifact>,
+    ),
+    Response,
+> {
     let repository_id = art.repository_id;
 
     let mut tx =
         super::publish_quota::begin_admitted_publish(db, repository_id, art.path, art.size_bytes)
             .await?;
+    let retired = match replace {
+        Some(location) => crate::services::artifact_service::retire_overwritten_artifact(
+            &mut tx,
+            repository_id,
+            location,
+            art.path,
+            None,
+            crate::services::artifact_service::OverwriteReplacement {
+                storage_key: art.storage_key,
+                checksum_sha256: art.checksum_sha256,
+                uploaded_by: Some(art.uploaded_by),
+            },
+        )
+        .await
+        .map_err(IntoResponse::into_response)?,
+        None => None,
+    };
     let id = insert_artifact_row(&mut tx, art).await?;
     tx.commit()
         .await
@@ -10040,7 +10146,7 @@ pub async fn insert_artifact(db: &PgPool, art: NewArtifact<'_>) -> Result<Uuid, 
     // double-held. Best-effort: never fails the insert.
     crate::services::quarantine_service::apply_upload_hold_hosted(db, repository_id, id).await;
 
-    Ok(id)
+    Ok((id, retired))
 }
 
 /// Insert a row into `artifacts` on a caller-supplied connection or
@@ -10097,8 +10203,36 @@ pub async fn ensure_unique_artifact_path(
     artifact_path: &str,
     conflict_message: &str,
 ) -> Result<(), Response> {
-    let existing: Option<Uuid> = sqlx::query_scalar(
-        "SELECT id FROM artifacts WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
+    ensure_unique_artifact_path_mutable(db, repo_id, artifact_path, conflict_message, None)
+        .await
+        .map(|_| ())
+}
+
+/// [`ensure_unique_artifact_path`] for file-drop formats that carry their own
+/// publish-time 409 (RPM, Pacman). On a mutable repository (#5188,
+/// `allow_overwrite`) a live row at the path is not a conflict: `Ok(true)`
+/// tells the caller it is replacing one. Nothing is removed here. The caller
+/// retires the live row inside its publish transaction
+/// ([`insert_artifact_replacing`] /
+/// [`retire_overwritten_artifact`](crate::services::artifact_service::retire_overwritten_artifact)),
+/// so a publish that fails on quota, storage or the INSERT leaves the old
+/// package, its scan results and its approvals untouched.
+///
+/// `replacement_sha256` is `Some` (the new file's SHA-256) when the repository
+/// allows overwrite, `None` when it is write-once. Identical bytes are not a
+/// replacement: they answer the same 409 as a write-once repository, so the
+/// live row keeps its id and approvals instead of being retired for nothing.
+#[allow(clippy::result_large_err)]
+pub async fn ensure_unique_artifact_path_mutable(
+    db: &PgPool,
+    repo_id: Uuid,
+    artifact_path: &str,
+    conflict_message: &str,
+    replacement_sha256: Option<&str>,
+) -> Result<bool, Response> {
+    let existing: Option<String> = sqlx::query_scalar(
+        "SELECT checksum_sha256 FROM artifacts \
+         WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
     )
     .bind(repo_id)
     .bind(artifact_path)
@@ -10106,12 +10240,15 @@ pub async fn ensure_unique_artifact_path(
     .await
     .map_err(|e| internal_error("Database", e))?;
 
-    if existing.is_some() {
+    let replaceable = |live: &str| {
+        replacement_sha256.is_some_and(|new| !live.trim().eq_ignore_ascii_case(new.trim()))
+    };
+    if existing.as_deref().is_some_and(|live| !replaceable(live)) {
         return Err((StatusCode::CONFLICT, conflict_message.to_string()).into_response());
     }
 
     super::cleanup_soft_deleted_artifact(db, repo_id, artifact_path).await;
-    Ok(())
+    Ok(existing.is_some())
 }
 
 /// Upsert format-specific metadata for a freshly-uploaded artifact and bump
@@ -11408,6 +11545,7 @@ pub(crate) fn build_remote_repo_with_format(
         age_gate_enabled: false,
         age_gate_min_age_days: 7,
         versioning_enabled: false,
+        immutability: crate::models::repository::RepositoryImmutability::WriteOnce,
         project_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
@@ -16179,6 +16317,7 @@ mod tests {
             content_encoding: content_encoding.map(str::to_string),
             commit_sha: None,
             stale_since: None,
+            revalidate: false,
         }
     }
 
@@ -19558,6 +19697,7 @@ mod tests {
             artifact_id: None,
             etag: None,
             stale_since: None,
+            revalidate: false,
         }
     }
 
@@ -20429,6 +20569,7 @@ mod tests {
             age_gate_mode: "upstream_publish_time".to_string(),
             curation_enabled: false,
             curation_default_action: "allow".to_string(),
+            allow_overwrite: false,
         }
     }
 
@@ -20458,6 +20599,37 @@ mod tests {
         let repo = promo_repo_info(false);
         assert!(repo.reject_if_promotion_only(false).is_ok());
         assert!(repo.reject_if_promotion_only(true).is_ok());
+    }
+
+    #[test]
+    fn test_repoinfo_overwrite_allowed_follows_overwrite_supported() {
+        let repo = |format: &str, repo_type: &str, allow_overwrite: bool| RepoInfo {
+            format: format.to_string(),
+            repo_type: repo_type.to_string(),
+            allow_overwrite,
+            ..promo_repo_info(false)
+        };
+        for format in ["pypi", "debian", "rpm", "alpine", "pacman", "generic"] {
+            assert!(repo(format, "local", true).overwrite_allowed(), "{format}");
+            assert!(
+                repo(format, "staging", true).overwrite_allowed(),
+                "{format}"
+            );
+            assert!(
+                !repo(format, "local", false).overwrite_allowed(),
+                "{format}"
+            );
+            assert!(
+                !repo(format, "remote", true).overwrite_allowed(),
+                "{format}"
+            );
+        }
+        // The PyPI and Debian routes also serve these formats, the allowlist
+        // does not.
+        for format in ["poetry", "conda", "jupyter", "apt", "npm", ""] {
+            assert!(!repo(format, "local", true).overwrite_allowed(), "{format}");
+        }
+        assert!(!repo("pypi", "", true).overwrite_allowed());
     }
 
     // ── promotion_only direct-delete gate ───────────────────────────
@@ -21198,6 +21370,7 @@ mod tests {
             age_gate_mode: "upstream_publish_time".to_string(),
             curation_enabled: false,
             curation_default_action: "allow".to_string(),
+            allow_overwrite: false,
         };
         let loc = info.storage_location();
         assert_eq!(loc.backend, "filesystem");
@@ -23393,6 +23566,101 @@ mod tests {
         db_helpers::cleanup(&pool, repo_id, user_id).await;
     }
 
+    // #5188: a mutable file-drop repo must NOT 409 on a
+    // re-upload to an occupied path, and must NOT remove the live row either:
+    // the caller retires it inside its publish transaction, so a publish that
+    // fails afterwards leaves the old package in place.
+    #[tokio::test]
+    async fn test_ensure_unique_artifact_path_mutable_keeps_live_row_for_the_publish() {
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let user_id = db_helpers::create_user(&pool).await;
+        let (repo_id, _, _) = db_helpers::create_repo(&pool, "local", "alpine").await;
+
+        let path = "x86_64/pkg-1.0.0.apk";
+        let live = insert_artifact(
+            &pool,
+            NewArtifact {
+                repository_id: repo_id,
+                path,
+                name: "pkg",
+                version: "1.0.0",
+                size_bytes: 1,
+                checksum_sha256: "a",
+                content_type: "application/vnd.alpine.package",
+                storage_key: "alpine/pkg/1.0.0",
+                uploaded_by: user_id,
+            },
+        )
+        .await
+        .expect("insert");
+
+        // Write-once → still 409.
+        let err = ensure_unique_artifact_path_mutable(
+            &pool,
+            repo_id,
+            path,
+            "Package already exists",
+            None,
+        )
+        .await
+        .expect_err("conflict expected when immutable");
+        assert_eq!(err.status(), StatusCode::CONFLICT);
+
+        // Mutable, identical bytes → 409 too: nothing to replace.
+        let same = ensure_unique_artifact_path_mutable(
+            &pool,
+            repo_id,
+            path,
+            "Package already exists",
+            Some("A"),
+        )
+        .await
+        .expect_err("identical bytes are not a replacement");
+        assert_eq!(same.status(), StatusCode::CONFLICT);
+
+        // Mutable, new bytes → passes, reports a replacement, removes nothing.
+        let replacing = ensure_unique_artifact_path_mutable(
+            &pool,
+            repo_id,
+            path,
+            "Package already exists",
+            Some("b"),
+        )
+        .await
+        .expect("mutable repo must not conflict");
+        assert!(replacing, "a live row at the path is a replacement");
+
+        let still_live: Option<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM artifacts WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
+        )
+        .bind(repo_id)
+        .bind(path)
+        .fetch_optional(&pool)
+        .await
+        .expect("query");
+        assert_eq!(
+            still_live,
+            Some(live),
+            "the live row must survive until the publish transaction retires it"
+        );
+        assert!(
+            !ensure_unique_artifact_path_mutable(
+                &pool,
+                repo_id,
+                "x86_64/other.apk",
+                "x",
+                Some("b")
+            )
+            .await
+            .expect("free path"),
+            "a free path is not a replacement"
+        );
+
+        db_helpers::cleanup(&pool, repo_id, user_id).await;
+    }
+
     // ── put_artifact_bytes + serve_local_artifact roundtrip ─────────────
 
     #[tokio::test]
@@ -23419,6 +23687,7 @@ mod tests {
             age_gate_mode: "upstream_publish_time".to_string(),
             curation_enabled: false,
             curation_default_action: "allow".to_string(),
+            allow_overwrite: false,
         };
 
         let bytes = Bytes::from_static(b"package-data");
@@ -23541,6 +23810,7 @@ mod tests {
             age_gate_mode: "upstream_publish_time".to_string(),
             curation_enabled: false,
             curation_default_action: "allow".to_string(),
+            allow_overwrite: false,
         };
 
         let payload = b"streamed-artifact-body".repeat(64);
@@ -23710,6 +23980,7 @@ mod tests {
             age_gate_mode: "upstream_publish_time".to_string(),
             curation_enabled: false,
             curation_default_action: "allow".to_string(),
+            allow_overwrite: false,
         };
 
         let opts = DownloadResponseOpts {
@@ -23762,6 +24033,7 @@ mod tests {
             age_gate_mode: "upstream_publish_time".to_string(),
             curation_enabled: false,
             curation_default_action: "allow".to_string(),
+            allow_overwrite: false,
         };
 
         // state.proxy_service is None: should short-circuit to Ok(None).
@@ -23815,6 +24087,7 @@ mod tests {
             age_gate_mode: "upstream_publish_time".to_string(),
             curation_enabled: false,
             curation_default_action: "allow".to_string(),
+            allow_overwrite: false,
         };
 
         let opts = DownloadResponseOpts {
@@ -23869,6 +24142,7 @@ mod tests {
             age_gate_mode: "upstream_publish_time".to_string(),
             curation_enabled: false,
             curation_default_action: "allow".to_string(),
+            allow_overwrite: false,
         };
         let bytes = Bytes::from_static(b"abc123");
         put_artifact_bytes(&state, &repo, "pypi/foo/1.0/foo.whl", bytes.clone())
@@ -23936,6 +24210,7 @@ mod tests {
             age_gate_mode: "upstream_publish_time".to_string(),
             curation_enabled: false,
             curation_default_action: "allow".to_string(),
+            allow_overwrite: false,
         };
         let bytes = Bytes::from_static(b"rpmbytes");
         put_artifact_bytes(&state, &repo, "rpm/ab.rpm", bytes.clone())
@@ -24004,6 +24279,7 @@ mod tests {
             age_gate_mode: "upstream_publish_time".to_string(),
             curation_enabled: false,
             curation_default_action: "allow".to_string(),
+            allow_overwrite: false,
         };
         let bytes = Bytes::from_static(b"dirbytes");
         put_artifact_bytes(&state, &repo, "rpm/packages/hello.rpm", bytes.clone())
@@ -24152,6 +24428,7 @@ mod tests {
             artifact_id: None,
             etag: None,
             stale_since: None,
+            revalidate: false,
         };
         let response = build_streaming_response(result, "application/octet-stream")
             .expect("response build must succeed");
@@ -24176,6 +24453,7 @@ mod tests {
             artifact_id: None,
             etag: None,
             stale_since: None,
+            revalidate: false,
         };
         let response =
             build_streaming_response(result, "text/xml").expect("response build must succeed");
@@ -24202,6 +24480,7 @@ mod tests {
             artifact_id: None,
             etag: None,
             stale_since: None,
+            revalidate: false,
         };
         let response = build_streaming_response(result, "application/octet-stream").unwrap();
         assert_eq!(
@@ -24229,6 +24508,7 @@ mod tests {
             artifact_id: None,
             etag: None,
             stale_since: None,
+            revalidate: false,
         };
         let response = build_streaming_response(result, "application/octet-stream").unwrap();
         assert!(
@@ -24250,6 +24530,7 @@ mod tests {
             artifact_id: None,
             etag: None,
             stale_since: None,
+            revalidate: false,
         };
         let response = build_streaming_response(result, "application/octet-stream").unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -24270,6 +24551,7 @@ mod tests {
             artifact_id: None,
             etag: None,
             stale_since: None,
+            revalidate: false,
         };
         let response = build_streaming_response(result, weird).unwrap();
         assert_eq!(
@@ -24295,6 +24577,7 @@ mod tests {
             artifact_id: None,
             etag: None,
             stale_since: None,
+            revalidate: false,
         };
         let response = stream_fetch_result(result, "application/octet-stream", Some("pkg.whl"))
             .expect("stream_fetch_result must build a response");
@@ -24327,6 +24610,7 @@ mod tests {
             artifact_id: None,
             etag: None,
             stale_since: None,
+            revalidate: false,
         };
         let response = stream_fetch_result(result, "application/octet-stream", None)
             .expect("stream_fetch_result must build a response");
@@ -25104,6 +25388,7 @@ mod tests {
                     content_type: Some("application/octet-stream".to_string()),
                     size_bytes: 9,
                     checksum_sha256: "deadbeef".to_string(),
+                    revalidate: false,
                 };
                 Ok(Bytes::from(serde_json::to_vec(&meta).unwrap()))
             } else {
@@ -25408,6 +25693,7 @@ mod tests {
                     content_type: Some("application/octet-stream".to_string()),
                     size_bytes: 9,
                     checksum_sha256: "deadbeef".to_string(),
+                    revalidate: false,
                 };
                 Ok(Bytes::from(serde_json::to_vec(&meta).unwrap()))
             } else {
@@ -28584,6 +28870,7 @@ mod tests {
             age_gate_mode: "upstream_publish_time".to_string(),
             curation_enabled: false,
             curation_default_action: "allow".to_string(),
+            allow_overwrite: false,
         };
         let params = age_gate_params(&info);
         assert!(params.age_gate_enabled);
@@ -29277,6 +29564,7 @@ mod tests {
             age_gate_mode: "upstream_publish_time".to_string(),
             curation_enabled,
             curation_default_action: "allow".to_string(),
+            allow_overwrite: false,
         }
     }
 
@@ -30120,11 +30408,19 @@ mod scan_on_upload_coverage_tests {
     /// Raw SQL inserts, tolerant of case, line breaks and a schema prefix.
     const INSERT_SQL: &str = r"(?i)INSERT\s+INTO\s+(public\.)?artifacts\b";
     /// Calls of the shared insert primitives.
-    const INSERT_CALLS: &[&str] = &["insert_artifact(", "insert_artifact_row("];
+    const INSERT_CALLS: &[&str] = &[
+        "insert_artifact(",
+        "insert_artifact_row(",
+        "insert_artifact_replacing(",
+    ];
     const TRIGGER: &str = "trigger_scan_on_upload(";
     const MARKER: &str = "NO-SCAN-ON-UPLOAD:";
     /// The shared insert primitives in this file: their callers are checked.
-    const PRIMITIVES: &[&str] = &["insert_artifact", "insert_artifact_row"];
+    const PRIMITIVES: &[&str] = &[
+        "insert_artifact",
+        "insert_artifact_row",
+        "insert_artifact_replacing",
+    ];
     /// Test-fixture-only sources.
     const EXEMPT_FILES: &[&str] = &["test_db_helpers.rs"];
 
@@ -30444,7 +30740,7 @@ mod scan_on_upload_coverage_tests {
             "check_quota_locked(",
         ],
         marker: QUOTA_MARKER,
-        self_covering: &["insert_artifact("],
+        self_covering: &["insert_artifact(", "insert_artifact_replacing("],
     };
     const QUOTA_MARKER: &str = "NO-QUOTA-ADMISSION:";
 

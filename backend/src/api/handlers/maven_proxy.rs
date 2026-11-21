@@ -189,6 +189,7 @@ pub(crate) async fn maven_local_fetch_storage_fallback(
                     artifact_id: None,
                     etag: None,
                     stale_since: None,
+                    revalidate: false,
                 });
             }
         }
@@ -224,6 +225,7 @@ pub(crate) async fn maven_local_fetch_storage_fallback(
             artifact_id: None,
             etag: None,
             stale_since: None,
+            revalidate: false,
         });
     }
 
@@ -394,6 +396,7 @@ pub(crate) async fn maven_local_fetch_storage_fallback(
         artifact_id: None,
         etag: None,
         stale_since: None,
+        revalidate: false,
     })
 }
 
@@ -607,6 +610,7 @@ mod tests {
             age_gate_mode: "upstream_publish_time".to_string(),
             curation_enabled: false,
             curation_default_action: "allow".to_string(),
+            allow_overwrite: false,
         };
         Some((pool, state, repo_id, repo, user_id))
     }

@@ -548,6 +548,7 @@ async fn serve_package(
     .await?;
     // #3143: quarantine + scan policy apply to the streamed download too.
     proxy_helpers::gate_and_record_streamed_local(&state.db, result.artifact_id, ctx).await?;
+    // A mutable repository's file comes back `no-cache` with its ETag (#5188).
     proxy_helpers::stream_fetch_result(result, PACKAGE_CONTENT_TYPE, Some(filename))
 }
 
@@ -666,12 +667,23 @@ fn check_upload_filename(filename: &str, info: &PkgInfo) -> Result<(), Response>
 /// databases are rendered from, so a package whose
 /// metadata could not be written must not be published at all (it would be
 /// invisible to pacman yet block re-upload with a 409).
+///
+/// `replace` (#5188): the repository's storage location when this publish
+/// replaces a live row on a mutable repository. That row is retired in the
+/// same transaction, so a failed publish leaves it in place.
 async fn insert_package_rows(
     db: &PgPool,
     artifact: proxy_helpers::NewArtifact<'_>,
     metadata: &PacmanMetadata,
     files: Option<&[String]>,
-) -> Result<uuid::Uuid, Response> {
+    replace: Option<&crate::storage::StorageLocation>,
+) -> Result<
+    (
+        uuid::Uuid,
+        Option<crate::services::artifact_service::RetiredArtifact>,
+    ),
+    Response,
+> {
     let repository_id = artifact.repository_id;
     let metadata = serde_json::to_value(metadata).map_err(|e| {
         error(
@@ -686,6 +698,23 @@ async fn insert_package_rows(
         artifact.size_bytes,
     )
     .await?;
+    let retired = match replace {
+        Some(location) => crate::services::artifact_service::retire_overwritten_artifact(
+            &mut tx,
+            repository_id,
+            location,
+            artifact.path,
+            None,
+            crate::services::artifact_service::OverwriteReplacement {
+                storage_key: artifact.storage_key,
+                checksum_sha256: artifact.checksum_sha256,
+                uploaded_by: Some(artifact.uploaded_by),
+            },
+        )
+        .await
+        .map_err(IntoResponse::into_response)?,
+        None => None,
+    };
     let artifact_id = proxy_helpers::insert_artifact_row(&mut tx, artifact).await?;
     sqlx::query(
         "INSERT INTO artifact_metadata (artifact_id, format, metadata) VALUES ($1, 'pacman', $2)",
@@ -709,7 +738,7 @@ async fn insert_package_rows(
         .bind(repository_id)
         .execute(db)
         .await;
-    Ok(artifact_id)
+    Ok((artifact_id, retired))
 }
 
 async fn store_package(
@@ -749,17 +778,24 @@ async fn store_package(
     }
 
     let artifact_path = package_artifact_path(&info.arch, filename);
-    proxy_helpers::ensure_unique_artifact_path(
+    // #5188: `replacing` when a mutable repository's live row holds the path;
+    // it is retired in the publish transaction, never before.
+    let sha256 = format!("{:x}", Sha256::digest(&body));
+    let replacing = proxy_helpers::ensure_unique_artifact_path_mutable(
         &state.db,
         repo.id,
         &artifact_path,
         "Package already exists",
+        repo.overwrite_allowed().then_some(sha256.as_str()),
     )
     .await?;
-
-    let sha256 = format!("{:x}", Sha256::digest(&body));
     let size_bytes = body.len() as i64;
-    let key = storage_key(repo.id, &artifact_path);
+    // A replacement never writes the key the live row still serves.
+    let key = match storage_key(repo.id, &artifact_path) {
+        key if replacing => crate::services::artifact_service::overwrite_storage_key(&key, &sha256),
+        key => key,
+    };
+    let location = repo.storage_location();
     proxy_helpers::put_artifact_bytes(state, repo, &key, body).await?;
 
     let files_indexed = contents.files.is_some();
@@ -769,7 +805,7 @@ async fn store_package(
         pkginfo: info.clone(),
         pgpsig: None,
     };
-    let artifact_id = insert_package_rows(
+    let (artifact_id, retired) = insert_package_rows(
         &state.db,
         proxy_helpers::NewArtifact {
             repository_id: repo.id,
@@ -784,8 +820,13 @@ async fn store_package(
         },
         &metadata,
         contents.files.as_deref(),
+        replacing.then_some(&location),
     )
     .await?;
+    crate::services::artifact_service::forget_retired_artifact(
+        state.search_service.as_ref(),
+        retired.as_ref(),
+    );
     crate::services::quarantine_service::apply_upload_hold_hosted(&state.db, repo.id, artifact_id)
         .await;
     crate::services::scanner_service::trigger_scan_on_upload(
@@ -1398,6 +1439,64 @@ mod db_tests {
         assert_eq!(
             get(&fx, &format!("x86_64/{MARKER_FILE}")).await.0,
             StatusCode::NOT_FOUND
+        );
+
+        fx.teardown().await;
+    }
+
+    /// #5188: a hosted pacman repo rejects a re-upload to an occupied path by
+    /// default, and once made mutable the re-upload replaces the stored bytes.
+    /// The pacman storage key is path-addressed, so the bytes are overwritten
+    /// in place and exactly one row survives.
+    #[tokio::test]
+    async fn mutable_repo_overwrites_package() {
+        let Some(fx) = tdh::Fixture::setup("local", "pacman").await else {
+            return;
+        };
+
+        // Two packages at the SAME coordinate (filename) with different bytes.
+        let (filename, first) = build_package_with("ak-ovr", "1.0-1", "x86_64", "usr/bin/one");
+        let (_, second) = build_package_with("ak-ovr", "1.0-1", "x86_64", "usr/bin/two");
+        assert_ne!(first, second, "fixtures must differ to prove replacement");
+
+        assert_eq!(
+            put(&fx, &filename, first.clone()).await,
+            StatusCode::CREATED
+        );
+        // Default repo: a second upload to the same path is a 409.
+        assert_eq!(
+            put(&fx, &filename, second.clone()).await,
+            StatusCode::CONFLICT
+        );
+
+        // Flip the repo to mutable.
+        sqlx::query("UPDATE repositories SET immutability = 'mutable' WHERE id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("set immutability");
+        assert_eq!(
+            put(&fx, &filename, second.clone()).await,
+            StatusCode::CREATED,
+            "mutable repo must accept the re-upload"
+        );
+
+        // Exactly one live row, and the served bytes are the replacement.
+        let live: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM artifacts WHERE repository_id = $1 AND is_deleted = false",
+        )
+        .bind(fx.repo_id)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("count live rows");
+        assert_eq!(live, 1, "a mutable overwrite must leave one live row");
+
+        let (status, body) = get(&fx, &format!("x86_64/{filename}")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            &body[..],
+            &second[..],
+            "the served package must be the replacement"
         );
 
         fx.teardown().await;

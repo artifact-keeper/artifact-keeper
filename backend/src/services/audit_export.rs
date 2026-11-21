@@ -130,6 +130,7 @@ impl AuditAction {
             | AuditAction::ArtifactMetadataUpdated
             | AuditAction::ArtifactRestored
             | AuditAction::ArtifactPurged
+            | AuditAction::ArtifactOverwritten
             | AuditAction::BackupStarted
             | AuditAction::BackupCompleted
             | AuditAction::RestoreStarted
@@ -529,6 +530,17 @@ pub mod details {
         /// mode before and after (`online` / `cache_only`).
         #[serde(skip_serializing_if = "Option::is_none")]
         pub upstream_mode_change: Option<UpstreamModeChangeAudit>,
+        /// An immutability-mode change on update (#5188), before and after.
+        /// `mutable` lets published content change under the same coordinate.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub immutability_change: Option<ImmutabilityChangeAudit>,
+    }
+
+    /// Before/after of a repository's immutability mode (#5188).
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+    pub struct ImmutabilityChangeAudit {
+        pub previous_immutability: crate::models::repository::RepositoryImmutability,
+        pub immutability: crate::models::repository::RepositoryImmutability,
     }
 
     /// Before/after of a Remote's upstream mode (#5282).
@@ -680,6 +692,23 @@ pub mod details {
         /// Original uploader, when known (not necessarily the delete actor).
         #[serde(skip_serializing_if = "Option::is_none")]
         pub uploaded_by: Option<Uuid>,
+    }
+
+    /// `ARTIFACT_OVERWRITTEN` (#5188): a mutable repository replaced the
+    /// content at `path`. The retired row is gone (its scan state cascaded
+    /// away), so this event is what keeps its id, digest and verdict.
+    #[derive(Debug, Clone, Serialize)]
+    pub struct ArtifactOverwriteDetails {
+        pub repository_id: Uuid,
+        pub path: String,
+        pub retired_artifact_id: Uuid,
+        /// `sha256:<hex>` of the content that was replaced.
+        pub previous_digest: String,
+        /// `sha256:<hex>` of the replacement.
+        pub digest: String,
+        /// The retired row's `quarantine_status`, if it had one.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub previous_scan_verdict: Option<String>,
     }
 
     /// `SETTING_CHANGED` — a security/system configuration change. Secret-bearing
@@ -1377,6 +1406,7 @@ mod tests {
             upstream_auth_change: None,
             age_gate_change: None,
             upstream_mode_change: None,
+            immutability_change: None,
         };
         let v = serde_json::to_value(&d).unwrap();
         assert_eq!(v["key"], "maven-releases");

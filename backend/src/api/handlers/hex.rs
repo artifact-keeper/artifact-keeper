@@ -2456,6 +2456,7 @@ mod tests {
         use crate::models::repository::{ReplicationPriority, RepositoryFormat};
         Repository {
             versioning_enabled: false,
+            immutability: crate::models::repository::RepositoryImmutability::WriteOnce,
             id: uuid::Uuid::new_v4(),
             key: key.to_string(),
             name: key.to_string(),
@@ -2999,6 +3000,7 @@ mod tests {
             age_gate_mode: "upstream_publish_time".to_string(),
             curation_enabled: false,
             curation_default_action: "allow".to_string(),
+            allow_overwrite: false,
         };
         assert_eq!(repo.repo_type, "hosted");
         assert!(repo.upstream_url.is_none());
@@ -3020,6 +3022,7 @@ mod tests {
             age_gate_mode: "upstream_publish_time".to_string(),
             curation_enabled: false,
             curation_default_action: "allow".to_string(),
+            allow_overwrite: false,
         };
         assert_eq!(repo.upstream_url.as_deref(), Some("https://repo.hex.pm"));
     }
@@ -3071,6 +3074,7 @@ mod tests {
             age_gate_mode: "upstream_publish_time".to_string(),
             curation_enabled: false,
             curation_default_action: "allow".to_string(),
+            allow_overwrite: false,
         };
         assert_ne!(repo.repo_type, "remote");
         assert_ne!(repo.repo_type, "virtual");
@@ -3093,6 +3097,7 @@ mod tests {
             age_gate_mode: "upstream_publish_time".to_string(),
             curation_enabled: false,
             curation_default_action: "allow".to_string(),
+            allow_overwrite: false,
         };
         assert_eq!(repo.repo_type, "remote");
         assert!(repo.upstream_url.is_some());
@@ -3116,6 +3121,7 @@ mod tests {
             age_gate_mode: "upstream_publish_time".to_string(),
             curation_enabled: false,
             curation_default_action: "allow".to_string(),
+            allow_overwrite: false,
         };
         assert_eq!(repo.repo_type, "remote");
         assert!(repo.upstream_url.is_none());
@@ -3138,6 +3144,7 @@ mod tests {
             age_gate_mode: "upstream_publish_time".to_string(),
             curation_enabled: false,
             curation_default_action: "allow".to_string(),
+            allow_overwrite: false,
         };
         assert_eq!(repo.repo_type, "virtual");
     }

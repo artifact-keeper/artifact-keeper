@@ -1347,10 +1347,13 @@ async fn complete_session_commit(
         &repo.format,
         repo.versioning_enabled,
     );
+    let overwrite_active =
+        crate::services::artifact_service::overwrite_applies(&repo, &session.artifact_path);
+    let mut retired = None;
     let mut attempt = 0;
     let (inserted_artifact_id, replaced) = loop {
         attempt += 1;
-        let gate = match &precondition {
+        let mut gate = match &precondition {
             Some(precondition) => {
                 match locked_precondition_gate(&mut tx, &session, precondition).await {
                     Ok(Some(gate)) => gate,
@@ -1376,6 +1379,27 @@ async fn complete_session_commit(
             }
             None => LockedPreconditionGate::default(),
         };
+        // #5188: on a mutable repository, different bytes at this path retire
+        // the old row in this transaction (new artifact id, its scan /
+        // approval state cascades away, its object goes to storage GC), as
+        // the whole-body PUT does in `finalize_upload`. A row with these same
+        // bytes is refreshed in place and keeps its id; a row a concurrent
+        // writer commits after this point is refused by `expect_absent` and
+        // retired on the second pass.
+        if overwrite_active {
+            match retire_for_overwrite(&mut tx, &repo, &session, &storage_key).await {
+                Ok((r, identical_live)) => {
+                    retired = r.or(retired);
+                    gate.replaces_current = identical_live;
+                    gate.expect_absent = !identical_live;
+                    gate.replaced_key = None;
+                }
+                Err(e) => {
+                    drop(tx);
+                    return Err(release_after_precommit_failure(&state.db, &session, e).await);
+                }
+            }
+        }
         let inserted = sqlx::query_scalar::<_, Uuid>(
             r#"
             INSERT INTO artifacts (repository_id, path, name, version, size_bytes,
@@ -1384,7 +1408,14 @@ async fn complete_session_commit(
             ON CONFLICT (repository_id, path) DO UPDATE SET
                 name = $3, version = $4, size_bytes = $5, checksum_sha256 = $6,
                 content_type = $7, storage_key = $8, uploaded_by = $9,
-                updated_at = NOW(), is_deleted = false
+                updated_at = NOW(), is_deleted = false,
+                -- This path records no SHA-1/MD5: keep the old row's only
+                -- when the bytes are the same, never describe new bytes
+                -- with digests of the old ones.
+                checksum_sha1 = CASE WHEN LOWER(artifacts.checksum_sha256) = LOWER(EXCLUDED.checksum_sha256)
+                                     THEN artifacts.checksum_sha1 END,
+                checksum_md5 = CASE WHEN LOWER(artifacts.checksum_sha256) = LOWER(EXCLUDED.checksum_sha256)
+                                    THEN artifacts.checksum_md5 END
             WHERE (artifacts.is_deleted
                 OR $10
                 OR artifacts.version IS DISTINCT FROM EXCLUDED.version
@@ -1412,7 +1443,7 @@ async fn complete_session_commit(
         .fetch_optional(&mut *tx)
         .await;
         match inserted {
-            Ok(None) if gate.expect_absent && attempt == 1 => continue,
+            Ok(None) if (gate.expect_absent || overwrite_active) && attempt == 1 => continue,
             other => break (other, gate.replaced_key),
         }
     };
@@ -1600,6 +1631,10 @@ async fn complete_session_commit(
         .await;
         return Err(map_err(StatusCode::INTERNAL_SERVER_ERROR, e));
     }
+    crate::services::artifact_service::forget_retired_artifact(
+        state.search_service.as_ref(),
+        retired.as_ref(),
+    );
 
     // The upload-time quarantine hold every native upload route applies
     // (`finalize_upload`, Maven, npm), so an artifact pushed through the
@@ -1899,6 +1934,46 @@ struct LockedPreconditionGate {
     expect_absent: bool,
     /// The storage key of the live row a matched `If-Match` replaces.
     replaced_key: Option<String>,
+}
+
+/// [`retire_overwritten_artifact`] for a chunked completion on a mutable
+/// repository (#5188). Returns the retired row, if any, and whether a live row
+/// with the session's own bytes still holds the path (it is locked here).
+///
+/// [`retire_overwritten_artifact`]: crate::services::artifact_service::retire_overwritten_artifact
+async fn retire_for_overwrite(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    repo: &crate::models::repository::Repository,
+    session: &upload_service::UploadSession,
+    storage_key: &str,
+) -> crate::error::Result<(
+    Option<crate::services::artifact_service::RetiredArtifact>,
+    bool,
+)> {
+    let retired = crate::services::artifact_service::retire_overwritten_artifact(
+        tx,
+        session.repository_id,
+        &repo.storage_location(),
+        &session.artifact_path,
+        Some(&session.checksum_sha256),
+        crate::services::artifact_service::OverwriteReplacement {
+            storage_key,
+            checksum_sha256: &session.checksum_sha256,
+            uploaded_by: Some(session.user_id),
+        },
+    )
+    .await?;
+    let identical_live = sqlx::query_scalar::<_, bool>(
+        "SELECT NOT is_deleted FROM artifacts \
+         WHERE repository_id = $1 AND path = $2 FOR UPDATE",
+    )
+    .bind(session.repository_id)
+    .bind(&session.artifact_path)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|e| crate::error::AppError::Database(e.to_string()))?
+    .unwrap_or(false);
+    Ok((retired, identical_live))
 }
 
 /// Lock the row at the session's path and evaluate `precondition` against it
@@ -7804,6 +7879,73 @@ mod tests {
         crate::services::quarantine_service::invalidate_config_cache(f.repo_id);
         f.teardown().await;
         assert_eq!(held.as_deref(), Some("quarantined"));
+    }
+
+    /// #5188: a chunked re-upload with new bytes to a mutable repository
+    /// replaces the artifact under a new id, so an approval recorded for the
+    /// old bytes does not carry over and no SHA-1/MD5 of the old bytes is left
+    /// describing the new ones. The same bytes again keep the id.
+    #[tokio::test]
+    async fn chunked_overwrite_on_mutable_repo_gets_a_new_id_5188() {
+        let Some(f) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        sqlx::query("UPDATE repositories SET immutability = 'mutable' WHERE id = $1")
+            .bind(f.repo_id)
+            .execute(&f.pool)
+            .await
+            .unwrap();
+        let path = "snap/thing-1.0.bin";
+        let row = || async {
+            sqlx::query_as::<_, (Uuid, Option<String>, Option<String>)>(
+                "SELECT id, checksum_sha1, checksum_md5 FROM artifacts \
+                 WHERE repository_id = $1 AND path = $2",
+            )
+            .bind(f.repo_id)
+            .bind(path)
+            .fetch_one(&f.pool)
+            .await
+            .unwrap()
+        };
+
+        let (s1, b1) = f
+            .chunked_upload(path, b"build one", serde_json::json!({}), false)
+            .await;
+        assert_eq!(s1, StatusCode::OK, "{}", String::from_utf8_lossy(&b1));
+        let (first_id, _, _) = row().await;
+        // Digests recorded for build one (as a whole-body upload stores them).
+        sqlx::query(
+            "UPDATE artifacts SET checksum_sha1 = repeat('a', 40), checksum_md5 = repeat('b', 32) \
+             WHERE id = $1",
+        )
+        .bind(first_id)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+        let (same, _) = f
+            .chunked_upload(path, b"build one", serde_json::json!({}), false)
+            .await;
+        let after_same = row().await;
+
+        let (s2, b2) = f
+            .chunked_upload(path, b"build two", serde_json::json!({}), false)
+            .await;
+        let (new_id, sha1, md5) = row().await;
+        f.teardown().await;
+
+        assert_eq!(same, StatusCode::OK);
+        assert_eq!(
+            after_same,
+            (first_id, Some("a".repeat(40)), Some("b".repeat(32))),
+            "identical bytes keep the id and their digests"
+        );
+        assert_eq!(s2, StatusCode::OK, "{}", String::from_utf8_lossy(&b2));
+        assert_ne!(new_id, first_id, "new bytes must get a new artifact id");
+        assert_eq!(
+            (sha1, md5),
+            (None, None),
+            "no digest of the old bytes survives"
+        );
     }
 
     // -----------------------------------------------------------------------

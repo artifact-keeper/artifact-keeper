@@ -43,6 +43,8 @@ pub enum AuditAction {
     ArtifactRestored,
     /// A trashed artifact was permanently deleted before storage GC reached it.
     ArtifactPurged,
+    /// A mutable repository replaced the content at a path (#5188).
+    ArtifactOverwritten,
 
     // System operations
     BackupStarted,
@@ -375,6 +377,7 @@ impl AuditAction {
             AuditAction::ArtifactMetadataUpdated => "ARTIFACT_METADATA_UPDATED",
             AuditAction::ArtifactRestored => "ARTIFACT_RESTORED",
             AuditAction::ArtifactPurged => "ARTIFACT_PURGED",
+            AuditAction::ArtifactOverwritten => "ARTIFACT_OVERWRITTEN",
             AuditAction::BackupStarted => "BACKUP_STARTED",
             AuditAction::BackupCompleted => "BACKUP_COMPLETED",
             AuditAction::BackupFailed => "BACKUP_FAILED",
@@ -966,6 +969,32 @@ impl AuditEntry {
     }
 }
 
+/// Write one `audit_log` row through `db` without emitting the export record.
+/// Takes any executor so a caller can record an event in the transaction
+/// that makes the change it describes (#5188).
+pub(crate) async fn insert_audit_row<'e>(
+    db: impl sqlx::PgExecutor<'e>,
+    entry: &AuditEntry,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO audit_log (id, user_id, action, resource_type, resource_id, details, ip_address, correlation_id)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        "#,
+    )
+    .bind(entry.event_id)
+    .bind(entry.user_id)
+    .bind(entry.action.as_str())
+    .bind(entry.resource_type.as_str())
+    .bind(entry.resource_id)
+    .bind(&entry.details)
+    .bind(entry.ip_address.map(|ip| ip.to_string()))
+    .bind(&entry.correlation_id)
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
 /// Audit service
 pub struct AuditService {
     db: PgPool,
@@ -1005,23 +1034,7 @@ impl AuditService {
     /// [`AuditService::log_batch`]. Does NOT emit the export record (callers
     /// emit exactly once, before any insert attempt).
     async fn insert_row(&self, entry: &AuditEntry) -> sqlx::Result<()> {
-        sqlx::query(
-            r#"
-            INSERT INTO audit_log (id, user_id, action, resource_type, resource_id, details, ip_address, correlation_id)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-            "#,
-        )
-        .bind(entry.event_id)
-        .bind(entry.user_id)
-        .bind(entry.action.as_str())
-        .bind(entry.resource_type.as_str())
-        .bind(entry.resource_id)
-        .bind(&entry.details)
-        .bind(entry.ip_address.map(|ip| ip.to_string()))
-        .bind(&entry.correlation_id)
-        .execute(&self.db)
-        .await?;
-        Ok(())
+        insert_audit_row(&self.db, entry).await
     }
 
     /// Log a batch of audit entries with one multi-row INSERT (#2522).
@@ -2361,6 +2374,10 @@ mod tests {
         );
         assert_eq!(AuditAction::ArtifactRestored.as_str(), "ARTIFACT_RESTORED");
         assert_eq!(AuditAction::ArtifactPurged.as_str(), "ARTIFACT_PURGED");
+        assert_eq!(
+            AuditAction::ArtifactOverwritten.as_str(),
+            "ARTIFACT_OVERWRITTEN"
+        );
     }
 
     #[test]

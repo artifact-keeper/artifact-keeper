@@ -6663,6 +6663,8 @@ async fn lookup_package(
         curation_default_action: row
             .try_get("curation_default_action")
             .unwrap_or_else(|_| "allow".to_string()),
+        // Conda is never mutable (#5188): not on the overwrite allowlist.
+        allow_overwrite: false,
     };
     let artifact = match row.try_get::<Option<uuid::Uuid>, _>("artifact_id") {
         Ok(Some(id)) => Some(HostedPackageRow {

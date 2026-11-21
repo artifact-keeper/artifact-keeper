@@ -156,6 +156,7 @@ async fn export_repository(
         quota_bytes: repo.quota_bytes,
         promotion_only: repo.promotion_only,
         versioning_enabled: repo.versioning_enabled,
+        immutability: repo.immutability,
         custom_user_agent: repo.custom_user_agent,
         curation_enabled: repo.curation_enabled,
         curation_default_action: repo.curation_default_action,

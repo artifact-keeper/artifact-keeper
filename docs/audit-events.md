@@ -117,12 +117,13 @@ the remaining actions is an incremental follow-up.
 
 | Actions | `details` shape |
 | --- | --- |
-| `REPOSITORY_CREATED` / `_UPDATED` / `_DELETED` | `RepositoryDetails` (`actor_id`, `key`, `is_public`, structured format/policy fields; `upstream_change` / `upstream_auth_change` on credential changes, secrets never carried; on `_UPDATED`, `project_change` `{previous_project_id, project_id}` when the project assignment changed, `project_id: null` for a cleared assignment, #4026; an age-gate policy change adds `age_gate_change`: the replaced policy, `actor_tier`, and `relaxed`; a `PUT .../upstream-mode` adds `upstream_mode_change` `{previous_upstream_mode, upstream_mode}`, #5282) |
+| `REPOSITORY_CREATED` / `_UPDATED` / `_DELETED` | `RepositoryDetails` (`actor_id`, `key`, `is_public`, structured format/policy fields; `upstream_change` / `upstream_auth_change` on credential changes, secrets never carried; on `_UPDATED`, `project_change` `{previous_project_id, project_id}` when the project assignment changed, `project_id: null` for a cleared assignment, #4026; an age-gate policy change adds `age_gate_change`: the replaced policy, `actor_tier`, and `relaxed`; a `PUT .../upstream-mode` adds `upstream_mode_change` `{previous_upstream_mode, upstream_mode}`, #5282; on `_UPDATED`, `immutability_change` `{previous_immutability, immutability}` (`write_once` / `mutable`) when the repository's immutability mode changed, #5188) |
 | `AGE_GATE_LOCK_SET` / `AGE_GATE_LOCK_RELEASED` | `lock` (`policy` / `review`), `actor_tier`, `repository_key`, and the policy (`age_gate_*`) or review (`review_id`, `package`, `version`, `status`) at that moment. A release is always a relaxation. |
 | `ROLE_ASSIGNED` / `_REVOKED`, `REPOSITORY_PERMISSION_CHANGED` | `PermissionDetails` (`actor_id`, `role_id`, `grantee_id`, `repository_id?`) |
 | `API_TOKEN_CREATED` / `_REVOKED` | `TokenDetails` (`token_id`, `token_name?`, `surface`, `expires_at?`, `policy_applied?`) |
 | `LOGIN_FAILED`, `PERMISSION_DENIED`, `LOGIN_RATE_LIMITED` | `AuthDetails` (`username?`, `path?`, `method?`, `reason?`, federated labels?) |
 | `ARTIFACT_UPLOADED` / `_DOWNLOADED` / `_DELETED` | `ArtifactDetails` (`repository_id`, `path`, `name`, `version?`, `size_bytes?`, `digest?`, `uploaded_by?`) |
+| `ARTIFACT_OVERWRITTEN` | `ArtifactOverwriteDetails` (`repository_id`, `path`, `retired_artifact_id`, `previous_digest`, `digest`, `previous_scan_verdict?`). Written in the publish transaction when a repository with `immutability: mutable` replaces the content at a path (#5188); `resource_id` is the retired artifact, `user_id` the uploader of the replacement, and `previous_scan_verdict` the retired row's `quarantine_status` |
 | `SETTING_CHANGED` | `SettingDetails` (`key`, `old_value?`, `new_value?`) |
 
 ## Privileged administrative actions
