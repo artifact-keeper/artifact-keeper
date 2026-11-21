@@ -632,10 +632,12 @@ pub struct CreateApiTokenRequest {
     pub expires_in_days: Option<i64>,
     /// Restrict the token to the repositories this selector matches (#4219).
     /// Same shape and storage as a service-account token's `repo_selector`:
-    /// it is resolved at authentication time, so a repository created later
-    /// that matches is picked up, and it only narrows the owner's own
-    /// repository permissions, never widens them. Omit it for a token with the
-    /// owner's full access; a selector with no criteria is refused.
+    /// it is resolved at authentication time and only narrows the owner's own
+    /// repository permissions, never widens them. A repository created later
+    /// that matches is picked up once the token's cached authentication
+    /// expires, up to 5 minutes after the repository was created (#5643).
+    /// Omit it for a token with the owner's full access; a selector with no
+    /// criteria is refused.
     #[serde(default)]
     #[schema(value_type = Option<Object>)]
     pub repo_selector: Option<serde_json::Value>,

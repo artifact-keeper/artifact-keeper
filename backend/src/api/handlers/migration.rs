@@ -3929,11 +3929,13 @@ mod tests {
         let (owner, owner_name) = tdh::create_user(&pool).await;
         let job = seed_claimed_running_job(&pool, owner, "gone-pod:1:x", -600.0).await;
 
-        let paused = MigrationService::new(pool.clone())
+        // The janitor pauses every lapsed job in the shared test database, so
+        // another test's janitor can pause this one first and leave this call
+        // a count of 0. Assert on this job's own row, not on the count.
+        MigrationService::new(pool.clone())
             .pause_stale_running_jobs()
             .await
             .expect("janitor");
-        assert!(paused >= 1, "the lapsed job must be paused");
         assert_eq!(
             job_status_and_summary(&pool, job).await,
             ("paused".to_string(), Some(WORKER_LOST.to_string()))

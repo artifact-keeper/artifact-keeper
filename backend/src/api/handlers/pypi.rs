@@ -694,7 +694,7 @@ fn build_simple_root_response(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
-    if accept.contains("application/vnd.pypi.simple.v1+json") {
+    if accept_prefers_pep691_json(accept) {
         let json = serde_json::json!({
             "meta": { "api-version": "1.2" },
             "projects": packages.iter().map(|p| {
@@ -804,11 +804,12 @@ async fn simple_project(
     // PEP 691 content negotiation also governs the proxy path: a JSON client
     // must get the upstream's JSON representation (which carries PEP 700
     // `upload-time`), not its HTML index (which rarely does).
-    let wants_json = headers
-        .get("accept")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .contains(PEP691_JSON_CONTENT_TYPE);
+    let wants_json = accept_prefers_pep691_json(
+        headers
+            .get("accept")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or(""),
+    );
 
     // Find all artifacts that belong to this package.
     // We normalize the name for matching: replace [_.-]+ with - then lowercase.
@@ -1507,7 +1508,7 @@ fn build_simple_project_response(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
-    if accept.contains("application/vnd.pypi.simple.v1+json") {
+    if accept_prefers_pep691_json(accept) {
         // PEP 691 JSON response
         let files: Vec<serde_json::Value> = artifacts
             .iter()
@@ -4074,9 +4075,9 @@ async fn pypi_proxy_cache_redirect(
         return None;
     }
     // #1555: resolve the no-prefix presign handle and confirm redirect support
-    // BEFORE the `is_cache_fresh` probe — the probe loads the cache-meta
-    // sidecar, so we avoid a wasted S3 GET when we can't redirect anyway (the
-    // streaming fallback re-reads the same sidecar).
+    // BEFORE the `fresh_cache_redirect_size` probe — the probe loads the
+    // cache-meta sidecar, so we avoid a wasted S3 GET when we can't redirect
+    // anyway (the streaming fallback re-reads the same sidecar).
     let storage = proxy.cache_storage_backend();
     if !storage.supports_redirect() {
         return None;
@@ -6790,8 +6791,12 @@ async fn upload(
     // service does the dedup `exists()` check first and only moves bytes on a
     // miss.
     let content = staged_content.upload_content().await?;
+    // #6317: the `pypi` metadata the simple index and JSON API render from
+    // commits in the same transaction as the artifact row. Written as a
+    // separate step after the commit, a pool timeout there answered 503 for a
+    // stored package (whose retry then got 409) and left it without metadata.
     let artifact = artifact_service
-        .upload_content_with_sync_options(
+        .upload_content_with_commit_metadata(
             repo.id,
             &artifact_path,
             &normalized,
@@ -6801,20 +6806,19 @@ async fn upload(
             digests,
             size_bytes,
             Some(user_id),
-            // #4889: queue after the metadata write below, not before it.
+            // #4889: queue below, once the upload has committed.
             false,
             None,
             None,
+            Some(crate::services::artifact_service::CommitMetadata {
+                format: "pypi",
+                metadata: pkg_metadata,
+            }),
         )
         .await
         .map_err(|e| e.into_response())?;
     // The staging copy is no longer needed once the service has consumed it.
     staged_content.discard().await;
-
-    artifact_service
-        .set_metadata(artifact.id, "pypi", pkg_metadata, serde_json::json!({}))
-        .await
-        .map_err(|e| e.into_response())?;
 
     if should_enqueue_pypi_sync_tasks(&headers) {
         super::queue_push_sync_tasks_now(
@@ -7682,6 +7686,49 @@ fn rewrite_upstream_urls(html: &str, repo_key: &str, project: &str) -> String {
 
 /// PEP 691 JSON simple-index media type.
 const PEP691_JSON_CONTENT_TYPE: &str = "application/vnd.pypi.simple.v1+json";
+
+/// Whether a Simple API request's `Accept` header asks for the PEP 691 JSON
+/// form rather than HTML (#5643).
+///
+/// The JSON media types are `application/vnd.pypi.simple.v1+json` and its
+/// alias `application/vnd.pypi.simple.latest+json`; the HTML ones are
+/// `text/html` and the `v1+html` / `latest+html` types. Each range's `q`
+/// (default 1; an unparseable value is ignored) is read, and JSON is chosen
+/// when its best `q` is above zero and at least the best HTML `q`, so a tie
+/// goes to JSON as it always has. Media types and parameter names compare
+/// case-insensitively.
+///
+/// Wildcard ranges (`*/*`, `text/*`, `application/*`) are deliberately not
+/// counted for either side, although RFC 9110 would let them match: counting
+/// them would change the answer for clients that send only a wildcard, which
+/// have always got the HTML default.
+fn accept_prefers_pep691_json(accept: &str) -> bool {
+    let mut json_q = 0.0_f32;
+    let mut html_q = 0.0_f32;
+    for range in accept.split(',') {
+        let mut parts = range.split(';');
+        let media = parts.next().unwrap_or("").trim().to_ascii_lowercase();
+        let q = parts
+            .filter_map(|p| p.split_once('='))
+            .find(|(k, _)| k.trim().eq_ignore_ascii_case("q"))
+            // An unparseable q is ignored (read as 1), so a malformed
+            // parameter keeps the answer the substring check gave before.
+            .and_then(|(_, v)| v.trim().parse::<f32>().ok())
+            .filter(|q| q.is_finite())
+            .unwrap_or(1.0)
+            .clamp(0.0, 1.0);
+        match media.as_str() {
+            "application/vnd.pypi.simple.v1+json" | "application/vnd.pypi.simple.latest+json" => {
+                json_q = json_q.max(q)
+            }
+            "text/html"
+            | "application/vnd.pypi.simple.v1+html"
+            | "application/vnd.pypi.simple.latest+html" => html_q = html_q.max(q),
+            _ => {}
+        }
+    }
+    json_q > 0.0 && json_q >= html_q
+}
 
 /// Cache-path suffix under which the PEP 691 JSON representation of a Simple
 /// project index is stored, appended to the HTML representation's cache path
@@ -14569,6 +14616,37 @@ mod tests {
     /// its response by hand (to keep the PEP 503 CSP headers) and so does not
     /// inherit the shared helper's contract automatically.
     #[test]
+    fn test_accept_prefers_pep691_json_reads_q_values_and_latest_alias() {
+        // #5643: substring matching ignored q-values and the `latest` alias.
+        for (accept, json) in [
+            ("application/vnd.pypi.simple.v1+json", true),
+            ("application/vnd.pypi.simple.latest+json", true),
+            ("Application/Vnd.Pypi.Simple.V1+JSON", true),
+            // pip / uv
+            (
+                "application/vnd.pypi.simple.v1+json, application/vnd.pypi.simple.v1+html; q=0.1, text/html; q=0.01",
+                true,
+            ),
+            ("application/vnd.pypi.simple.v1+json, text/html;q=0.9", true),
+            ("application/vnd.pypi.simple.v1+json;q=0.5, */*", true),
+            ("text/html, application/vnd.pypi.simple.v1+json", true),
+            ("application/vnd.pypi.simple.v1+json;q=0.1, text/html", false),
+            ("application/vnd.pypi.simple.v1+json;q=0", false),
+            // An unparseable q is ignored, as the old substring check did.
+            ("application/vnd.pypi.simple.v1+json;q=bogus", true),
+            ("application/vnd.pypi.simple.v1+json;q=bogus, text/html;q=0.5", true),
+            ("application/vnd.pypi.simple.v1+json;q=0.2, text/html;q=nan", false),
+            ("application/*, */*", false),
+            ("application/vnd.pypi.simple.v1+html", false),
+            ("text/html", false),
+            ("*/*", false),
+            ("", false),
+        ] {
+            assert_eq!(accept_prefers_pep691_json(accept), json, "{accept}");
+        }
+    }
+
+    #[test]
     fn test_negotiated_simple_index_declares_vary_accept() {
         let packages = vec!["flask".to_string()];
         let artifacts = vec![project_artifact("pkg-1.0.0.tar.gz", "aaa")];
@@ -17716,7 +17794,8 @@ mod tests {
         let proxy = tdh::build_proxy_service_with_fs(pool.clone(), &storage_path);
         // Presigned ENABLED, but the filesystem proxy backend reports
         // supports_redirect() == false, so the helper must still return None
-        // without touching the DB (the is_cache_fresh probe is never reached).
+        // without touching the DB (the fresh_cache_redirect_size probe is
+        // never reached).
         let state =
             tdh::build_state_with_proxy_presigned(pool.clone(), &storage_path, proxy.clone());
 
