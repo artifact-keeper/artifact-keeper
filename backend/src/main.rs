@@ -197,6 +197,7 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     // needs nothing from the database or the rest of startup.
     let metrics_handle = metrics_service::init_metrics();
     tracing::info!("Prometheus metrics recorder initialized");
+    artifact_keeper_backend::services::proxy_scan_service::publish_db_grace_window_gauges();
 
     // Connect to database
     let db_pool = db::create_pool(&config).await?;
@@ -954,6 +955,9 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     };
     app_state.set_scanner_service(scanner_service);
     app_state.shutdown_token = runtime_shutdown_token.clone();
+    // Health and readiness probes read the database through their own small
+    // pool, so a burst that fills the request pool cannot fail them (#4182).
+    app_state.probe_pool = db::create_probe_pool(&config)?;
 
     // Initialize quality check service for health scoring and quality gates
     let quality_check_service = Arc::new(

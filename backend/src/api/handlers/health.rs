@@ -474,7 +474,7 @@ async fn check_service_health(
     )
 )]
 pub async fn health_check(State(state): State<SharedState>) -> impl IntoResponse {
-    let db_check = match sqlx::query("SELECT 1").fetch_one(&state.db).await {
+    let db_check = match sqlx::query("SELECT 1").fetch_one(state.probe_db()).await {
         Ok(_) => CheckStatus {
             status: STATUS_HEALTHY.to_string(),
             message: None,
@@ -609,7 +609,7 @@ pub async fn health_check(State(state): State<SharedState>) -> impl IntoResponse
     )
 )]
 pub async fn readiness_check(State(state): State<SharedState>) -> impl IntoResponse {
-    let db_check = match sqlx::query("SELECT 1").fetch_one(&state.db).await {
+    let db_check = match sqlx::query("SELECT 1").fetch_one(state.probe_db()).await {
         Ok(_) => CheckStatus {
             status: STATUS_HEALTHY.to_string(),
             message: None,
@@ -623,7 +623,7 @@ pub async fn readiness_check(State(state): State<SharedState>) -> impl IntoRespo
     let migrations_check = match sqlx::query_scalar::<_, bool>(
         "SELECT EXISTS(SELECT 1 FROM _sqlx_migrations WHERE success = true)",
     )
-    .fetch_one(&state.db)
+    .fetch_one(state.probe_db())
     .await
     {
         Ok(true) => CheckStatus {
