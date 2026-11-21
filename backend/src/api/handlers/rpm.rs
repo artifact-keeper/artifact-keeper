@@ -1960,6 +1960,24 @@ pub(crate) async fn record_rpm_metadata_in_tx(
     repo_id: uuid::Uuid,
     metadata: &serde_json::Value,
 ) -> Result<(), sqlx::Error> {
+    write_rpm_metadata_in_tx(tx, artifact_id, metadata).await?;
+    let _ = sqlx::query("UPDATE repositories SET updated_at = NOW() WHERE id = $1")
+        .bind(repo_id)
+        .execute(&mut **tx)
+        .await;
+    Ok(())
+}
+
+/// The `artifact_metadata` half of [`record_rpm_metadata_in_tx`], without the
+/// repository `updated_at` bump: the shared upload service writes an RPM
+/// document in its commit transaction with this (#6383), and the caller bumps
+/// the timestamp after the commit, so concurrent uploads to one repository do
+/// not queue on its row while they commit.
+pub(crate) async fn write_rpm_metadata_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    artifact_id: uuid::Uuid,
+    metadata: &serde_json::Value,
+) -> Result<(), sqlx::Error> {
     sqlx::query("SAVEPOINT rpm_metadata")
         .execute(&mut **tx)
         .await?;
@@ -2000,10 +2018,6 @@ pub(crate) async fn record_rpm_metadata_in_tx(
         }
         Err(e) => return Err(e),
     }
-    let _ = sqlx::query("UPDATE repositories SET updated_at = NOW() WHERE id = $1")
-        .bind(repo_id)
-        .execute(&mut **tx)
-        .await;
     Ok(())
 }
 
@@ -3556,13 +3570,25 @@ async fn store_rpm(
 
     let size_bytes = content.len() as i64;
 
+    // Store RPM-specific metadata: filename-derived NEVRA enriched with the
+    // parsed RPM header (summary, license, sourcerpm, ...) so primary.xml can
+    // describe the package fully (#2588). The filename already parsed above,
+    // so the builder always yields metadata here.
+    //
+    // #6383: the document commits in the same transaction as the artifact
+    // row, on both layouts. Written after the commit with a failure only
+    // logged, a pool timeout there left a stored package out of
+    // `primary.xml`.
+    let rpm_metadata = parsed_metadata
+        .unwrap_or_else(|| build_rpm_metadata(&pkg_name, &pkg_version, &release, &arch, filename));
+
     let artifact_id = if depth > 0 {
         let storage = state
             .storage_for_repo(&repo.storage_location())
             .map_err(IntoResponse::into_response)?;
         state
             .create_artifact_service(storage)
-            .upload_with_sync_options(
+            .upload_with_commit_metadata(
                 repo.id,
                 &artifact_path,
                 &pkg_name,
@@ -3570,9 +3596,14 @@ async fn store_rpm(
                 "application/x-rpm",
                 content.clone(),
                 Some(user_id),
-                // #4889: queue after the RPM metadata write below, not before
-                // it.
+                // #4889: queue below, once the upload has committed.
                 false,
+                // #6346: registered once, below, with the header's summary.
+                crate::services::artifact_service::CatalogRegistration::Caller,
+                Some(crate::services::artifact_service::CommitMetadata {
+                    format: "rpm",
+                    metadata: rpm_metadata.clone(),
+                }),
             )
             .await
             .map_err(IntoResponse::into_response)?
@@ -3580,8 +3611,15 @@ async fn store_rpm(
     } else {
         let storage_key = build_rpm_storage_key(&repo.id, filename);
         proxy_helpers::put_artifact_bytes(state, repo, &storage_key, content.clone()).await?;
-        let id = proxy_helpers::insert_artifact(
+        let mut tx = super::publish_quota::begin_admitted_publish(
             &state.db,
+            repo.id,
+            &artifact_path,
+            size_bytes,
+        )
+        .await?;
+        let id = proxy_helpers::insert_artifact_row(
+            &mut tx,
             proxy_helpers::NewArtifact {
                 repository_id: repo.id,
                 path: &artifact_path,
@@ -3595,6 +3633,14 @@ async fn store_rpm(
             },
         )
         .await?;
+        write_rpm_metadata_in_tx(&mut tx, id, &rpm_metadata)
+            .await
+            .map_err(|e| proxy_helpers::internal_error("Database", e))?;
+        tx.commit()
+            .await
+            .map_err(|e| proxy_helpers::internal_error("Database", e))?;
+        // As `proxy_helpers::insert_artifact` does once its row commits.
+        crate::services::quarantine_service::apply_upload_hold_hosted(&state.db, repo.id, id).await;
         // #4166: the ArtifactService branch above scans via finalize_upload;
         // this direct insert has to trigger scan-on-upload itself.
         crate::services::scanner_service::trigger_scan_on_upload(
@@ -3607,16 +3653,10 @@ async fn store_rpm(
         id
     };
 
-    // Store RPM-specific metadata: filename-derived NEVRA enriched with the
-    // parsed RPM header (summary, license, sourcerpm, ...) so primary.xml can
-    // describe the package fully (#2588). The filename already parsed above,
-    // so the builder always yields metadata here.
-    let rpm_metadata = parsed_metadata
-        .unwrap_or_else(|| build_rpm_metadata(&pkg_name, &pkg_version, &release, &arch, filename));
-
-    if let Err(e) = record_rpm_metadata(&state.db, artifact_id, repo.id, &rpm_metadata).await {
-        warn!(artifact_id = %artifact_id, error = %e, "RPM metadata could not be recorded");
-    }
+    let _ = sqlx::query("UPDATE repositories SET updated_at = NOW() WHERE id = $1")
+        .bind(repo.id)
+        .execute(&state.db)
+        .await;
 
     // `%pre`/`%post`/`%preun`/`%postun` run as root on `dnf install` (#4033).
     // Best-effort: the artifact row is already committed, and a package with

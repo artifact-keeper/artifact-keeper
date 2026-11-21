@@ -1766,14 +1766,38 @@ impl ArtifactService {
         // error is truthful and its retry starts clean (no 409 for a package
         // that was stored, no package stored without metadata).
         if let Some(CommitMetadata { format, metadata }) = commit_metadata {
-            Self::upsert_metadata(
-                &mut *tx,
-                artifact.id,
-                format,
-                metadata,
-                serde_json::json!({}),
-            )
-            .await?;
+            if format == "rpm" {
+                // #6383: an RPM document too large for the column keeps the
+                // "unparseable" marker instead of failing the upload (#3801).
+                crate::api::handlers::rpm::write_rpm_metadata_in_tx(
+                    &mut tx,
+                    artifact.id,
+                    &metadata,
+                )
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
+            } else {
+                Self::upsert_metadata(
+                    &mut *tx,
+                    artifact.id,
+                    format,
+                    metadata,
+                    serde_json::json!({}),
+                )
+                .await?;
+            }
+        }
+
+        // #2367: append an immutable revision to `artifact_versions` for
+        // versioning-enabled Generic/Mlmodel repos. Identical-bytes
+        // re-uploads create no new revision (idempotent republish); the
+        // `version` coordinate doubles as the human `version_label`.
+        //
+        // #6383: in the transaction that commits the row. After the commit, a
+        // failure here (a pool timeout) answered an error for an upload that
+        // had landed, and left its HEAD without the revision that records it.
+        if versioning_active {
+            Self::record_version_in_tx(&mut tx, &artifact, prior_head, version).await?;
         }
 
         // Commit the admission + INSERT together, releasing the ledger-row
@@ -1781,14 +1805,6 @@ impl ArtifactService {
         tx.commit()
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
-
-        // #2367: append an immutable revision to `artifact_versions` for
-        // versioning-enabled Generic/Mlmodel repos. Identical-bytes
-        // re-uploads create no new revision (idempotent republish); the
-        // `version` coordinate doubles as the human `version_label`.
-        if versioning_active {
-            self.record_version(&artifact, prior_head, version).await?;
-        }
 
         // Apply quarantine hold if enabled for this repository. This is the
         // shared upload path (pypi/debian/incus/generic), which only ever
@@ -2084,14 +2100,16 @@ impl ArtifactService {
     ///   predates the feature (zero `artifact_versions` rows) records that
     ///   prior HEAD as revision 1 before appending the new upload.
     ///
-    /// Returns the revision number the upload landed at (`None` when the
-    /// upload was an identical-bytes no-op onto an unversioned HEAD).
-    async fn record_version(
-        &self,
+    /// Runs in the transaction that upserted the HEAD row (#6383), so the
+    /// revision commits with it or not at all. That transaction holds the
+    /// HEAD row's lock, which serializes concurrent uploads to one coordinate
+    /// here, so `MAX(revision) + 1` is not raced by another upload.
+    async fn record_version_in_tx(
+        tx: &mut sqlx::Transaction<'static, sqlx::Postgres>,
         artifact: &Artifact,
         prior_head: Option<PriorHeadRow>,
         version_label: Option<&str>,
-    ) -> Result<Option<i32>> {
+    ) -> Result<()> {
         // Identical-bytes re-upload: keep the existing history untouched.
         if let Some(ref prior) = prior_head {
             if prior
@@ -2099,10 +2117,7 @@ impl ArtifactService {
                 .trim()
                 .eq_ignore_ascii_case(artifact.checksum_sha256.trim())
             {
-                return Ok(self
-                    .latest_version_info(artifact.repository_id, &artifact.path)
-                    .await?
-                    .map(|(rev, _)| rev));
+                return Ok(());
             }
         }
 
@@ -2112,14 +2127,15 @@ impl ArtifactService {
         )
         .bind(artifact.repository_id)
         .bind(&artifact.path)
-        .fetch_one(&self.db)
+        .fetch_one(&mut **tx)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
         // Backfill-on-write: preserve the pre-feature HEAD as revision 1.
         if current_max.is_none() {
             if let Some(prior) = prior_head {
-                self.insert_revision_row(
+                Self::insert_revision_row(
+                    tx,
                     artifact.repository_id,
                     &artifact.path,
                     &prior.name,
@@ -2136,31 +2152,31 @@ impl ArtifactService {
             }
         }
 
-        let revision = self
-            .insert_revision_row(
-                artifact.repository_id,
-                &artifact.path,
-                &artifact.name,
-                version_label,
-                artifact.size_bytes,
-                &artifact.checksum_sha256,
-                artifact.checksum_sha1.as_deref(),
-                artifact.checksum_md5.as_deref(),
-                &artifact.content_type,
-                &artifact.storage_key,
-                artifact.uploaded_by,
-            )
-            .await?;
-        Ok(Some(revision))
+        Self::insert_revision_row(
+            tx,
+            artifact.repository_id,
+            &artifact.path,
+            &artifact.name,
+            version_label,
+            artifact.size_bytes,
+            &artifact.checksum_sha256,
+            artifact.checksum_sha1.as_deref(),
+            artifact.checksum_md5.as_deref(),
+            &artifact.content_type,
+            &artifact.storage_key,
+            artifact.uploaded_by,
+        )
+        .await?;
+        Ok(())
     }
 
-    /// Insert one `artifact_versions` row at `MAX(revision)+1`, retrying once
-    /// on the UNIQUE(repository_id, path, revision) constraint so two
-    /// concurrent uploads to the same coordinate both land (on consecutive
-    /// revisions) instead of one failing spuriously.
+    /// Insert one `artifact_versions` row at `MAX(revision)+1` in `tx`. A
+    /// writer outside the upload path that claimed the number first (the
+    /// coordinate's HEAD row lock serializes uploads) is retried once, behind
+    /// a savepoint so the failed insert does not abort the upload transaction.
     #[allow(clippy::too_many_arguments)]
     async fn insert_revision_row(
-        &self,
+        tx: &mut sqlx::Transaction<'static, sqlx::Postgres>,
         repository_id: Uuid,
         path: &str,
         name: &str,
@@ -2173,6 +2189,7 @@ impl ArtifactService {
         storage_key: &str,
         uploaded_by: Option<Uuid>,
     ) -> Result<i32> {
+        let db_err = |e: sqlx::Error| AppError::Database(e.to_string());
         for attempt in 0..2 {
             let current_max: Option<i32> = sqlx::query_scalar::<_, Option<i32>>(
                 "SELECT MAX(revision) FROM artifact_versions \
@@ -2180,11 +2197,15 @@ impl ArtifactService {
             )
             .bind(repository_id)
             .bind(path)
-            .fetch_one(&self.db)
+            .fetch_one(&mut **tx)
             .await
-            .map_err(|e| AppError::Database(e.to_string()))?;
+            .map_err(db_err)?;
             let revision = next_revision(current_max);
 
+            sqlx::query("SAVEPOINT artifact_revision")
+                .execute(&mut **tx)
+                .await
+                .map_err(db_err)?;
             let inserted = sqlx::query(
                 "INSERT INTO artifact_versions ( \
                      repository_id, path, revision, version_label, name, size_bytes, \
@@ -2204,14 +2225,24 @@ impl ArtifactService {
             .bind(content_type)
             .bind(storage_key)
             .bind(uploaded_by)
-            .execute(&self.db)
+            .execute(&mut **tx)
             .await;
 
             match inserted {
-                Ok(_) => return Ok(revision),
+                Ok(_) => {
+                    sqlx::query("RELEASE SAVEPOINT artifact_revision")
+                        .execute(&mut **tx)
+                        .await
+                        .map_err(db_err)?;
+                    return Ok(revision);
+                }
                 Err(e) if attempt == 0 && e.to_string().contains("duplicate key") => {
-                    // A concurrent upload claimed this revision number;
-                    // recompute MAX and retry once.
+                    // Another writer claimed this revision number; recompute
+                    // MAX and retry once.
+                    sqlx::query("ROLLBACK TO SAVEPOINT artifact_revision")
+                        .execute(&mut **tx)
+                        .await
+                        .map_err(db_err)?;
                     continue;
                 }
                 Err(e) => return Err(AppError::Database(e.to_string())),
@@ -4024,6 +4055,196 @@ mod tests {
             .await
             .expect("read metadata");
         assert!(meta.is_some(), "the retried upload has its metadata");
+    }
+
+    /// #6346: a handler that registers the catalog row itself passes
+    /// `CatalogRegistration::Caller`, and the upload service then writes no
+    /// catalog row of its own (it used to write one the handler wrote again).
+    /// `Derive` keeps registering it.
+    #[tokio::test]
+    async fn test_6346_caller_registration_writes_no_catalog_row() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, _, storage_dir) = tdh::create_repo(&pool, "local", "pypi").await;
+        let storage: Arc<dyn StorageBackend> = Arc::new(
+            crate::storage::filesystem::FilesystemStorage::new(storage_dir),
+        );
+        let service = ArtifactService::new(pool.clone(), storage);
+        let catalog_rows = |name: &'static str| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM packages WHERE repository_id = $1 AND name = $2",
+                )
+                .bind(repo_id)
+                .bind(name)
+                .fetch_one(&pool)
+                .await
+                .expect("count catalog rows")
+            }
+        };
+        for (name, catalog, want) in [
+            ("caller6346", CatalogRegistration::Caller, 0),
+            ("derive6346", CatalogRegistration::Derive, 1),
+        ] {
+            let path = format!("{name}/1.0/{name}-{}.tar.gz", Uuid::new_v4().simple());
+            service
+                .upload_with_commit_metadata(
+                    repo_id,
+                    &path,
+                    name,
+                    Some("1.0"),
+                    "application/gzip",
+                    Bytes::from(format!("body {path}")),
+                    None,
+                    false,
+                    catalog,
+                    None,
+                )
+                .await
+                .expect("upload");
+            assert_eq!(catalog_rows(name).await, want, "{catalog:?}");
+        }
+    }
+
+    /// #6383: an RPM document handed to the upload commits with the row, and
+    /// one too large for the column is stored with the "unparseable" repodata
+    /// marker instead of failing the upload, as every RPM metadata write is.
+    #[tokio::test]
+    async fn test_6383_rpm_commit_metadata_keeps_the_size_fallback() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, _, storage_dir) = tdh::create_repo(&pool, "local", "rpm").await;
+        let storage: Arc<dyn StorageBackend> = Arc::new(
+            crate::storage::filesystem::FilesystemStorage::new(storage_dir),
+        );
+        let service = ArtifactService::new(pool.clone(), storage);
+        let marker = format!("rpm6383-{}", Uuid::new_v4().simple());
+        let fault = tdh::install_write_fault(&pool, "artifact_metadata", "metadata", &marker).await;
+        let path = format!("{marker}-1.0-1.noarch.rpm");
+        let upload = |metadata: serde_json::Value| {
+            let service = &service;
+            let path = path.clone();
+            async move {
+                service
+                    .upload_with_commit_metadata(
+                        repo_id,
+                        &path,
+                        "rpm6383",
+                        Some("1.0-1"),
+                        "application/x-rpm",
+                        Bytes::from(format!("body {path}")),
+                        None,
+                        false,
+                        CatalogRegistration::Caller,
+                        Some(CommitMetadata {
+                            format: "rpm",
+                            metadata,
+                        }),
+                    )
+                    .await
+            }
+        };
+        let failed = upload(serde_json::json!({"name": marker})).await;
+        assert!(failed.is_err(), "the injected fault must fail the upload");
+        let rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM artifacts WHERE repository_id = $1 AND path = $2",
+        )
+        .bind(repo_id)
+        .bind(&path)
+        .fetch_one(&pool)
+        .await
+        .expect("count rows");
+        assert_eq!(
+            rows, 0,
+            "a failed RPM metadata write must not leave the row"
+        );
+        fault.remove().await;
+
+        let artifact = upload(serde_json::json!({"name": "rpm6383"}))
+            .await
+            .expect("the retry is a fresh upload");
+        let meta = service
+            .get_metadata(artifact.id)
+            .await
+            .expect("read metadata")
+            .expect("the RPM document commits with the row");
+        assert_eq!(meta.format, "rpm");
+        assert_eq!(meta.metadata["name"], "rpm6383");
+    }
+
+    /// #6383: on a versioning-enabled repository the revision is appended in
+    /// the transaction that replaces the HEAD. A failed revision write used to
+    /// answer an error after the HEAD had already been replaced; now nothing
+    /// commits and the HEAD still serves the previous bytes.
+    #[tokio::test]
+    async fn test_6383_failed_revision_write_rolls_back_the_versioned_upload() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, _, storage_dir) = tdh::create_repo(&pool, "local", "generic").await;
+        sqlx::query("UPDATE repositories SET versioning_enabled = true WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .expect("enable versioning");
+        let storage: Arc<dyn StorageBackend> = Arc::new(
+            crate::storage::filesystem::FilesystemStorage::new(storage_dir),
+        );
+        let service = ArtifactService::new(pool.clone(), storage);
+        let marker = format!("vers6383-{}", Uuid::new_v4().simple());
+        let path = format!("{marker}/1.0/blob.bin");
+        let upload = |body: &'static str| {
+            let service = &service;
+            let path = path.clone();
+            async move {
+                service
+                    .upload_with_sync_options(
+                        repo_id,
+                        &path,
+                        "blob.bin",
+                        Some("1.0"),
+                        "application/octet-stream",
+                        Bytes::from_static(body.as_bytes()),
+                        None,
+                        false,
+                    )
+                    .await
+            }
+        };
+        let first = upload("revision one").await.expect("first upload");
+        let fault = tdh::install_write_fault(&pool, "artifact_versions", "path", &marker).await;
+        let failed = upload("revision two").await;
+        fault.remove().await;
+        assert!(failed.is_err(), "the injected fault must fail the upload");
+        let head: String = sqlx::query_scalar(
+            "SELECT checksum_sha256 FROM artifacts WHERE repository_id = $1 AND path = $2",
+        )
+        .bind(repo_id)
+        .bind(&path)
+        .fetch_one(&pool)
+        .await
+        .expect("read HEAD");
+        assert_eq!(
+            head, first.checksum_sha256,
+            "a failed revision write must leave the previous HEAD in place"
+        );
+
+        upload("revision two").await.expect("the retry lands");
+        let revisions: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM artifact_versions WHERE repository_id = $1 AND path = $2",
+        )
+        .bind(repo_id)
+        .bind(&path)
+        .fetch_one(&pool)
+        .await
+        .expect("count revisions");
+        assert_eq!(revisions, 2, "one revision per committed upload");
     }
 
     /// #3517: `exists` no longer reports an Azure throttle, 5xx or auth

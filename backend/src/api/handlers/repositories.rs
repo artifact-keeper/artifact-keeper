@@ -12626,15 +12626,51 @@ async fn persist_generic_staged_upload(
     // UNIQUE(repository_id, path) constraint is still satisfied without the
     // manual purge.
 
-    let catalog_name = if let Some(native) = &native {
-        super::upload::format_finalize::catalog_name(&state.db, repo.id, &native.staged).await
-    } else {
-        None
-    };
     let size_bytes = staged.size_bytes();
+    let checksum_sha256 = digests.sha256.clone();
+    // #6383: the format metadata a natively finalized package (or an `.rpm`
+    // whose header this path parsed) is served from commits in the same
+    // transaction as its artifact row, as on the native routes (#6317) and the
+    // chunked completion (#5002). Written after the commit with a failure only
+    // logged, a pool timeout there left a stored package out of its format's
+    // index.
+    let commit_document = if let Some(native) = &native {
+        let context = super::upload::format_finalize::FinalizeContext {
+            repository_id: repo.id,
+            repository_key: &key,
+            artifact_path: &path,
+            size_bytes,
+            checksum_sha256: &checksum_sha256,
+        };
+        match super::upload::format_finalize::metadata_document(
+            &native.staged,
+            &native.target,
+            &context,
+            rpm_metadata.as_ref(),
+        ) {
+            Ok(document) => document.map(|document| (document.format, document.metadata)),
+            Err(e) => {
+                tracing::warn!(path = %path, error = %e, "format metadata could not be derived");
+                None
+            }
+        }
+    } else {
+        rpm_metadata.clone().map(|metadata| ("rpm", metadata))
+    };
+    let rpm_document = commit_document
+        .as_ref()
+        .is_some_and(|(format, _)| *format == "rpm");
+    // #6346: a natively finalized package's catalog row is registered once,
+    // by `format_finalize::record` below, with what its parser read; the
+    // upload service writes none of its own.
+    let catalog = if native.is_some() {
+        crate::services::artifact_service::CatalogRegistration::Caller
+    } else {
+        crate::services::artifact_service::CatalogRegistration::Derive
+    };
     let content = staged.upload_content().await?;
     let artifact = artifact_service
-        .upload_content_with_sync_options(
+        .upload_content_with_commit_metadata(
             repo.id,
             &path,
             &name,
@@ -12645,8 +12681,11 @@ async fn persist_generic_staged_upload(
             size_bytes,
             Some(auth.user_id),
             !is_replication_request(headers),
-            catalog_name.as_deref(),
+            catalog,
             precondition.as_ref(),
+            commit_document.map(|(format, metadata)| {
+                crate::services::artifact_service::CommitMetadata { format, metadata }
+            }),
         )
         .await;
     // The staging copy is no longer needed once the service has consumed it,
@@ -12662,21 +12701,16 @@ async fn persist_generic_staged_upload(
         checksum_sha256: &artifact.checksum_sha256,
     };
     if let Some(native) = native {
-        record_generic_native_finalize(
-            state,
-            &artifact_service,
-            &context,
-            artifact.id,
-            native,
-            rpm_metadata.as_ref(),
-        )
-        .await;
-    } else if let Some(metadata) = &rpm_metadata {
-        if let Err(e) =
-            super::rpm::record_rpm_metadata(&state.db, artifact.id, repo.id, metadata).await
-        {
-            tracing::warn!(artifact_id = %artifact.id, error = %e, "RPM metadata could not be recorded");
-        }
+        record_generic_native_finalize(state, &context, artifact.id, native, rpm_metadata.as_ref())
+            .await;
+    }
+    if rpm_document {
+        // The repository timestamp every RPM metadata write bumps; after the
+        // commit, so concurrent uploads do not queue on the repository row.
+        let _ = sqlx::query("UPDATE repositories SET updated_at = NOW() WHERE id = $1")
+            .bind(repo.id)
+            .execute(&state.db)
+            .await;
     }
 
     // #6317: the upload has committed. The reads below only fill the response
@@ -12819,56 +12853,27 @@ async fn stage_generic_native_finalize(
 }
 
 /// Record a natively finalized generic upload's format rows against its
-/// committed artifact (#5254): the `artifact_metadata` document, then the
-/// catalog entry, install-script analysis and index cache invalidation the
-/// native route performs. The artifact is already committed, so a failure is
-/// logged rather than failing the upload, as the RPM metadata write on this
-/// path always was.
+/// committed artifact (#5254): the catalog entry, install-script analysis and
+/// index cache invalidation the native route performs. The `artifact_metadata`
+/// document committed with the row (#6383). The artifact is already
+/// committed, so a failure here is logged rather than failing the upload.
 async fn record_generic_native_finalize(
     state: &SharedState,
-    artifact_service: &ArtifactService,
     context: &super::upload::format_finalize::FinalizeContext<'_>,
     artifact_id: Uuid,
     native: GenericNativeFinalize,
     rpm_metadata: Option<&serde_json::Value>,
 ) {
-    use super::upload::format_finalize;
     let GenericNativeFinalize { target, staged } = native;
-    match format_finalize::metadata_document(&staged, &target, context, rpm_metadata) {
-        Ok(Some(document)) => {
-            let written = if document.format == "rpm" {
-                super::rpm::record_rpm_metadata(
-                    &state.db,
-                    artifact_id,
-                    context.repository_id,
-                    &document.metadata,
-                )
-                .await
-                .map(|_| ())
-                .map_err(|e| e.to_string())
-            } else {
-                artifact_service
-                    .set_metadata(
-                        artifact_id,
-                        document.format,
-                        document.metadata,
-                        document.properties,
-                    )
-                    .await
-                    .map(|_| ())
-                    .map_err(|e| e.to_string())
-            };
-            if let Err(e) = written {
-                tracing::warn!(artifact_id = %artifact_id, error = %e, "format metadata could not be recorded");
-            }
-        }
-        Ok(None) => {}
-        Err(e) => {
-            tracing::warn!(artifact_id = %artifact_id, error = %e, "format metadata could not be derived");
-        }
-    }
-    if let Err(e) =
-        format_finalize::record(state, context, artifact_id, &target, staged, rpm_metadata).await
+    if let Err(e) = super::upload::format_finalize::record(
+        state,
+        context,
+        artifact_id,
+        &target,
+        staged,
+        rpm_metadata,
+    )
+    .await
     {
         tracing::warn!(artifact_id = %artifact_id, error = %e, "format records could not be written");
     }

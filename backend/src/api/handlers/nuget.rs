@@ -5378,8 +5378,12 @@ async fn push_package(
         .map_err(|e| e.into_response())?;
     let artifact_service = state.create_artifact_service(storage);
     let content = staged.upload_content().await?;
+    // #6383: the `nuget` document the feed is served from commits in the same
+    // transaction as the artifact row. Written after the commit with its
+    // result discarded, a failure there (a pool timeout) left a stored package
+    // without its metadata and out of the feed.
     let artifact = artifact_service
-        .upload_content_with_sync_options(
+        .upload_content_with_commit_metadata(
             repo.id,
             &artifact_path,
             &package_id,
@@ -5389,31 +5393,21 @@ async fn push_package(
             digests,
             size_bytes,
             Some(user_id),
-            // #4889: queue after the metadata write below, not before it.
+            // #4889: queue after the commit below.
             false,
-            Some(&catalog_name),
+            // #6346: registered once, below, under `catalog_name` and with the
+            // `.nuspec` description.
+            crate::services::artifact_service::CatalogRegistration::Caller,
             None,
+            Some(crate::services::artifact_service::CommitMetadata {
+                format: "nuget",
+                metadata: build_nuget_push_metadata(&nuspec),
+            }),
         )
         .await
         .map_err(|e| e.into_response())?;
     // The staging copy is no longer needed once the service has consumed it.
     staged.discard().await;
-
-    // Build metadata JSON.
-    let metadata = build_nuget_push_metadata(&nuspec);
-
-    // Store metadata.
-    let _ = sqlx::query!(
-        r#"
-        INSERT INTO artifact_metadata (artifact_id, format, metadata)
-        VALUES ($1, 'nuget', $2)
-        ON CONFLICT (artifact_id) DO UPDATE SET metadata = $2
-        "#,
-        artifact.id,
-        metadata,
-    )
-    .execute(&state.db)
-    .await;
 
     // #4889: the metadata document is now written, so a worker that claims the
     // task immediately can send it. The helper also applies the #4725 guard
@@ -6967,6 +6961,85 @@ mod push_db_tests {
     // reach `push_package`. We confirm via end-to-end success (HTTP 201 or
     // similar 2xx) for each URL shape.
     // -----------------------------------------------------------------------
+
+    /// #6383: the `nuget` document the feed is served from commits with the
+    /// artifact row. The push used to write it after the commit and discard
+    /// the result, so a failure there stored a package the feed never listed
+    /// and its retry was refused with 409. Now the failure stores nothing and
+    /// the retry is a clean push. The catalog row is written once (#6346).
+    #[tokio::test]
+    async fn push_metadata_commits_with_the_row_and_catalog_is_written_once_6383() {
+        let Some(f) = tdh::Fixture::setup("local", "nuget").await else {
+            return;
+        };
+        let id = format!("Fault6383x{}", uuid::Uuid::new_v4().simple());
+        let fault = tdh::install_write_fault(&f.pool, "artifact_metadata", "metadata", &id).await;
+        let app = f.router_with_auth(super::router());
+        let req = put_nupkg(
+            format!("/{}/api/v2/package", f.repo_key),
+            build_nupkg(&id, "1.0.0", "fault 6383"),
+        )
+        .await;
+        let (status, body) = tdh::send(app, req).await;
+        fault.remove().await;
+        let rows = |pool: sqlx::PgPool, repo_id: uuid::Uuid, name: String| async move {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM artifacts \
+                 WHERE repository_id = $1 AND LOWER(name) = LOWER($2) AND NOT is_deleted",
+            )
+            .bind(repo_id)
+            .bind(name)
+            .fetch_one(&pool)
+            .await
+            .expect("count rows")
+        };
+        assert!(
+            !status.is_success(),
+            "a push whose metadata write fails must not answer {status}: {:?}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(
+            rows(f.pool.clone(), f.repo_id, id.clone()).await,
+            0,
+            "a push whose metadata write fails must store nothing"
+        );
+
+        let app = f.router_with_auth(super::router());
+        let req = put_nupkg(
+            format!("/{}/api/v2/package", f.repo_key),
+            build_nupkg(&id, "1.0.0", "fault 6383"),
+        )
+        .await;
+        let (status, body) = tdh::send(app, req).await;
+        assert!(
+            status.is_success(),
+            "the retry is a clean push, got {status}: {:?}",
+            String::from_utf8_lossy(&body)
+        );
+        let (metadata_rows, catalog_description): (i64, Option<String>) = sqlx::query_as(
+            "SELECT (SELECT COUNT(*) FROM artifact_metadata m JOIN artifacts a ON a.id = m.artifact_id \
+                      WHERE a.repository_id = $1 AND LOWER(a.name) = LOWER($2) AND m.format = 'nuget'), \
+                    (SELECT description FROM packages WHERE repository_id = $1 AND name = $2)",
+        )
+        .bind(f.repo_id)
+        .bind(&id)
+        .fetch_one(&f.pool)
+        .await
+        .expect("read metadata and catalog");
+        assert_eq!(metadata_rows, 1, "the pushed package has its metadata");
+        assert_eq!(catalog_description.as_deref(), Some("fault 6383"));
+        let catalog_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM packages WHERE repository_id = $1 AND LOWER(name) = LOWER($2)",
+        )
+        .bind(f.repo_id)
+        .bind(&id)
+        .fetch_one(&f.pool)
+        .await
+        .expect("count catalog rows");
+        assert_eq!(catalog_rows, 1, "one catalog row, in the .nuspec casing");
+
+        f.teardown().await;
+    }
 
     #[tokio::test]
     async fn push_package_route_accepts_no_trailing_slash() {

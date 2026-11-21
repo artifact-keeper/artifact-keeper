@@ -1012,9 +1012,9 @@ async fn stage_pypi(
 /// Record a natively finalized upload's non-metadata format records against
 /// its committed artifact row: catalog entries, script analysis and cache
 /// invalidation. The `artifact_metadata` document itself
-/// ([`metadata_document`]) is written by the caller: inside the artifact-row
-/// transaction on a chunked completion (#5002), right after the commit on the
-/// single generic PUT, as the native routes write theirs (#5254).
+/// ([`metadata_document`]) is written by the caller inside the artifact-row
+/// transaction: on a chunked completion (#5002) and on the single generic PUT
+/// (#6383), as the native routes write theirs (#6317).
 /// `rpm_metadata` is the header metadata the caller's RPM parse produced (RPM
 /// only).
 pub(crate) async fn record(
