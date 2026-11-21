@@ -1164,6 +1164,40 @@ pub fn spawn_all(
         });
     }
 
+    // Build record retention (artifact-keeper-web#618): hourly, applies the
+    // `build_retention_days` and `build_retention_keep_last` system settings
+    // (read on every pass, both off by default). Same shape as the audit
+    // retention pass above
+    {
+        use crate::services::build_retention as retention;
+        let db = db.clone();
+        tokio::spawn(async move {
+            match retention::configured_policy(&db).await {
+                Ok(policy) => tracing::info!("{}", retention::startup_message(policy)),
+                Err(e) => tracing::warn!("Build retention: could not read the settings: {}", e),
+            }
+            tokio::time::sleep(jittered_startup_delay(240)).await;
+            let mut ticker = interval(Duration::from_secs(
+                retention::BUILD_RETENTION_INTERVAL_SECS,
+            ));
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                match retention::configured_policy(&db).await {
+                    Ok(policy) if policy.is_off() => {
+                        tracing::debug!("Build retention is off, skipping")
+                    }
+                    Ok(policy) => {
+                        if let Err(e) = retention::run_pass(&db, policy).await {
+                            tracing::warn!("Build retention pass failed: {}", e);
+                        }
+                    }
+                    Err(e) => tracing::warn!("Build retention: could not read the settings: {}", e),
+                }
+            }
+        });
+    }
+
     // Download statistics retention (#4541): opt-in via
     // DOWNLOAD_STATS_RETENTION_DAYS. Trims download_statistics and
     // proxy_download_statistics on one replica at a time; the lease is renewed
@@ -1469,7 +1503,7 @@ pub fn spawn_all(
     }
 
     tracing::info!(
-        "Background schedulers started: metrics, health monitor, lifecycle, stuck-scan janitor, backup schedules, sync policies, webhook retries, curation sync, upload cleanup, download ticket cleanup, age-gate auto-approval, environment advisory re-evaluation, audit retention"
+        "Background schedulers started: metrics, health monitor, lifecycle, stuck-scan janitor, backup schedules, sync policies, webhook retries, curation sync, upload cleanup, download ticket cleanup, age-gate auto-approval, environment advisory re-evaluation, audit retention, build retention"
     );
 }
 
