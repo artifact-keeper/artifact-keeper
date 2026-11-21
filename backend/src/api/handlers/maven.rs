@@ -1738,12 +1738,53 @@ fn maven_virtual_age_gate_answer(
     }
 }
 
+/// The gate's retryable refusal for a GA-level document it cannot filter
+/// (#6382). Serving the upstream bytes here would let a lenient client see
+/// versions whose downloads the gate withholds; the fixed `reason` values keep
+/// the warning's label cardinality bounded.
+fn unfilterable_gated_metadata_response(
+    repo_key: &str,
+    package: &str,
+    reason: &'static str,
+) -> Response {
+    tracing::warn!(
+        repository = %repo_key,
+        package = %package,
+        reason = reason,
+        "age-gated Maven metadata could not be filtered; refusing the listing"
+    );
+    proxy_helpers::age_gate_unavailable_response(repo_key, package)
+}
+
+/// Rewrite a gated listing, or refuse it when the rewrite cannot be produced.
+/// `None` means the document parsed for dating but the rewriter could not
+/// reproduce it (or a decision named a version it does not list): the gate
+/// cannot vouch for the unfiltered bytes, so they are never served (#6382).
+fn rewrite_gated_listing(
+    xml: &str,
+    blocked: &std::collections::HashSet<String>,
+    repo_key: &str,
+    package: &str,
+) -> Result<Bytes, Response> {
+    match crate::services::age_gate_maven::filter_metadata_versions(xml, blocked) {
+        Some(filtered) => Ok(Bytes::from(filtered)),
+        None => Err(unfilterable_gated_metadata_response(
+            repo_key,
+            package,
+            "rewrite_failed",
+        )),
+    }
+}
+
 /// Withhold versions younger than a gated Remote's minimum age from a GA-level
 /// `maven-metadata.xml` (#4702), so `LATEST`, `RELEASE` and version ranges
 /// never resolve to a version whose download would be refused. Returns the
 /// bytes unchanged when nothing is withheld (the checksum then still matches
 /// the upstream's). The `.sha1` (and the other digests) of the metadata are
-/// computed from what this returns. A pass that leaves versions undated (see
+/// computed from what this returns. A gated document that cannot be decoded,
+/// parsed or rewritten is refused with the gate's retryable 503 (#6382): a
+/// lenient client seeing those unfiltered bytes could select a version whose
+/// download the gate withholds. A pass that leaves versions undated (see
 /// below) is memoized for [`crate::services::age_gate_maven::LISTING_MEMO_TTL`]
 /// and reused by the next calls for the same upstream document, so the body
 /// and its checksum sidecars come from the same filtered bytes (#6284)
@@ -1780,23 +1821,31 @@ async fn maven_filter_listing(
     let Some(params) = maven_gate_policy(state, inputs).await? else {
         return Ok(FilteredListing::whole(content));
     };
+    // The identity is the request path's, never the document's own ids.
+    let package = format!("{group_id}:{artifact_id}");
     let Some(svc) = state.age_gate_service.as_deref() else {
         return Err(proxy_helpers::age_gate_unavailable_response(
             upstream.repo_key,
-            &format!("{group_id}:{artifact_id}"),
+            &package,
         ));
     };
     let Ok(xml) = std::str::from_utf8(&content) else {
-        return Ok(FilteredListing::whole(content));
+        return Err(unfilterable_gated_metadata_response(
+            upstream.repo_key,
+            &package,
+            "non_utf8",
+        ));
     };
     let Some(doc) = gate::metadata_versions(xml) else {
-        return Ok(FilteredListing::whole(content));
+        return Err(unfilterable_gated_metadata_response(
+            upstream.repo_key,
+            &package,
+            "unparseable",
+        ));
     };
     if doc.gated_newest_first.is_empty() {
         return Ok(FilteredListing::whole(content));
     }
-    // The identity is the request path's, never the document's own ids.
-    let package = format!("{group_id}:{artifact_id}");
 
     // The memo key of this pass, set only where a pass can leave versions
     // undated (POM dating), and whether it did, i.e. whether the next pass
@@ -1931,10 +1980,7 @@ async fn maven_filter_listing(
             &params.key,
             crate::services::age_gate_service::format_label(&params.format),
         );
-        match gate::filter_metadata_versions(xml, &blocked) {
-            Some(filtered) => Bytes::from(filtered),
-            None => content.clone(),
-        }
+        rewrite_gated_listing(xml, &blocked, upstream.repo_key, &package)?
     };
     // First writer wins (passes over one document are serialized above, so
     // this is a backstop): every client in the window gets the same bytes and
@@ -18667,6 +18713,91 @@ mod age_gate_4702_tests {
         );
     }
 
+    /// #6382: a gated document the strict parser rejects is refused with the
+    /// gate's retryable 503, on the listing and on its checksum sidecar, so a
+    /// lenient resolver cannot read it as an unfiltered version list.
+    #[tokio::test]
+    async fn unparseable_gated_metadata_is_refused_6382() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let body = b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<metadata><versioning>\
+                     <versions><version>2.0.0</version></versions></versioning></metadata>\n"
+            .to_vec();
+        let mock = upstream_with_metadata(body).await;
+        let (id, key, dir) = gated_remote(&pool, &mock, "upstream_publish_time").await;
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), dir.to_str().unwrap());
+        let state =
+            tdh::build_state_with_proxy_and_age_gate(pool.clone(), dir.to_str().unwrap(), proxy);
+        let path = format!("{G}/widget/maven-metadata.xml");
+        let meta = get(&state, &key, &path).await;
+        let sha1 = get(&state, &key, &format!("{path}.sha1")).await;
+        drop_repo(&pool, id).await;
+
+        for (what, (status, body)) in [("metadata", &meta), ("sha1", &sha1)] {
+            assert_eq!(
+                *status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{what}: {}",
+                String::from_utf8_lossy(body)
+            );
+            let json: serde_json::Value = serde_json::from_slice(body).expect("503 body is JSON");
+            assert_eq!(json["error"], "age_gate_unavailable", "{what}");
+            assert_eq!(json["package"], "com.example.agegate:widget", "{what}");
+        }
+    }
+
+    /// #6382: non-UTF-8 bytes cannot be checked for withheld versions, so a
+    /// gated listing refuses them instead of serving them verbatim.
+    #[tokio::test]
+    async fn non_utf8_gated_metadata_is_refused_6382() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let body = b"\xff\xfe<metadata><groupId>com.example.agegate</groupId>\
+                     <artifactId>widget</artifactId><versioning><versions>\
+                     <version>2.0.0</version></versions></versioning></metadata>"
+            .to_vec();
+        let mock = upstream_with_metadata(body).await;
+        let (id, key, dir) = gated_remote(&pool, &mock, "upstream_publish_time").await;
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), dir.to_str().unwrap());
+        let state =
+            tdh::build_state_with_proxy_and_age_gate(pool.clone(), dir.to_str().unwrap(), proxy);
+        let (status, body) = get(&state, &key, &format!("{G}/widget/maven-metadata.xml")).await;
+        drop_repo(&pool, id).await;
+
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("503 body is JSON");
+        assert_eq!(json["error"], "age_gate_unavailable");
+    }
+
+    /// #6382: if the rewriter cannot reproduce a document that was parsed for
+    /// dating, refuse it rather than falling back to the upstream bytes. A
+    /// blocked version the document does not list forces `None` from the
+    /// rewriter, which is the divergence the guard is for.
+    #[test]
+    fn failed_listing_rewrite_refuses_upstream_bytes_6382() {
+        let xml = "<?xml version=\"1.0\"?><metadata><groupId>com.example.agegate</groupId>\
+                   <artifactId>widget</artifactId><versioning><versions>\
+                   <version>1.0.0</version></versions></versioning></metadata>";
+        let blocked = std::collections::HashSet::from(["2.0.0".to_string()]);
+        let err = rewrite_gated_listing(xml, &blocked, "remote", "com.example.agegate:widget")
+            .expect_err("a failed rewrite must refuse the listing");
+        assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(rewrite_gated_listing(
+            xml,
+            &std::collections::HashSet::from(["1.0.0".to_string()]),
+            "remote",
+            "com.example.agegate:widget",
+        )
+        .is_ok());
+    }
+
     /// When the GA's `lastUpdated` is older than the gate, every listed
     /// version is old enough: the listing is served unchanged with no POM
     /// fetched.
@@ -18694,6 +18825,18 @@ mod age_gate_4702_tests {
             !probed,
             "no POM fetch when lastUpdated already dates every version"
         );
+    }
+
+    /// An upstream serving `body` as this GA's `maven-metadata.xml`, for the
+    /// fail-closed cases of #6382.
+    async fn upstream_with_metadata(body: Vec<u8>) -> MockServer {
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/{G}/widget/maven-metadata.xml")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+            .mount(&mock)
+            .await;
+        mock
     }
 
     /// `first_seen`: a version seen for the first time just now is young,
@@ -19146,6 +19289,33 @@ mod age_gate_4702_tests {
         drop_repo(&pool, id).await;
         assert_eq!(jar.0, StatusCode::OK);
         assert!(String::from_utf8_lossy(&meta.1).contains(&format!("<version>{YOUNG}</version>")));
+    }
+
+    /// #6382 control: without the gate an unparseable upstream document is
+    /// still served verbatim; only a gated listing needs to fail closed.
+    #[tokio::test]
+    async fn ungated_remote_serves_unparseable_metadata_6382() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let body = b"<metadata><versioning><versions><version>2.0.0</version></versions></versioning></metadata>\n".to_vec();
+        let mock = upstream_with_metadata(body.clone()).await;
+        let (id, key, dir) = tdh::create_repo(&pool, "remote", "maven").await;
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(mock.uri())
+            .bind(id)
+            .execute(&pool)
+            .await
+            .expect("upstream");
+        tdh::publish_repo(&pool, id).await;
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), dir.to_str().unwrap());
+        let state =
+            tdh::build_state_with_proxy_and_age_gate(pool.clone(), dir.to_str().unwrap(), proxy);
+        let (status, served) = get(&state, &key, &format!("{G}/widget/maven-metadata.xml")).await;
+        drop_repo(&pool, id).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(served, Bytes::from(body));
     }
 }
 
