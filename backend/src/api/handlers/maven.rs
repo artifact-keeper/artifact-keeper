@@ -3221,6 +3221,24 @@ fn virtual_metadata_not_found(member_unavailable: bool) -> Response {
     }
 }
 
+/// The answer for a Maven Virtual metadata merge that is ready to serve
+/// (#5777). An unavailable member leaves the merge incomplete: a merged
+/// `<versions>` list without it makes Maven pick the wrong `latest`/`release`
+/// and resolve a range without its versions. The default keeps #5809's
+/// marked, uncacheable partial merge; a virtual that explicitly sets
+/// `virtual_member_fallback = strict` gets the retryable 503 instead, as it
+/// does for artifact downloads (#5810).
+fn serve_maven_virtual_merge(
+    xml: Bytes,
+    marks: MetadataMarks,
+    fallback: proxy_helpers::VirtualMemberFallback,
+) -> Result<(Bytes, MetadataMarks), Response> {
+    if fallback.is_strict() && marks.is_partial() {
+        return Err(proxy_helpers::member_unavailable_response());
+    }
+    Ok((xml, marks))
+}
+
 /// Fetch a single Remote virtual member's Maven metadata document at `path`
 /// from upstream (via the proxy cache), as a UTF-8 string. A non-Remote
 /// member or a miss is [`MemberMetadata::Miss`]; a member whose upstream
@@ -3429,6 +3447,10 @@ async fn fetch_maven_metadata_bytes(
     // Virtual repos: merge metadata from all members.
     if repo.repo_type == RepositoryType::Virtual {
         let members = proxy_helpers::authorized_virtual_members(&state.db, auth, repo.id).await?;
+        // #5777: an unavailable member leaves the merge partial. An
+        // explicitly strict `virtual_member_fallback` (#5810) turns it into
+        // the retryable 503; the default keeps #5809's partial merge.
+        let fallback = proxy_helpers::virtual_member_fallback(&state.db, repo.id).await;
 
         // Whether the GA-level merge may be shared through the process-wide
         // cache (#3323). The merge is built from the members THIS caller may
@@ -3571,7 +3593,7 @@ async fn fetch_maven_metadata_bytes(
             };
 
             if let Some(xml) = ga_merge {
-                return Ok((xml, marks));
+                return serve_maven_virtual_merge(xml, marks, fallback);
             }
 
             // Group-level plugin-prefix metadata (#1595). A path like
@@ -3609,7 +3631,7 @@ async fn fetch_maven_metadata_bytes(
             }
 
             if let Some(xml) = crate::formats::maven::merge_plugin_prefix_metadata(&member_docs) {
-                return Ok((Bytes::from(xml), marks));
+                return serve_maven_virtual_merge(Bytes::from(xml), marks, fallback);
             }
         }
 
@@ -3668,7 +3690,7 @@ async fn fetch_maven_metadata_bytes(
                 if let Some(xml) =
                     generate_snapshot_metadata_xml(&group_id, &artifact_id, &version, &all_entries)
                 {
-                    return Ok((Bytes::from(xml), marks));
+                    return serve_maven_virtual_merge(Bytes::from(xml), marks, fallback);
                 }
             }
         }
@@ -14402,7 +14424,9 @@ mod tests {
     /// `404 Metadata not found` Maven and Gradle cache as "no versions"; and
     /// the empty merge must not be cached, so the next request after the
     /// members recover is served. Members that all answer a permanent 404
-    /// keep the definitive 404; one healthy member is merged as before.
+    /// keep the definitive 404; one healthy member is merged as before. A
+    /// virtual that explicitly sets `virtual_member_fallback = strict` gets
+    /// the retryable 503 for that partial merge too (#5777).
     #[tokio::test]
     async fn test_virtual_metadata_member_outage_answers_503_not_404_5621() {
         use crate::api::handlers::test_db_helpers as tdh;
@@ -14517,6 +14541,121 @@ mod tests {
             cached_after_outage,
             vec![None],
             "an empty merge with an unavailable member must not be cached (#5621)"
+        );
+    }
+
+    /// #5777: a Virtual that explicitly sets
+    /// `virtual_member_fallback = strict` answers the retryable 503 when a
+    /// metadata merge has an unavailable member, even if another member
+    /// answered. With the default `available` the #5809 partial merge is
+    /// kept: marked partial and uncacheable, with the healthy version listed.
+    #[tokio::test]
+    async fn test_virtual_metadata_strict_fallback_answers_503_5777() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::path_regex;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let upstream_meta = generate_metadata_xml(
+            "com.strict5777",
+            "lib",
+            &["2.0.0".to_string()],
+            "2.0.0",
+            Some("2.0.0"),
+            "20240101000000",
+        );
+        let upstream = MockServer::start().await;
+        Mock::given(path_regex("^/down/"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&upstream)
+            .await;
+        Mock::given(path_regex("^/ok/.*maven-metadata\\.xml$"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(upstream_meta))
+            .mount(&upstream)
+            .await;
+        let scratch = std::env::temp_dir().join(format!("mvn5777s-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&scratch).expect("create scratch dir");
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), scratch.to_str().unwrap());
+        let state = tdh::build_state_with_proxy(pool.clone(), scratch.to_str().unwrap(), proxy);
+        let members = [
+            format!("{}/down", upstream.uri()),
+            format!("{}/ok", upstream.uri()),
+        ];
+        let (virtual_id, virtual_key, repos) = metadata_outage_virtual_5621(&pool, &members).await;
+        let down_key: String = sqlx::query_scalar("SELECT key FROM repositories WHERE id = $1")
+            .bind(repos[1].0)
+            .fetch_one(&pool)
+            .await
+            .expect("down member key");
+        let path = format!("/{virtual_key}/com/strict5777/lib/maven-metadata.xml");
+
+        let (partial_status, partial_body, partial_headers) = tdh::send_with_headers(
+            tdh::router_anon(router(), state.clone()),
+            tdh::get(path.clone()),
+        )
+        .await;
+        set_member_fallback_5810(&pool, virtual_id, "strict").await;
+        let mut strict_answers = Vec::new();
+        for suffix in ["", ".sha1"] {
+            strict_answers.push((
+                suffix,
+                tdh::send_with_headers(
+                    tdh::router_anon(router(), state.clone()),
+                    tdh::get(format!("{path}{suffix}")),
+                )
+                .await,
+            ));
+        }
+        let key = (virtual_id, "com.strict5777".to_string(), "lib".to_string());
+        let cached = VIRTUAL_MAVEN_METADATA_CACHE.get(&key).await;
+        for (id, dir) in &repos {
+            tdh::cleanup_member_repo(&pool, *id, dir).await;
+        }
+        let _ = std::fs::remove_dir_all(&scratch);
+
+        let partial_body = String::from_utf8_lossy(&partial_body);
+        assert_eq!(
+            partial_status,
+            StatusCode::OK,
+            "the default keeps #5809's partial merge: {partial_body}"
+        );
+        assert!(
+            partial_body.contains("<version>2.0.0</version>"),
+            "the healthy member's versions are served: {partial_body}"
+        );
+        assert_eq!(
+            partial_headers
+                .get(crate::api::handlers::proxy_helpers::PARTIAL_MEMBERS_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some(down_key.as_str()),
+            "the default partial merge names the member it lacks"
+        );
+        assert_eq!(
+            partial_headers
+                .get(axum::http::header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("no-store")
+        );
+        for (suffix, (status, body, headers)) in &strict_answers {
+            assert_eq!(
+                *status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{suffix}: {}",
+                String::from_utf8_lossy(body)
+            );
+            assert_eq!(
+                headers
+                    .get(axum::http::header::RETRY_AFTER)
+                    .and_then(|v| v.to_str().ok()),
+                Some(crate::error::RETRY_AFTER_SECS_ON_503),
+                "{suffix}: the strict 503 must carry Retry-After"
+            );
+        }
+        assert_eq!(
+            cached, None,
+            "a merge built without an unavailable member must not be cached (#5621, #5777)"
         );
     }
 

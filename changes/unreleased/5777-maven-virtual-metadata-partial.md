@@ -1,0 +1,5 @@
+---
+section: Added
+issues: [#5777]
+---
+- **Maven virtual metadata can refuse to serve a merge that is missing an unavailable member** (#5777). Set `virtual_member_fallback` to `strict` on a virtual repository and the GA, plugin-prefix and SNAPSHOT `maven-metadata.xml` merges, plus their checksums, answer the retryable `503` with `Retry-After` when a member was unavailable, instead of a partial merge. An unset or `available` virtual keeps #5809's partial merge, marked with `X-AK-Partial-Members`, `Cache-Control: no-store` and `Warning: 199` and never cached. Strict is worth enabling for virtuals that serve SNAPSHOTs or version ranges: Maven, Gradle and coursier keep resolved metadata locally whatever the response headers say, so a partial `<versions>` list can make them pick the wrong `latest`/`release` or resolve a range without the missing member's versions. It is the same setting that governs artifact downloads (#5810). `.meta/prefixes.txt` is unaffected: a member that cannot confirm its prefixes still bails the union, so a permanent `404` stays a `404` and Resolver does not filter on a partial allowlist. See `docs/virtual-metadata-merges.md`.

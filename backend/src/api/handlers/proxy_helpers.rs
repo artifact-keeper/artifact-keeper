@@ -5498,7 +5498,9 @@ pub const VIRTUAL_MEMBER_FALLBACK_CONFIG_KEY: &str = "virtual_member_fallback";
 
 /// Whether an artifact download through a virtual repository may be served
 /// by a lower-priority member while a higher-priority Remote member is
-/// unavailable (#5810). Metadata merges have their own policy
+/// unavailable (#5810). Maven `maven-metadata.xml` merges honour this setting
+/// too: [`Self::Strict`] answers the retryable 503 for a merge missing an
+/// unavailable member (#5777). Other metadata merges have their own policy
 /// ([`VIRTUAL_METADATA_PARTIAL_CONFIG_KEY`]) and ignore this one.
 #[derive(
     Debug,
@@ -5520,7 +5522,9 @@ pub enum VirtualMemberFallback {
     Available,
     /// An unavailable member is terminal: the download answers `503` with
     /// `Retry-After` instead of serving a lower member's copy. A `404` or
-    /// another permanent `4xx` is still a miss and the walk goes on.
+    /// another permanent `4xx` is still a miss and the walk goes on. A Maven
+    /// `maven-metadata.xml` merge missing an unavailable member answers the
+    /// same `503` instead of a partial merge (#5777).
     Strict,
 }
 
