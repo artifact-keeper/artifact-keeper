@@ -955,6 +955,9 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     };
     app_state.set_scanner_service(scanner_service);
     app_state.shutdown_token = runtime_shutdown_token.clone();
+    // Health and readiness probes read the database through their own small
+    // pool, so a burst that fills the request pool cannot fail them (#4182).
+    app_state.probe_pool = db::create_probe_pool(&config)?;
 
     // Initialize quality check service for health scoring and quality gates
     let quality_check_service = Arc::new(

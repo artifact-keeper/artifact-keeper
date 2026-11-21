@@ -187,6 +187,12 @@ pub const BUILTIN_ADMIN_USERNAME: &str = "admin";
 pub struct AppState {
     pub config: Config,
     pub db: PgPool,
+    /// The separate pool `/health` and `/readyz` read the database through
+    /// (#4182), so a request pool saturated by a burst does not fail the
+    /// probes of a replica that is busy, not broken. `None` (tests, or
+    /// `DATABASE_PROBE_CONNECTIONS=0`): the probes use [`Self::db`]. Read it
+    /// through [`Self::probe_db`].
+    pub probe_pool: Option<PgPool>,
     pub storage: Arc<dyn StorageBackend>,
     pub storage_registry: Arc<StorageRegistry>,
     pub plugin_registry: Option<Arc<PluginRegistry>>,
@@ -328,6 +334,7 @@ impl AppState {
         Self {
             config,
             db,
+            probe_pool: None,
             storage,
             storage_registry,
             plugin_registry: None,
@@ -383,6 +390,7 @@ impl AppState {
         Self {
             config,
             db,
+            probe_pool: None,
             storage,
             storage_registry,
             plugin_registry: Some(plugin_registry),
@@ -412,6 +420,12 @@ impl AppState {
             transfer_meter,
             shutdown_token: tokio_util::sync::CancellationToken::new(),
         }
+    }
+
+    /// The pool health and readiness probes query: the dedicated probe pool
+    /// when there is one, else the request pool.
+    pub fn probe_db(&self) -> &PgPool {
+        self.probe_pool.as_ref().unwrap_or(&self.db)
     }
 
     /// Return whether initial setup (the forced admin password change) is
