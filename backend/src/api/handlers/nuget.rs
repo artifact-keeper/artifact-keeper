@@ -5216,7 +5216,7 @@ fn base64_standard(bytes: &[u8]) -> String {
 ///
 /// Best-effort like the catalog writes it feeds: a failed lookup falls back to
 /// the `.nuspec` casing rather than failing the push.
-async fn existing_catalog_name(
+pub(crate) async fn existing_catalog_name(
     db: &PgPool,
     repository_id: uuid::Uuid,
     lowercased_id: &str,
@@ -5471,19 +5471,20 @@ async fn push_package(
 // ---------------------------------------------------------------------------
 
 /// Metadata extracted from a .nuspec file.
-struct NuspecInfo {
-    id: String,
-    version: String,
-    description: String,
-    authors: String,
+pub(crate) struct NuspecInfo {
+    pub(crate) id: String,
+    pub(crate) version: String,
+    pub(crate) description: String,
+    pub(crate) authors: String,
 }
 
 /// Parse the .nuspec XML from inside a .nupkg (ZIP) archive.
 ///
-/// Reads directly from any `Read + Seek` source — the streaming push path passes
-/// the SEEKABLE staged scratch `File` so the archive is never re-buffered in
-/// memory. Uses simple string matching rather than a full XML parser.
-fn parse_nuspec_from_reader<R: std::io::Read + std::io::Seek>(
+/// Reads directly from any `Read + Seek` source — the push and generic-upload
+/// paths pass the SEEKABLE staged scratch `File` so the archive is never
+/// re-buffered in memory. Uses simple string matching rather than a full XML
+/// parser.
+pub(crate) fn parse_nuspec_from_reader<R: std::io::Read + std::io::Seek>(
     reader: R,
 ) -> Result<NuspecInfo, String> {
     // Bound the decompression: entry-count cap + per-metadata-entry cap so a
@@ -5562,7 +5563,7 @@ fn build_nuget_artifact_path(package_id: &str, version: &str) -> String {
 }
 
 /// Build the NuGet push metadata JSON.
-fn build_nuget_push_metadata(info: &NuspecInfo) -> serde_json::Value {
+pub(crate) fn build_nuget_push_metadata(info: &NuspecInfo) -> serde_json::Value {
     serde_json::json!({
         "id": info.id,
         "version": info.version,

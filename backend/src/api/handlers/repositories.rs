@@ -12626,6 +12626,11 @@ async fn persist_generic_staged_upload(
     // UNIQUE(repository_id, path) constraint is still satisfied without the
     // manual purge.
 
+    let catalog_name = if let Some(native) = &native {
+        super::upload::format_finalize::catalog_name(&state.db, repo.id, &native.staged).await
+    } else {
+        None
+    };
     let size_bytes = staged.size_bytes();
     let content = staged.upload_content().await?;
     let artifact = artifact_service
@@ -12640,7 +12645,7 @@ async fn persist_generic_staged_upload(
             size_bytes,
             Some(auth.user_id),
             !is_replication_request(headers),
-            None,
+            catalog_name.as_deref(),
             precondition.as_ref(),
         )
         .await;
@@ -12803,6 +12808,9 @@ async fn stage_generic_native_finalize(
     let staged_native = format_finalize::stage(&repo.format, path, &target, source)
         .await
         .map_err(|reason| AppError::Validation(reason).into_response())?;
+    format_finalize::ensure_unique_nuget(&state.db, repo.id, path, Some(&staged_native))
+        .await
+        .map_err(|e| e.into_response())?;
     drop(local);
     Ok(Some(GenericNativeFinalize {
         target: format_finalize::resolved_target(target, &staged_native),
