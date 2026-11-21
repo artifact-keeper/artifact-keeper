@@ -212,4 +212,6 @@ jobs:
           SQLX_OFFLINE: true
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
           CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER: x86_64-w64-mingw32-gcc
-        run: cargo auditable build --release --target ${{ matrix.target }} --features ${{ matrix.features }}
+        # GIT_SHA as release.yml passes it (#6181), so this build runs the same
+        # build script with the same inputs.
+        run: GIT_SHA="$(git rev-parse HEAD)" cargo auditable build --release --target ${{ matrix.target }} --features ${{ matrix.features }}

@@ -976,7 +976,11 @@ jobs:
         # that `cargo audit bin` read a complete graph out of. cargo-auditable's
         # own CI covers native macOS and an ELF cross with a GCC cross-toolchain
         # (i686), which is the shape of the aarch64-unknown-linux-gnu leg.
-        run: cargo auditable build --release --target ${{ matrix.target }} --features ${{ matrix.features }}
+        #
+        # GIT_SHA is the commit /health and the startup log report. build.rs
+        # no longer reads git itself (#6181), so a shipped build passes it,
+        # from the commit actually checked out, as git rev-parse gave before.
+        run: GIT_SHA="$(git rev-parse HEAD)" cargo auditable build --release --target ${{ matrix.target }} --features ${{ matrix.features }}
 
       - name: Package binary (Unix)
         if: "!contains(matrix.target, 'windows')"

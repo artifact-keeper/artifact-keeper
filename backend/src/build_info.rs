@@ -1,16 +1,17 @@
 //! Build/version metadata baked in at compile time.
 //!
-//! `GIT_SHA` is provided by `build.rs`, which runs `git rev-parse HEAD` (with a
-//! `GIT_SHA` build-env override for out-of-tree builds) and falls back to the
-//! literal `"unknown"` when no git checkout is available — e.g. release
-//! tarballs or CI that builds from an exported source tree. Consumers must
-//! therefore treat `"unknown"` as a valid, non-fatal value.
+//! `GIT_SHA` is provided by `build.rs` from the `GIT_SHA` build environment
+//! variable, which every shipped build sets (the Docker Publish build arg,
+//! release.yml's binaries), and is the literal `"unknown"` otherwise: a local
+//! or CI test build, which no longer reads git so a commit does not recompile
+//! the crate (#6181). Consumers must therefore treat `"unknown"` as a valid,
+//! non-fatal value.
 
 /// Semantic version of the running build, from `CARGO_PKG_VERSION`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Full git commit SHA of the build, or `"unknown"` when built outside a git
-/// checkout. Baked by `build.rs`.
+/// Full git commit SHA of the build, or `"unknown"` when the build did not
+/// set `GIT_SHA`. Baked by `build.rs`.
 pub const GIT_SHA: &str = env!("GIT_SHA");
 
 /// Length of the short SHA form, matching the `sha-<commit>` tag emitted by the
