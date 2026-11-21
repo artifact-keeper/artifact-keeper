@@ -2009,6 +2009,31 @@ pub struct CachedArtifactEntry {
 }
 
 /// Cache metadata for a proxied artifact
+/// A fresh proxy-cache entry as the presigned-redirect freshness probe read
+/// it ([`ProxyService::fresh_cache_redirect`]). The fast path takes every
+/// check it makes before signing from this copy of the sidecar (#6361).
+#[derive(Debug, Clone)]
+pub struct FreshCacheEntry {
+    metadata: CacheMetadata,
+}
+
+impl FreshCacheEntry {
+    /// The size the sidecar records, which the transfer meter counts when the
+    /// URL is issued (#6035).
+    pub fn size_bytes(&self) -> i64 {
+        self.metadata.size_bytes
+    }
+
+    /// Refuse a redirect to an entry inside its Package Age Policy hold
+    /// (#2075), as the fetch paths do ([`check_quarantine_until`]): `Err`
+    /// (Conflict/Authorization) while the hold this copy records is active.
+    /// The hold is never re-read, so an entry evicted or re-filled after the
+    /// probe cannot pass as "no hold known" (#6361).
+    pub fn quarantine_gate(&self) -> Result<()> {
+        check_quarantine_until(self.metadata.quarantine_until)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CacheMetadata {
     /// When the cached body was last fetched from upstream or confirmed
@@ -3437,26 +3462,26 @@ impl CacheStore {
         keys: &CacheKeys,
         mutability: Option<cache_classifier::Mutability>,
     ) -> bool {
-        self.fresh_size(keys, mutability).await.is_some()
+        self.fresh_metadata(keys, mutability).await.is_some()
     }
 
-    /// [`Self::is_fresh`], returning the size the sidecar records for a fresh
-    /// entry (`None` when not fresh). A presigned-redirect fast path tags its
-    /// 302 with this size for the transfer meter (#6035), so the sidecar is
-    /// read once per redirect rather than once for freshness and again for
-    /// the size.
-    async fn fresh_size(
+    /// [`Self::is_fresh`], returning the sidecar it read for a fresh entry
+    /// (`None` when not fresh). A presigned-redirect fast path takes the size
+    /// for the transfer meter (#6035), the Package Age Policy hold and the
+    /// digest its scan gate looks up from this one copy (#6361), so the
+    /// sidecar is read once per redirect, and a sidecar evicted after this
+    /// read cannot make a later check see "no hold".
+    async fn fresh_metadata(
         &self,
         keys: &CacheKeys,
         mutability: Option<cache_classifier::Mutability>,
-    ) -> Option<i64> {
+    ) -> Option<CacheMetadata> {
         let cache_key = &keys.content;
 
         let Ok(Some(metadata)) = self.load_metadata(&keys.metadata).await else {
             return None;
         };
-        let size_bytes = metadata.size_bytes;
-        let fresh = |ok: bool| ok.then_some(size_bytes);
+        let fresh = |ok: bool| ok.then(|| metadata.clone());
         if Utc::now() > metadata.expires_under(mutability) {
             return None;
         }
@@ -6989,19 +7014,34 @@ impl ProxyService {
         self.cache_store.is_fresh(&keys, mutability).await
     }
 
-    /// [`Self::is_cache_fresh`] for a presigned-redirect fast path: the size
-    /// the cache sidecar records when the entry is fresh, `None` otherwise.
-    /// The fast path tags its 302 with that size so the transfer meter counts
-    /// the object when the URL is issued (#6035), without a second sidecar
-    /// read after the freshness probe.
-    pub async fn fresh_cache_redirect_size(&self, repo_key: &str, path: &str) -> Option<i64> {
+    /// [`Self::is_cache_fresh`] for a presigned-redirect fast path: the cache
+    /// sidecar the probe read when the entry is fresh, `None` otherwise.
+    ///
+    /// Every decision the fast path makes before signing is taken from this
+    /// one copy: the size the transfer meter counts when the URL is issued
+    /// (#6035), the Package Age Policy hold
+    /// ([`FreshCacheEntry::quarantine_gate`]) and the digest whose stored
+    /// scan verdict [`Self::cache_scan_gate`] reads (#6361). A second read of
+    /// the sidecar could come back empty, because another replica or a
+    /// lifecycle rule evicted the entry or because this process memoised a
+    /// miss before another replica filled it, and the hold check then
+    /// passed a held entry. A missing or unreadable sidecar is `None` here,
+    /// so it is never redirected to.
+    pub async fn fresh_cache_redirect(
+        &self,
+        repo_key: &str,
+        path: &str,
+    ) -> Option<FreshCacheEntry> {
         let keys = CacheKeys::derive(&self.cache_scope, repo_key, path).ok()?;
         let mutability = self.effective_mutability_by_key(repo_key, path).await;
-        self.cache_store.fresh_size(&keys, mutability).await
+        self.cache_store
+            .fresh_metadata(&keys, mutability)
+            .await
+            .map(|metadata| FreshCacheEntry { metadata })
     }
 
     /// Gate a presigned-redirect fast path on the Remote's origin policy
-    /// (#4506), the sibling of [`Self::cache_quarantine_gate`]. A redirect
+    /// (#4506), the sibling of [`FreshCacheEntry::quarantine_gate`]. A redirect
     /// hands out the cached object without the body passing through the
     /// gated fetch paths, so every fast path asks this after its freshness
     /// probe and before signing. A refusal is the fetch paths' 403.
@@ -7010,24 +7050,14 @@ impl ProxyService {
             .await
     }
 
-    /// Gate a presigned-redirect fast path on a Package Age Policy hold (#2075).
-    ///
-    /// The redirect fast path (`proxy_fetch_or_redirect` and the virtual-member
-    /// proxy redirect) short-circuits a fresh cache hit into a 302 pointing at a
-    /// presigned URL without ever pulling the body through the backend. That skips
-    /// the quarantine gate the buffered/streaming fetch paths enforce via
-    /// [`check_quarantine_until`], so on redirect-capable backends a fresh entry
-    /// still inside its hold window would be handed out. This probe closes that
-    /// gap: it loads the same cache sidecar and applies the identical hold
-    /// decision BEFORE any redirect is issued.
-    ///
-    /// Mirrors the B6-safe stance elsewhere in this service (see the follower
-    /// re-check in `fetch_artifact_with_cache_path_and_accept`): a missing
-    /// sidecar, an absent hold, an elapsed hold, or a sidecar READ error all
-    /// resolve to `Ok(())` ("no hold known"). Only a sidecar recording a
-    /// still-active `quarantine_until` returns `Err` (Conflict/Authorization),
-    /// which the handler maps to 409/403 — no redirect, no upstream refetch.
-    pub async fn cache_quarantine_gate(&self, repo_key: &str, path: &str) -> Result<()> {
+    /// The Package Age Policy hold (#2075) the sidecar at `path` records, read
+    /// on its own. The redirect fast paths do not use this: they take the
+    /// hold from the freshness probe's copy
+    /// ([`FreshCacheEntry::quarantine_gate`], #6361), because a missing
+    /// sidecar reads as "no hold known" here. Kept for tests that check a
+    /// hold was written or released.
+    #[cfg(test)]
+    pub(crate) async fn cache_quarantine_gate(&self, repo_key: &str, path: &str) -> Result<()> {
         let metadata_key = Self::cache_metadata_key(&self.cache_scope, repo_key, path)?;
         if let Some(metadata) = self
             .load_cache_metadata(&metadata_key)
@@ -7040,7 +7070,7 @@ impl ProxyService {
     }
 
     /// Gate a presigned-redirect fast path on the stored scan verdict of the
-    /// cached body (#4514), the sibling of [`Self::cache_quarantine_gate`].
+    /// cached body (#4514), the sibling of [`FreshCacheEntry::quarantine_gate`].
     ///
     /// For a redirect helper that serves only files the format's route gates
     /// (a PyPI distribution): it treats `cache_path` as such a file. A
@@ -7054,8 +7084,11 @@ impl ProxyService {
     /// under the Remote's own policy (see
     /// [`decide_cache_scan_gate`](crate::services::proxy_scan_service::decide_cache_scan_gate)).
     /// A Remote that does not scan and a format that does not enforce
-    /// scan-on-proxy are [`CacheScanGate::Serve`]; under `fail_closed` a path
-    /// whose sidecar cannot be read is [`CacheScanGate::NotForFastPath`].
+    /// scan-on-proxy are [`CacheScanGate::Serve`]; under `fail_closed` an
+    /// entry whose sidecar records no digest is [`CacheScanGate::NotForFastPath`].
+    /// `entry` is the freshness probe's copy of the sidecar
+    /// ([`Self::fresh_cache_redirect`]), so the verdict looked up is the one
+    /// for the body the probe vouched for (#6361).
     ///
     /// `scanner` supplies the live CVE-scanner version, read only when it
     /// decides something (a `clean` verdict under `fail_closed`). With
@@ -7066,6 +7099,7 @@ impl ProxyService {
         &self,
         repo_key: &str,
         cache_path: &str,
+        entry: &FreshCacheEntry,
         scanner: Option<&crate::services::scanner_service::ScannerService>,
         record_block: bool,
     ) -> Result<CacheScanGate> {
@@ -7075,19 +7109,17 @@ impl ProxyService {
         let Some(policy) = self.fast_path_scan_policy(RemoteRef::Key(repo_key)).await? else {
             return Ok(CacheScanGate::Serve);
         };
-        let metadata_key = Self::cache_metadata_key(&self.cache_scope, repo_key, cache_path)?;
-        let metadata = self
-            .load_cache_metadata(&metadata_key)
-            .await
-            .unwrap_or(None);
-        let Some(metadata) = metadata.filter(|m| !m.checksum_sha256.is_empty()) else {
+        // #6361: the digest of the body the freshness probe vouched for, not
+        // a second read of a sidecar that may be gone by now.
+        let digest = entry.metadata.checksum_sha256.as_str();
+        if digest.is_empty() {
             return Ok(if policy.action.is_fail_closed() {
                 CacheScanGate::NotForFastPath
             } else {
                 CacheScanGate::Serve
             });
-        };
-        let digest = metadata.checksum_sha256;
+        }
+        let digest = digest.to_string();
         let stored = self.stored_verdict_for(&digest).await?;
         let current_version = match (&stored, scanner) {
             (Some(s), Some(scanner))
@@ -15224,7 +15256,7 @@ mod tests {
     }
 
     /// Build a fresh sidecar carrying the supplied Package Age Policy hold
-    /// (`quarantine_until`). Used to drive `cache_quarantine_gate` (#2075)
+    /// (`quarantine_until`). Used to drive the redirect hold check (#2075)
     /// through the held / elapsed / no-hold states.
     fn metadata_bytes_with_quarantine(quarantine_until: Option<DateTime<Utc>>) -> Bytes {
         let metadata = CacheMetadata {
@@ -15244,107 +15276,61 @@ mod tests {
         Bytes::from(serde_json::to_vec(&metadata).unwrap())
     }
 
-    #[tokio::test]
-    async fn test_cache_quarantine_gate_blocks_when_hold_active() {
-        let until = Utc::now() + chrono::Duration::minutes(30);
-        let mock = Arc::new(CacheFreshMock::new(
-            Some(metadata_bytes_with_quarantine(Some(until))),
-            true,
-        ));
+    /// The redirect fast path's hold check (#2075), taken from the freshness
+    /// probe's own copy of the sidecar (#6361). Each test uses its own
+    /// coordinate so no other test's sidecar is read.
+    async fn fresh_redirect_hold(metadata: Option<Bytes>) -> Option<Result<()>> {
+        let mock = Arc::new(CacheFreshMock::new(metadata, true));
         let service = build_proxy_service_with_storage(mock.clone());
-
-        // Unique coordinate per test: `cache_quarantine_gate` reads through the
-        // process-global `PROXY_METADATA_LRU`, keyed by the derived metadata key
-        // (`proxy-cache/<repo_key>/<path>/__cache_meta__.json`). A shared literal
-        // coordinate lets one quarantine-gate test's cached sidecar poison a peer
-        // running concurrently in the same process (in-process `cargo test`
-        // parallelism); a per-test key isolates the LRU entry (#2758). Mirrors the
-        // `format!("maven-central-{}", Uuid::new_v4())` pattern used elsewhere.
         let repo_key = format!("npm-proxy-{}", Uuid::new_v4());
-        let err = service
-            .cache_quarantine_gate(&repo_key, "lodash")
+        service
+            .fresh_cache_redirect(&repo_key, "lodash")
             .await
-            .expect_err("an active hold must block the redirect fast path");
-        match err {
-            AppError::Conflict(_) => {}
-            other => panic!("expected Conflict for an active hold, got {other:?}"),
-        }
+            .map(|entry| entry.quarantine_gate())
     }
 
     #[tokio::test]
-    async fn test_cache_quarantine_gate_allows_when_hold_elapsed() {
+    async fn test_fresh_redirect_blocks_when_hold_active() {
+        let until = Utc::now() + chrono::Duration::minutes(30);
+        let gate = fresh_redirect_hold(Some(metadata_bytes_with_quarantine(Some(until))))
+            .await
+            .expect("a fresh entry");
+        assert!(
+            matches!(gate, Err(AppError::Conflict(_))),
+            "an active hold must block the redirect fast path, got {gate:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fresh_redirect_allows_when_hold_elapsed() {
         let until = Utc::now() - chrono::Duration::minutes(30);
-        let mock = Arc::new(CacheFreshMock::new(
-            Some(metadata_bytes_with_quarantine(Some(until))),
-            true,
-        ));
-        let service = build_proxy_service_with_storage(mock.clone());
-
-        // Per-test coordinate isolates the process-global metadata LRU (#2758).
-        let repo_key = format!("npm-proxy-{}", Uuid::new_v4());
+        let gate = fresh_redirect_hold(Some(metadata_bytes_with_quarantine(Some(until)))).await;
         assert!(
-            service
-                .cache_quarantine_gate(&repo_key, "lodash")
-                .await
-                .is_ok(),
-            "an elapsed hold must not block the redirect"
+            matches!(gate, Some(Ok(()))),
+            "an elapsed hold must not block the redirect, got {gate:?}"
         );
     }
 
     #[tokio::test]
-    async fn test_cache_quarantine_gate_allows_when_no_hold() {
-        let mock = Arc::new(CacheFreshMock::new(
-            Some(metadata_bytes_with_quarantine(None)),
-            true,
-        ));
-        let service = build_proxy_service_with_storage(mock.clone());
-
-        // Per-test coordinate isolates the process-global metadata LRU (#2758).
-        let repo_key = format!("npm-proxy-{}", Uuid::new_v4());
+    async fn test_fresh_redirect_allows_when_no_hold() {
+        let gate = fresh_redirect_hold(Some(metadata_bytes_with_quarantine(None))).await;
         assert!(
-            service
-                .cache_quarantine_gate(&repo_key, "lodash")
-                .await
-                .is_ok(),
-            "a sidecar with no hold must not block the redirect"
+            matches!(gate, Some(Ok(()))),
+            "a sidecar with no hold must not block the redirect, got {gate:?}"
         );
     }
 
+    /// #6361: a missing or unreadable sidecar is not "no hold known" on the
+    /// redirect fast path. The probe reports the entry as not fresh, so no URL
+    /// is signed and the gated fetch path answers.
     #[tokio::test]
-    async fn test_cache_quarantine_gate_allows_when_sidecar_missing() {
-        let mock = Arc::new(CacheFreshMock::new(/* metadata = */ None, true));
-        let service = build_proxy_service_with_storage(mock.clone());
-
-        // Per-test coordinate isolates the process-global metadata LRU (#2758).
-        let repo_key = format!("npm-proxy-{}", Uuid::new_v4());
+    async fn test_fresh_redirect_declines_missing_or_unreadable_sidecar_6361() {
+        assert!(fresh_redirect_hold(None).await.is_none(), "missing sidecar");
         assert!(
-            service
-                .cache_quarantine_gate(&repo_key, "lodash")
+            fresh_redirect_hold(Some(Bytes::from_static(b"{ not valid json")))
                 .await
-                .is_ok(),
-            "a missing sidecar means no hold known -> allow"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_cache_quarantine_gate_allows_on_sidecar_read_error() {
-        // Malformed JSON makes load_metadata return Err (not NotFound); the
-        // B6-safe stance degrades that to "no hold known" -> Ok, so a transient
-        // sidecar read/parse failure never blocks a legitimate redirect.
-        let mock = Arc::new(CacheFreshMock::new(
-            Some(Bytes::from_static(b"{ not valid json")),
-            true,
-        ));
-        let service = build_proxy_service_with_storage(mock.clone());
-
-        // Per-test coordinate isolates the process-global metadata LRU (#2758).
-        let repo_key = format!("npm-proxy-{}", Uuid::new_v4());
-        assert!(
-            service
-                .cache_quarantine_gate(&repo_key, "lodash")
-                .await
-                .is_ok(),
-            "a sidecar read/parse error must be treated as no hold known"
+                .is_none(),
+            "unreadable sidecar"
         );
     }
 
