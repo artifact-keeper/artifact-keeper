@@ -386,7 +386,9 @@ jobs:
           push: false
           load: true
           tags: artifact-keeper-backend:test
-          cache-from: type=registry,ref=ghcr.io/${{ github.repository }}-backend:buildcache-amd64
+          cache-from: |
+            type=registry,ref=ghcr.io/${{ github.repository }}-backend:buildcache-amd64
+            type=registry,ref=ghcr.io/${{ github.repository }}-backend:buildcache-scanner-amd64
           build-args: |
             CARGO_BUILD_JOBS=4
             CARGO_PROFILE=ci

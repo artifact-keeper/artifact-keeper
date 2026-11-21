@@ -10,7 +10,8 @@
 #
 # Invariants for docker-compose.yml:
 #   - artifact-keeper-backend and artifact-keeper-openscap images are tagged
-#     ${ARTIFACT_KEEPER_VERSION:-latest} (released together, same tag)
+#     ${ARTIFACT_KEEPER_VERSION:-latest} (released together, same tag), the
+#     backend with the -scanner suffix since it scans in process (#5971)
 #   - the artifact-keeper-web image is tagged
 #     ${ARTIFACT_KEEPER_WEB_VERSION:-latest} (web releases are decoupled, #2708)
 #   - no other ghcr.io/artifact-keeper image is left on a literal tag
@@ -32,7 +33,7 @@ import yaml
 
 compose_path, env_path = sys.argv[1:3]
 EXPECTED_TAG = {
-    "artifact-keeper-backend": "${ARTIFACT_KEEPER_VERSION:-latest}",
+    "artifact-keeper-backend": "${ARTIFACT_KEEPER_VERSION:-latest}-scanner",
     "artifact-keeper-openscap": "${ARTIFACT_KEEPER_VERSION:-latest}",
     "artifact-keeper-web": "${ARTIFACT_KEEPER_WEB_VERSION:-latest}",
 }

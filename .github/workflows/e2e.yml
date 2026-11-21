@@ -130,7 +130,9 @@ jobs:
           # Read-only registry cache warmed by docker-publish.yml on main;
           # this workflow only has contents:read, so it cannot (and should
           # not) push cache back to GHCR.
-          cache-from: type=registry,ref=ghcr.io/${{ github.repository }}-backend:buildcache-amd64
+          cache-from: |
+            type=registry,ref=ghcr.io/${{ github.repository }}-backend:buildcache-amd64
+            type=registry,ref=ghcr.io/${{ github.repository }}-backend:buildcache-scanner-amd64
           # Cargo inside the build otherwise sees all of the host's CPUs,
           # not the pod's share (see docker/Dockerfile.backend).
           build-args: |

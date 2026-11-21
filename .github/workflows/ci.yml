@@ -3679,13 +3679,15 @@ jobs:
           #     type=gha for (~7.7 GB of the 10 GB Actions quota, evicting the
           #     Rust caches daily), and that quota is already full.
           # The registry cache still covers the non-Rust stages (base images,
-          # rootfs-builder, the grype build, grype-db-seed). The Rust cook
+          # rootfs-builder, and from `buildcache-scanner-amd64` the grype
+          # build and grype-db-seed). The Rust cook
           # misses `buildcache-amd64`, which is warmed with `release` (see
           # below); `buildcache-ci-amd64`, warmed on `main` by the Warm CI
           # Image Cache job below, holds the `ci` cook (#6133).
           cache-from: |
             type=registry,ref=ghcr.io/${{ github.repository }}-backend:buildcache-ci-amd64
             type=registry,ref=ghcr.io/${{ github.repository }}-backend:buildcache-amd64
+            type=registry,ref=ghcr.io/${{ github.repository }}-backend:buildcache-scanner-amd64
           # CARGO_BUILD_JOBS=4: the hosted runner's core count, which is what
           # cargo would use anyway; passed explicitly because the Dockerfile
           # defaults to 8 for the self-hosted pools (see
