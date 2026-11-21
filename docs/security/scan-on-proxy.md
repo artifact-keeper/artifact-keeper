@@ -656,6 +656,17 @@ repository falls back to the 30-day window alone. A `fail_closed` repository
 reuses a `clean` verdict only when both versions are known and equal;
 otherwise it scans again, and an inconclusive result is `423`.
 
+Grype's version string carries the vulnerability-database build date, so
+every database update makes every stored verdict stale at once, and the next
+pull of every cached package waits for a scan or is served pending at the same
+time. `PROXY_SCAN_VERDICT_MAX_AGE_HOURS` trades that for a fixed window: set,
+a verdict is reused for that many hours whatever the database build it was
+graded with, and each verdict expires on its own schedule. A scanner binary
+upgrade still makes it stale, and the window replaces the 30 days. `0` scans
+again on every pull. Unset, or a value that is not a whole number of hours,
+keeps the rules above. A `vulnerable` verdict keeps blocking for the same
+window, also when a newer database would grade the bytes clean.
+
 A verdict also records the coordinate it was graded as (`pin_identity`,
 migration 301). For most formats the bytes name that coordinate themselves (an
 npm tarball's `package.json`, a crate's `Cargo.toml`), so one verdict per
