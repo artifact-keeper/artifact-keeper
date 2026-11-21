@@ -47,10 +47,13 @@ expect() { # expect <want rc: ok|bad> <name> <dir> [args...]
 
 PINNED='[toolchain]
 channel = "1.98.0"'
-GOOD_WF='jobs:
+SHA=df2a88e9fe4098bad09cb42c3dec7187f15861fc
+GOOD_WF="jobs:
   b:
     steps:
-      - uses: dtolnay/rust-toolchain@1.98.0'
+      - uses: dtolnay/rust-toolchain@${SHA} # master
+        with:
+          toolchain: 1.98.0"
 
 echo "check-toolchain-pin.sh:"
 
@@ -89,14 +92,56 @@ expect bad "a workflow pinned to a DIFFERENT version is rejected" \
       - uses: dtolnay/rust-toolchain@1.97.0")"
 
 expect bad "a 'toolchain:' input that overrides the pin is rejected" \
-  "$(scaffold wf-input "$PINNED" "$GOOD_WF
+  "$(scaffold wf-input "$PINNED" "jobs:
+  b:
+    steps:
+      - uses: dtolnay/rust-toolchain@${SHA}
         with:
           toolchain: nightly")"
 
-expect ok "a 'toolchain:' input equal to the pin is accepted" \
-  "$(scaffold wf-input-ok "$PINNED" "$GOOD_WF
+# --- #6178: pinned by sha, the compiler is the input ---------------------------
+expect bad "the branch ref @1.98.0 (it can move under the same name) is rejected" \
+  "$(scaffold wf-branch "$PINNED" "jobs:
+  b:
+    steps:
+      - uses: dtolnay/rust-toolchain@1.98.0")"
+
+expect bad "a sha-pinned step with no 'toolchain:' input is rejected" \
+  "$(scaffold wf-sha-noinput "$PINNED" "jobs:
+  b:
+    steps:
+      - uses: dtolnay/rust-toolchain@${SHA}
+        with:
+          components: clippy")"
+
+expect bad "a 'toolchain:' in the NEXT step does not count for the dtolnay step" \
+  "$(scaffold wf-sha-nextstep "$PINNED" "jobs:
+  b:
+    steps:
+      - uses: dtolnay/rust-toolchain@${SHA}
+      - uses: some/other-action@v1
         with:
           toolchain: 1.98.0")"
+
+expect ok "a named step (uses: under - name:) with the input is accepted" \
+  "$(scaffold wf-named "$PINNED" "jobs:
+  b:
+    steps:
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@${SHA} # master
+
+        with:
+          targets: x86_64-pc-windows-gnu
+          # the input
+          toolchain: '1.98.0'
+      - run: cargo build")"
+
+expect bad "one bad step among good ones is still caught" \
+  "$(scaffold wf-mixed "$PINNED" "$GOOD_WF
+      - name: Setup Rust again
+        uses: dtolnay/rust-toolchain@${SHA}
+        with:
+          targets: x86_64-pc-windows-gnu")"
 
 # --- prose about the floating ref is not the floating ref --------------------
 # ci.yml and rust-toolchain.toml both explain #3551 in comments that necessarily
@@ -107,7 +152,9 @@ expect ok "a COMMENT mentioning dtolnay/rust-toolchain@stable does not fail" \
   b:
     steps:
       # We used to say dtolnay/rust-toolchain@stable here, which floated.
-      - uses: dtolnay/rust-toolchain@1.98.0")"
+      - uses: dtolnay/rust-toolchain@${SHA}
+        with:
+          toolchain: 1.98.0")"
 
 # --- a repo with no Rust workflows at all is not a failure -------------------
 expect ok "a pinned repo with no dtolnay steps passes" \

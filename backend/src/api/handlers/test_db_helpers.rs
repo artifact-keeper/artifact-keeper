@@ -3167,8 +3167,9 @@ pub struct PresignMemBackend {
 
 impl PresignMemBackend {
     /// Seed a fresh positive cache entry (body + `__cache_meta__.json` sidecar)
-    /// at the given keys, so `ProxyService::is_cache_fresh` returns true and the
-    /// redirect/epoch paths proceed to derive and act on the scoped key.
+    /// at the given keys, so `ProxyService::is_cache_fresh` returns true,
+    /// `ProxyService::fresh_cache_redirect_size` returns the recorded size, and
+    /// the redirect/epoch paths proceed to derive and act on the scoped key.
     pub fn seed_fresh_entry(&self, content_key: &str, metadata_key: &str) {
         let mut g = self.objects.lock().unwrap();
         g.insert(content_key.to_string(), Bytes::from_static(b"cached-body"));
@@ -3249,7 +3250,8 @@ impl crate::services::storage_service::StorageBackend for PresignMemBackend {
 }
 
 /// A fresh, non-expired positive proxy-cache sidecar (no pinned `storage_etag`,
-/// so `is_cache_fresh` falls back to an existence check of the body key).
+/// so `is_cache_fresh` and `fresh_cache_redirect_size` fall back to an
+/// existence check of the body key).
 pub fn fresh_cache_sidecar_bytes() -> Bytes {
     let meta = crate::services::proxy_service::CacheMetadata {
         cached_at: chrono::Utc::now(),

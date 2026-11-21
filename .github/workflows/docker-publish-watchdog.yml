@@ -23,7 +23,9 @@ name: Docker Publish Watchdog
 # JOBS of every started run: a job queued with no runner for 45 minutes, or a
 # run older than 4 hours, makes it RED. It CANCELS such a run only when that
 # loses nothing: attempt 1 of a main push, nothing mid-build, a newer main
-# push waiting to replace it, and no Release Candidate in flight. Tags,
+# push waiting to replace it, no Release Candidate in flight, and no earlier
+# started main run cancelled since main last completed one (#6297: one
+# cancel per advance, so a saturated pool cannot starve `:main`). Tags,
 # dispatches (a promote, a candidate's build), the schedule, release/** and
 # re-runs are reported, never cancelled. 45 minutes: an idle pool picks a job
 # up in under a minute, and one amd64 build is ~50-70 minutes, so a 45-minute
@@ -116,7 +118,7 @@ jobs:
               {
                 echo "### Stale or stuck Docker Publish runs"
                 echo
-                echo "Action: ${STALE_ACTION}. \`stale\`: queued ${STALE_MINUTES}m+ with no job started. \`stuck\`: started, with a job waiting ${STUCK_JOB_MINUTES}m+ for a runner or ${STUCK_RUN_MINUTES}m+ old; \`hold=\` says why it was not cancelled (only a superseded main push with nothing mid-build is)."
+                echo "Action: ${STALE_ACTION}. \`stale\`: queued ${STALE_MINUTES}m+ with no job started. \`stuck\`: started, with a job waiting ${STUCK_JOB_MINUTES}m+ for a runner or ${STUCK_RUN_MINUTES}m+ old; \`hold=\` says why it was not cancelled (only a superseded main push with nothing mid-build is, at most one per completed main run)."
                 echo
                 echo '```'
                 echo "$out"
