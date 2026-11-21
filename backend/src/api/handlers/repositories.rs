@@ -1250,8 +1250,10 @@ pub struct CreateRepositoryRequest {
     pub virtual_metadata_partial: Option<bool>,
     /// Virtual repositories only: whether an artifact download may fall back
     /// to a lower-priority member while a higher-priority one is unavailable
-    /// (#5810); see `UpdateRepositoryRequest.virtual_member_fallback`.
-    /// Refused (400) on any other repository type.
+    /// (#5810), and whether a Maven `maven-metadata.xml` merge missing an
+    /// unavailable member answers `503` instead of a partial merge (#5777);
+    /// see `UpdateRepositoryRequest.virtual_member_fallback`. Refused (400)
+    /// on any other repository type.
     #[schema(nullable = false)]
     pub virtual_member_fallback: Option<proxy_helpers::VirtualMemberFallback>,
     /// Composer Remote repositories only (#6332): forward `search.json` to the
@@ -1534,9 +1536,11 @@ pub struct UpdateRepositoryRequest {
     /// member breaker). `available` (the default) serves the next member in
     /// priority order; `strict` answers 503 with `Retry-After` instead, so a
     /// lower member's copy is never served in place of a higher member's.
-    /// A 404 is a miss under both. Metadata merges are not affected (see
-    /// `virtual_metadata_partial`). Stored in `repository_config` under
-    /// `virtual_member_fallback`; read back in
+    /// A 404 is a miss under both. A Maven `maven-metadata.xml` merge that is
+    /// missing an unavailable member answers the same 503 under `strict`
+    /// rather than a partial merge (#5777); other metadata merges are not
+    /// affected (see `virtual_metadata_partial`). Stored in
+    /// `repository_config` under `virtual_member_fallback`; read back in
     /// `RepositoryResponse.virtual_member_fallback`. Refused (400) on any
     /// other repository type.
     #[schema(nullable = false)]
@@ -1801,10 +1805,10 @@ pub struct RepositoryResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub virtual_metadata_partial: Option<bool>,
     /// Virtual repositories only (#5810): the member-fallback mode of the
-    /// virtual's artifact downloads; see
-    /// `UpdateRepositoryRequest.virtual_member_fallback`. Always present on a
-    /// virtual repository (`available` when never set), omitted on every
-    /// other type.
+    /// virtual's artifact downloads and Maven `maven-metadata.xml` merges
+    /// (#5777); see `UpdateRepositoryRequest.virtual_member_fallback`. Always
+    /// present on a virtual repository (`available` when never set), omitted
+    /// on every other type.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub virtual_member_fallback: Option<proxy_helpers::VirtualMemberFallback>,
     /// Composer Remote repositories only (#6332): whether `search.json` is
@@ -2410,8 +2414,8 @@ async fn with_quarantine_settings(
 /// Populate a virtual repository's own settings on `RepositoryResponse`:
 /// `virtual_metadata_partial` (#5621), the stored opt-in read exactly as the
 /// merges read it (`false` when unset), and `virtual_member_fallback`
-/// (#5810), read exactly as the download walks read it (`available` when
-/// unset). Both are left `None` on every other type.
+/// (#5810), read exactly as the download walks and Maven merges read it
+/// (`available` when unset). Both are left `None` on every other type.
 async fn with_virtual_settings(
     db: &sqlx::PgPool,
     repo_id: Uuid,
