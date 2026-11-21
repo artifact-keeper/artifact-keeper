@@ -46663,6 +46663,7 @@ mod content_encoding_forwarding_tests {
             content_encoding: encoding.map(str::to_owned),
             commit_sha: None,
             stale_since: None,
+            revalidate: false,
         }
     }
 

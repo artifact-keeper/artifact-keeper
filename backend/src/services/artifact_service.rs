@@ -324,6 +324,10 @@ pub(crate) struct OverwriteReplacement<'a> {
 pub struct RetiredArtifact {
     pub id: Uuid,
     pub storage_key: String,
+    /// The `ARTIFACT_OVERWRITTEN` export record, streamed by
+    /// [`forget_retired_artifact`] once the publish has committed. `None`
+    /// when the retired row was not a live file being replaced.
+    pub audit: Option<crate::services::audit_export::AuditEventRecord>,
 }
 
 /// Retire the row at `(repository_id, path)` that a mutable-repository
@@ -358,11 +362,11 @@ pub(crate) async fn retire_overwritten_artifact(
     replacement: OverwriteReplacement<'_>,
 ) -> Result<Option<RetiredArtifact>> {
     let new_storage_key = replacement.storage_key;
-    let retired = sqlx::query_as::<_, (Uuid, String, String, Option<String>)>(
+    let retired = sqlx::query_as::<_, (Uuid, String, String, Option<String>, bool)>(
         "DELETE FROM artifacts \
           WHERE repository_id = $1 AND path = $2 \
             AND ($3::text IS NULL OR LOWER(TRIM(checksum_sha256)) <> LOWER(TRIM($3))) \
-         RETURNING id, storage_key, checksum_sha256, quarantine_status",
+         RETURNING id, storage_key, checksum_sha256, quarantine_status, is_deleted",
     )
     .bind(repository_id)
     .bind(path)
@@ -370,35 +374,46 @@ pub(crate) async fn retire_overwritten_artifact(
     .fetch_optional(&mut *tx)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
-    let Some((id, storage_key, previous_sha256, previous_scan_verdict)) = retired else {
+    let Some((id, storage_key, previous_sha256, previous_scan_verdict, was_deleted)) = retired
+    else {
         return Ok(None);
     };
-    let mut entry = crate::services::audit_service::AuditEntry::new(
-        crate::services::audit_service::AuditAction::ArtifactOverwritten,
-        crate::services::audit_service::ResourceType::Artifact,
-    )
-    .resource(id)
-    .resource_name(path)
-    .details_typed(
-        crate::services::audit_export::details::ArtifactOverwriteDetails {
-            repository_id,
-            path: path.to_string(),
-            retired_artifact_id: id,
-            previous_digest: format!("sha256:{}", previous_sha256.trim().to_ascii_lowercase()),
-            digest: format!(
-                "sha256:{}",
-                replacement.checksum_sha256.to_ascii_lowercase()
-            ),
-            previous_scan_verdict,
-        },
-    );
-    if let Some(actor) = replacement.uploaded_by {
-        entry = entry.user(actor);
-    }
-    crate::services::audit_export::emit_entry(&entry);
-    crate::services::audit_service::insert_audit_row(&mut *tx, &entry)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
+    // A soft-deleted row is a tombstone, not a file being replaced: the
+    // re-publish is not an overwrite, so it is not audited as one.
+    let previous_sha256 = previous_sha256.trim().to_ascii_lowercase();
+    let audit =
+        if was_deleted || previous_sha256 == replacement.checksum_sha256.to_ascii_lowercase() {
+            None
+        } else {
+            let mut entry = crate::services::audit_service::AuditEntry::new(
+                crate::services::audit_service::AuditAction::ArtifactOverwritten,
+                crate::services::audit_service::ResourceType::Artifact,
+            )
+            .resource(id)
+            .resource_name(path)
+            .details_typed(
+                crate::services::audit_export::details::ArtifactOverwriteDetails {
+                    repository_id,
+                    path: path.to_string(),
+                    retired_artifact_id: id,
+                    previous_digest: format!("sha256:{previous_sha256}"),
+                    digest: format!(
+                        "sha256:{}",
+                        replacement.checksum_sha256.to_ascii_lowercase()
+                    ),
+                    previous_scan_verdict,
+                },
+            );
+            if let Some(actor) = replacement.uploaded_by {
+                entry = entry.user(actor);
+            }
+            crate::services::audit_service::insert_audit_row(&mut *tx, &entry)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
+            Some(crate::services::audit_export::AuditEventRecord::from_entry(
+                &entry,
+            ))
+        };
     if storage_key != new_storage_key {
         let scope = crate::services::storage_gc_service::oci_gc_candidate_scope(location);
         sqlx::query(
@@ -416,16 +431,25 @@ pub(crate) async fn retire_overwritten_artifact(
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
     }
-    Ok(Some(RetiredArtifact { id, storage_key }))
+    Ok(Some(RetiredArtifact {
+        id,
+        storage_key,
+        audit,
+    }))
 }
 
-/// Drop a retired overwrite's document from the search index (#5188). The
-/// replacement is indexed under its own new id; without this the old id would
-/// keep answering searches for the path. Fire-and-forget, post-commit.
+/// After a mutable-repository overwrite (#5188) commits: stream its
+/// `ARTIFACT_OVERWRITTEN` record (the `audit_log` row committed with the
+/// publish; streaming earlier would report overwrites that rolled back), and
+/// drop the retired document from the search index, since the replacement
+/// is indexed under its own new id. Fire-and-forget; call only post-commit.
 pub(crate) fn forget_retired_artifact(
     search: Option<&Arc<OpenSearchService>>,
     retired: Option<&RetiredArtifact>,
 ) {
+    if let Some(record) = retired.and_then(|r| r.audit.as_ref()) {
+        crate::services::audit_export::emit_audit_event(record);
+    }
     let (Some(search), Some(retired)) = (search, retired) else {
         return;
     };
@@ -6920,6 +6944,22 @@ mod tests {
         .await
         .expect("rows at path");
         assert_eq!(live, 1, "exactly one row holds the path");
+
+        // A re-publish over a soft-deleted row is not an overwrite of a live
+        // file, so it is not audited as one.
+        sqlx::query("UPDATE artifacts SET is_deleted = true WHERE id = $1")
+            .bind(second.id)
+            .execute(&pool)
+            .await
+            .expect("soft delete");
+        upload(b"build-3")
+            .await
+            .expect("re-publish over the tombstone");
+        assert_eq!(
+            count(OVERWRITES, second.id).await,
+            0,
+            "a tombstone is not an overwritten file"
+        );
 
         let journaled = |key: String| {
             let pool = pool.clone();

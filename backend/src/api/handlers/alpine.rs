@@ -2095,16 +2095,21 @@ async fn store_apk(
     let artifact_path = build_alpine_artifact_path(branch, repository, arch, filename);
 
     // Check for duplicate
-    let existing = sqlx::query_scalar!(
-        "SELECT id FROM artifacts WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
-        repo.id,
-        artifact_path
+    let existing: Option<String> = sqlx::query_scalar(
+        "SELECT checksum_sha256 FROM artifacts \
+         WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
     )
+    .bind(repo.id)
+    .bind(&artifact_path)
     .fetch_optional(&state.db)
     .await
     .map_err(crate::api::handlers::db_err)?;
 
-    if existing.is_some() && !repo.overwrite_allowed() {
+    // Identical bytes are not a replacement (#5188): they keep the live row,
+    // its id and approvals, with the same 409 a write-once repository gives.
+    if existing.as_deref().is_some_and(|live| {
+        !repo.overwrite_allowed() || live.trim().eq_ignore_ascii_case(&computed_sha256)
+    }) {
         return Err((StatusCode::CONFLICT, "Package already exists").into_response());
     }
     // #5188: a mutable repository replaces the live row. It is retired in the

@@ -2205,6 +2205,9 @@ pub(crate) fn build_streaming_response_with_disposition(
     if let Some(ref etag) = result.etag {
         builder = builder.header("etag", etag);
     }
+    if result.revalidate {
+        builder = builder.header("cache-control", "no-cache");
+    }
     // The proxy no longer decodes upstream bodies (see
     // `http_client::base_client_builder`), so a content-coded body must be
     // declared as such or the client silently writes compressed bytes to disk.
@@ -6788,6 +6791,11 @@ pub(crate) struct LocalArtifactRow {
     pub checksum_sha256: String,
     #[sqlx(default)]
     pub path: String,
+    /// The row's repository is mutable (#5188): its file is served as
+    /// `no-cache` with its SHA-256 as `ETag`. A query that does not select it
+    /// reads as write-once.
+    #[sqlx(default)]
+    pub mutable: bool,
 }
 
 /// Check quarantine status on a fetched artifact row of `repo_id`, mapping
@@ -6840,25 +6848,29 @@ impl LocalLookup<'_> {
     pub(crate) fn select_sql(&self) -> &'static str {
         match self {
             LocalLookup::Path(_) => {
-                "SELECT id, storage_key, content_type, size_bytes, quarantine_status, quarantine_until, checksum_sha256, path \
+                "SELECT id, storage_key, content_type, size_bytes, quarantine_status, quarantine_until, checksum_sha256, path, \
+                 (SELECT immutability = 'mutable' FROM repositories WHERE id = $1) AS mutable \
                  FROM artifacts \
                  WHERE repository_id = $1 AND path = $2 AND is_deleted = false \
                  LIMIT 1"
             }
             LocalLookup::NameVersion(_, _) => {
-                "SELECT id, storage_key, content_type, size_bytes, quarantine_status, quarantine_until, checksum_sha256, path \
+                "SELECT id, storage_key, content_type, size_bytes, quarantine_status, quarantine_until, checksum_sha256, path, \
+                 (SELECT immutability = 'mutable' FROM repositories WHERE id = $1) AS mutable \
                  FROM artifacts \
                  WHERE repository_id = $1 AND name = $2 AND version = $3 AND is_deleted = false \
                  LIMIT 1"
             }
             LocalLookup::NameVersionSuffix(_, _, _) => {
-                "SELECT id, storage_key, content_type, size_bytes, quarantine_status, quarantine_until, checksum_sha256, path \
+                "SELECT id, storage_key, content_type, size_bytes, quarantine_status, quarantine_until, checksum_sha256, path, \
+                 (SELECT immutability = 'mutable' FROM repositories WHERE id = $1) AS mutable \
                  FROM artifacts \
                  WHERE repository_id = $1 AND name = $2 AND version = $3 AND path LIKE $4 AND is_deleted = false \
                  LIMIT 1"
             }
             LocalLookup::NameVersionCaseInsensitive(_, _) => {
-                "SELECT id, storage_key, content_type, size_bytes, quarantine_status, quarantine_until, checksum_sha256, path \
+                "SELECT id, storage_key, content_type, size_bytes, quarantine_status, quarantine_until, checksum_sha256, path, \
+                 (SELECT immutability = 'mutable' FROM repositories WHERE id = $1) AS mutable \
                  FROM artifacts \
                  WHERE repository_id = $1 AND LOWER(name) = $2 AND version = $3 AND is_deleted = false \
                  LIMIT 1"
@@ -7025,7 +7037,10 @@ async fn open_local_stream(
         // Local artifact row resolved: surface its id so the virtual-member
         // streaming resolver can record the download exactly once (#2260).
         artifact_id: Some(artifact.id),
-        etag: None,
+        etag: artifact
+            .mutable
+            .then(|| crate::api::handlers::repositories::artifact_etag(&artifact.checksum_sha256)),
+        revalidate: artifact.mutable,
         stale_since: None,
     })
 }
@@ -9793,7 +9808,7 @@ pub async fn ensure_unique_artifact_path(
     artifact_path: &str,
     conflict_message: &str,
 ) -> Result<(), Response> {
-    ensure_unique_artifact_path_mutable(db, repo_id, artifact_path, conflict_message, false)
+    ensure_unique_artifact_path_mutable(db, repo_id, artifact_path, conflict_message, None)
         .await
         .map(|_| ())
 }
@@ -9807,16 +9822,22 @@ pub async fn ensure_unique_artifact_path(
 /// [`retire_overwritten_artifact`](crate::services::artifact_service::retire_overwritten_artifact)),
 /// so a publish that fails on quota, storage or the INSERT leaves the old
 /// package, its scan results and its approvals untouched.
+///
+/// `replacement_sha256` is `Some` (the new file's SHA-256) when the repository
+/// allows overwrite, `None` when it is write-once. Identical bytes are not a
+/// replacement: they answer the same 409 as a write-once repository, so the
+/// live row keeps its id and approvals instead of being retired for nothing.
 #[allow(clippy::result_large_err)]
 pub async fn ensure_unique_artifact_path_mutable(
     db: &PgPool,
     repo_id: Uuid,
     artifact_path: &str,
     conflict_message: &str,
-    allow_overwrite: bool,
+    replacement_sha256: Option<&str>,
 ) -> Result<bool, Response> {
-    let existing: Option<Uuid> = sqlx::query_scalar(
-        "SELECT id FROM artifacts WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
+    let existing: Option<String> = sqlx::query_scalar(
+        "SELECT checksum_sha256 FROM artifacts \
+         WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
     )
     .bind(repo_id)
     .bind(artifact_path)
@@ -9824,7 +9845,10 @@ pub async fn ensure_unique_artifact_path_mutable(
     .await
     .map_err(|e| internal_error("Database", e))?;
 
-    if existing.is_some() && !allow_overwrite {
+    let replaceable = |live: &str| {
+        replacement_sha256.is_some_and(|new| !live.trim().eq_ignore_ascii_case(new.trim()))
+    };
+    if existing.as_deref().is_some_and(|live| !replaceable(live)) {
         return Err((StatusCode::CONFLICT, conflict_message.to_string()).into_response());
     }
 
@@ -15519,6 +15543,7 @@ mod tests {
             content_encoding: content_encoding.map(str::to_string),
             commit_sha: None,
             stale_since: None,
+            revalidate: false,
         }
     }
 
@@ -18784,6 +18809,7 @@ mod tests {
             artifact_id: None,
             etag: None,
             stale_since: None,
+            revalidate: false,
         }
     }
 
@@ -22556,25 +22582,37 @@ mod tests {
         .await
         .expect("insert");
 
-        // allow_overwrite = false → still 409.
+        // Write-once → still 409.
         let err = ensure_unique_artifact_path_mutable(
             &pool,
             repo_id,
             path,
             "Package already exists",
-            false,
+            None,
         )
         .await
         .expect_err("conflict expected when immutable");
         assert_eq!(err.status(), StatusCode::CONFLICT);
 
-        // allow_overwrite = true → passes, reports a replacement, removes nothing.
+        // Mutable, identical bytes → 409 too: nothing to replace.
+        let same = ensure_unique_artifact_path_mutable(
+            &pool,
+            repo_id,
+            path,
+            "Package already exists",
+            Some("A"),
+        )
+        .await
+        .expect_err("identical bytes are not a replacement");
+        assert_eq!(same.status(), StatusCode::CONFLICT);
+
+        // Mutable, new bytes → passes, reports a replacement, removes nothing.
         let replacing = ensure_unique_artifact_path_mutable(
             &pool,
             repo_id,
             path,
             "Package already exists",
-            true,
+            Some("b"),
         )
         .await
         .expect("mutable repo must not conflict");
@@ -22594,9 +22632,15 @@ mod tests {
             "the live row must survive until the publish transaction retires it"
         );
         assert!(
-            !ensure_unique_artifact_path_mutable(&pool, repo_id, "x86_64/other.apk", "x", true)
-                .await
-                .expect("free path"),
+            !ensure_unique_artifact_path_mutable(
+                &pool,
+                repo_id,
+                "x86_64/other.apk",
+                "x",
+                Some("b")
+            )
+            .await
+            .expect("free path"),
             "a free path is not a replacement"
         );
 
@@ -23370,6 +23414,7 @@ mod tests {
             artifact_id: None,
             etag: None,
             stale_since: None,
+            revalidate: false,
         };
         let response = build_streaming_response(result, "application/octet-stream")
             .expect("response build must succeed");
@@ -23394,6 +23439,7 @@ mod tests {
             artifact_id: None,
             etag: None,
             stale_since: None,
+            revalidate: false,
         };
         let response =
             build_streaming_response(result, "text/xml").expect("response build must succeed");
@@ -23420,6 +23466,7 @@ mod tests {
             artifact_id: None,
             etag: None,
             stale_since: None,
+            revalidate: false,
         };
         let response = build_streaming_response(result, "application/octet-stream").unwrap();
         assert_eq!(
@@ -23447,6 +23494,7 @@ mod tests {
             artifact_id: None,
             etag: None,
             stale_since: None,
+            revalidate: false,
         };
         let response = build_streaming_response(result, "application/octet-stream").unwrap();
         assert!(
@@ -23468,6 +23516,7 @@ mod tests {
             artifact_id: None,
             etag: None,
             stale_since: None,
+            revalidate: false,
         };
         let response = build_streaming_response(result, "application/octet-stream").unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -23488,6 +23537,7 @@ mod tests {
             artifact_id: None,
             etag: None,
             stale_since: None,
+            revalidate: false,
         };
         let response = build_streaming_response(result, weird).unwrap();
         assert_eq!(
@@ -23513,6 +23563,7 @@ mod tests {
             artifact_id: None,
             etag: None,
             stale_since: None,
+            revalidate: false,
         };
         let response = stream_fetch_result(result, "application/octet-stream", Some("pkg.whl"))
             .expect("stream_fetch_result must build a response");
@@ -23545,6 +23596,7 @@ mod tests {
             artifact_id: None,
             etag: None,
             stale_since: None,
+            revalidate: false,
         };
         let response = stream_fetch_result(result, "application/octet-stream", None)
             .expect("stream_fetch_result must build a response");

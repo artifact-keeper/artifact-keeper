@@ -189,6 +189,7 @@ pub(crate) async fn maven_local_fetch_storage_fallback(
                     artifact_id: None,
                     etag: None,
                     stale_since: None,
+                    revalidate: false,
                 });
             }
         }
@@ -224,6 +225,7 @@ pub(crate) async fn maven_local_fetch_storage_fallback(
             artifact_id: None,
             etag: None,
             stale_since: None,
+            revalidate: false,
         });
     }
 
@@ -394,6 +396,7 @@ pub(crate) async fn maven_local_fetch_storage_fallback(
         artifact_id: None,
         etag: None,
         stale_since: None,
+        revalidate: false,
     })
 }
 

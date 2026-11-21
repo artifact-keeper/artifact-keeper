@@ -11616,6 +11616,9 @@ fn virtual_member_serve_head(
     if let Some(value) = etag.and_then(|e| header::HeaderValue::from_str(&e).ok()) {
         builder = builder.header(header::ETAG, value);
     }
+    if result.revalidate {
+        builder = builder.header(header::CACHE_CONTROL, "no-cache");
+    }
     proxy_helpers::apply_stale_markers(builder, result.stale_since)
 }
 

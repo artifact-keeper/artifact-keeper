@@ -548,21 +548,8 @@ async fn serve_package(
     .await?;
     // #3143: quarantine + scan policy apply to the streamed download too.
     proxy_helpers::gate_and_record_streamed_local(&state.db, result.artifact_id, ctx).await?;
-    let checksum = match (repo.overwrite_allowed(), result.artifact_id) {
-        (true, Some(id)) => {
-            sqlx::query_scalar::<_, String>("SELECT checksum_sha256 FROM artifacts WHERE id = $1")
-                .bind(id)
-                .fetch_optional(&state.db)
-                .await
-                .map_err(super::db_err)?
-        }
-        _ => None,
-    };
-    let resp = proxy_helpers::stream_fetch_result(result, PACKAGE_CONTENT_TYPE, Some(filename))?;
-    Ok(match checksum {
-        Some(checksum) => proxy_helpers::revalidate_if_mutable(repo, &checksum, resp),
-        None => resp,
-    })
+    // A mutable repository's file comes back `no-cache` with its ETag (#5188).
+    proxy_helpers::stream_fetch_result(result, PACKAGE_CONTENT_TYPE, Some(filename))
 }
 
 /// The binary signature stored for a package, if one was uploaded.
@@ -793,16 +780,15 @@ async fn store_package(
     let artifact_path = package_artifact_path(&info.arch, filename);
     // #5188: `replacing` when a mutable repository's live row holds the path;
     // it is retired in the publish transaction, never before.
+    let sha256 = format!("{:x}", Sha256::digest(&body));
     let replacing = proxy_helpers::ensure_unique_artifact_path_mutable(
         &state.db,
         repo.id,
         &artifact_path,
         "Package already exists",
-        repo.overwrite_allowed(),
+        repo.overwrite_allowed().then_some(sha256.as_str()),
     )
     .await?;
-
-    let sha256 = format!("{:x}", Sha256::digest(&body));
     let size_bytes = body.len() as i64;
     // A replacement never writes the key the live row still serves.
     let key = match storage_key(repo.id, &artifact_path) {

@@ -720,6 +720,7 @@ async fn maven_local_fetch_snapshot(
         artifact_id: Some(resolved.id),
         etag: None,
         stale_since: None,
+        revalidate: false,
     })
 }
 

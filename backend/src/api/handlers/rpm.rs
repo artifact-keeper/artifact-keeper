@@ -3561,12 +3561,15 @@ async fn store_rpm(
     // #5188: on a mutable repository `replacing` is true when a live row holds
     // the path. It is retired in the publish transaction below (the
     // nested-layout branch: inside `upload_with_sync_options`), never before.
+    let content_sha256 = repo
+        .overwrite_allowed()
+        .then(|| crate::services::artifact_service::ArtifactService::calculate_sha256(&content));
     let replacing = proxy_helpers::ensure_unique_artifact_path_mutable(
         &state.db,
         repo.id,
         &artifact_path,
         "Package already exists",
-        repo.overwrite_allowed(),
+        content_sha256.as_deref(),
     )
     .await?;
 

@@ -11284,6 +11284,7 @@ mod tests {
             artifact_id: None,
             etag: None,
             stale_since: None,
+            revalidate: false,
         }
     }
 
@@ -11402,6 +11403,7 @@ mod tests {
             artifact_id: None,
             etag: None,
             stale_since: None,
+            revalidate: false,
         }
     }
 
@@ -11968,6 +11970,7 @@ mod tests {
             artifact_id: None,
             etag: None,
             stale_since: None,
+            revalidate: false,
         }
     }
 
@@ -13093,9 +13096,9 @@ mod tests {
     }
 
     /// #5188: a virtual over a mutable member serves the replacement (it reads
-    /// the member's row on every request, with no cache of its own), and the
-    /// member serves its file as `no-cache` with the SHA-256 as `ETag`, so a
-    /// Remote or HTTP cache in front of it revalidates.
+    /// the member's row on every request, with no cache of its own), and both
+    /// the member and the virtual serve the file as `no-cache` with the
+    /// SHA-256 as `ETag`, so a Remote or HTTP cache in front revalidates.
     #[tokio::test]
     async fn virtual_over_mutable_member_serves_the_replacement_5188() {
         use crate::api::handlers::test_db_helpers as tdh;
@@ -13132,7 +13135,7 @@ mod tests {
         let (first, _) = upload(b"build-1").await;
         let (_, via_virtual_1, _) = get(fx.repo_key.clone()).await;
         let (second, _) = upload(b"build-2").await;
-        let (status, via_virtual_2, _) = get(fx.repo_key.clone()).await;
+        let (status, via_virtual_2, virtual_headers) = get(fx.repo_key.clone()).await;
         let (_, _, member_headers) = get(member_key.clone()).await;
 
         tdh::cleanup_member_repo(&fx.pool, member_id, &member_dir).await;
@@ -13146,16 +13149,19 @@ mod tests {
             b"build-2",
             "the virtual serves the replacement"
         );
-        assert_eq!(
-            member_headers
-                .get("cache-control")
-                .and_then(|v| v.to_str().ok()),
-            Some("no-cache")
-        );
-        assert_eq!(
-            member_headers.get("etag").and_then(|v| v.to_str().ok()),
-            Some(format!("\"{}\"", ArtifactService::calculate_sha256(b"build-2")).as_str())
-        );
+        let etag = format!("\"{}\"", ArtifactService::calculate_sha256(b"build-2"));
+        for (label, headers) in [("member", &member_headers), ("virtual", &virtual_headers)] {
+            assert_eq!(
+                headers.get("cache-control").and_then(|v| v.to_str().ok()),
+                Some("no-cache"),
+                "{label}"
+            );
+            assert_eq!(
+                headers.get("etag").and_then(|v| v.to_str().ok()),
+                Some(etag.as_str()),
+                "{label}"
+            );
+        }
     }
 
     /// #5188: re-uploading an existing filename (what `twine upload` does on
@@ -17478,6 +17484,7 @@ mod tests {
             artifact_id: None,
             etag: None,
             stale_since: None,
+            revalidate: false,
         };
 
         let response = build_streaming_file_response("numpy-1.0-py3-none-any.whl", result);
@@ -21157,6 +21164,7 @@ mod content_encoding_forwarding_tests {
             content_encoding: encoding.map(str::to_owned),
             commit_sha: None,
             stale_since: None,
+            revalidate: false,
         }
     }
 

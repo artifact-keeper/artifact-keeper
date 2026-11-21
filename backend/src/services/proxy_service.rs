@@ -522,8 +522,12 @@ pub struct StreamingFetchResult {
     /// Upstream `ETag` when known (fresh fetch, cache hit, or stale-if-error
     /// serve). `None` for local artifact reads, which have no upstream ETag.
     /// Forwarded verbatim on the outbound response so clients that require
-    /// an ETag on the resolve HEAD (e.g. `huggingface_hub`) get one.
+    /// an ETag on the resolve HEAD (e.g. `huggingface_hub`) get one. A local
+    /// read from a mutable repository (#5188) carries the row's SHA-256 here.
     pub etag: Option<String>,
+    /// Served from a mutable repository (#5188): the response builders add
+    /// `Cache-Control: no-cache`, so a cache in front revalidates `etag`.
+    pub revalidate: bool,
     /// Upstream `Content-Encoding` when the cached/streamed bytes are content
     /// coded — see [`UpstreamResponse::content_encoding`]. Must be forwarded
     /// with the body on every serve (fresh, cache hit, stale-if-error) or the
@@ -557,6 +561,7 @@ impl From<StreamHandle> for StreamingFetchResult {
             content_encoding: handle.headers.content_encoding,
             commit_sha: handle.headers.commit_sha,
             stale_since: handle.headers.stale_since,
+            revalidate: false,
         }
     }
 }
@@ -881,6 +886,8 @@ struct CacheMetadataTemplate {
     /// repository's quarantine policy is disabled.
     quarantine_until: Option<DateTime<Utc>>,
     ttl_secs: i64,
+    /// See [`CacheMetadata::revalidate`].
+    revalidate: bool,
     /// Optional content digest the cache commit is gated on (#2274, widened
     /// past SHA-256 by GHSA-qxv7-p3mq-88fv). When `Some`,
     /// [`CachePersister::tee_stream`] persists the cached object ONLY if the
@@ -1837,10 +1844,13 @@ pub(crate) struct UpstreamHeaders {
 
 /// Whether upstream asked every cache to revalidate this response before
 /// reusing it (#5188): `Cache-Control: no-cache`, `no-store` or `max-age=0`.
-/// A mutable repository serves its files with `no-cache`, so a Remote in front
-/// of one caches them with a zero TTL and revalidates on each read, instead of
-/// keeping a path the classifier calls immutable forever. A field-qualified
-/// `no-cache="…"` only restricts those headers and does not count.
+/// A mutable repository serves its files with `no-cache` and an `ETag`, so a
+/// Remote in front of one revalidates them on each read instead of keeping a
+/// path the classifier calls immutable forever. Callers honour it only when
+/// upstream also sent an `ETag`: without a validator every read would be a
+/// full refetch, which an upstream that merely sends `max-age=0` on content
+/// that never changes did not ask for. A field-qualified `no-cache="…"` only
+/// restricts those headers and does not count.
 pub(crate) fn upstream_requires_revalidation(headers: &reqwest::header::HeaderMap) -> bool {
     headers
         .get_all(reqwest::header::CACHE_CONTROL)
@@ -1887,7 +1897,7 @@ fn extract_streaming_headers(headers: &reqwest::header::HeaderMap) -> UpstreamHe
         content_encoding,
         commit_sha,
         last_modified,
-        revalidate: upstream_requires_revalidation(headers),
+        revalidate: upstream_requires_revalidation(headers) && headers.contains_key(ETAG),
     }
 }
 
@@ -1905,6 +1915,7 @@ fn head_only_result(headers: UpstreamHeaders) -> StreamingFetchResult {
         content_encoding: headers.content_encoding,
         commit_sha: headers.commit_sha,
         stale_since: None,
+        revalidate: false,
     }
 }
 
@@ -2096,12 +2107,12 @@ pub struct CacheMetadata {
     pub size_bytes: i64,
     /// SHA-256 checksum of cached content
     pub checksum_sha256: String,
-    /// The entry was written with a zero TTL, because upstream asked for
-    /// revalidation (`Cache-Control: no-cache`, `no-store` or `max-age=0`, as
-    /// a mutable repository serves its files, #5188) or the repository's TTL
-    /// is zero. Every read revalidates it, even on a path the classifier
-    /// calls immutable. `#[serde(default)]` keeps older sidecars cacheable
-    /// as before.
+    /// Upstream asked for revalidation (`Cache-Control: no-cache`, `no-store`
+    /// or `max-age=0`, with an `ETag`), as a mutable repository serves its
+    /// files (#5188). Every read revalidates the entry, even on a path the
+    /// classifier calls immutable; `expires_at` keeps the classifier's TTL,
+    /// so the stale-if-error window while upstream is down is unchanged.
+    /// `#[serde(default)]` keeps older sidecars cacheable as before.
     #[serde(default)]
     pub revalidate: bool,
 }
@@ -2986,6 +2997,8 @@ pub struct DeferredCacheCommit {
     content_encoding: Option<String>,
     commit_sha: Option<String>,
     ttl_secs: i64,
+    /// See [`CacheMetadata::revalidate`].
+    revalidate: bool,
     repository_id: Uuid,
     cache_path: String,
     quarantine_until: Option<DateTime<Utc>>,
@@ -3556,6 +3569,7 @@ impl CachePersister {
         // Upstream X-Repo-Commit for these bytes, recorded for the same reason.
         commit_sha: Option<String>,
         ttl_secs: i64,
+        revalidate: bool,
         repository_id: Uuid,
         artifact_path: &str,
         quarantine_until: Option<DateTime<Utc>>,
@@ -3615,7 +3629,7 @@ impl CachePersister {
             content_type,
             size_bytes: content.len() as i64,
             checksum_sha256: checksum,
-            revalidate: ttl_secs <= 0,
+            revalidate,
         };
 
         // #1618 S9: sidecar written second, after the content object above.
@@ -4128,7 +4142,7 @@ impl CachePersister {
                             content_type: template.content_type,
                             size_bytes: result.bytes_written as i64,
                             checksum_sha256: result.checksum_sha256,
-                            revalidate: template.ttl_secs <= 0,
+                            revalidate: template.revalidate,
                         };
                         match serde_json::to_vec(&metadata) {
                             Ok(json) => {
@@ -5068,7 +5082,8 @@ impl UpstreamClient {
             .and_then(|v| v.to_str().ok())
             .map(String::from);
 
-        let revalidate = upstream_requires_revalidation(response.headers());
+        let revalidate = upstream_requires_revalidation(response.headers())
+            && response.headers().contains_key(ETAG);
         let last_modified = response
             .headers()
             .get(reqwest::header::LAST_MODIFIED)
@@ -7225,6 +7240,7 @@ impl ProxyService {
                 commit.content_encoding.clone(),
                 commit.commit_sha.clone(),
                 commit.ttl_secs,
+                commit.revalidate,
                 commit.repository_id,
                 &commit.cache_path,
                 commit.quarantine_until,
@@ -7562,11 +7578,7 @@ impl ProxyService {
                 let upstream_encoding = resp.content_encoding.clone();
                 // #1611: mutability-aware TTL (immutable -> forever), unless
                 // upstream asked for revalidation (#5188).
-                let cache_ttl = if resp.revalidate {
-                    0
-                } else {
-                    self.cache_ttl_for_path(repo, cache_path).await
-                };
+                let cache_ttl = self.cache_ttl_for_path(repo, cache_path).await;
                 // Package Age Policy (#1770): resolve the hold window
                 // BEFORE caching so the sidecar records it; the window
                 // is based on the upstream release date when known
@@ -7717,6 +7729,7 @@ impl ProxyService {
                         content_encoding: upstream_encoding.clone(),
                         commit_sha: resp.commit_sha.clone(),
                         ttl_secs: cache_ttl,
+                        revalidate: resp.revalidate,
                         repository_id: repo.id,
                         cache_path: cache_path.to_string(),
                         quarantine_until,
@@ -7733,6 +7746,7 @@ impl ProxyService {
                         upstream_encoding.clone(),
                         resp.commit_sha,
                         cache_ttl,
+                        resp.revalidate,
                         repo.id,
                         cache_path,
                         quarantine_until,
@@ -8692,6 +8706,7 @@ impl ProxyService {
                 commit_sha: metadata.upstream_commit_sha.clone(),
                 // Fresh by default; the stale-if-error caller sets this (#4581).
                 stale_since: None,
+                revalidate: false,
             })),
             Err(AppError::NotFound(_)) => {
                 tracing::debug!(
@@ -8785,11 +8800,7 @@ impl ProxyService {
         // keys off `cache_path` — the canonical artifact identity — not the
         // upstream-specific download URL. Upstream asking for revalidation
         // (#5188) overrides the classifier.
-        let cache_ttl = if upstream.revalidate {
-            0
-        } else {
-            self.cache_ttl_for_path(repo, cache_path).await
-        };
+        let cache_ttl = self.cache_ttl_for_path(repo, cache_path).await;
 
         // Cache miss + successful upstream fetch: a new artifact is being
         // cached. Surface the scan-on-proxy gap (#1274) before teeing to
@@ -8946,6 +8957,7 @@ impl ProxyService {
                 last_modified: upstream.last_modified,
                 quarantine_until,
                 ttl_secs: cache_ttl,
+                revalidate: upstream.revalidate,
                 expected_checksum,
                 // #2218/#2270: identity for the persisted catalog row, written
                 // by the streaming Commit arm with the true byte count/checksum.
@@ -9732,6 +9744,7 @@ impl ProxyService {
                 resp.content_encoding,
                 resp.commit_sha,
                 dists_ttl_secs,
+                resp.revalidate,
                 repo.id,
                 path,
                 None,
@@ -11804,6 +11817,7 @@ impl ProxyService {
         // Upstream X-Repo-Commit for these bytes, recorded for the same reason.
         commit_sha: Option<String>,
         ttl_secs: i64,
+        revalidate: bool,
         repository_id: Uuid,
         artifact_path: &str,
         quarantine_until: Option<DateTime<Utc>>,
@@ -11819,6 +11833,7 @@ impl ProxyService {
                 content_encoding,
                 commit_sha,
                 ttl_secs,
+                revalidate,
                 repository_id,
                 artifact_path,
                 quarantine_until,
@@ -15949,6 +15964,7 @@ mod tests {
             last_modified: None,
             quarantine_until: None,
             ttl_secs: 60,
+            revalidate: false,
             expected_checksum: None,
             repository_id: Uuid::nil(),
             path: "test/path".to_string(),
@@ -19064,6 +19080,7 @@ mod tests {
             last_modified: None,
             quarantine_until: None,
             ttl_secs: 7200,
+            revalidate: false,
             expected_checksum: None,
             repository_id: Uuid::nil(),
             path: "test/path".to_string(),
@@ -19301,6 +19318,7 @@ mod tests {
                 None,
                 None,
                 3600,
+                false,
                 Uuid::nil(),
                 "repo/path",
                 None,
@@ -20926,6 +20944,7 @@ mod tests {
             artifact_id: None,
             etag: None,
             stale_since: None,
+            revalidate: false,
         };
         assert_eq!(r.content_length, Some(12345));
         assert_eq!(r.content_type.as_deref(), Some("application/octet-stream"));
@@ -21743,6 +21762,7 @@ mod tests {
                 None,
                 None,
                 ONE_DAY_SECS,
+                false,
                 Uuid::new_v4(),
                 cache_path,
                 None,
@@ -27924,8 +27944,9 @@ mod tests {
 
     /// #5188: a path the classifier calls immutable is still revalidated when
     /// upstream (a mutable repository) serves it with `Cache-Control:
-    /// no-cache`, on the buffered and the streaming path: once upstream
-    /// replaces the file, the Remote serves the replacement.
+    /// no-cache` and an `ETag`, on the buffered and the streaming path: once
+    /// upstream replaces the file, the Remote serves the replacement. Without
+    /// an `ETag` the directive is not honoured and the entry stays cached.
     #[tokio::test]
     async fn test_upstream_no_cache_revalidates_an_immutable_path_5188() {
         use crate::api::handlers::test_db_helpers as tdh;
@@ -27936,13 +27957,17 @@ mod tests {
             return;
         };
         let jar = "com/example/app/1.0.0/app-1.0.0.jar";
-        for streaming in [false, true] {
+        for (streaming, with_etag) in [(false, true), (true, true), (false, false), (true, false)] {
             let server = MockServer::start().await;
             let build = |body: &'static [u8], etag: &str| {
-                ResponseTemplate::new(200)
+                let t = ResponseTemplate::new(200)
                     .insert_header("cache-control", "no-cache")
-                    .insert_header("etag", etag)
-                    .set_body_bytes(body)
+                    .set_body_bytes(body);
+                if with_etag {
+                    t.insert_header("etag", etag)
+                } else {
+                    t
+                }
             };
             Mock::given(any())
                 .respond_with(build(b"build-1", "\"v1\""))
@@ -27954,7 +27979,7 @@ mod tests {
                 .mount(&server)
                 .await;
 
-            let key = format!("s5188-{streaming}");
+            let key = format!("s5188-{streaming}-{with_etag}");
             let tmp = std::env::temp_dir().join(format!("{key}-{}", Uuid::new_v4()));
             std::fs::create_dir_all(&tmp).expect("tmp");
             let proxy = tdh::build_proxy_service_with_fs(pool.clone(), tmp.to_str().unwrap());
@@ -27987,9 +28012,11 @@ mod tests {
             }
             let _ = std::fs::remove_dir_all(&tmp);
             assert_eq!(bodies[0], b"build-1", "streaming={streaming}");
+            let expected: &[u8] = if with_etag { b"build-2" } else { b"build-1" };
             assert_eq!(
-                bodies[1], b"build-2",
-                "streaming={streaming}: a no-cache entry must be revalidated"
+                bodies[1], expected,
+                "streaming={streaming} etag={with_etag}: no-cache with an ETag revalidates, \
+                 without one the immutable entry stays cached"
             );
         }
     }
@@ -29091,6 +29118,7 @@ mod tests {
                 None,
                 None,
                 3600,
+                false,
                 Uuid::new_v4(),
                 "some/path",
                 None,
@@ -30015,6 +30043,7 @@ mod tests {
                 None,
                 None,
                 3600,
+                false,
                 Uuid::new_v4(),
                 path,
                 None,
