@@ -719,6 +719,7 @@ impl AgeGatePolicy {
 /// both.
 fn invalidate_decision_memos(repository_id: Uuid) {
     crate::api::handlers::vscode::invalidate_gallery_age_gate_memo(repository_id);
+    crate::services::age_gate_maven::forget_listings_for_repo(repository_id);
 }
 
 pub struct AgeGateService {

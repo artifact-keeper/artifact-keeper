@@ -12626,6 +12626,11 @@ async fn persist_generic_staged_upload(
     // UNIQUE(repository_id, path) constraint is still satisfied without the
     // manual purge.
 
+    let catalog_name = if let Some(native) = &native {
+        super::upload::format_finalize::catalog_name(&state.db, repo.id, &native.staged).await
+    } else {
+        None
+    };
     let size_bytes = staged.size_bytes();
     let content = staged.upload_content().await?;
     let artifact = artifact_service
@@ -12640,7 +12645,7 @@ async fn persist_generic_staged_upload(
             size_bytes,
             Some(auth.user_id),
             !is_replication_request(headers),
-            None,
+            catalog_name.as_deref(),
             precondition.as_ref(),
         )
         .await;
@@ -12674,10 +12679,17 @@ async fn persist_generic_staged_upload(
         }
     }
 
+    // #6317: the upload has committed. The reads below only fill the response
+    // body, so a failure (a pool timeout under load) falls back to a default
+    // instead of answering 503 for a stored artifact, whose retry would then
+    // be refused with 409.
     let downloads = artifact_service
         .get_download_stats(artifact.id)
         .await
-        .map_err(|e| e.into_response())?;
+        .unwrap_or_else(|e| {
+            tracing::warn!(artifact_id = %artifact.id, error = %e, "upload committed; download count for the response could not be read");
+            0
+        });
     let metadata_json = wasm_metadata.map(|m| m.to_json());
 
     // #2367: echo the revision this upload landed at for versioned repos.
@@ -12685,7 +12697,10 @@ async fn persist_generic_staged_upload(
         artifact_service
             .latest_version_info(repo.id, &artifact.path)
             .await
-            .map_err(|e| e.into_response())?
+            .unwrap_or_else(|e| {
+                tracing::warn!(artifact_id = %artifact.id, error = %e, "upload committed; revision for the response could not be read");
+                None
+            })
             .map(|(rev, label)| (Some(rev), label))
             .unwrap_or((None, None))
     } else {
@@ -12793,6 +12808,9 @@ async fn stage_generic_native_finalize(
     let staged_native = format_finalize::stage(&repo.format, path, &target, source)
         .await
         .map_err(|reason| AppError::Validation(reason).into_response())?;
+    format_finalize::ensure_unique_nuget(&state.db, repo.id, path, Some(&staged_native))
+        .await
+        .map_err(|e| e.into_response())?;
     drop(local);
     Ok(Some(GenericNativeFinalize {
         target: format_finalize::resolved_target(target, &staged_native),
