@@ -197,6 +197,7 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     // needs nothing from the database or the rest of startup.
     let metrics_handle = metrics_service::init_metrics();
     tracing::info!("Prometheus metrics recorder initialized");
+    artifact_keeper_backend::services::proxy_scan_service::publish_db_grace_window_gauges();
 
     // Connect to database
     let db_pool = db::create_pool(&config).await?;

@@ -12176,8 +12176,7 @@ pub(crate) fn manifest_gate_serves_referrer(
     now: chrono::DateTime<chrono::Utc>,
 ) -> bool {
     use crate::services::proxy_scan_service::{
-        decide_serve, verdict_is_reusable, ProxyScanAction, ProxyScanRow, ServeDecision,
-        VERDICT_CLEAN,
+        decide_serve, ProxyScanAction, ProxyScanRow, ServeDecision, VERDICT_CLEAN,
     };
     let ttl = crate::services::scanner_service::DEDUP_TTL_DAYS as i64;
     let row = match (&referrer.verdict, referrer.scanned_at) {
@@ -12198,9 +12197,11 @@ pub(crate) fn manifest_gate_serves_referrer(
     };
     match posture {
         ReferrerPosture::Unknown => false,
+        // No DB-update grace (#6300) for hosted content: nothing queues a
+        // re-grade of it, so only a verdict from the live build counts.
         ReferrerPosture::Hosted => row.is_some_and(|r| {
             r.verdict == VERDICT_CLEAN
-                && verdict_is_reusable(
+                && crate::services::proxy_scan_service::verdict_is_reusable_under(
                     &r.verdict,
                     r.scanned_at,
                     r.scanner_version.as_deref(),
@@ -12208,6 +12209,8 @@ pub(crate) fn manifest_gate_serves_referrer(
                     ProxyScanAction::FailClosed,
                     ttl,
                     now,
+                    None,
+                    false,
                 )
         }),
         ReferrerPosture::Proxy(action) => {
