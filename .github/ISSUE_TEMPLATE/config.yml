@@ -6,6 +6,9 @@ contact_links:
   - name: Security Vulnerability
     url: https://github.com/artifact-keeper/artifact-keeper/security/advisories/new
     about: Please report security vulnerabilities privately through GitHub Security Advisories
+  - name: Discord
+    url: https://discord.gg/8T7NW2PeS2
+    about: Chat with the community and get quick help. File bugs here and report security issues privately.
   - name: GitHub Discussions
     url: https://github.com/orgs/artifact-keeper/discussions
     about: Ask questions and discuss ideas with the community

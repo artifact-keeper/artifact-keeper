@@ -13,6 +13,7 @@
 [![Rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](https://www.rust-lang.org/)
 [![Docker](https://img.shields.io/badge/docker-ghcr.io%20%7C%20Docker%20Hub-blue.svg)](https://hub.docker.com/u/artifactkeeper)
 [![Sponsor](https://img.shields.io/badge/Sponsor-GitHub%20Sponsors-EA4AAA?logo=githubsponsors&logoColor=white)](https://github.com/sponsors/artifact-keeper)
+[![Discord](https://img.shields.io/discord/1527760136456900748?label=Discord&logo=discord&logoColor=white)](https://discord.gg/8T7NW2PeS2)
 
 An enterprise-grade, open-source artifact registry supporting **45+ package formats**. Built with Rust.
 
@@ -463,11 +464,16 @@ And one sponsor who chose to stay private. Thank you.
 
 [Become a sponsor](https://github.com/sponsors/artifact-keeper) to support the project and get your name listed here.
 
+## Community
+
+- **Discord**: chat, quick help and per-ecosystem channels at [discord.gg/8T7NW2PeS2](https://discord.gg/8T7NW2PeS2)
+- **GitHub Discussions**: [ideas and Q&A](https://github.com/artifact-keeper/artifact-keeper/discussions)
+- **Issues**: confirmed bugs go in the [issue tracker](https://github.com/artifact-keeper/artifact-keeper/issues)
+- **Security**: report vulnerabilities privately as described in [SECURITY.md](https://github.com/artifact-keeper/artifact-keeper/blob/main/SECURITY.md), never in Discord or public issues
+
 ## Contributing
 
 We welcome contributions! See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
-
-Have questions or ideas? Join the conversation in [GitHub Discussions](https://github.com/artifact-keeper/artifact-keeper/discussions).
 
 ## License
 
