@@ -190,6 +190,39 @@ pub fn spawn_scan_worker(state: SharedState, shutdown: CancellationToken) {
                     Err(e) => tracing::warn!(error = %e, "failed to publish scan queue depth"),
                 }
 
+                // #6300: how far behind the re-grades after a DB update are,
+                // against the grace window they have to finish in.
+                match queue.oldest_pending_regrade_secs().await {
+                    Ok(secs) => {
+                        crate::services::metrics_service::record_proxy_scan_regrade_backlog_oldest(
+                            "queue", secs,
+                        );
+                        let windows = crate::services::proxy_scan_service::db_grace_windows();
+                        let window = windows.serving.max(windows.fail_closed).num_seconds() as f64;
+                        static LAST_WARN: std::sync::Mutex<Option<tokio::time::Instant>> =
+                            std::sync::Mutex::new(None);
+                        let behind = window > 0.0 && secs > window / 2.0;
+                        let due = behind
+                            && LAST_WARN.lock().is_ok_and(|mut last| {
+                                let due =
+                                    last.is_none_or(|at| at.elapsed() > Duration::from_secs(300));
+                                if due {
+                                    *last = Some(tokio::time::Instant::now());
+                                }
+                                due
+                            });
+                        if due {
+                            tracing::warn!(
+                                oldest_secs = secs,
+                                window_secs = window,
+                                "proxy re-grades after a vulnerability-DB update are not keeping \
+                                 up with the grace window; add scan workers (#6300)"
+                            );
+                        }
+                    }
+                    Err(e) => tracing::warn!(error = %e, "failed to read the re-grade backlog"),
+                }
+
                 // Live consumers (cluster-wide) and this pod's own slot
                 // occupancy. Together they answer "is the queue backed up
                 // because nothing is consuming it, or because everything is
@@ -265,7 +298,7 @@ pub fn spawn_scan_worker(state: SharedState, shutdown: CancellationToken) {
                 // A rescan beyond the free rescan slots (more claimed in one
                 // batch than are free) goes straight back, before its wait is
                 // recorded: it has not stopped waiting.
-                let rescan_permit = if job.job_kind() == Some(ScanJobKind::Rescan) {
+                let rescan_permit = if job.in_rescan_band() {
                     match Arc::clone(&rescan_permits).try_acquire_owned() {
                         Ok(p) => Some(p),
                         Err(_) => {
@@ -450,6 +483,11 @@ async fn retry_when_scanner_timed_out(
 /// Dispatch to the branch for this job's kind.
 async fn execute(state: &SharedState, job: &ScanJob) -> Result<(), JobFailure> {
     match job.job_kind() {
+        // #6300: a re-grade nobody waits on asks the adapter for the
+        // background band, as a rescan does.
+        Some(ScanJobKind::ProxyFile) if job.in_rescan_band() => {
+            crate::services::scan_queue::in_background(scan_proxy_file(state, job)).await
+        }
         Some(ScanJobKind::ProxyFile) => scan_proxy_file(state, job).await,
         Some(ScanJobKind::HostedArtifact) => scan_hosted_artifact(state, job).await,
         Some(ScanJobKind::HostedUpload) => {
@@ -471,6 +509,22 @@ async fn execute(state: &SharedState, job: &ScanJob) -> Result<(), JobFailure> {
             job.kind
         ))),
     }
+}
+
+/// [`scan_proxy_file`] for a job held in memory rather than claimed from the
+/// queue: the in-process re-grade after a vulnerability-DB update when the
+/// queue is off (#6300). The error is the reason no verdict was recorded.
+pub(crate) async fn scan_proxy_file_in_process(
+    state: &SharedState,
+    job: &ScanJob,
+) -> std::result::Result<(), String> {
+    scan_proxy_file(state, job)
+        .await
+        .map_err(|failure| match failure {
+            JobFailure::Retryable(m)
+            | JobFailure::Terminal(m)
+            | JobFailure::EngineUnavailable(m) => m,
+        })
 }
 
 /// Scan a proxy-cached file by reference: the body the rescan endpoint already

@@ -376,6 +376,24 @@ pub fn create_router(state: SharedState) -> Router {
         client_ip_context_middleware,
     ));
 
+    // Database admission gate (#4182). At most DATABASE_REQUEST_CONCURRENCY
+    // requests run their handler phase while the pool is busy; past it a
+    // request waits at most DATABASE_REQUEST_ACQUIRE_WAIT_MS for a permit
+    // and is otherwise answered 503 POOL_EXHAUSTED + Retry-After at once,
+    // instead of queueing on the pool with the whole burst. Outside every
+    // middleware that reads the database (setup, guest access, visibility,
+    // auth), so a shed request has done no work; probes are never gated.
+    if let Some(gate) = crate::api::middleware::db_admission::DbAdmission::new(
+        state.db.clone(),
+        state.config.database_request_wait_ms(),
+        state.config.database_request_slots(),
+    ) {
+        router = router.layer(middleware::from_fn_with_state(
+            gate,
+            crate::api::middleware::db_admission::db_admission_gate,
+        ));
+    }
+
     // Defense-in-depth backstop (outermost layer). A router-wide load-shed +
     // concurrency limit (+ optional request timeout) so that NO request path —
     // even one that runs an unbounded CPU-bound operation (bcrypt,
@@ -426,7 +444,7 @@ fn overloaded_response() -> Response {
 /// global concurrency backstop (GHSA-9f9r-c4w8-rjv9).
 const PROBE_PATHS: &[&str] = &["/health", "/healthz", "/ready", "/readyz", "/livez"];
 
-fn is_probe_path(path: &str) -> bool {
+pub(crate) fn is_probe_path(path: &str) -> bool {
     PROBE_PATHS.contains(&path)
 }
 
