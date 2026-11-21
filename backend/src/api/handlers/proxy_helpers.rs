@@ -24,7 +24,7 @@ use crate::services::proxy_scan_service::CacheScanGate;
 pub(crate) use crate::services::proxy_service::CachedBody;
 pub use crate::services::proxy_service::StreamingFetchResult;
 use crate::services::proxy_service::{DeferredCommitSlot, DirectUpstreamBody, ProxyService};
-use crate::services::virtual_member_breaker::{fetch_error_trips_breaker, MemberBreaker};
+use crate::services::virtual_member_breaker::MemberBreaker;
 // Re-export the per-format buffered-metadata byte ceilings (#1608 Phase 4b /
 // #2181) so format handlers select a cap via `proxy_helpers::<CONST>`.
 pub use crate::services::proxy_service::{DEFAULT_METADATA_MAX_BYTES, LARGE_METADATA_MAX_BYTES};
@@ -722,6 +722,24 @@ fn proxy_fetch_failure_level(
     }
 }
 
+/// Response header naming the HTTP status the upstream answered, on a generic
+/// proxy `502` (#5643). The body stays "Failed to fetch from upstream"; the
+/// header lets an operator see the cause (a `403` from a flat-layout index
+/// asked for `/simple/...`, say) without the backend log. Only the status is
+/// carried, never the upstream URL or body.
+pub(crate) const UPSTREAM_STATUS_HEADER: &str = "x-ak-upstream-status";
+
+/// Set [`UPSTREAM_STATUS_HEADER`] on `response` when `e` carries the
+/// upstream's non-success status.
+fn insert_upstream_status_header(response: &mut Response, e: &crate::error::AppError) {
+    if let Some(status) = crate::services::proxy_service::upstream_error_status(e) {
+        response.headers_mut().insert(
+            UPSTREAM_STATUS_HEADER,
+            axum::http::HeaderValue::from(status.as_u16()),
+        );
+    }
+}
+
 /// [`map_proxy_error`] for a caller that already knows whether `e` is an
 /// upstream refusal of an anonymous request ([`proxy_fetch_failure_level`]).
 fn map_proxy_error_classified(
@@ -862,6 +880,7 @@ fn map_proxy_error_classified(
             }
             let mut response =
                 (StatusCode::BAD_GATEWAY, "Failed to fetch from upstream").into_response();
+            insert_upstream_status_header(&mut response, &e);
             if let Some(status) = crate::services::proxy_service::upstream_refusal_status(&e) {
                 let hub_code = crate::services::proxy_service::upstream_hub_error_code(&e);
                 response
@@ -2074,11 +2093,9 @@ async fn proxy_fetch_streaming_member(
         proxy_service.fetch_artifact_streaming(member, path).await
     };
     // #5810: the member's answer, for its download breaker.
-    proxy_service.member_breaker().record(
-        member.id,
-        &member.key,
-        fetched.as_ref().is_err_and(fetch_error_trips_breaker),
-    );
+    proxy_service
+        .member_breaker()
+        .record_fetch(member.id, &member.key, &fetched);
     streaming_fetch_response(
         fetched,
         &member.key,
@@ -3901,7 +3918,9 @@ where
             let Some(deadline) = walk.deadline else {
                 return fetch.await;
             };
-            match tokio::time::timeout(deadline, fetch).await {
+            // #5013: our own deadline, so a request still waiting inside
+            // counts against the member's upstream circuit.
+            match crate::services::upstream_circuit::within_own_deadline(deadline, fetch).await {
                 Ok(outcome) => outcome,
                 Err(_) => {
                     record_virtual_member_download_deadline_miss(&member.key, walk.path, deadline);
@@ -4650,11 +4669,9 @@ where
                         None => proxy.fetch_artifact_streaming(member, path).await,
                     };
                     // #5810: the member's answer, for its download breaker.
-                    proxy.member_breaker().record(
-                        member.id,
-                        &member.key,
-                        fetch.as_ref().is_err_and(fetch_error_trips_breaker),
-                    );
+                    proxy
+                        .member_breaker()
+                        .record_fetch(member.id, &member.key, &fetch);
                     // #6214: read a refusal of the member's own credentials
                     // as unavailable, for a caller that asked for it.
                     let refused = refusals_db.is_some()
@@ -5347,7 +5364,8 @@ pub async fn within_virtual_member_deadline<F: std::future::Future>(
     fut: F,
 ) -> Result<F::Output, std::time::Duration> {
     let deadline = virtual_member_metadata_timeout();
-    tokio::time::timeout(deadline, fut)
+    // #5013: our own deadline (see `within_own_deadline`).
+    crate::services::upstream_circuit::within_own_deadline(deadline, fut)
         .await
         .map_err(|_| deadline)
 }
@@ -12810,6 +12828,300 @@ async fn proxy_cached_object_is_readable(
     }
 }
 
+/// Re-grades this process started or queued in the last ten minutes (#6300), so
+/// a hot digest reused under the DB-update grace queues one, not one per pull.
+/// Ten minutes is fixed: a re-grade that records nothing (the cached object
+/// is gone, the engine failed) is asked for again by the first pull after it.
+static RECENT_REGRADES: once_cell::sync::Lazy<moka::future::Cache<(Uuid, String), ()>> =
+    once_cell::sync::Lazy::new(|| {
+        moka::future::Cache::builder()
+            .max_capacity(100_000)
+            .time_to_live(std::time::Duration::from_secs(600))
+            .build()
+    });
+
+/// Re-grades this process runs at once when the durable scan queue is off or
+/// cannot take the job (#6300).
+const IN_PROCESS_REGRADES: usize = 2;
+
+/// Re-grades of proxy-cached files waiting for one of those slots. Each holds
+/// a reference to the cached object, not its bytes, which are read when its
+/// turn comes; past this many a pull leaves its re-grade to a later pull.
+const IN_PROCESS_REGRADE_BACKLOG: usize = 10_000;
+
+/// Digests with an in-process re-grade waiting or running, and since when
+/// (#6300). Its size is the backlog [`IN_PROCESS_REGRADE_BACKLOG`] caps, its
+/// oldest entry is `ak_proxy_scan_regrade_backlog_oldest_seconds{where=
+/// "in_process"}`, and a digest in it keeps the DB-update grace past the
+/// window ([`proxy_regrade_queued`]). Process-wide, like the grace record.
+static IN_PROCESS_REGRADE_PENDING: once_cell::sync::Lazy<
+    std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
+> = once_cell::sync::Lazy::new(Default::default);
+
+/// Publish the in-process backlog's oldest age, and warn (at most every five
+/// minutes) once it passes half the longer grace window: past the window
+/// those digests fall back to scans on the request path.
+fn publish_in_process_regrade_backlog(
+    pending: &std::collections::HashMap<String, std::time::Instant>,
+) {
+    let oldest = pending
+        .values()
+        .map(|at| at.elapsed().as_secs_f64())
+        .fold(0.0, f64::max);
+    crate::services::metrics_service::record_proxy_scan_regrade_backlog_oldest(
+        "in_process",
+        oldest,
+    );
+    let windows = crate::services::proxy_scan_service::db_grace_windows();
+    let window = windows.serving.max(windows.fail_closed).num_seconds() as f64;
+    static LAST_WARN: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+    if window > 0.0 && oldest > window / 2.0 {
+        if let Ok(mut last) = LAST_WARN.lock() {
+            if last.is_none_or(|at| at.elapsed() > std::time::Duration::from_secs(300)) {
+                *last = Some(std::time::Instant::now());
+                tracing::warn!(
+                    backlog = pending.len(),
+                    oldest_secs = oldest,
+                    window_secs = window,
+                    "proxy re-grades after a vulnerability-DB update are not keeping up \
+                     with the grace window; turn the scan queue on or add workers (#6300)"
+                );
+            }
+        }
+    }
+}
+
+/// Whether the in-process backlog is full.
+fn claim_in_process_regrade_is_full() -> bool {
+    IN_PROCESS_REGRADE_PENDING
+        .lock()
+        .map(|p| p.len() >= IN_PROCESS_REGRADE_BACKLOG)
+        .unwrap_or(true)
+}
+
+/// Take a backlog slot for `digest`. `false` when it already has one or the
+/// backlog is full.
+fn claim_in_process_regrade(digest: &str) -> bool {
+    let Ok(mut pending) = IN_PROCESS_REGRADE_PENDING.lock() else {
+        return false;
+    };
+    if pending.len() >= IN_PROCESS_REGRADE_BACKLOG || pending.contains_key(digest) {
+        return false;
+    }
+    pending.insert(digest.to_string(), std::time::Instant::now());
+    publish_in_process_regrade_backlog(&pending);
+    true
+}
+
+/// Releases a backlog slot when the re-grade ends, however it ends.
+struct InProcessRegradeSlot(String);
+
+impl Drop for InProcessRegradeSlot {
+    fn drop(&mut self) {
+        if let Ok(mut pending) = IN_PROCESS_REGRADE_PENDING.lock() {
+            pending.remove(&self.0);
+            publish_in_process_regrade_backlog(&pending);
+        }
+    }
+}
+
+/// Whether a re-grade (or any scan) of `digest` is waiting or running: in
+/// this process's backlog, or, with the scan queue on, as a pending or
+/// running `proxy_file` job (#6300). Asked only for a verdict past its
+/// DB-update grace window, which such a re-grade keeps reusable a while
+/// longer. A query fault answers `false`: the pull is then scanned as before.
+pub(crate) async fn proxy_regrade_queued(state: &crate::api::SharedState, digest: &str) -> bool {
+    if IN_PROCESS_REGRADE_PENDING
+        .lock()
+        .map(|p| p.contains_key(digest))
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    if !state.config.scan_queue_enabled {
+        return false;
+    }
+    sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (SELECT 1 FROM scan_queue WHERE kind = 'proxy_file' AND digest = $1 \
+         AND state IN ('pending', 'running'))",
+    )
+    .bind(digest)
+    .fetch_one(&state.db)
+    .await
+    .unwrap_or(false)
+}
+
+/// A `proxy_file` job for the cached object at `cache_path`, held in memory:
+/// the in-process re-grade runs it as the queue worker would (#6300).
+fn in_memory_proxy_file_job(
+    repo_id: Uuid,
+    cache_path: &str,
+    digest: &str,
+    size_bytes: i64,
+    expected: Option<&crate::services::scanner_service::ExpectedComponent>,
+) -> crate::services::scan_queue::ScanJob {
+    crate::services::scan_queue::ScanJob {
+        id: Uuid::new_v4(),
+        kind: crate::services::scan_queue::ScanJobKind::ProxyFile
+            .as_str()
+            .to_string(),
+        priority: crate::services::scan_queue::PRIORITY_REGRADE,
+        repository_id: Some(repo_id),
+        cache_path: Some(cache_path.to_string()),
+        digest: Some(digest.to_string()),
+        content_type: None,
+        size_bytes: Some(size_bytes),
+        expected_ecosystem: expected.map(|e| e.ecosystem.as_db_str().to_string()),
+        expected_name: expected.map(|e| e.name.clone()),
+        expected_version: expected.map(|e| e.version.clone()),
+        artifact_id: None,
+        prepared: None,
+        bypass_dedup: false,
+        attempts: 0,
+        max_attempts: 1,
+        created_at: Utc::now(),
+    }
+}
+
+fn in_process_regrade_permits() -> &'static std::sync::Arc<tokio::sync::Semaphore> {
+    static PERMITS: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
+        std::sync::OnceLock::new();
+    PERMITS.get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(IN_PROCESS_REGRADES)))
+}
+
+/// Re-grade bytes whose stored verdict was graded against the previous
+/// vulnerability-DB build and was reused for this pull under the DB-update
+/// grace (#6300). Nobody waits on it: with the scan queue on it is a
+/// `proxy_file` job at [`PRIORITY_REGRADE`], claimed after all other work and
+/// within the workers' rescan slots; otherwise it runs here, at most
+/// [`IN_PROCESS_REGRADES`] at a time, in the background band, from the bytes
+/// in hand when a slot is free. With none free a cached file waits its turn
+/// (up to [`IN_PROCESS_REGRADE_BACKLOG`] of them) and anything else (an
+/// image, an OS package) is deferred to a later pull. Either way it
+/// reads the bytes already in hand or in the proxy cache, never the upstream,
+/// and records the verdict against the live build like any scan.
+///
+/// [`PRIORITY_REGRADE`]: crate::services::scan_queue::PRIORITY_REGRADE
+#[allow(clippy::too_many_arguments)]
+async fn start_proxy_regrade(
+    state: &crate::api::SharedState,
+    repo_id: Uuid,
+    digest: &str,
+    cache_path: Option<&str>,
+    synthetic: &crate::models::artifact::Artifact,
+    bytes: &Bytes,
+    identity: &ProxyScanIdentity,
+    mode: &ProxyScanMode,
+) {
+    use crate::services::metrics_service::record_proxy_scan_regrade;
+    let expected = match identity {
+        ProxyScanIdentity::Established(e) => Some(e.clone()),
+        ProxyScanIdentity::NotApplicable => None,
+        // A stored verdict never pertains to an unestablished identity.
+        ProxyScanIdentity::Unestablished => return,
+    };
+    let key = (repo_id, digest.to_string());
+    if !RECENT_REGRADES
+        .entry(key.clone())
+        .or_insert(())
+        .await
+        .is_fresh()
+    {
+        return;
+    }
+    let cached = queued_scan_ref(mode, cache_path, expected.as_ref(), bytes.len());
+    if let Some(cache_path) = cached.filter(|_| state.config.scan_queue_enabled) {
+        if enqueue_proxy_file_scan(
+            state,
+            repo_id,
+            cache_path,
+            digest,
+            bytes.len() as i64,
+            expected.as_ref(),
+            crate::services::scan_queue::PRIORITY_REGRADE,
+        )
+        .await
+        {
+            record_proxy_scan_regrade("queued");
+            return;
+        }
+    }
+    // A free slot re-grades the bytes in hand at once: a fresh fill may not be
+    // in the proxy cache yet. Only a re-grade that has to wait for a slot is
+    // held as a reference to the cached object, which is written by then.
+    let free = std::sync::Arc::clone(in_process_regrade_permits()).try_acquire_owned();
+    if let (Some(cache_path), Err(_)) = (cached, &free) {
+        if claim_in_process_regrade(digest) {
+            let slot = InProcessRegradeSlot(digest.to_string());
+            record_proxy_scan_regrade("started");
+            let job = in_memory_proxy_file_job(
+                repo_id,
+                cache_path,
+                digest,
+                bytes.len() as i64,
+                expected.as_ref(),
+            );
+            let state = state.clone();
+            tokio::spawn(async move {
+                let _slot = slot;
+                let permit = std::sync::Arc::clone(in_process_regrade_permits())
+                    .acquire_owned()
+                    .await;
+                let Ok(_permit) = permit else { return };
+                if let Err(why) = crate::services::scan_queue::in_background(
+                    crate::services::scan_worker::scan_proxy_file_in_process(&state, &job),
+                )
+                .await
+                {
+                    tracing::info!(
+                        repo_id = %repo_id, digest = ?job.digest, reason = %why,
+                        "proxy re-grade recorded no verdict; a later pull asks again"
+                    );
+                }
+            });
+            return;
+        }
+        // Already waiting or running here, or the backlog is full.
+        if !claim_in_process_regrade_is_full() {
+            return;
+        }
+        RECENT_REGRADES.invalidate(&key).await;
+        record_proxy_scan_regrade("deferred");
+        return;
+    }
+    let Ok(permit) = free else {
+        RECENT_REGRADES.invalidate(&key).await;
+        record_proxy_scan_regrade("deferred");
+        return;
+    };
+    if !claim_in_process_regrade(digest) {
+        return;
+    }
+    let slot = InProcessRegradeSlot(digest.to_string());
+    record_proxy_scan_regrade("started");
+    let state = state.clone();
+    let digest = digest.to_string();
+    let synthetic = synthetic.clone();
+    let bytes = bytes.clone();
+    let mode = mode.clone();
+    tokio::spawn(async move {
+        let _permit = permit;
+        let _slot = slot;
+        let budget = proxy_scan_mode_budget(&mode);
+        let _ = crate::services::scan_queue::in_background(proxy_scan_and_record(
+            &state,
+            repo_id,
+            &digest,
+            &synthetic,
+            &bytes,
+            expected.as_ref(),
+            &mode,
+            budget,
+        ))
+        .await;
+    });
+}
+
 /// Fail-open digests queued in the last minute: a burst on one digest upserts the
 /// same `scan_queue` row per hit, each waiter holding a pool connection on its lock.
 static RECENT_BACKFILL_ENQUEUES: once_cell::sync::Lazy<moka::future::Cache<(Uuid, String), ()>> =
@@ -13021,13 +13333,47 @@ async fn decide_proxy_scan_serve(
         _ => None,
     };
 
-    match decide_serve(
-        row.as_ref(),
+    let now = Utc::now();
+    let ttl = crate::services::scanner_service::DEDUP_TTL_DAYS as i64;
+    let mut decision = decide_serve(row.as_ref(), current_version.as_deref(), action, ttl, now);
+    // #6300: past the DB-update grace window, a verdict whose re-grade is
+    // still queued keeps deciding the pull (up to one more window), so a
+    // backlog does not turn into a wave of scans on the request path.
+    if matches!(
+        decision,
+        ServeDecision::ScanInline | ServeDecision::ServePendingScanAsync
+    ) && crate::services::proxy_scan_service::grace_extension_possible(
+        row.as_ref().and_then(|r| r.scanner_version.as_deref()),
         current_version.as_deref(),
         action,
-        crate::services::scanner_service::DEDUP_TTL_DAYS as i64,
-        Utc::now(),
+        now,
+    ) && proxy_regrade_queued(state, digest).await
+    {
+        decision = crate::services::proxy_scan_service::decide_serve_with_queued_regrade(
+            row.as_ref(),
+            current_version.as_deref(),
+            action,
+            ttl,
+            now,
+            true,
+        );
+    }
+    // #6300: a verdict from the previous vulnerability-DB build decides this
+    // pull only within the DB-update grace; it is re-graded off the request
+    // path, so the next pull after that is decided against the live build.
+    if matches!(
+        decision,
+        ServeDecision::ServeCached | ServeDecision::BlockCached
+    ) && crate::services::proxy_scan_service::verdict_needs_regrade(
+        row.as_ref().and_then(|r| r.scanner_version.as_deref()),
+        current_version.as_deref(),
     ) {
+        start_proxy_regrade(
+            state, repo_id, digest, cache_path, &synthetic, bytes, &identity, &mode,
+        )
+        .await;
+    }
+    match decision {
         ServeDecision::BlockCached => {
             // #3243 stage 3 / #3246: a repo that explicitly opted in via
             // `block_on_policy_violation` applies its `severity_threshold` to
@@ -20769,6 +21115,37 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     }
 
+    /// #5643: the generic 502 names the upstream's status in a header, and
+    /// only when there was one; the body is unchanged.
+    #[test]
+    fn test_map_proxy_error_names_upstream_status_on_generic_502_5643() {
+        let err = crate::error::AppError::BadGateway(
+            "Upstream returned error status 403 Forbidden: https://u.example/simple/x/".into(),
+        );
+        let response = map_proxy_error("repo-key", "simple/x/", err);
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            response.headers().get(UPSTREAM_STATUS_HEADER).unwrap(),
+            "403"
+        );
+        let err = crate::error::AppError::BadGateway(
+            "Upstream returned error status 400 Bad Request: u".into(),
+        );
+        let response = map_proxy_error("repo-key", "pkg", err);
+        assert_eq!(
+            response.headers().get(UPSTREAM_STATUS_HEADER).unwrap(),
+            "400"
+        );
+        for err in [
+            crate::error::AppError::BadGateway("upstream timeout".into()),
+            crate::error::AppError::Storage("connection reset".into()),
+        ] {
+            let response = map_proxy_error("repo-key", "pkg", err);
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+            assert!(response.headers().get(UPSTREAM_STATUS_HEADER).is_none());
+        }
+    }
+
     #[test]
     fn test_map_proxy_error_bad_gateway_stays_bad_gateway() {
         let err = crate::error::AppError::BadGateway("upstream timeout".to_string());
@@ -22376,6 +22753,9 @@ mod tests {
                 database_max_connections: 20,
                 database_min_connections: 5,
                 database_acquire_timeout_secs: 30,
+                database_request_acquire_wait_ms: None,
+                database_probe_connections: 1,
+                database_request_concurrency: None,
                 database_idle_timeout_secs: 600,
                 database_max_lifetime_secs: 1800,
                 database_tcp_keepalives: true,

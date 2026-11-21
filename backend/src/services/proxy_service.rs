@@ -4665,6 +4665,31 @@ pub(crate) struct UpstreamClient {
     /// Which upstream requests write an `UPSTREAM_FETCHED` audit row (#5286).
     /// `Off` unless [`ProxyService::with_upstream_fetch_audit`] set it.
     audit_mode: UpstreamFetchAuditMode,
+    /// Per-upstream circuit breakers (#5013), keyed by repository and
+    /// upstream host. Every repository-scoped request in [`Self::send`] is
+    /// admitted through them. In memory, per replica; kept across a rebuild
+    /// with new timeouts.
+    circuits: Arc<crate::services::upstream_circuit::UpstreamCircuits>,
+}
+
+/// Why [`UpstreamClient::send`] produced no response (#5013).
+pub(crate) enum UpstreamSendError {
+    /// The request failed: the error `RequestBuilder::send` gives.
+    Transport(reqwest::Error),
+    /// The upstream's circuit is open, so the request was not sent.
+    CircuitOpen(crate::services::upstream_circuit::CircuitOpen),
+}
+
+impl UpstreamSendError {
+    /// The error for the caller: `transport` maps a transport failure the
+    /// way that call site always has; an open circuit is the breaker's own
+    /// `503` ([`crate::services::upstream_circuit::is_upstream_circuit_open`]).
+    fn into_app_error(self, transport: impl FnOnce(reqwest::Error) -> AppError) -> AppError {
+        match self {
+            Self::Transport(err) => transport(err),
+            Self::CircuitOpen(open) => open.into_app_error(),
+        }
+    }
 }
 
 /// The error for an upstream destination the outbound address policy refuses
@@ -4720,7 +4745,24 @@ impl UpstreamClient {
             #[cfg(test)]
             test_loopback_ports: std::sync::Mutex::new(None),
             audit_mode: UpstreamFetchAuditMode::Off,
+            circuits: Arc::new(crate::services::upstream_circuit::UpstreamCircuits::from_env()),
         }
+    }
+
+    /// Share `circuits` (#5013) with this client: the breaker state of the
+    /// client it replaces.
+    fn with_circuits(
+        mut self,
+        circuits: Arc<crate::services::upstream_circuit::UpstreamCircuits>,
+    ) -> Self {
+        self.circuits = circuits;
+        self
+    }
+
+    /// This client's per-upstream circuit breakers (#5013).
+    #[cfg(test)]
+    pub(crate) fn circuits(&self) -> &crate::services::upstream_circuit::UpstreamCircuits {
+        &self.circuits
     }
 
     /// Set the timeouts the per-Remote egress clients are built with.
@@ -4744,18 +4786,47 @@ impl UpstreamClient {
     /// conda, sbt and VS Code member walks) already sit at the compiler's
     /// layout query-depth limit in the coverage build. An opaque boxed future
     /// adds one level, fewer than inlining `send_upstream` did before.
+    ///
+    /// A request for a repository is admitted through that repository's
+    /// circuit for the request's host first (#5013): while it is open the
+    /// request is not sent and [`UpstreamSendError::CircuitOpen`] comes back
+    /// at once. The answer, or the failure, is recorded against the circuit.
     fn send(
         &self,
         request: reqwest::RequestBuilder,
         repo_id: Option<Uuid>,
         caller: UpstreamCaller,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = reqwest::Result<reqwest::Response>> + Send + '_>,
+        Box<
+            dyn std::future::Future<
+                    Output = std::result::Result<reqwest::Response, UpstreamSendError>,
+                > + Send
+                + '_,
+        >,
     > {
+        use crate::services::upstream_circuit::CallOutcome;
         let audit = UpstreamAuditTarget::for_mode(&self.db, self.audit_mode, repo_id, caller);
         Box::pin(async move {
             let env_proxy_recheck = self.uses_env_proxy(repo_id).await;
-            send_upstream_audited(request, audit, env_proxy_recheck).await
+            let (client, built) = request.build_split();
+            let built = built.map_err(UpstreamSendError::Transport)?;
+            let call = match repo_id {
+                Some(repo_id) => Some(
+                    self.circuits
+                        .admit(repo_id, built.url())
+                        .map_err(UpstreamSendError::CircuitOpen)?,
+                ),
+                None => None,
+            };
+            let request = reqwest::RequestBuilder::from_parts(client, built);
+            let result = send_upstream_audited(request, audit, env_proxy_recheck).await;
+            if let Some(call) = call {
+                call.finish(match &result {
+                    Ok(response) => CallOutcome::of_status(response.status()),
+                    Err(err) => CallOutcome::of_transport_error(err, is_ssrf_block_error(err)),
+                });
+            }
+            result.map_err(UpstreamSendError::Transport)
         })
     }
 
@@ -5046,7 +5117,9 @@ impl UpstreamClient {
             .send(request, Some(repo_id), UpstreamCaller::Proxy)
             .await
             .map_err(|e| {
-                classify_send_error(e, &format!("fetch from upstream {}", diagnostic_url))
+                e.into_app_error(|e| {
+                    classify_send_error(e, &format!("fetch from upstream {}", diagnostic_url))
+                })
             })?;
 
         let status = response.status();
@@ -5131,7 +5204,9 @@ impl UpstreamClient {
             .send(request, Some(repo_id), UpstreamCaller::Proxy)
             .await
             .map_err(|e| {
-                classify_send_error(e, &format!("POST JSON to upstream {}", diagnostic_url))
+                e.into_app_error(|e| {
+                    classify_send_error(e, &format!("POST JSON to upstream {}", diagnostic_url))
+                })
             })?;
 
         Self::read_upstream_response_capped(response, url, max).await
@@ -5298,7 +5373,9 @@ impl UpstreamClient {
             .send(request, Some(repo_id), UpstreamCaller::Proxy)
             .await
             .map_err(|e| {
-                classify_send_error(e, &format!("fetch from upstream {}", diagnostic_url))
+                e.into_app_error(|e| {
+                    classify_send_error(e, &format!("fetch from upstream {}", diagnostic_url))
+                })
             })?;
 
         let status = response.status();
@@ -5448,13 +5525,15 @@ impl UpstreamClient {
                     .send(retry_request, Some(repo_id), UpstreamCaller::Proxy)
                     .await
                     .map_err(|e| {
-                        classify_send_error(
-                            e,
-                            &format!(
-                                "fetch from upstream {} after token exchange",
-                                retry_diagnostic_url
-                            ),
-                        )
+                        e.into_app_error(|e| {
+                            classify_send_error(
+                                e,
+                                &format!(
+                                    "fetch from upstream {} after token exchange",
+                                    retry_diagnostic_url
+                                ),
+                            )
+                        })
                     })?;
 
                 // #4527: no credentials went to the token service, so a
@@ -5572,10 +5651,12 @@ impl UpstreamClient {
             .send(token_request, repo_id, UpstreamCaller::OciToken)
             .await
             .map_err(|e| {
-                AppError::Storage(format!(
-                    "Failed to request bearer token from {}: {}",
-                    realm, e
-                ))
+                e.into_app_error(|e| {
+                    AppError::Storage(format!(
+                        "Failed to request bearer token from {}: {}",
+                        realm, e
+                    ))
+                })
             })?;
 
         if !token_response.status().is_success() {
@@ -5941,7 +6022,9 @@ impl UpstreamClient {
             .send(request, Some(repo_id), UpstreamCaller::Revalidate)
             .await
             .map_err(|e| {
-                AppError::Storage(format!("Failed to check upstream for changes: {}", e))
+                e.into_app_error(|e| {
+                    AppError::Storage(format!("Failed to check upstream for changes: {}", e))
+                })
             })?;
         // The URL may embed upstream `user:password@` credentials (#4452);
         // every log line below renders the redacted form.
@@ -6084,7 +6167,10 @@ impl UpstreamClient {
             .await
         {
             Ok(response) => response,
-            Err(e) => {
+            // #5013: the GET path would be refused the same way; answer the
+            // HEAD as unavailable at once instead of asking twice.
+            Err(UpstreamSendError::CircuitOpen(open)) => return Err(open.into_app_error()),
+            Err(UpstreamSendError::Transport(e)) => {
                 tracing::debug!(
                     url = %shown,
                     error = %e.without_url(),
@@ -6430,7 +6516,8 @@ impl ProxyService {
         self.upstream_client = Arc::new(
             UpstreamClient::new(self.db.clone(), build_upstream_http_client(&timeouts))
                 .with_timeouts(timeouts)
-                .with_audit_mode(self.upstream_client.audit_mode),
+                .with_audit_mode(self.upstream_client.audit_mode)
+                .with_circuits(Arc::clone(&self.upstream_client.circuits)),
         );
         self.detached_fill_permits = Arc::new(Semaphore::new(timeouts.max_detached_fills));
         self.upstream_timeouts = timeouts;
@@ -7674,7 +7761,8 @@ impl ProxyService {
         // long as the socket stays open. A deadline is a transient failure,
         // so stale-if-error below still applies.
         let deadline = self.upstream_timeouts.fetch_deadline();
-        let upstream_result = match tokio::time::timeout(
+        // #5013: our own deadline (see `within_own_deadline`).
+        let upstream_result = match crate::services::upstream_circuit::within_own_deadline(
             deadline,
             self.fetch_from_upstream_with_accept(full_url, repo.id, accept, max),
         )
@@ -9938,14 +10026,16 @@ impl ProxyService {
             .send(request, Some(repo_id), UpstreamCaller::Revalidate)
             .await
             .map_err(|e| {
-                // Redact the target URL (may carry `user:pass@` upstream creds) and
-                // drop the URL reqwest embeds in its own error (#2926) before this
-                // surfaces to a client.
-                AppError::Storage(format!(
-                    "Failed to fetch from upstream: {} - {}",
-                    redact_url_for_diagnostics(url),
-                    e.without_url()
-                ))
+                e.into_app_error(|e| {
+                    // Redact the target URL (may carry `user:pass@` upstream
+                    // creds) and drop the URL reqwest embeds in its own error
+                    // (#2926) before this surfaces to a client.
+                    AppError::Storage(format!(
+                        "Failed to fetch from upstream: {} - {}",
+                        redact_url_for_diagnostics(url),
+                        e.without_url()
+                    ))
+                })
             })?;
 
         let status = response.status();
@@ -16803,6 +16893,44 @@ mod tests {
         assert_eq!(handle.headers.stale_since, Some(expires_at));
     }
 
+    /// #5013: a request the upstream circuit refused takes the stale-if-error
+    /// arm like any other upstream outage: the stale body is served.
+    #[tokio::test]
+    async fn test_stale_if_error_serves_through_an_open_circuit_5013() {
+        let backend = CacheObjectBackend::new();
+        backend
+            .put_object("proxy-cache/npm-proxy/5013-open/__content__", b"STALE")
+            .await;
+        backend
+            .put_sidecar(
+                "proxy-cache/npm-proxy/5013-open/__cache_meta__.json",
+                &stale_positive_sidecar(5),
+            )
+            .await;
+        let proxy = build_proxy_service_with_storage(backend);
+        let repo = crate::api::handlers::proxy_helpers::build_remote_repo(
+            Uuid::new_v4(),
+            "npm-proxy",
+            "https://registry.npmjs.org",
+        );
+        let refused = crate::services::upstream_circuit::CircuitOpen {
+            host: "registry.npmjs.org:443".into(),
+            retry_in: Duration::from_secs(9),
+        }
+        .into_app_error();
+        let handle = proxy
+            .handle_streaming_leader_upstream_error(
+                &repo,
+                "5013-open",
+                "proxy-cache/npm-proxy/5013-open/__content__",
+                "proxy-cache/npm-proxy/5013-open/__cache_meta__.json",
+                refused,
+            )
+            .await
+            .expect("an open circuit serves the stale copy");
+        assert_eq!(drain_body(handle.body).await, b"STALE");
+    }
+
     /// #4581: past the grace window the upstream error propagates instead of
     /// serving an arbitrarily old body.
     #[tokio::test]
@@ -19926,6 +20054,94 @@ mod tests {
                 "the configured upstream must still receive its credentials"
             );
         }
+    }
+
+    /// #5013: after `AK_UPSTREAM_CIRCUIT_FAILURES` failures in a row from a
+    /// Remote's upstream, its circuit opens and the upstream is not dialled
+    /// again: every request, on any path of that host, is answered as
+    /// unavailable at once, never as a miss. A `404` never trips it, and
+    /// another Remote on the same host keeps its own circuit.
+    #[tokio::test]
+    async fn upstream_circuit_stops_dialling_a_failing_upstream_5013() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::upstream_auth::UpstreamAuthMode;
+        use crate::services::upstream_circuit::is_upstream_circuit_open;
+        use wiremock::matchers::path as wm_path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let upstream = MockServer::start().await;
+        Mock::given(wm_path("/dead.bin"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&upstream)
+            .await;
+        Mock::given(wm_path("/ok.bin"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"ok".as_ref()))
+            .mount(&upstream)
+            .await;
+        let (repo_id, _key, dir) = tdh::create_repo(&pool, "remote", "generic").await;
+        let (other_id, _other_key, other_dir) = tdh::create_repo(&pool, "remote", "generic").await;
+        point_remote_at(&pool, repo_id, &upstream.uri()).await;
+        point_remote_at(&pool, other_id, &upstream.uri()).await;
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), dir.to_str().unwrap());
+        let client = &proxy.upstream_client;
+        let threshold = client.circuits().settings().failures as usize;
+        let (dead, gone, ok) = (
+            format!("{}/dead.bin", upstream.uri()),
+            format!("{}/gone.bin", upstream.uri()),
+            format!("{}/ok.bin", upstream.uri()),
+        );
+        let fetch = |url: String, repo: Uuid| async move {
+            client
+                .fetch_buffered(&url, repo, None, 1 << 20, UpstreamAuthMode::Anonymous)
+                .await
+        };
+        let fail = |url: String, repo: Uuid| async move {
+            match fetch(url.clone(), repo).await {
+                Ok(_) => panic!("{url} answered"),
+                Err(err) => err,
+            }
+        };
+        let hits = || async { upstream.received_requests().await.unwrap_or_default().len() };
+
+        // A real miss is an answer: any number of them leave it closed.
+        for _ in 0..threshold * 2 {
+            let err = fail(gone.clone(), repo_id).await;
+            assert!(matches!(err, AppError::NotFound(_)), "{err:?}");
+        }
+        for _ in 0..threshold {
+            let err = fail(dead.clone(), repo_id).await;
+            assert!(!is_upstream_circuit_open(&err), "{err:?}");
+        }
+        let dialled = hits().await;
+        assert_eq!(dialled, threshold * 3);
+        for url in [&dead, &gone, &ok] {
+            let err = fail(url.clone(), repo_id).await;
+            assert!(is_upstream_circuit_open(&err), "{url}: {err:?}");
+            assert!(matches!(err, AppError::ServiceUnavailable(_)));
+            assert_eq!(
+                classify_member_fetch_failure(&err),
+                MemberFetchFailure::Unavailable,
+                "an open circuit must never read as a miss"
+            );
+        }
+        assert!(client
+            .check_etag_changed(&ok, "\"e\"", repo_id, None)
+            .await
+            .is_err());
+        assert!(client.fetch_stream(&ok, repo_id).await.is_err());
+        assert_eq!(hits().await, dialled, "an open circuit dials nothing");
+
+        // Another Remote on the same host is unaffected.
+        let body = fetch(ok.clone(), other_id).await.expect("other remote");
+        assert_eq!(&body.content[..], b"ok");
+
+        tdh::cleanup_member_repo(&pool, repo_id, &dir).await;
+        tdh::cleanup_member_repo(&pool, other_id, &other_dir).await;
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&other_dir);
     }
 
     /// #4452: redacting `upstream_url` on read must not change what the

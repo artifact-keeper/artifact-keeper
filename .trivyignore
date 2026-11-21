@@ -10,7 +10,8 @@
 #       in docker/Dockerfile.scanner-adapter — scanner-adapter image only; the
 #       backend images do NOT bundle trivy)
 #     - /usr/local/bin/buildctl  (moby/buildkit v0.33.1 with golang.org/x/net
-#       overridden to v0.62.0 since #5565, BUILT FROM SOURCE in
+#       overridden to v0.62.0 since #5565 and containerd/v2 to v2.3.7 since
+#       #6394, BUILT FROM SOURCE in
 #       docker/Dockerfile.backend since 2026-10-10 — UBI backend image only)
 #   All are short-lived CLI subprocesses the services shell out to. They are
 #   NOT part of the network-reachable service surface (axum HTTP :8080 / gRPC

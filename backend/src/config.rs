@@ -1352,9 +1352,10 @@ pub struct Config {
     /// databases with restricted connection budgets (e.g., shared RDS).
     ///
     /// Size the whole fleet, not one replica (#4549):
-    /// `DATABASE_MAX_CONNECTIONS × replicas` + the single-flight lock/wait
-    /// connections held outside the pool (capped per replica by
-    /// `PROXY_SINGLEFLIGHT_MAX_LOCK_WAITERS`) + headroom for one
+    /// `(DATABASE_MAX_CONNECTIONS + DATABASE_PROBE_CONNECTIONS) × replicas`,
+    /// plus the single-flight lock/wait connections held outside the pool
+    /// (capped per replica by
+    /// `PROXY_SINGLEFLIGHT_LOCK_MAX_CONNECTIONS`) + headroom for one
     /// rolling-update surge replica must stay below Postgres
     /// `max_connections`. The defaults give 3 × 50 = 150 against a stock
     /// server's 100; see the Database section of `.env.example`.
@@ -1369,6 +1370,38 @@ pub struct Config {
     /// under sustained pool exhaustion instead of piling up; raise for batch
     /// workloads where waiting is preferable to retrying.
     pub database_acquire_timeout_secs: u64,
+
+    /// Longest a request queues at the database admission gate for a slot
+    /// (see `database_request_concurrency`) while every slot is held and the
+    /// pool is busy (#4182). A request whose predicted wait (requests queued
+    /// ahead x average slot hold time / slots) is longer is answered
+    /// `503 POOL_EXHAUSTED` at once with a predicted `Retry-After`; one that
+    /// queues and still gets no slot in time is answered the same. Env var:
+    /// `DATABASE_REQUEST_ACQUIRE_WAIT_MS`. `None` (unset): the pool's own
+    /// acquire timeout, `DATABASE_ACQUIRE_TIMEOUT_SECS x 1000`, so the gate
+    /// sheds only where a queued acquire would have timed out anyway; see
+    /// [`Config::database_request_wait_ms`]. `0` turns the gate off.
+    pub database_request_acquire_wait_ms: Option<u64>,
+
+    /// Connections in the separate pool that `/health` and `/readyz` read
+    /// the database through, so a request pool saturated by a burst does not
+    /// fail the readiness probe of a replica that is busy, not broken
+    /// (#4182). Counts toward the connection budget on top of
+    /// `database_max_connections`. Env var: `DATABASE_PROBE_CONNECTIONS`.
+    /// Default 1. `0` makes the probes share the request pool (the behaviour
+    /// before 1.13).
+    pub database_probe_connections: u32,
+
+    /// How many requests may be in their handler phase at once while the
+    /// request pool is busy (#4182): past it, a request waits for an
+    /// admission permit within `database_request_acquire_wait_ms` and is
+    /// otherwise shed. Bounds how many requests compete for the pool's
+    /// connections, so an admitted request's queries wait behind a bounded
+    /// crowd instead of the whole burst. Sheds nothing while the pool has
+    /// room. Env var: `DATABASE_REQUEST_CONCURRENCY`. Default four per pool
+    /// connection (`None`: `4 × database_max_connections`, see
+    /// [`Config::database_request_slots`]). `0` turns the gate off.
+    pub database_request_concurrency: Option<usize>,
 
     /// Maximum number of bcrypt-bound auth operations (login,
     /// password verification, API-token verification) allowed to run
@@ -1983,6 +2016,9 @@ redacted_debug!(Config {
     show database_max_connections,
     show database_min_connections,
     show database_acquire_timeout_secs,
+    show database_request_acquire_wait_ms,
+    show database_probe_connections,
+    show database_request_concurrency,
     show database_idle_timeout_secs,
     show database_max_lifetime_secs,
     show database_tcp_keepalives,
@@ -2156,6 +2192,9 @@ impl Default for Config {
             database_max_connections: 50,
             database_min_connections: 5,
             database_acquire_timeout_secs: 5,
+            database_request_acquire_wait_ms: None,
+            database_probe_connections: 1,
+            database_request_concurrency: None,
             database_idle_timeout_secs: 600,
             database_max_lifetime_secs: 1800,
             database_tcp_keepalives: true,
@@ -2244,6 +2283,23 @@ impl Default for Config {
 }
 
 impl Config {
+    /// The database admission gate's wait budget in milliseconds (#4182):
+    /// `DATABASE_REQUEST_ACQUIRE_WAIT_MS` when set, otherwise the pool's own
+    /// acquire timeout, so the gate never sheds a request that would have got
+    /// a connection on the pool before it timed out. `0`: gate off.
+    pub fn database_request_wait_ms(&self) -> u64 {
+        self.database_request_acquire_wait_ms
+            .unwrap_or(self.database_acquire_timeout_secs.saturating_mul(1000))
+    }
+
+    /// Database admission slots (#4182): `DATABASE_REQUEST_CONCURRENCY` when
+    /// set, otherwise four per pool connection, so a smaller or larger pool
+    /// scales the gate with it.
+    pub fn database_request_slots(&self) -> usize {
+        self.database_request_concurrency
+            .unwrap_or(4 * self.database_max_connections as usize)
+    }
+
     /// The HTTP/1 header-read timeout to hand the server (#4665); `None`
     /// when `HTTP_HEADER_READ_TIMEOUT_SECS=0` turned it off.
     pub fn http_header_read_timeout(&self) -> Option<std::time::Duration> {
@@ -2565,6 +2621,13 @@ impl Config {
             database_max_connections: env_parse("DATABASE_MAX_CONNECTIONS", 50),
             database_min_connections: env_parse("DATABASE_MIN_CONNECTIONS", 5),
             database_acquire_timeout_secs: env_parse("DATABASE_ACQUIRE_TIMEOUT_SECS", 5),
+            database_request_acquire_wait_ms: env::var("DATABASE_REQUEST_ACQUIRE_WAIT_MS")
+                .ok()
+                .and_then(|v| v.trim().parse().ok()),
+            database_probe_connections: env_parse("DATABASE_PROBE_CONNECTIONS", 1),
+            database_request_concurrency: env::var("DATABASE_REQUEST_CONCURRENCY")
+                .ok()
+                .and_then(|v| v.trim().parse().ok()),
             database_idle_timeout_secs: env_parse("DATABASE_IDLE_TIMEOUT_SECS", 600),
             database_max_lifetime_secs: env_parse("DATABASE_MAX_LIFETIME_SECS", 1800),
             database_tcp_keepalives: !matches!(
@@ -3198,6 +3261,50 @@ fn secret_alphabet_size(chars: &[char]) -> usize {
 #[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod tests {
+
+    /// #4182: the admission slots follow the pool unless pinned.
+    #[test]
+    fn request_slots_default_to_four_per_pool_connection_4182() {
+        let derived = Config {
+            database_max_connections: 20,
+            database_request_concurrency: None,
+            ..Config::default()
+        };
+        assert_eq!(derived.database_request_slots(), 80);
+        assert_eq!(Config::default().database_request_slots(), 200);
+        let pinned = Config {
+            database_request_concurrency: Some(7),
+            ..derived.clone()
+        };
+        assert_eq!(pinned.database_request_slots(), 7);
+        let off = Config {
+            database_request_concurrency: Some(0),
+            ..derived
+        };
+        assert_eq!(off.database_request_slots(), 0);
+    }
+
+    /// #4182: the gate's wait follows the pool's acquire timeout unless set.
+    #[test]
+    fn request_wait_defaults_to_the_acquire_timeout_4182() {
+        assert_eq!(Config::default().database_request_wait_ms(), 5_000);
+        let slower = Config {
+            database_acquire_timeout_secs: 12,
+            ..Config::default()
+        };
+        assert_eq!(slower.database_request_wait_ms(), 12_000);
+        let pinned = Config {
+            database_request_acquire_wait_ms: Some(500),
+            ..slower.clone()
+        };
+        assert_eq!(pinned.database_request_wait_ms(), 500);
+        let off = Config {
+            database_request_acquire_wait_ms: Some(0),
+            ..slower
+        };
+        assert_eq!(off.database_request_wait_ms(), 0);
+    }
+
     use super::*;
     use std::sync::Mutex;
 
