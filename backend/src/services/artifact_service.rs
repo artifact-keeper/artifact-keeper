@@ -94,9 +94,39 @@ pub struct ContentDigests {
 /// (#6317), for a format that serves the package from `artifact_metadata`.
 /// Written with empty `properties`, exactly as [`ArtifactService::set_metadata`]
 /// with `{}` would.
+///
+/// An `rpm` document that is too large for the column is stored with the
+/// "unparseable" repodata marker instead, as every RPM metadata write does
+/// (#3801), so it never fails the upload for its size alone.
 pub struct CommitMetadata<'a> {
     pub format: &'a str,
     pub metadata: serde_json::Value,
+}
+
+/// Who writes an upload's package catalog row (`packages` /
+/// `package_versions`) once its artifact row commits (#6318, #6346).
+#[derive(Debug, Clone, Copy, Default)]
+pub enum CatalogRegistration<'a> {
+    /// The upload service derives the catalog name from the artifact row
+    /// (Maven/Gradle from the GAV path) and registers it.
+    #[default]
+    Derive,
+    /// The upload service registers it under this name: the caller's own
+    /// catalog identity when `artifacts.name` is a normalized form of it
+    /// (NuGet keeps the authored casing, #3976).
+    Name(&'a str),
+    /// The calling format handler registers it itself, with the description
+    /// and catalog metadata it parsed, after the upload returns. The service
+    /// writes no catalog row, so one upload writes its catalog row once
+    /// instead of twice.
+    Caller,
+}
+
+impl<'a> CatalogRegistration<'a> {
+    /// The pre-#6318 `catalog_name` argument: a name, or derive one.
+    pub fn from_name(name: Option<&'a str>) -> Self {
+        name.map_or(Self::Derive, Self::Name)
+    }
 }
 
 /// Where the body of a streaming upload comes from (#3916).
@@ -1061,6 +1091,7 @@ impl ArtifactService {
             data,
             uploaded_by,
             enqueue_sync_tasks,
+            CatalogRegistration::Derive,
             None,
         )
         .await
@@ -1080,6 +1111,7 @@ impl ArtifactService {
         data: Bytes,
         uploaded_by: Option<Uuid>,
         enqueue_sync_tasks: bool,
+        catalog: CatalogRegistration<'_>,
         commit_metadata: Option<CommitMetadata<'_>>,
     ) -> Result<Artifact> {
         let size_bytes = data.len() as i64;
@@ -1127,7 +1159,7 @@ impl ArtifactService {
             &storage_key,
             uploaded_by,
             enqueue_sync_tasks,
-            None,
+            catalog,
             None,
             CasRewrite::Bytes(data),
             commit_metadata,
@@ -1218,7 +1250,7 @@ impl ArtifactService {
             size_bytes,
             uploaded_by,
             enqueue_sync_tasks,
-            catalog_name,
+            CatalogRegistration::from_name(catalog_name),
             precondition,
             None,
         )
@@ -1244,13 +1276,17 @@ impl ArtifactService {
         size_bytes: i64,
         uploaded_by: Option<Uuid>,
         enqueue_sync_tasks: bool,
-        catalog_name: Option<&str>,
+        catalog: CatalogRegistration<'_>,
         precondition: Option<&WritePrecondition>,
         commit_metadata: Option<CommitMetadata<'_>>,
     ) -> Result<Artifact> {
         let storage_key = Self::storage_key_from_checksum(&digests.sha256);
 
+        // #6318: one read of the repository row serves the preflight and the
+        // finalize.
+        let repo = self.repo_service.get_by_id(repository_id).await.ok();
         self.preflight_upload(
+            repo.as_ref(),
             repository_id,
             path,
             version,
@@ -1314,7 +1350,7 @@ impl ArtifactService {
                 &storage_key,
                 uploaded_by,
                 enqueue_sync_tasks,
-                catalog_name,
+                catalog,
                 precondition,
                 rewrite,
                 commit_metadata,
@@ -1524,7 +1560,7 @@ impl ArtifactService {
         storage_key: &str,
         uploaded_by: Option<Uuid>,
         enqueue_sync_tasks: bool,
-        catalog_name: Option<&str>,
+        catalog: CatalogRegistration<'_>,
         precondition: Option<&WritePrecondition>,
         rewrite: CasRewrite,
         commit_metadata: Option<CommitMetadata<'_>>,
@@ -1808,14 +1844,23 @@ impl ArtifactService {
             // same GAV coordinates as the name. `artifact.version` on this path
             // is a naive path segment (e.g. the first groupId component), which
             // no grouped listing row ever matches.
-            // #3976: `catalog_name` is the caller's own catalog identity, for a
-            // handler whose `artifacts.name` is a normalized form of it —
-            // NuGet stores the lowercased id, so deriving the name here
-            // registered a second, lowercased package beside the handler's.
-            let registration = match catalog_name {
-                Some(catalog_name) => Some((catalog_name.to_string(), ver.clone(), None)),
-                None => match self.repo_service.get_by_id(artifact.repository_id).await {
-                    Ok(repo)
+            // #3976: `CatalogRegistration::Name` is the caller's own catalog
+            // identity, for a handler whose `artifacts.name` is a normalized
+            // form of it — NuGet stores the lowercased id, so deriving the
+            // name here registered a second, lowercased package beside the
+            // handler's.
+            // #6346: a handler that registers the catalog row itself, with
+            // the description and metadata it parsed, says so
+            // (`CatalogRegistration::Caller`), and this writes nothing: the
+            // row used to be upserted here and again by the handler, two
+            // writes and four pool checkouts for one upload.
+            let registration = match catalog {
+                CatalogRegistration::Caller => None,
+                CatalogRegistration::Name(catalog_name) => {
+                    Some((catalog_name.to_string(), ver.clone(), None))
+                }
+                CatalogRegistration::Derive => match repo_for_upload.as_ref() {
+                    Some(repo)
                         if matches!(
                             repo.format,
                             RepositoryFormat::Maven | RepositoryFormat::Gradle
@@ -3893,6 +3938,7 @@ mod tests {
                 Bytes::from(format!("body {path}")),
                 None,
                 false,
+                CatalogRegistration::Derive,
                 Some(CommitMetadata {
                     format: "pypi",
                     metadata: serde_json::json!({"name": "pkg6317", "version": "1.0"}),
@@ -3945,6 +3991,7 @@ mod tests {
                         body,
                         None,
                         false,
+                        CatalogRegistration::Derive,
                         Some(CommitMetadata {
                             format: &format,
                             metadata: serde_json::json!({"name": "pkg6317"}),

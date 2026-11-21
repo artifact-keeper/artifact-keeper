@@ -6808,7 +6808,9 @@ async fn upload(
             Some(user_id),
             // #4889: queue below, once the upload has committed.
             false,
-            None,
+            // #6346: registered once, below, with the summary and catalog
+            // metadata parsed here.
+            crate::services::artifact_service::CatalogRegistration::Caller,
             None,
             Some(crate::services::artifact_service::CommitMetadata {
                 format: "pypi",

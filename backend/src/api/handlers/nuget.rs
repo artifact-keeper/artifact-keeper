@@ -5349,12 +5349,12 @@ async fn push_package(
     let filename = build_nupkg_filename(&package_id, &version);
     let artifact_path = build_nuget_artifact_path(&package_id, &version);
 
-    // #3976: this push writes the catalog twice -- once in the finalize tail of
-    // the upload below, once in the registration after it -- and `packages` is
-    // `UNIQUE (repository_id, name)`, which is case-sensitive while a NuGet id
-    // is not. Both writes therefore take ONE name, resolved here: the casing an
-    // earlier push of this id already registered, or, for an id the catalog has
-    // not seen, the casing the `.nuspec` declares. `artifacts.name` stays
+    // #3976: `packages` is `UNIQUE (repository_id, name)`, which is
+    // case-sensitive while a NuGet id is not, so the catalog write below takes
+    // ONE name, resolved here: the casing an earlier push of this id already
+    // registered, or, for an id the catalog has not seen, the casing the
+    // `.nuspec` declares. (#6346: the upload service no longer writes a second
+    // catalog row of its own for this push.) `artifacts.name` stays
     // lowercased -- every NuGet read compares `LOWER(name)` and none of them
     // read `packages`.
     let catalog_name = existing_catalog_name(&state.db, repo.id, &package_id)

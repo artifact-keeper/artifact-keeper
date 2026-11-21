@@ -166,22 +166,6 @@ pub(crate) fn resolved_target(target: NativeTarget, staged: &StagedNativeFinaliz
     }
 }
 
-/// The catalog identity a staged package writes, when it differs from the
-/// lowercased `artifacts.name` the shared upload service would derive. NuGet
-/// keeps the id's authored casing and reuses an existing row's spelling.
-pub(crate) async fn catalog_name(
-    db: &sqlx::PgPool,
-    repository_id: Uuid,
-    staged: &StagedNativeFinalize,
-) -> Option<String> {
-    match staged {
-        StagedNativeFinalize::Nuget(nuget) => {
-            Some(nuget_catalog_name(db, repository_id, &nuget.info).await)
-        }
-        _ => None,
-    }
-}
-
 async fn nuget_catalog_name(db: &sqlx::PgPool, repository_id: Uuid, info: &NuspecInfo) -> String {
     let lowercased_id = info.id.to_lowercase();
     existing_catalog_name(db, repository_id, &lowercased_id)
