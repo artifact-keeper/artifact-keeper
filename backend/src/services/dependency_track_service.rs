@@ -328,9 +328,7 @@ pub struct DependencyTrackService {
     /// Cache for a file-sourced API key; unused when the key is provided
     /// directly via `DEPENDENCY_TRACK_API_KEY`.
     cached_file_key: std::sync::Mutex<CachedFileKey>,
-    /// Serializes this client's Maven provisioning; PostgreSQL advisory locks
-    /// cover independent AK replicas, and HTTP 409s trigger exact lookups.
-    maven_provisioning: tokio::sync::Mutex<()>,
+    maven_provisioning: maven::MavenProvisioning,
 }
 
 /// Dependency-Track project representation
@@ -777,7 +775,7 @@ impl DependencyTrackService {
             config,
             page_size: DT_PAGE_SIZE,
             cached_file_key: std::sync::Mutex::new(CachedFileKey::default()),
-            maven_provisioning: tokio::sync::Mutex::new(()),
+            maven_provisioning: Default::default(),
         })
     }
 
@@ -2479,7 +2477,7 @@ mod tests {
             },
             page_size: TEST_PAGE_SIZE,
             cached_file_key: std::sync::Mutex::new(CachedFileKey::default()),
-            maven_provisioning: tokio::sync::Mutex::new(()),
+            maven_provisioning: Default::default(),
         }
     }
 
@@ -2498,7 +2496,7 @@ mod tests {
             },
             page_size: TEST_PAGE_SIZE,
             cached_file_key: std::sync::Mutex::new(CachedFileKey::default()),
-            maven_provisioning: tokio::sync::Mutex::new(()),
+            maven_provisioning: Default::default(),
         }
     }
 
@@ -3243,7 +3241,7 @@ mod tests {
             },
             page_size: TEST_PAGE_SIZE,
             cached_file_key: std::sync::Mutex::new(CachedFileKey::default()),
-            maven_provisioning: tokio::sync::Mutex::new(()),
+            maven_provisioning: Default::default(),
         };
         assert_eq!(svc.api_key().unwrap(), "direct-key");
         assert_eq!(svc.api_key().unwrap(), "direct-key");

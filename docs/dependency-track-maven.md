@@ -40,42 +40,37 @@ It does not remove previously generated local SBOMs, findings or DT projects.
 
 ## Collection identity and existing projects
 
-With automatic collections enabled, Maven coordinates determine identity:
+Automatic collections use the Maven group, artifact ID and Artifact Keeper
+repository UUID as the Dependency-Track project name. The two versions below
+belong to the same repository.
 
 ```text
-ru.molnet:MBOX_core                     collection, version = null
-  ru.molnet:MBOX_core : 1.0.0            versioned project
-  ru.molnet:MBOX_core : 2.1.0            versioned project
+ru.molnet:MBOX_core [c307710c-8448-4850-87db-f716b332c64e]    collection, version = null
+  ru.molnet:MBOX_core [c307710c-8448-4850-87db-f716b332c64e]  version 1.0.0
+  ru.molnet:MBOX_core [c307710c-8448-4850-87db-f716b332c64e]  version 2.1.0
 ```
 
-New collections and children use the exact qualified name `groupId:artifactId`,
-the Maven `group` field and a Maven PURL. Both names include the group because DT
-uniqueness is based on name/version, not group/name/version. Collections use
-`collectionLogic=AGGREGATE_DIRECT_CHILDREN` and receive no SBOM. Each version
-gets its own child and receives its own SBOM; different versions are never merged.
+Different repositories, including those created on independent Artifact Keeper
+installations sharing Dependency-Track, get separate collections and children
+even when their coordinates and repository keys match. Replicas of one
+installation share repository UUIDs. A database clone also retains those UUIDs.
+When the name would exceed Dependency-Track's 255-character limit, it uses
+`maven:sha256:<coordinate digest> [<repository UUID>]`.
 
-Existing exact qualified names, or artifactId names with matching group or Maven
-PURL, are reused without renaming. A collection with an older arbitrary name can
-be identified by its exact Maven PURL, including through an existing child's
-parent. No fuzzy name matching is used. List/lookup responses are followed by
-full project-detail reads before examining parent relationships.
+Each project has the Maven group and PURL. The collection uses
+`AGGREGATE_DIRECT_CHILDREN`. Each version has its own child and receives its
+own SBOM. The integration finds projects through an exact name/version lookup.
+Unscoped projects may match the Maven PURL while belonging to a different
+repository, so enabling collections starts a scoped hierarchy and leaves those
+projects and their history intact. To retain a previous project's history in
+the hierarchy, verify which repository owns it and rename it in Dependency-Track
+to the scoped name before the first eligible submission. A conflicting project
+at the scoped name stops submission for that coordinate and logs a diagnostic.
 
-If multiple collections or children match, an unversioned project is not a
-direct-child collection, or an artifactId-only legacy project has neither group
-nor PURL evidence, provisioning is skipped with a diagnostic. Existing data stays
-intact. An operator can supply the correct group/PURL in DT after verifying the
-identity, then rescan. The integration does not guess ownership or create a
-duplicate as a fallback for ambiguous legacy data.
-
-An existing child without a parent is attached using a partial PATCH containing
-the parent UUID and the child's unchanged `active`, `isLatest` and
-`collectionLogic` values. DT 4.14 applies primitive defaults even to omitted
-PATCH fields, so these values must be carried forward to preserve project state.
-A child already linked to the correct parent needs no
-update. A different existing parent is preserved, logged and remains the child's
-parent; the child's normal SBOM upload continues. No project is deleted,
-recreated, converted to a collection or stripped of its existing fields/history.
-Ancestors are checked before adding a relationship to prevent cycles.
+An existing scoped child without a parent is attached with a partial PATCH that
+carries its current `active`, `isLatest` and `collectionLogic` values. Parent
+assignment checks ancestors for cycles. A child that already has a parent keeps
+that relationship and continues to receive its SBOM.
 
 JAR and POM publications with the same coordinates already address the same DT
 name/version when these features are disabled. This remains one version project
@@ -86,26 +81,23 @@ inventory merging. Excluding a classifier does not affect a primary JAR or POM.
 
 ## Permissions, concurrency and failures
 
-The API key's team needs `VIEW_PORTFOLIO` for list, lookup and full-detail reads,
+The API key's team needs `VIEW_PORTFOLIO` for lookup and full-detail reads,
 `PORTFOLIO_MANAGEMENT` for explicit project creation and parent updates, and
 `BOM_UPLOAD` for submission. Existing finding/policy reads also require
 `VIEW_VULNERABILITY` and `VIEW_POLICY_VIOLATION`. `PROJECT_CREATION_UPLOAD` alone
 does not authorize explicit project creation or parent assignment.
 
-Maven provisioning is serialized within one client and across AK replicas sharing
-PostgreSQL using a transaction-scoped advisory lock on the full Maven identity.
-The lock times out after 30 seconds and is released after upstream errors too;
-it writes no local scan state. This avoids relying on DT to enforce uniqueness
-for simultaneous collection creation with a null version. Independent AK
-installations sharing DT should coordinate ownership: they do not share this
-lock. A creation HTTP 409 triggers bounded exact lookups and full-detail
-validation of the winning project.
-Requests queue on the client mutex before acquiring a database connection, so
-an upstream outage holds at most one pool connection per client for DT work.
-Parent assignment re-reads the child and never deliberately replaces a different
-parent. DT 4.14 does not offer compare-and-set parent updates; coordinate manual
-hierarchy edits with automated provisioning to avoid a concurrent operator edit
-between the final read and PATCH. Different versions still upload separate BOMs.
+Existing version projects with a parent are resolved through HTTP alone.
+Hierarchy changes are serialized for the same repository and Maven group/artifact
+pair. Replicas sharing a database take a PostgreSQL advisory lock on a dedicated
+session. The 30-second deadline covers lookup, lock acquisition and HTTP
+provisioning, and the session closes if the work is cancelled or times out.
+Each client allows up to four concurrent lock sessions outside the request pool.
+A creation HTTP 409 triggers exact lookups and validation of the winning project.
+
+Parent assignment re-reads the child before PATCH. Coordinate manual edits to
+the same hierarchy with automated provisioning because DT 4.14 applies parent
+changes without a compare-and-set condition.
 
 Transport errors, permission errors (401/403), unresolved conflicts and server
 errors are logged with operation/status diagnostics. They stop that DT submission

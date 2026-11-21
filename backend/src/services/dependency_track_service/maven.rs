@@ -1,14 +1,72 @@
 //! Maven-only Dependency-Track policy and collection provisioning.
 //!
 //! API contract verified against /api/openapi.json from the official 4.14.0
-//! executable (PUT /project, GET /project/{uuid}, PATCH /project/{uuid}).
+//! executable (GET /project/lookup, PUT /project, GET and PATCH /project/{uuid}).
 //! PATCH sends parent and unchanged state flags, never a serialized GET response.
 
 use super::*;
 use crate::formats::maven::{MavenCoordinates, MavenHandler};
-use std::collections::HashSet;
+use crate::services::cluster_lock::{lease_object_id, ClusterLock, PgAdvisoryLock};
+use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Weak};
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard, Semaphore};
+use uuid::Uuid;
 
 const DIRECT_CHILDREN: &str = "AGGREGATE_DIRECT_CHILDREN";
+const DT_PROJECT_NAME_LIMIT: usize = 255;
+
+const MAVEN_PROVISIONING_TIMEOUT: Duration = Duration::from_secs(30);
+const MAVEN_PROVISIONING_LOCK_CLASS: i32 = 0x4454_4d56; // "DTMV"
+const MAX_MAVEN_LOCK_SESSIONS: usize = 4;
+
+#[derive(Debug)]
+pub(super) struct MavenProvisioning {
+    in_flight: std::sync::Mutex<HashMap<String, Weak<AsyncMutex<()>>>>,
+    sessions: Semaphore,
+}
+
+impl Default for MavenProvisioning {
+    fn default() -> Self {
+        Self {
+            in_flight: Default::default(),
+            sessions: Semaphore::new(MAX_MAVEN_LOCK_SESSIONS),
+        }
+    }
+}
+
+impl MavenProvisioning {
+    async fn lock(&self, name: &str) -> OwnedMutexGuard<()> {
+        let lock = {
+            let mut in_flight = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
+            in_flight.retain(|_, lock| lock.strong_count() != 0);
+            match in_flight.get(name).and_then(Weak::upgrade) {
+                Some(lock) => lock,
+                None => {
+                    let lock = Arc::new(AsyncMutex::new(()));
+                    in_flight.insert(name.to_owned(), Arc::downgrade(&lock));
+                    lock
+                }
+            }
+        };
+        lock.lock_owned().await
+    }
+}
+
+fn project_name(repository_id: Uuid, coordinates: &MavenCoordinates) -> String {
+    let identity = format!(
+        "{}:{}",
+        urlencoding::encode(&coordinates.group_id),
+        urlencoding::encode(&coordinates.artifact_id),
+    );
+    let name = format!("{identity} [{repository_id}]");
+    if name.len() <= DT_PROJECT_NAME_LIMIT {
+        return name;
+    }
+    // The extra colon distinguishes a hashed identity from a literal group:artifact.
+    let digest = Sha256::digest(identity.as_bytes());
+    format!("maven:sha256:{digest:x} [{repository_id}]")
+}
 
 impl DependencyTrackService {
     /// Sidecars have their own upload handling and are not classifier artifacts.
@@ -37,236 +95,127 @@ impl DependencyTrackService {
         self.config.auto_collections
     }
 
-    /// Serialize all AK replicas sharing a database. DT 4.14 checks name/version
-    /// before creation but does not guarantee a database uniqueness constraint
-    /// for that pair (notably for null versions). A client mutex alone cannot
-    /// prevent two replicas from creating the same collection concurrently.
-    pub async fn get_or_create_maven_project_with_db(
+    pub async fn get_or_create_maven_project(
         &self,
         db: &sqlx::PgPool,
+        repository_id: Uuid,
         coordinates: &MavenCoordinates,
-        legacy_name: &str,
         description: &str,
     ) -> Result<DtProject> {
         if self.excludes_maven_classifier(coordinates) {
             return Err(AppError::Validation("Excluded Maven classifier".into()));
         }
-        // Queue locally before acquiring a pool connection. An upstream outage
-        // must not fill the publication pool with transactions waiting on this
-        // client's mutex: at most one connection per client is held for DT.
-        let _guard = self.maven_provisioning.lock().await;
-        let mut transaction = db.begin().await?;
-        sqlx::query("SET LOCAL lock_timeout = '30s'")
-            .execute(&mut *transaction)
-            .await?;
-        // PostgreSQL hashes the entire identity; collisions only serialize
-        // unrelated artifacts and never change how projects are matched.
-        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
-            .bind(format!(
-                "dependency-track:maven:{}:{}",
-                coordinates.group_id, coordinates.artifact_id
-            ))
-            .execute(&mut *transaction)
-            .await?;
-        let project = self
-            .provision_maven_project(coordinates, legacy_name, description)
-            .await;
-        // No local state was written. Release even when the upstream failed.
-        transaction.rollback().await?;
-        project
+        let name = project_name(repository_id, coordinates);
+        tokio::time::timeout(MAVEN_PROVISIONING_TIMEOUT, async {
+            // Established projects only need an exact read; the session lock
+            // covers changes to the hierarchy across replicas.
+            let version = Some(coordinates.version.as_str());
+            if let Some(child) = self.find_maven_project(&name, version, coordinates).await? {
+                if child.parent.is_some() {
+                    return Ok(child);
+                }
+            }
+
+            let _local = self.maven_provisioning.lock(&name).await;
+            let _session_slot = self
+                .maven_provisioning
+                .sessions
+                .acquire()
+                .await
+                .expect("semaphore is never closed");
+            // DT checks name/version before inserting, but concurrent creates
+            // can still both succeed. Use a dedicated PostgreSQL session with
+            // no open transaction or checked-out request-pool connection.
+            let lease = PgAdvisoryLock::new(db.clone())
+                .acquire_blocking(
+                    MAVEN_PROVISIONING_LOCK_CLASS,
+                    lease_object_id(&name),
+                    MAVEN_PROVISIONING_TIMEOUT,
+                )
+                .await?
+                .ok_or_else(|| maven_provisioning_timeout(&name))?;
+            let result = self
+                .provision_maven_project(&name, coordinates, description)
+                .await;
+            lease.release().await;
+            result
+        })
+        .await
+        .map_err(|_| maven_provisioning_timeout(&name))?
     }
 
-    /// HTTP-only test entry point; production also takes the database lock.
-    #[cfg(all(test, ak_test_shard = "services-1"))]
-    async fn get_or_create_maven_project(
-        &self,
-        coordinates: &MavenCoordinates,
-        legacy_name: &str,
-        description: &str,
-    ) -> Result<DtProject> {
-        let _guard = self.maven_provisioning.lock().await;
-        self.provision_maven_project(coordinates, legacy_name, description)
-            .await
-    }
-
-    /// Provisioning runs only after the scanner's classifier eligibility check.
-    /// No local scan state is read or written by this method.
     async fn provision_maven_project(
         &self,
+        name: &str,
         coordinates: &MavenCoordinates,
-        legacy_name: &str,
         description: &str,
     ) -> Result<DtProject> {
-        // Defense in depth for future callers: excluded artifacts make zero requests.
-        if self.excludes_maven_classifier(coordinates) {
-            return Err(AppError::Validation("Excluded Maven classifier".into()));
-        }
-        let identity = format!("{}:{}", coordinates.group_id, coordinates.artifact_id);
-        let projects = self.list_projects().await?;
-        let mut collections = Vec::new();
-        let mut children = Vec::new();
-        let mut related_parents = HashSet::new();
-
-        for summary in projects {
-            // A renamed legacy collection with only a group cannot establish
-            // artifact identity. Don't create a second collection beside it.
-            let unidentified_collection = summary.version.is_none()
-                && is_collection(&summary)
-                && summary.group.as_deref() == Some(coordinates.group_id.as_str())
-                && summary.purl.is_none()
-                && !summary
-                    .name
-                    .starts_with(&format!("{}:", coordinates.group_id));
-            // Exact names or structured PURL identity only. No fuzzy matching.
-            if summary.name != identity
-                && summary.name != coordinates.artifact_id
-                && summary.name != legacy_name
-                && !purl_matches(&summary, coordinates)
-                && !unidentified_collection
-            {
-                continue;
-            }
-            // List and lookup responses may omit parent. Always fetch full details.
-            let project = self.maven_project_details(&summary.uuid).await?;
-            let strong_identity = project_matches(&project, coordinates);
-            if !strong_identity {
-                // A conflicting explicit namespace proves this is another artifact.
-                if project
-                    .group
-                    .as_deref()
-                    .is_some_and(|g| g != coordinates.group_id)
-                    || project.purl.is_some()
-                {
-                    continue;
-                }
-                return Err(ambiguous(
-                    &identity,
-                    "legacy project lacks unambiguous Maven artifact identity",
-                ));
-            }
-            // Older versions may point to a renamed collection whose list
-            // response carries no identity fields. Inspect that lineage too.
-            if project.version.is_some() {
-                if let Some(parent) = &project.parent {
-                    related_parents.insert(parent.uuid.clone());
-                }
-            }
-            if project.version.is_none() {
-                if project.collection_logic.as_deref() != Some(DIRECT_CHILDREN) {
-                    return Err(ambiguous(
-                        &identity,
-                        "unversioned project is not a direct-child collection",
-                    ));
-                }
-                collections.push(project);
-            } else if project.version.as_deref() == Some(coordinates.version.as_str()) {
-                if is_collection(&project) {
-                    return Err(ambiguous(
-                        &identity,
-                        "versioned project is itself a collection",
-                    ));
-                }
-                children.push(project);
-            }
-        }
-        let mut unidentified_parent = false;
-        for uuid in related_parents {
-            if collections.iter().any(|p| p.uuid == uuid) {
-                continue;
-            }
-            let parent = self.maven_project_details(&uuid).await?;
-            if project_matches(&parent, coordinates)
-                && parent.version.is_none()
-                && parent.collection_logic.as_deref() == Some(DIRECT_CHILDREN)
-            {
-                collections.push(parent);
-            } else {
-                unidentified_parent = true;
-            }
-        }
-        if children.len() > 1 || collections.len() > 1 {
-            return Err(ambiguous(&identity, "multiple exact project identities"));
-        }
-        let child = children.pop();
-        // A legacy child can identify a renamed collection through its actual parent.
-        // A different parent is preserved, and no redundant collection is created.
-        if let Some(existing) = child.as_ref() {
-            if let Some(parent_ref) = existing.parent.as_ref() {
-                let parent = self.maven_project_details(&parent_ref.uuid).await?;
-                if !project_matches(&parent, coordinates)
-                    || parent.version.is_some()
-                    || parent.collection_logic.as_deref() != Some(DIRECT_CHILDREN)
-                    || collections.first().is_some_and(|p| p.uuid != parent.uuid)
-                {
-                    warn!(project_uuid = %existing.uuid, parent_uuid = %parent.uuid,
-                        maven_identity = %identity, "Preserving different existing Dependency-Track parent");
-                    return Ok(existing.clone());
-                }
-                info!(collection_uuid = %parent.uuid, maven_identity = %identity,
-                    "Reusing existing Dependency-Track Maven collection");
-                return Ok(existing.clone());
-            }
+        let version = Some(coordinates.version.as_str());
+        let child = self.find_maven_project(name, version, coordinates).await?;
+        if let Some(child) = child.as_ref().filter(|child| child.parent.is_some()) {
+            return Ok(child.clone());
         }
 
-        if unidentified_parent {
-            return Err(ambiguous(
-                &identity,
-                "another version has an unidentified existing parent",
-            ));
-        }
-
-        let parent = if let Some(parent) = collections.pop() {
-            info!(collection_uuid = %parent.uuid, maven_identity = %identity,
-                "Reusing existing Dependency-Track Maven collection");
-            parent
-        } else {
-            let parent = self
-                .create_maven_project(&CreateProjectRequest {
-                    name: identity.clone(),
-                    version: None,
-                    description: Some(description.into()),
-                    group: Some(coordinates.group_id.clone()),
-                    purl: Some(maven_purl(coordinates, false)),
-                    parent: None,
-                    collection_logic: Some(DIRECT_CHILDREN.into()),
-                })
-                .await?;
-            if !project_matches(&parent, coordinates)
-                || parent.version.is_some()
-                || parent.collection_logic.as_deref() != Some(DIRECT_CHILDREN)
-            {
-                return Err(ambiguous(&identity, "conflicting collection identity"));
+        let parent = match self.find_maven_project(name, None, coordinates).await? {
+            Some(parent) => parent,
+            None => {
+                let parent = self
+                    .create_maven_project(&CreateProjectRequest {
+                        name: name.to_owned(),
+                        version: None,
+                        description: Some(description.into()),
+                        group: Some(coordinates.group_id.clone()),
+                        purl: Some(maven_purl(coordinates, false)),
+                        parent: None,
+                        collection_logic: Some(DIRECT_CHILDREN.into()),
+                    })
+                    .await?;
+                validate_maven_project(&parent, name, None, coordinates)?;
+                info!(collection_uuid = %parent.uuid, maven_identity = %name,
+                    "Provisioned Dependency-Track Maven collection");
+                parent
             }
-            info!(collection_uuid = %parent.uuid, maven_identity = %identity,
-                "Provisioned Dependency-Track Maven collection");
-            parent
         };
 
-        let child = if let Some(child) = child {
-            child
-        } else {
-            // New children use the qualified identity too: DT uniqueness is
-            // name/version, NOT group/name/version. Keep exact legacy children.
-            self.create_maven_project(&CreateProjectRequest {
-                name: identity.clone(),
-                version: Some(coordinates.version.clone()),
-                description: Some(description.into()),
-                group: Some(coordinates.group_id.clone()),
-                purl: Some(maven_purl(coordinates, true)),
-                parent: Some(DtProjectParent {
-                    uuid: parent.uuid.clone(),
-                }),
-                collection_logic: None,
-            })
-            .await?
+        let child = match child {
+            Some(child) => child,
+            None => {
+                let child = self
+                    .create_maven_project(&CreateProjectRequest {
+                        name: name.to_owned(),
+                        version: Some(coordinates.version.clone()),
+                        description: Some(description.into()),
+                        group: Some(coordinates.group_id.clone()),
+                        purl: Some(maven_purl(coordinates, true)),
+                        parent: Some(DtProjectParent {
+                            uuid: parent.uuid.clone(),
+                        }),
+                        collection_logic: None,
+                    })
+                    .await?;
+                validate_maven_project(&child, name, version, coordinates)?;
+                child
+            }
         };
-        if !project_matches(&child, coordinates)
-            || child.version.as_deref() != Some(coordinates.version.as_str())
-            || is_collection(&child)
-        {
-            return Err(ambiguous(&identity, "conflicting child identity"));
+        if child.parent.as_ref().is_some_and(|p| p.uuid == parent.uuid) {
+            return Ok(child);
         }
-        self.attach_maven_parent(child, &parent).await
+        self.attach_maven_parent(child, &parent, coordinates).await
+    }
+
+    async fn find_maven_project(
+        &self,
+        name: &str,
+        version: Option<&str>,
+        coordinates: &MavenCoordinates,
+    ) -> Result<Option<DtProject>> {
+        let Some(summary) = self.find_project(name, version).await? else {
+            return Ok(None);
+        };
+        // Read details before relying on the parent relationship or flags.
+        let project = self.maven_project_details(&summary.uuid).await?;
+        validate_maven_project(&project, name, version, coordinates)?;
+        Ok(Some(project))
     }
 
     async fn maven_project_details(&self, uuid: &str) -> Result<DtProject> {
@@ -309,7 +258,7 @@ impl DependencyTrackService {
             .await
             .map_err(|e| dt_transport_err("Maven project creation", e))?;
         if response.status() == StatusCode::CONFLICT {
-            // Another AK instance may have won the unique name/version race.
+            // Another creator may have won the name/version race.
             // Retry reads only; never turn a permission failure into a create.
             for attempt in 0..3 {
                 if let Some(project) = self
@@ -337,15 +286,20 @@ impl DependencyTrackService {
             .map_err(|e| dt_upstream_parse_err("Maven project creation", e))
     }
 
-    async fn attach_maven_parent(&self, child: DtProject, parent: &DtProject) -> Result<DtProject> {
+    async fn attach_maven_parent(
+        &self,
+        child: DtProject,
+        parent: &DtProject,
+        coordinates: &MavenCoordinates,
+    ) -> Result<DtProject> {
         // Re-read before assignment, including after a concurrent create conflict.
         let mut child = self.maven_project_details(&child.uuid).await?;
-        if is_collection(&child) {
-            return Err(ambiguous(
-                &child.name,
-                "child became a collection during provisioning",
-            ));
-        }
+        validate_maven_project(
+            &child,
+            &parent.name,
+            Some(&coordinates.version),
+            coordinates,
+        )?;
         if let Some(existing) = child.parent.as_ref() {
             if existing.uuid != parent.uuid {
                 warn!(project_uuid = %child.uuid, parent_uuid = %existing.uuid,
@@ -357,7 +311,10 @@ impl DependencyTrackService {
         let mut ancestor = parent.clone();
         loop {
             if !seen.insert(ancestor.uuid.clone()) {
-                return Err(ambiguous(&child.name, "cyclic parent relationship"));
+                return Err(AppError::Validation(format!(
+                    "Dependency-Track Maven project {} has a cyclic parent relationship",
+                    child.name,
+                )));
             }
             let Some(next) = ancestor.parent else { break };
             ancestor = self.maven_project_details(&next.uuid).await?;
@@ -407,37 +364,37 @@ impl DependencyTrackService {
     }
 }
 
-fn ambiguous(identity: &str, reason: &str) -> AppError {
-    warn!(
-        maven_identity = identity,
-        reason, "Dependency-Track Maven identity is ambiguous; preserving existing projects"
-    );
-    AppError::Validation(format!(
-        "Dependency-Track Maven identity {identity}: {reason}"
+fn maven_provisioning_timeout(name: &str) -> AppError {
+    AppError::ServiceUnavailable(format!(
+        "Dependency-Track Maven provisioning timed out for {name}"
     ))
 }
 
-fn is_collection(project: &DtProject) -> bool {
-    project
-        .collection_logic
-        .as_deref()
-        .is_some_and(|logic| logic != "NONE")
-}
-
-fn project_matches(project: &DtProject, coordinates: &MavenCoordinates) -> bool {
-    if project
-        .group
-        .as_deref()
-        .is_some_and(|group| group != coordinates.group_id)
+fn validate_maven_project(
+    project: &DtProject,
+    name: &str,
+    version: Option<&str>,
+    coordinates: &MavenCoordinates,
+) -> Result<()> {
+    let valid_collection_logic = match version {
+        None => project.collection_logic.as_deref() == Some(DIRECT_CHILDREN),
+        Some(_) => matches!(project.collection_logic.as_deref(), None | Some("NONE")),
+    };
+    if project.name != name
+        || project.version.as_deref() != version
+        || !valid_collection_logic
+        || project
+            .group
+            .as_deref()
+            .is_some_and(|group| group != coordinates.group_id)
+        || (project.purl.is_some() && !purl_matches(project, coordinates))
     {
-        return false;
+        return Err(AppError::Validation(format!(
+            "Dependency-Track project {} conflicts with scoped Maven identity {name} (version {version:?})",
+            project.uuid,
+        )));
     }
-    if project.purl.is_some() {
-        return purl_matches(project, coordinates);
-    }
-    project.name == format!("{}:{}", coordinates.group_id, coordinates.artifact_id)
-        || (project.name == coordinates.artifact_id
-            && project.group.as_deref() == Some(coordinates.group_id.as_str()))
+    Ok(())
 }
 
 fn purl_matches(project: &DtProject, coordinates: &MavenCoordinates) -> bool {
@@ -469,12 +426,26 @@ fn maven_purl(coordinates: &MavenCoordinates, versioned: bool) -> String {
     purl
 }
 
-#[cfg(all(test, ak_test_shard = "services-1"))]
+#[cfg(ak_test_shard = "services-1")]
+#[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::{json, Value};
     use std::sync::{Arc, Mutex};
     use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+    const REPOSITORY: Uuid = Uuid::from_u128(1);
+    const SCOPED_NAME: &str = "ru.molnet:core [00000000-0000-0000-0000-000000000001]";
+
+    async fn provision(
+        svc: &DependencyTrackService,
+        coordinates: &MavenCoordinates,
+    ) -> Result<DtProject> {
+        let name = project_name(REPOSITORY, coordinates);
+        let _guard = svc.maven_provisioning.lock(&name).await;
+        svc.provision_maven_project(&name, coordinates, "repo")
+            .await
+    }
 
     fn service(url: &str, collections: bool, csv: &str) -> DependencyTrackService {
         DependencyTrackService {
@@ -489,13 +460,26 @@ mod tests {
             },
             page_size: DT_PAGE_SIZE,
             cached_file_key: std::sync::Mutex::new(CachedFileKey::default()),
-            maven_provisioning: tokio::sync::Mutex::new(()),
+            maven_provisioning: Default::default(),
         }
     }
 
     fn coordinates(version: &str) -> MavenCoordinates {
         MavenHandler::parse_coordinates(&format!("ru/molnet/core/{version}/core-{version}.jar"))
             .unwrap()
+    }
+
+    #[test]
+    fn long_project_names_fit_dependency_tracks_limit() {
+        let mut c = coordinates("1.0");
+        c.group_id = "g".repeat(220);
+        let name = project_name(REPOSITORY, &c);
+        assert!(name.len() <= DT_PROJECT_NAME_LIMIT);
+        assert!(name.starts_with("maven:sha256:"));
+        c.version = "2.0".into();
+        assert_eq!(project_name(REPOSITORY, &c), name);
+        c.artifact_id = "other".into();
+        assert_ne!(project_name(REPOSITORY, &c), name);
     }
 
     #[test]
@@ -574,8 +558,8 @@ mod tests {
             .is_none());
     }
 
-    /// Stateful HTTP fake: omits parents in list/lookup, enforces unique
-    /// name/version, supports a competing creator and records every request.
+    /// Stateful HTTP fake: omits parents in lookup, supports a competing
+    /// creator and can simulate DT accepting duplicate names and versions.
     #[derive(Default)]
     struct Portfolio {
         projects: Vec<Value>,
@@ -599,38 +583,24 @@ mod tests {
                         .set_body_string("injected upstream failure");
                 }
             }
-            if method == "GET" && path == "/api/v1/project" {
-                let projects: Vec<_> = state
-                    .projects
-                    .iter()
-                    .map(|p| {
-                        let mut summary = p.clone();
-                        summary.as_object_mut().unwrap().remove("parent");
-                        summary
-                    })
-                    .collect();
-                let response = ResponseTemplate::new(200)
-                    .insert_header("X-Total-Count", projects.len().to_string())
-                    .set_body_json(projects);
-                return if state.allow_duplicates {
-                    response.set_delay(Duration::from_millis(30))
-                } else {
-                    response
-                };
-            }
             if method == "GET" && path == "/api/v1/project/lookup" {
                 let query: std::collections::HashMap<_, _> = req.url.query_pairs().collect();
                 let found = state.projects.iter().find(|p| {
                     p["name"].as_str() == query.get("name").map(|v| v.as_ref())
                         && p["version"].as_str() == query.get("version").map(|v| v.as_ref())
                 });
-                return match found {
+                let response = match found {
                     Some(p) => {
                         let mut summary = p.clone();
                         summary.as_object_mut().unwrap().remove("parent");
                         ResponseTemplate::new(200).set_body_json(summary)
                     }
                     None => ResponseTemplate::new(404),
+                };
+                return if state.allow_duplicates {
+                    response.set_delay(Duration::from_millis(30))
+                } else {
+                    response
                 };
             }
             if let Some(uuid) = path.strip_prefix("/api/v1/project/") {
@@ -704,7 +674,7 @@ mod tests {
     }
 
     fn child(parent: Option<&str>) -> Value {
-        let mut p = json!({"uuid": "child", "name": "core", "version": "1.0", "group": "ru.molnet",
+        let mut p = json!({"uuid": "child", "name": SCOPED_NAME, "version": "1.0", "group": "ru.molnet",
             "description": "operator description", "collectionLogic": "NONE", "active": false, "isLatest": true});
         if let Some(uuid) = parent {
             p["parent"] = json!({"uuid": uuid});
@@ -715,16 +685,13 @@ mod tests {
     #[tokio::test]
     async fn creates_collection_and_version_and_uploads_only_to_child() {
         let (_server, state, svc) = api(Portfolio::default()).await;
-        let c = svc
-            .get_or_create_maven_project(&coordinates("1.0"), "core", "repo")
-            .await
-            .unwrap();
+        let c = provision(&svc, &coordinates("1.0")).await.unwrap();
         svc.upload_sbom(&c.uuid, "{}").await.unwrap();
         let state = state.lock().unwrap();
         assert_eq!(state.projects.len(), 2);
         assert_eq!(state.projects[0]["version"], Value::Null);
         assert_eq!(state.projects[0]["collectionLogic"], DIRECT_CHILDREN);
-        assert_eq!(state.projects[0]["name"], "ru.molnet:core");
+        assert_eq!(state.projects[0]["name"], SCOPED_NAME);
         assert_eq!(
             state.projects[1]["parent"]["uuid"],
             state.projects[0]["uuid"]
@@ -733,17 +700,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reuses_renamed_collection_and_links_legacy_child_without_replacing_fields() {
+    async fn reuses_scoped_collection_and_links_child_without_replacing_fields() {
         let (server, state, svc) = api(Portfolio {
-            projects: vec![parent("old collection label"), child(None)],
+            projects: vec![parent(SCOPED_NAME), child(None)],
             ..Default::default()
         })
         .await;
         for _ in 0..2 {
-            let c = svc
-                .get_or_create_maven_project(&coordinates("1.0"), "core", "repo")
-                .await
-                .unwrap();
+            let c = provision(&svc, &coordinates("1.0")).await.unwrap();
             assert_eq!(c.uuid, "child");
             svc.upload_sbom(&c.uuid, "{}").await.unwrap();
         }
@@ -774,8 +738,10 @@ mod tests {
             ..Default::default()
         })
         .await;
+        let db = sqlx::PgPool::connect_lazy("postgres://localhost/test").unwrap();
+        db.close().await;
         let c = svc
-            .get_or_create_maven_project(&coordinates("1.0"), "core", "repo")
+            .get_or_create_maven_project(&db, REPOSITORY, &coordinates("1.0"), "repo")
             .await
             .unwrap();
         assert_eq!(c.parent.unwrap().uuid, "other");
@@ -800,9 +766,9 @@ mod tests {
         let first_coords = coordinates("1.0");
         let second_coords = coordinates("2.0");
         let (a, b, c) = tokio::join!(
-            svc.get_or_create_maven_project(&first_coords, "core", "repo"),
-            svc.get_or_create_maven_project(&second_coords, "core", "repo"),
-            second.get_or_create_maven_project(&first_coords, "core", "repo"),
+            provision(&svc, &first_coords),
+            provision(&svc, &second_coords),
+            provision(&second, &first_coords),
         );
         let a = a.unwrap();
         let b = b.unwrap();
@@ -812,27 +778,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ambiguous_legacy_identity_and_multiple_collections_never_mutate() {
-        let mut unknown = child(None);
-        unknown.as_object_mut().unwrap().remove("group");
-        let mut duplicate = parent("another label");
-        duplicate["uuid"] = json!("second-parent");
-        let mut renamed = parent("historic label");
-        renamed.as_object_mut().unwrap().remove("purl");
-        for projects in [
-            vec![unknown],
-            vec![parent("first"), duplicate],
-            vec![renamed],
-        ] {
+    async fn conflicting_scoped_projects_never_mutate() {
+        let mut wrong_group = child(None);
+        wrong_group["group"] = json!("wrong.group");
+        let mut versioned_collection = child(None);
+        versioned_collection["collectionLogic"] = json!(DIRECT_CHILDREN);
+        let mut wrong_collection = parent(SCOPED_NAME);
+        wrong_collection["collectionLogic"] = json!("NONE");
+        for project in [wrong_group, versioned_collection, wrong_collection] {
             let (server, _, svc) = api(Portfolio {
-                projects,
+                projects: vec![project],
                 ..Default::default()
             })
             .await;
-            assert!(svc
-                .get_or_create_maven_project(&coordinates("1.0"), "core", "repo")
-                .await
-                .is_err());
+            assert!(provision(&svc, &coordinates("1.0")).await.is_err());
             assert!(server
                 .received_requests()
                 .await
@@ -845,13 +804,14 @@ mod tests {
     #[tokio::test]
     async fn excludes_before_any_http_call() {
         let server = MockServer::start().await;
+        let db = sqlx::PgPool::connect_lazy("postgres://localhost/test").unwrap();
         for collections in [false, true] {
             let svc = service(&server.uri(), collections, "JAVADOC");
             let c = svc
                 .maven_coordinates(Some("maven"), "g/core/1/core-1-javadoc.jar")
                 .unwrap();
             assert!(svc
-                .get_or_create_maven_project(&c, "core", "repo")
+                .get_or_create_maven_project(&db, REPOSITORY, &c, "repo")
                 .await
                 .is_err());
         }
@@ -862,12 +822,12 @@ mod tests {
     async fn upstream_failures_are_returned_without_destructive_requests() {
         for status in [401, 403, 409, 500, 503] {
             for (method, path, projects) in [
-                ("GET", "/api/v1/project", vec![]),
+                ("GET", "/api/v1/project/lookup", vec![]),
                 ("PUT", "/api/v1/project", vec![]),
                 (
                     "PATCH",
                     "/api/v1/project/child",
-                    vec![parent("old"), child(None)],
+                    vec![parent(SCOPED_NAME), child(None)],
                 ),
             ] {
                 let (server, _, svc) = api(Portfolio {
@@ -876,10 +836,7 @@ mod tests {
                     ..Default::default()
                 })
                 .await;
-                let err = svc
-                    .get_or_create_maven_project(&coordinates("1.0"), "core", "repo")
-                    .await
-                    .unwrap_err();
+                let err = provision(&svc, &coordinates("1.0")).await.unwrap_err();
                 assert!(err.to_string().contains(&status.to_string()), "{err}");
                 let requests = server.received_requests().await.unwrap();
                 assert!(!requests.iter().any(|r| r.method.as_str() == "DELETE"
@@ -908,41 +865,68 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn older_version_lineage_prevents_duplicate_renamed_collection() {
-        let mut older = child(Some("parent"));
-        older["version"] = json!("0.9");
-        // Simulate a collection with a nonstandard name and no namespace proof.
-        let uncertain = json!({"uuid": "parent", "name": "historic collection", "version": null, "collectionLogic": DIRECT_CHILDREN});
-        let (server, _, svc) = api(Portfolio {
-            projects: vec![older, uncertain],
+    async fn separates_repositories_with_the_same_coordinates_and_leaves_unscoped_projects_intact()
+    {
+        let mut unscoped_child = child(Some("parent"));
+        unscoped_child["name"] = json!("ru.molnet:core");
+        unscoped_child["purl"] = json!("pkg:maven/ru.molnet/core@1.0");
+        let unscoped = vec![parent("ru.molnet:core"), unscoped_child];
+        let (server, state, svc) = api(Portfolio {
+            projects: unscoped.clone(),
             ..Default::default()
         })
         .await;
-        assert!(svc
-            .get_or_create_maven_project(&coordinates("1.0"), "core", "repo")
+        let c = coordinates("1.0");
+        let other_name = project_name(Uuid::from_u128(2), &c);
+        let first = provision(&svc, &c).await.unwrap();
+        let second = svc
+            .provision_maven_project(&other_name, &c, "repo")
             .await
-            .is_err());
+            .unwrap();
+        assert_ne!(first.uuid, second.uuid);
+        assert_ne!(first.parent.unwrap().uuid, second.parent.unwrap().uuid);
         assert!(server
             .received_requests()
             .await
             .unwrap()
             .iter()
-            .all(|r| r.method.as_str() == "GET"));
+            .all(|r| { r.method.as_str() != "GET" || r.url.path() != "/api/v1/project" }));
+        let state = state.lock().unwrap();
+        assert_eq!(state.projects.len(), 6);
+        assert_eq!(&state.projects[..2], unscoped.as_slice());
+    }
+
+    #[tokio::test]
+    async fn a_busy_project_does_not_block_other_coordinates() {
+        let (_server, _, svc) = api(Portfolio::default()).await;
+        let name = project_name(REPOSITORY, &coordinates("1.0"));
+        let _guard = svc.maven_provisioning.lock(&name).await;
+        let next_version = project_name(REPOSITORY, &coordinates("2.0"));
+        assert!(tokio::time::timeout(
+            Duration::from_millis(25),
+            svc.maven_provisioning.lock(&next_version),
+        )
+        .await
+        .is_err());
+
+        let mut other = coordinates("1.0");
+        other.artifact_id = "other".into();
+        tokio::time::timeout(Duration::from_secs(5), provision(&svc, &other))
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]
     async fn cycle_is_rejected_before_parent_assignment() {
-        let mut p = parent("collection");
+        let mut p = parent(SCOPED_NAME);
         p["parent"] = json!({"uuid": "child"});
         let (server, _, svc) = api(Portfolio {
             projects: vec![p, child(None)],
             ..Default::default()
         })
         .await;
-        let err = svc
-            .get_or_create_maven_project(&coordinates("1.0"), "core", "repo")
-            .await
-            .unwrap_err();
+        let err = provision(&svc, &coordinates("1.0")).await.unwrap_err();
         assert!(err.to_string().contains("cyclic"));
         assert!(server
             .received_requests()
@@ -962,10 +946,7 @@ mod tests {
                     &format!("ru/molnet/core/1.0/core-1.0.{extension}"),
                 )
                 .unwrap();
-            let p = svc
-                .get_or_create_maven_project(&c, "core", "repo")
-                .await
-                .unwrap();
+            let p = provision(&svc, &c).await.unwrap();
             svc.upload_sbom(&p.uuid, &format!("{{\"inventory\":\"{extension}\"}}"))
                 .await
                 .unwrap();
@@ -983,22 +964,22 @@ mod tests {
         };
         let (_server, state, svc) = api(Portfolio {
             allow_duplicates: true,
-            fault: Some(("GET".into(), "/api/v1/project".into(), 503)),
+            fault: Some(("PUT".into(), "/api/v1/project".into(), 503)),
             ..Default::default()
         })
         .await;
         let a = coordinates("1.0");
         let b = coordinates("2.0");
         assert!(svc
-            .get_or_create_maven_project_with_db(&db, &a, "core", "repo")
+            .get_or_create_maven_project(&db, REPOSITORY, &a, "repo")
             .await
             .is_err());
         state.lock().unwrap().fault = None;
         let other = service(&svc.config.base_url, true, "");
         let (first, second, repeated) = tokio::join!(
-            svc.get_or_create_maven_project_with_db(&db, &a, "core", "repo"),
-            other.get_or_create_maven_project_with_db(&db, &b, "core", "repo"),
-            other.get_or_create_maven_project_with_db(&db, &a, "core", "repo"),
+            svc.get_or_create_maven_project(&db, REPOSITORY, &a, "repo"),
+            other.get_or_create_maven_project(&db, REPOSITORY, &b, "repo"),
+            other.get_or_create_maven_project(&db, REPOSITORY, &a, "repo"),
         );
         let first = first.unwrap();
         assert_eq!(first.uuid, repeated.unwrap().uuid);

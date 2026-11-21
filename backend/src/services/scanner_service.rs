@@ -11396,10 +11396,10 @@ impl ScannerService {
         let project_result = if let Some(coordinates) =
             maven_coordinates.as_ref().filter(|_| dt.auto_collections())
         {
-            dt.get_or_create_maven_project_with_db(
+            dt.get_or_create_maven_project(
                 &self.db,
+                artifact.repository_id,
                 coordinates,
-                project_name,
                 &description,
             )
             .await
