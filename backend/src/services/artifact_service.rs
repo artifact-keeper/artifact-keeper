@@ -174,6 +174,12 @@ impl MultiHasher {
     }
 }
 
+/// The coordinate's row as the release-immutability backstop reads it.
+struct PriorRow {
+    version: Option<String>,
+    checksum_sha256: String,
+}
+
 /// Reject a write that would overwrite content at an immutable coordinate.
 ///
 /// The single oracle for upload immutability, shared by
@@ -223,19 +229,22 @@ pub(crate) async fn enforce_path_immutability_with(
         .map(|r| versioning_applies(&r.format, r.versioning_enabled))
         .unwrap_or(false);
 
-    // (1) live-overwrite check
-    let existing = sqlx::query!(
-        "SELECT id, version FROM artifacts WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
-        repository_id,
-        path
+    // `UNIQUE (repository_id, path)`: the coordinate has at most one row,
+    // live or a tombstone, and both checks below read it. One read, not two
+    // (#6318).
+    let row: Option<(Option<String>, String, bool)> = sqlx::query_as(
+        "SELECT version, checksum_sha256, is_deleted FROM artifacts \
+         WHERE repository_id = $1 AND path = $2",
     )
+    .bind(repository_id)
+    .bind(path)
     .fetch_optional(db)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
-    if let Some(existing) = existing {
-        if !versioning_active && !replaces_current && existing.version == version.map(String::from)
-        {
+    // (1) live-overwrite check
+    if let Some((existing_version, _, false)) = &row {
+        if !versioning_active && !replaces_current && existing_version.as_deref() == version {
             return Err(AppError::Conflict(
                 "Artifact version already exists and is immutable".to_string(),
             ));
@@ -252,15 +261,10 @@ pub(crate) async fn enforce_path_immutability_with(
         return Ok(());
     }
 
-    let prior = sqlx::query!(
-        "SELECT checksum_sha256, version FROM artifacts \
-         WHERE repository_id = $1 AND path = $2",
-        repository_id,
-        path
-    )
-    .fetch_optional(db)
-    .await
-    .map_err(|e| AppError::Database(e.to_string()))?;
+    let prior = row.map(|(version, checksum_sha256, _)| PriorRow {
+        version,
+        checksum_sha256,
+    });
 
     // Only a *released* coordinate is immutable: either the structural
     // classifier marks it immutable, or the prior row was published as a
@@ -1126,9 +1130,14 @@ impl ArtifactService {
         let checksum_md5 = Self::calculate_md5(&data);
         let storage_key = Self::storage_key_from_checksum(&checksum_sha256);
 
+        // #6318: one read of the repository row serves the preflight and the
+        // finalize; each used to read it again (four checkouts per upload).
+        let repo = self.repo_service.get_by_id(repository_id).await.ok();
+
         // Quota, live-overwrite check, and the release-immutability
         // backstop — shared with the streaming path.
         self.preflight_upload(
+            repo.as_ref(),
             repository_id,
             path,
             version,
@@ -1147,6 +1156,7 @@ impl ArtifactService {
         }
 
         self.finalize_upload(
+            repo,
             repository_id,
             path,
             name,
@@ -1338,6 +1348,7 @@ impl ArtifactService {
 
         let finalized = self
             .finalize_upload(
+                repo,
                 repository_id,
                 path,
                 name,
@@ -1405,8 +1416,10 @@ impl ArtifactService {
     /// (The plugin `BeforeUpload` veto that used to run here was dead code —
     /// its dispatcher was never constructed in production — and was removed
     /// in #3499.)
+    #[allow(clippy::too_many_arguments)]
     async fn preflight_upload(
         &self,
+        repo: Option<&Repository>,
         repository_id: Uuid,
         path: &str,
         version: Option<&str>,
@@ -1424,14 +1437,28 @@ impl ArtifactService {
                 return Err(WritePrecondition::failed(path));
             }
         }
-        crate::services::rpm_layout::validate_upload(&self.db, repository_id, path).await?;
+        // Only an RPM repository can carry a nested repodata layout (#6318:
+        // the depth lookup cost every other format a checkout per upload).
+        // The persistence trigger re-checks the layout in the writer's
+        // transaction either way.
+        if repo.is_none_or(|repo| repo.format == RepositoryFormat::Rpm) {
+            crate::services::rpm_layout::validate_upload(&self.db, repository_id, path).await?;
+        }
         // Check quota (repository quota and, if any, its project's aggregate
         // quota, #2474).
-        if let Some(denial) = self
-            .repo_service
-            .quota_preflight(repository_id, size_bytes)
-            .await?
-        {
+        let denial = match repo {
+            Some(repo) => {
+                self.repo_service
+                    .quota_preflight_for(repo, size_bytes)
+                    .await?
+            }
+            None => {
+                self.repo_service
+                    .quota_preflight(repository_id, size_bytes)
+                    .await?
+            }
+        };
+        if let Some(denial) = denial {
             return Err(denial.into_error());
         }
 
@@ -1441,11 +1468,10 @@ impl ArtifactService {
         // UPDATE` and silently overwrote an occupied immutable coordinate
         // (#3924), because this function — the documented chokepoint — was
         // simply never on it.
-        let repo = self.repo_service.get_by_id(repository_id).await;
         let immutability = enforce_path_immutability_with(
             &self.db,
             repository_id,
-            repo.as_ref().ok(),
+            repo,
             path,
             version,
             checksum_sha256,
@@ -1548,6 +1574,7 @@ impl ArtifactService {
     #[allow(clippy::too_many_arguments)]
     async fn finalize_upload(
         &self,
+        repo_for_upload: Option<Repository>,
         repository_id: Uuid,
         path: &str,
         name: &str,
@@ -1570,7 +1597,6 @@ impl ArtifactService {
         // idempotent on identical-bytes re-uploads and (b) backfill the
         // pre-existing HEAD as revision 1 on the first versioned write to a
         // coordinate that predates the feature.
-        let repo_for_upload = self.repo_service.get_by_id(repository_id).await.ok();
         let versioning_active = repo_for_upload
             .as_ref()
             .is_some_and(|r| versioning_applies(&r.format, r.versioning_enabled));
@@ -1822,27 +1848,27 @@ impl ArtifactService {
         // instead of re-running the full 3-way aggregate here. `base_usage`
         // excludes the row we just wrote at `path`, so post-upload usage is
         // `base_usage + size_bytes`. It is `Some` only when a finite quota is
-        // set (the only case a warning can fire).
-        if let Some(base_usage) = admission.base_usage {
-            if let Ok(repo) = self.repo_service.get_by_id(repository_id).await {
-                if let Some(quota) = repo.quota_bytes {
-                    let current_usage = base_usage + size_bytes;
-                    if crate::services::repository_service::exceeds_quota_warning_threshold(
+        // set (the only case a warning can fire). #6318: the repository row
+        // read at the start of this finalize carries the quota; reading it
+        // again here cost a pool checkout per upload.
+        if let (Some(base_usage), Some(repo)) = (admission.base_usage, repo_for_upload.as_ref()) {
+            if let Some(quota) = repo.quota_bytes {
+                let current_usage = base_usage + size_bytes;
+                if crate::services::repository_service::exceeds_quota_warning_threshold(
+                    current_usage,
+                    quota,
+                ) {
+                    let usage_pct = crate::services::repository_service::quota_usage_percentage(
                         current_usage,
                         quota,
-                    ) {
-                        let usage_pct = crate::services::repository_service::quota_usage_percentage(
-                            current_usage,
-                            quota,
-                        );
-                        tracing::warn!(
-                            repository_key = %repo.key,
-                            usage_percent = format!("{:.1}", usage_pct * 100.0),
-                            current_bytes = current_usage,
-                            quota_bytes = quota,
-                            "Repository quota warning: usage exceeds 80%"
-                        );
-                    }
+                    );
+                    tracing::warn!(
+                        repository_key = %repo.key,
+                        usage_percent = format!("{:.1}", usage_pct * 100.0),
+                        current_bytes = current_usage,
+                        quota_bytes = quota,
+                        "Repository quota warning: usage exceeds 80%"
+                    );
                 }
             }
         }
@@ -1946,13 +1972,29 @@ impl ArtifactService {
 
         // Trigger scan-on-upload if scanner service is configured. The same
         // gate every format-native upload handler goes through (#4166).
-        crate::services::scanner_service::trigger_scan_on_upload(
-            &self.db,
-            self.scanner_service.clone(),
-            artifact.repository_id,
-            artifact.id,
-        )
-        .await;
+        // #6318: with the repository row in hand, the upload is counted
+        // without a lookup of its own; the scan gate is unchanged.
+        match repo_for_upload.as_ref() {
+            Some(repo) => {
+                crate::services::scanner_service::trigger_scan_on_upload_for(
+                    &self.db,
+                    self.scanner_service.clone(),
+                    (&repo.key, repo.format.as_key(), artifact.size_bytes),
+                    artifact.repository_id,
+                    artifact.id,
+                )
+                .await
+            }
+            None => {
+                crate::services::scanner_service::trigger_scan_on_upload(
+                    &self.db,
+                    self.scanner_service.clone(),
+                    artifact.repository_id,
+                    artifact.id,
+                )
+                .await
+            }
+        };
 
         // #2382: summarise a `.safetensors` header into `artifact_metadata`.
         // Placed after the quarantine hold and the scan trigger so its

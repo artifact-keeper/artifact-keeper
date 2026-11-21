@@ -8392,6 +8392,82 @@ mod tests {
         }
     }
 
+    /// #6318 / #6346: one PyPI upload goes back to the connection pool a
+    /// bounded number of times, and registers its catalog row once, with the
+    /// summary and catalog metadata the handler parsed.
+    ///
+    /// Each checkout is a chance to wait on, or time out on, an exhausted
+    /// pool, so per-upload connection demand sets how many uploads a small
+    /// pool carries. Before #6318 the handler upserted the catalog row a second
+    /// time after the service's finalize had, and wrote the repository
+    /// timestamp and the analysis on separate checkouts. The bound is the
+    /// measured count plus no slack: a change that adds a checkout to the
+    /// upload path has to raise it here, on purpose.
+    #[tokio::test]
+    async fn upload_pool_checkouts_are_bounded_and_catalog_written_once_6318() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some((fx, acquires)) = tdh::Fixture::setup_counting("local", "pypi").await else {
+            return;
+        };
+        let (content_type, body) = pypi_upload_multipart(
+            "acq-6318",
+            "1.0.0",
+            "acq_6318-1.0.0-py3-none-any.whl",
+            b"fake-wheel-bytes-6318",
+            "pool checkout summary 6318",
+            ">=3.9",
+        );
+        let app = fx.router_with_auth(super::router());
+        let before = acquires.get();
+        let (status, resp) = tdh::send(
+            app,
+            tdh::post(format!("/{}/", fx.repo_key), &content_type, body),
+        )
+        .await;
+        let used = acquires.get() - before;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "upload: {}",
+            String::from_utf8_lossy(&resp)
+        );
+        eprintln!("#6318 PyPI upload pool checkouts: {used}");
+        for site in acquires.sites_since(before) {
+            eprintln!("  checkout: {site}");
+        }
+
+        let (description, metadata): (Option<String>, Option<serde_json::Value>) = sqlx::query_as(
+            "SELECT description, metadata FROM packages \
+                 WHERE repository_id = $1 AND name = 'acq-6318'",
+        )
+        .bind(fx.repo_id)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("one catalog row");
+        assert_eq!(description.as_deref(), Some("pool checkout summary 6318"));
+        let metadata = metadata.expect("catalog metadata");
+        assert_eq!(metadata["requires_python"], ">=3.9", "{metadata}");
+        let versions: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM package_versions pv JOIN packages p ON p.id = pv.package_id \
+             WHERE p.repository_id = $1 AND p.name = 'acq-6318' AND pv.version = '1.0.0'",
+        )
+        .bind(fx.repo_id)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("count versions");
+        assert_eq!(versions, 1);
+
+        assert!(
+            used <= PYPI_UPLOAD_MAX_POOL_CHECKOUTS,
+            "a PyPI upload took {used} pool checkouts, more than the {PYPI_UPLOAD_MAX_POOL_CHECKOUTS} \
+             it is pinned at (#6318)"
+        );
+    }
+
+    /// The pool checkouts one PyPI upload is pinned at (#6318): measured, 19
+    /// before the change and 11 after.
+    const PYPI_UPLOAD_MAX_POOL_CHECKOUTS: usize = 11;
+
     fn headers_with_replication(value: &str) -> HeaderMap {
         let mut headers = HeaderMap::new();
         headers.insert(
