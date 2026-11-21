@@ -557,6 +557,9 @@ queued more than the window before them, so a backlog that keeps growing still
 needs more worker slots. Rescans come after everything else. Each kind's
 `ak_scan_queue_oldest_pending_seconds` shows how long its oldest due job has
 waited.
+`POST /api/v1/security/scan` with a `repository_id` and
+`POST /api/v1/admin/rescan-for-inventory` queue one job per artifact, so
+with the queue on no hosted scan runs in the process that took the request.
 
 **Running the worker separately.** With the queue on, `SCAN_WORKER_ENABLED`
 (default `true`) has each instance drain it. In a multi-replica deployment set
@@ -625,6 +628,20 @@ oldest one's age are `ak_scan_queue_depth{kind="rescan",state="pending"}` and
 adapter for its background band: `"priority": "background"` in an image scan
 request and `X-Scan-Priority: background` on a filesystem upload. Other scans
 send neither, and an adapter without that band ignores both and scans as usual.
+
+**API pods without grype.** A backend without `grype` on its `PATH` never
+starts it: a scan that needs grype fails (never clean). Stored verdicts are
+compared against the CVE scanner versions of the live scan workers: each
+worker records its own on every sweep (`scan_worker_scanner_versions`), a
+verdict graded by any live worker is reused, and a version no worker reported
+for two minutes stops counting (with every worker down, the TTL alone decides,
+as for an unknown version). Run the API pods without grype and
+`SCAN_WORKER_ENABLED=false`, and the workers with it. The proxy scans the queue
+cannot carry (listed above) still run in the API process and fail closed there,
+and a `fail_open` OCI pull is served `pending` and never scanned, so keep grype
+on the API pods while repositories need those. At startup the backend logs an
+error when grype is missing and the queue is off, or when it is missing on a
+worker.
 
 The worker publishes `ak_scan_queue_depth`,
 `ak_scan_queue_oldest_pending_seconds`, `ak_scan_queue_wait_seconds`,

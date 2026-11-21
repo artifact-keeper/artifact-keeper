@@ -6418,6 +6418,101 @@ async fn run_inline_proxy_scanners_target(
     Ok(verdict)
 }
 
+/// How long a scan worker's reported CVE scanner version counts as live: four
+/// of its 30 s sweeps. Past that the worker is taken as gone, and with no live
+/// worker an instance without grype has no version to compare (TTL only, as
+/// for an unknown version).
+pub(crate) const REPORTED_CVE_SCANNER_VERSION_LIVE_SECS: f64 = 120.0;
+
+/// How long an instance without a CVE scanner of its own reuses the live
+/// versions it last read.
+const REPORTED_CVE_SCANNER_VERSION_CACHE: Duration = Duration::from_secs(30);
+
+/// Rows of workers gone longer than this are deleted on a sweep. Every
+/// restart reports under a new worker identity.
+const REPORTED_CVE_SCANNER_VERSION_RETENTION_SECS: f64 = 86_400.0;
+
+/// Record the CVE scanner version this scan worker runs, one row per worker,
+/// refreshed on every sweep. Instances without grype (API pods) compare stored
+/// verdicts against the versions of the live workers, so workers whose
+/// vulnerability databases updated at different times never overwrite each
+/// other.
+pub(crate) async fn publish_cve_scanner_version(
+    db: &PgPool,
+    worker_id: &str,
+    version: &str,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO scan_worker_scanner_versions (worker_id, cve_scanner_version, reported_at) \
+         VALUES ($1, $2, NOW()) \
+         ON CONFLICT (worker_id) DO UPDATE SET \
+             cve_scanner_version = EXCLUDED.cve_scanner_version, reported_at = NOW()",
+    )
+    .bind(worker_id)
+    .bind(version)
+    .execute(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+    sqlx::query(
+        "DELETE FROM scan_worker_scanner_versions \
+         WHERE reported_at < NOW() - make_interval(secs => $1)",
+    )
+    .bind(REPORTED_CVE_SCANNER_VERSION_RETENTION_SECS)
+    .execute(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+    Ok(())
+}
+
+/// Distinct CVE scanner versions the live scan workers run, newest
+/// vulnerability-DB build first. Empty when no worker reported within
+/// `live_secs` or the read failed.
+pub(crate) async fn read_live_cve_scanner_versions(db: &PgPool, live_secs: f64) -> Vec<String> {
+    sqlx::query_scalar::<_, String>(
+        "SELECT cve_scanner_version FROM scan_worker_scanner_versions \
+         WHERE reported_at > NOW() - make_interval(secs => $1) \
+         GROUP BY cve_scanner_version \
+         ORDER BY split_part(cve_scanner_version, '+db-', 2) DESC, MAX(reported_at) DESC",
+    )
+    .bind(live_secs)
+    .fetch_all(db)
+    .await
+    .unwrap_or_else(|e| {
+        warn!(error = %e, "failed to read the scan workers' CVE scanner versions");
+        Vec::new()
+    })
+}
+
+/// [`read_live_cve_scanner_versions`] behind a short per-process cache, so the
+/// serve path reads the table at most every 30 s.
+async fn live_cve_scanner_versions(db: &PgPool) -> Arc<Vec<String>> {
+    static CACHE: Mutex<Option<(Instant, Arc<Vec<String>>)>> = Mutex::new(None);
+    if let Some((at, versions)) = CACHE.lock().ok().and_then(|c| c.clone()) {
+        if at.elapsed() < REPORTED_CVE_SCANNER_VERSION_CACHE {
+            return versions;
+        }
+    }
+    let versions =
+        Arc::new(read_live_cve_scanner_versions(db, REPORTED_CVE_SCANNER_VERSION_LIVE_SECS).await);
+    if let Ok(mut cache) = CACHE.lock() {
+        *cache = Some((Instant::now(), Arc::clone(&versions)));
+    }
+    versions
+}
+
+/// The version to compare a stored verdict against on an instance without
+/// grype: the verdict's own version when a live worker runs it (so it is
+/// fresh, whichever worker graded it), otherwise the newest live one. `None`
+/// with no live worker.
+pub(crate) fn reported_version_for(live: &[String], stored: Option<&str>) -> Option<String> {
+    if let Some(stored) = stored {
+        if live.iter().any(|v| v == stored) {
+            return Some(stored.to_owned());
+        }
+    }
+    live.first().cloned()
+}
+
 /// Live version string of the CVE-authoritative scanner (Grype), e.g.
 /// `grype-0.83.0`.
 ///
@@ -6511,6 +6606,12 @@ pub trait Scanner: Send + Sync {
     /// absent or down, must not fail-close the proxy path.
     fn is_cve_authoritative(&self) -> bool {
         false
+    }
+
+    /// Whether this process can run the scanner's engine. `false` only for an
+    /// engine this image does not ship (grype on the image without it).
+    fn is_installed(&self) -> bool {
+        true
     }
 
     /// Run the scan against artifact content and metadata. Returns both
@@ -9609,8 +9710,12 @@ mod construction {
             // image and intentionally stays fail-closed: a missing grype binary is
             // `classify_grype_spawn_error` -> hard error -> `failed`, the safety net
             // for an image that somehow ships no scanner engine at all.
-            info!("Grype scanner enabled");
             let mut grype_scanner = GrypeScanner::new(scan_workspace_path.clone());
+            if grype_scanner.is_installed() {
+                info!("Grype scanner enabled");
+            } else {
+                warn!("Grype scanner enabled but grype is not installed, grype scans fail here");
+            }
             // Wire the per-repo token minter so grype's registry pull is
             // authenticated for private images (#2093).
             if let Some(identity) = scan_identity.clone() {
@@ -9994,7 +10099,27 @@ impl ScannerService {
     /// proxy serve path threads this into `verdict_is_fresh` as
     /// `current_version` so a cached verdict from an older scanner / CVE-DB
     /// forces a re-scan instead of serving stale-clean until the TTL expires.
+    /// Without the engine installed here, the newest version a live scan
+    /// worker reports, see [`Self::cve_scanner_version_for`].
     pub async fn cve_scanner_version(&self) -> Option<String> {
+        self.cve_scanner_version_for(None).await
+    }
+
+    /// [`Self::cve_scanner_version`] for one stored verdict. Without the
+    /// engine installed here, the verdict's own version when a live scan
+    /// worker runs it, else the newest live one, `None` with no live worker.
+    pub async fn cve_scanner_version_for(&self, stored: Option<&str>) -> Option<String> {
+        let cve = self.scanners.iter().find(|s| s.is_cve_authoritative())?;
+        if cve.is_installed() {
+            cve.version().await
+        } else {
+            reported_version_for(&live_cve_scanner_versions(&self.db).await, stored)
+        }
+    }
+
+    /// The CVE scanner version this process can run itself, without the
+    /// version the scan workers report.
+    pub async fn local_cve_scanner_version(&self) -> Option<String> {
         cve_authoritative_scanner_version(&self.scanners).await
     }
 
@@ -12317,25 +12442,6 @@ pub(crate) mod test_helpers {
         }
     }
 
-    /// Assert that a scan result is an error containing the expected label.
-    pub fn assert_scan_failed(
-        result: &crate::error::Result<crate::services::scanner_service::ScanOutput>,
-        expected_label: &str,
-    ) {
-        assert!(
-            result.is_err(),
-            "scan() must return Err, not Ok(vec![]), when {} fails",
-            expected_label
-        );
-        let err_msg = result.as_ref().unwrap_err().to_string();
-        assert!(
-            err_msg.contains(&format!("{} failed", expected_label)),
-            "error message should contain '{} failed', got: {}",
-            expected_label,
-            err_msg
-        );
-    }
-
     /// A non-login scanner service-account `User` fixture (#2093). Shared by the
     /// image- and grype-scanner token-minter tests so the fixture is defined
     /// once.
@@ -13994,6 +14100,154 @@ mod tests {
             post_scan_status_decision(None, 1, Some(&ok), false).status,
             "flagged"
         );
+    }
+
+    /// A `ScannerService` with no grype installed, as on an API pod without it.
+    fn service_without_grype(pool: &PgPool, ws: &str) -> ScannerService {
+        ScannerService {
+            db: pool.clone(),
+            scanners: vec![Arc::new(
+                crate::services::grype_scanner::GrypeScanner::new(ws.to_string()).with_binary(None),
+            )],
+            scan_result_service: Arc::new(ScanResultService::new(pool.clone())),
+            scan_config_service: Arc::new(ScanConfigService::new(pool.clone())),
+            storage: Arc::new(crate::storage::filesystem::FilesystemStorage::new(ws)),
+            storage_registry: Arc::new(crate::storage::StorageRegistry::new(
+                HashMap::new(),
+                "filesystem".to_string(),
+            )),
+            storage_base_path: ws.to_string(),
+            scan_workspace_path: ws.to_string(),
+            dependency_track: None,
+            scan_queue_enabled: Default::default(),
+        }
+    }
+
+    async fn clear_worker_versions(pool: &PgPool) {
+        sqlx::query("DELETE FROM scan_worker_scanner_versions")
+            .execute(pool)
+            .await
+            .expect("clear worker versions");
+    }
+
+    #[test]
+    fn reported_version_is_the_verdicts_own_when_a_live_worker_runs_it() {
+        let live = vec![
+            "grype-1+db-2026-11-14".to_string(),
+            "grype-1+db-2026-11-13".to_string(),
+        ];
+        for stored in ["grype-1+db-2026-11-14", "grype-1+db-2026-11-13"] {
+            assert_eq!(
+                reported_version_for(&live, Some(stored)).as_deref(),
+                Some(stored)
+            );
+        }
+        assert_eq!(
+            reported_version_for(&live, Some("grype-1+db-2026-11-12")).as_deref(),
+            Some("grype-1+db-2026-11-14")
+        );
+        assert_eq!(
+            reported_version_for(&live, None).as_deref(),
+            Some("grype-1+db-2026-11-14")
+        );
+        assert_eq!(
+            reported_version_for(&[], Some("grype-1+db-2026-11-14")),
+            None
+        );
+    }
+
+    /// Two workers on different vulnerability-DB builds: a verdict either one
+    /// graded stays fresh on an instance without grype, whichever worker
+    /// reported last. An older build than any live worker runs is stale.
+    /// `_queued`: scan worker tests publish too.
+    #[tokio::test]
+    async fn verdicts_of_every_live_worker_stay_fresh_without_grype_queued() {
+        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+            return;
+        };
+        clear_worker_versions(&pool).await;
+        let (old, new) = ("grype-0.121.3+db-2026-11-13", "grype-0.121.3+db-2026-11-14");
+        for (worker, version) in [("w-a", old), ("w-b", new), ("w-a", old)] {
+            publish_cve_scanner_version(&pool, worker, version)
+                .await
+                .expect("publish");
+        }
+        assert_eq!(
+            read_live_cve_scanner_versions(&pool, REPORTED_CVE_SCANNER_VERSION_LIVE_SECS).await,
+            vec![new.to_string(), old.to_string()]
+        );
+
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let service = service_without_grype(&pool, &workspace.path().to_string_lossy());
+        assert_eq!(service.local_cve_scanner_version().await, None);
+        let now = Utc::now();
+        let scanned_at = now - chrono::Duration::hours(1);
+        for stored in [old, new] {
+            let live = service.cve_scanner_version_for(Some(stored)).await;
+            assert!(
+                crate::services::proxy_scan_service::verdict_is_fresh(
+                    scanned_at,
+                    Some(stored),
+                    live.as_deref(),
+                    DEDUP_TTL_DAYS as i64,
+                    now
+                ),
+                "a verdict graded by a live worker ({stored}) is fresh, compared against {live:?}"
+            );
+        }
+        let older = "grype-0.121.3+db-2026-11-12";
+        let live = service.cve_scanner_version_for(Some(older)).await;
+        assert!(!crate::services::proxy_scan_service::verdict_is_fresh(
+            scanned_at,
+            Some(older),
+            live.as_deref(),
+            DEDUP_TTL_DAYS as i64,
+            now
+        ));
+        assert_eq!(service.cve_scanner_version().await.as_deref(), Some(new));
+
+        clear_worker_versions(&pool).await;
+    }
+
+    /// With every worker gone, the version they last reported stops counting
+    /// after four sweeps, and a worker gone a day is deleted on the next one.
+    #[tokio::test]
+    async fn a_version_no_live_worker_reports_is_ignored_without_grype_queued() {
+        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+            return;
+        };
+        clear_worker_versions(&pool).await;
+        let version = "grype-0.121.3+db-2026-11-13";
+        publish_cve_scanner_version(&pool, "w-gone", version)
+            .await
+            .expect("publish");
+        publish_cve_scanner_version(&pool, "w-long-gone", version)
+            .await
+            .expect("publish");
+        sqlx::query(
+            "UPDATE scan_worker_scanner_versions SET reported_at = NOW() - CASE worker_id \
+             WHEN 'w-gone' THEN interval '5 minutes' ELSE interval '2 days' END",
+        )
+        .execute(&pool)
+        .await
+        .expect("age the rows");
+
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let service = service_without_grype(&pool, &workspace.path().to_string_lossy());
+        assert_eq!(service.cve_scanner_version_for(Some(version)).await, None);
+        assert_eq!(service.cve_scanner_version().await, None);
+
+        publish_cve_scanner_version(&pool, "w-new", "grype-0.121.3+db-2026-11-14")
+            .await
+            .expect("publish");
+        let workers: Vec<String> =
+            sqlx::query_scalar("SELECT worker_id FROM scan_worker_scanner_versions ORDER BY 1")
+                .fetch_all(&pool)
+                .await
+                .expect("rows");
+        assert_eq!(workers, vec!["w-gone".to_string(), "w-new".to_string()]);
+
+        clear_worker_versions(&pool).await;
     }
 
     /// Build a `ScannerService` wired to the fixture's pool and storage.

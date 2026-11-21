@@ -239,6 +239,73 @@ fn classify_grype_spawn_error(err: &std::io::Error) -> AppError {
     }
 }
 
+/// Why a scan that needs grype fails on an instance without it. The scan is
+/// `failed`, never clean.
+pub(crate) const GRYPE_NOT_INSTALLED: &str =
+    "grype is not installed on this instance, so it runs no grype scan. Run the \
+     scans on scan workers built from the artifact-keeper-backend -scanner image \
+     (SCAN_QUEUE_ENABLED), or use that image here";
+
+#[cfg(windows)]
+const GRYPE_EXECUTABLE: &str = "grype.exe";
+#[cfg(not(windows))]
+const GRYPE_EXECUTABLE: &str = "grype";
+
+/// The `grype` executable a `PATH` value resolves to, found without running
+/// anything. Empty entries are skipped: they would mean the working directory.
+pub(crate) fn find_grype(path: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+    std::env::split_paths(path?)
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .map(|dir| dir.join(GRYPE_EXECUTABLE))
+        .find(|candidate| is_executable(candidate))
+}
+
+/// [`find_grype`] on this process's `PATH`.
+pub fn grype_on_path() -> Option<PathBuf> {
+    find_grype(std::env::var_os("PATH").as_deref())
+}
+
+#[cfg(unix)]
+fn is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn is_executable(path: &Path) -> bool {
+    path.is_file()
+}
+
+/// What to tell the operator at startup when grype is not installed, and
+/// whether it is an error. `None` when it is installed.
+pub fn grype_absence_notice(
+    installed: bool,
+    scan_queue_enabled: bool,
+    scan_worker_enabled: bool,
+) -> Option<(bool, &'static str)> {
+    match (installed, scan_queue_enabled, scan_worker_enabled) {
+        (true, _, _) => None,
+        (false, false, _) => Some((
+            true,
+            "grype is not installed and SCAN_QUEUE_ENABLED is off: every scan that needs \
+             grype fails on this instance. Use the artifact-keeper-backend -scanner image, \
+             or turn the scan queue on and run scan workers on that image",
+        )),
+        (false, true, true) => Some((
+            true,
+            "grype is not installed but this instance drains the scan queue \
+             (SCAN_WORKER_ENABLED): its scan jobs fail. Run the scan workers on the \
+             artifact-keeper-backend -scanner image and set SCAN_WORKER_ENABLED=false here",
+        )),
+        (false, true, false) => Some((
+            false,
+            "grype is not installed: hosted scans go to the scan queue for the workers. \
+             Proxy scans the queue cannot carry (OCI images, catalog rescans, OS package \
+             pins, fail_closed fills that are not cached) fail closed on this instance",
+        )),
+    }
+}
+
 /// Conservatively classify Grype stderr as evidence of a *fatal* scan failure
 /// even when Grype exited 0.
 ///
@@ -660,6 +727,9 @@ pub struct GrypeScanner {
     /// TTL (seconds) for the per-repo scan token (config
     /// `scan_token_ttl_seconds`). Only consulted when a minter is wired.
     scan_token_ttl_seconds: i64,
+    /// The grype executable found on `PATH` at construction. `None` means no
+    /// grype process is ever started.
+    binary: Option<PathBuf>,
 }
 
 struct LocalOciBlob {
@@ -954,7 +1024,27 @@ impl GrypeScanner {
             auth: None,
             scan_identity: None,
             scan_token_ttl_seconds: 300,
+            binary: grype_on_path(),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_binary(mut self, binary: Option<PathBuf>) -> Self {
+        self.binary = binary;
+        self
+    }
+
+    fn installed_binary(&self) -> Result<&Path> {
+        self.binary
+            .as_deref()
+            .ok_or_else(|| AppError::Internal(GRYPE_NOT_INSTALLED.to_string()))
+    }
+
+    /// The binary as a probe argument. `None` when grype is not installed.
+    fn probe_binary(&self) -> Option<String> {
+        self.binary
+            .as_deref()
+            .map(|b| b.to_string_lossy().into_owned())
     }
 
     /// Attach a token minter so registry-mode scans of a known repository pull
@@ -1447,7 +1537,7 @@ impl GrypeScanner {
         auth_env: &[(&'static str, String)],
         excludes: &[&str],
     ) -> Result<GrypeRun> {
-        let mut command = tokio::process::Command::new("grype");
+        let mut command = tokio::process::Command::new(self.installed_binary()?);
         // `tokio::process::Command` defaults `kill_on_drop` to `false`. This
         // spawn runs inside a caller-supplied `tokio::time::timeout` (the
         // inline proxy gate's PROXY_SCAN_INLINE_BUDGET /
@@ -1892,6 +1982,10 @@ impl Scanner for GrypeScanner {
         true
     }
 
+    fn is_installed(&self) -> bool {
+        self.binary.is_some()
+    }
+
     /// Grype handles both filesystem-style artifacts (npm tarballs, PyPI
     /// wheels, lockfiles) via `dir:` mode and OCI / Docker images via
     /// `registry:` mode (#1160). The only artifacts we explicitly reject
@@ -1943,11 +2037,12 @@ impl Scanner for GrypeScanner {
     /// probe degrades to the bare CLI token (freshness falls back to the TTL),
     /// and a missing/unparseable CLI probe still returns `None`.
     async fn version(&self) -> Option<String> {
+        let binary = self.probe_binary()?;
         cached_cli_version(&self.cached_version, || async {
-            let raw = capture_cli_version("grype", &["--version"]).await?;
+            let raw = capture_cli_version(&binary, &["--version"]).await?;
             let cli = format_grype_version(&raw)?;
             let db_build = match crate::services::scanner_service::capture_cli_output_with_env(
-                "grype",
+                &binary,
                 &["db", "status"],
                 &grype_db_env(),
             )
@@ -1968,13 +2063,14 @@ impl Scanner for GrypeScanner {
     /// JSON form first and falls back to the text form for grype releases
     /// that predate `-o json`. `None` when no valid DB is installed.
     async fn vuln_db(&self) -> Option<crate::models::security::VulnDbProvenance> {
+        let binary = self.probe_binary()?;
         let raw = crate::services::scanner_service::cached_cli_version_with_hit_ttl(
             &self.cached_db_status,
             GRYPE_DB_STATUS_TTL,
             || async {
                 let env = grype_db_env();
                 match crate::services::scanner_service::capture_cli_output_with_env(
-                    "grype",
+                    &binary,
                     &["db", "status", "-o", "json"],
                     &env,
                 )
@@ -1983,7 +2079,7 @@ impl Scanner for GrypeScanner {
                     Some(json) => Some(json),
                     None => {
                         crate::services::scanner_service::capture_cli_output_with_env(
-                            "grype",
+                            &binary,
                             &["db", "status"],
                             &env,
                         )
@@ -2002,6 +2098,7 @@ impl Scanner for GrypeScanner {
         _metadata: Option<&ArtifactMetadata>,
         content: &Bytes,
     ) -> Result<ScanOutput> {
+        self.installed_binary()?;
         info!(
             "Starting Grype scan for artifact: {} ({})",
             artifact.name, artifact.id
@@ -2038,6 +2135,7 @@ impl Scanner for GrypeScanner {
         metadata: Option<&ArtifactMetadata>,
         content: &Bytes,
     ) -> Result<ScanOutput> {
+        self.installed_binary()?;
         self.scan_target_inner(target, metadata, content).await
     }
 }
@@ -2143,7 +2241,7 @@ impl GrypeScanner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::services::scanner_service::test_helpers::{assert_scan_failed, make_test_artifact};
+    use crate::services::scanner_service::test_helpers::make_test_artifact;
 
     fn make_artifact(name: &str, content_type: &str) -> Artifact {
         make_test_artifact(name, content_type, &format!("test/{}", name))
@@ -2484,7 +2582,8 @@ mod tests {
             "must request the cyclonedx BOM in the same invocation"
         );
         assert_eq!(
-            body.matches("Command::new(\"grype\")").count(),
+            body.matches("Command::new(self.installed_binary()?)")
+                .count(),
             1,
             "exactly one grype subprocess per scan"
         );
@@ -4083,28 +4182,23 @@ mod tests {
         let artifact = make_artifact("pkg-1.0.0.tar.gz", "application/gzip");
         let content = Bytes::from_static(b"not a real archive");
 
-        // Impossible workspace path
-        let bad_ws = GrypeScanner::new("/dev/null/impossible-workspace".to_string());
+        // Impossible workspace path, with a binary so the scan gets that far
+        let bad_ws = GrypeScanner::new("/dev/null/impossible-workspace".to_string())
+            .with_binary(Some(PathBuf::from("/bin/false")));
         assert!(
             bad_ws.scan(&artifact, None, &content).await.is_err(),
             "scan() must return Err when workspace creation fails"
         );
 
-        // Missing grype binary (skip if grype is installed)
-        if std::process::Command::new("grype")
-            .arg("version")
-            .output()
-            .is_ok()
-        {
-            eprintln!("grype is installed, skipping unavailable-grype test");
-            return;
-        }
+        // Missing grype binary
         let dir = tempfile::tempdir().unwrap();
-        let no_grype = GrypeScanner::new(dir.path().to_string_lossy().to_string());
-        assert_scan_failed(
-            &no_grype.scan(&artifact, None, &content).await,
-            "Grype scan",
-        );
+        let no_grype =
+            GrypeScanner::new(dir.path().to_string_lossy().to_string()).with_binary(None);
+        let err = no_grype
+            .scan(&artifact, None, &content)
+            .await
+            .expect_err("scan() must return Err without grype");
+        assert!(err.to_string().contains(GRYPE_NOT_INSTALLED), "{err}");
     }
 
     /// A minimal but REAL Python wheel: a zip carrying a `.dist-info/METADATA`,
@@ -4732,7 +4826,10 @@ mod tests {
             body
         );
         let spawns = include_str!("grype_scanner.rs")
-            .matches("tokio::process::Command::new(\"grype\")")
+            .matches(concat!(
+                "tokio::process::Command::new(",
+                "self.installed_binary()?)"
+            ))
             .count();
         assert_eq!(
             spawns, 1,
@@ -5247,5 +5344,95 @@ mod tests {
         // Object form -> both fields preserved.
         assert_eq!(licenses[1].value.as_deref(), Some("MIT"));
         assert_eq!(licenses[1].spdx_expression.as_deref(), Some("MIT"));
+    }
+
+    #[cfg(unix)]
+    fn executable(path: &Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(path, body).expect("write");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn find_grype_takes_only_an_executable_on_path() {
+        let empty = tempfile::tempdir().expect("tempdir");
+        let not_executable = tempfile::tempdir().expect("tempdir");
+        let installed = tempfile::tempdir().expect("tempdir");
+        std::fs::write(not_executable.path().join(GRYPE_EXECUTABLE), b"").expect("write");
+        executable(&installed.path().join(GRYPE_EXECUTABLE), "");
+        let path = |dirs: &[&Path]| std::env::join_paths(dirs).expect("join");
+
+        assert_eq!(find_grype(None), None);
+        assert_eq!(find_grype(Some(std::ffi::OsStr::new(""))), None);
+        assert_eq!(find_grype(Some(&path(&[empty.path()]))), None);
+        assert_eq!(
+            find_grype(Some(&path(&[empty.path(), not_executable.path()]))),
+            None
+        );
+        assert_eq!(
+            find_grype(Some(&path(&[
+                empty.path(),
+                not_executable.path(),
+                installed.path()
+            ]))),
+            Some(installed.path().join(GRYPE_EXECUTABLE))
+        );
+    }
+
+    /// A pod without grype starts no grype process, for a scan or a probe, and
+    /// the scan fails rather than coming back clean.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_scanner_without_grype_starts_no_process() {
+        let bin = tempfile::tempdir().expect("tempdir");
+        let marker = bin.path().join("ran");
+        let fake = bin.path().join("grype");
+        executable(
+            &fake,
+            &format!(
+                "#!/bin/sh\ntouch '{}'\necho 'grype 0.121.3'\n",
+                marker.display()
+            ),
+        );
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let ws = workspace.path().to_string_lossy().into_owned();
+
+        let installed = GrypeScanner::new(ws.clone()).with_binary(Some(fake));
+        assert!(installed.is_installed());
+        assert!(installed.version().await.is_some());
+        assert!(
+            marker.exists(),
+            "the fake grype must run when it is installed"
+        );
+        std::fs::remove_file(&marker).expect("reset marker");
+
+        let absent = GrypeScanner::new(ws).with_binary(None);
+        assert!(!absent.is_installed());
+        assert_eq!(absent.version().await, None);
+        assert!(absent.vuln_db().await.is_none());
+        let artifact = make_artifact("left-pad-1.3.0.tgz", "application/gzip");
+        let err = absent
+            .scan(&artifact, None, &Bytes::from_static(b"not scanned"))
+            .await
+            .expect_err("a scan without grype must fail, never come back clean");
+        assert!(err.to_string().contains(GRYPE_NOT_INSTALLED), "{err}");
+        assert!(!marker.exists(), "no grype process may start without grype");
+    }
+
+    #[test]
+    fn grype_absence_notice_says_what_still_runs() {
+        assert_eq!(grype_absence_notice(true, false, true), None);
+        assert_eq!(grype_absence_notice(true, true, false), None);
+
+        let (error, text) = grype_absence_notice(false, false, true).expect("notice");
+        assert!(
+            error && text.contains("SCAN_QUEUE_ENABLED is off"),
+            "{text}"
+        );
+        let (error, text) = grype_absence_notice(false, true, true).expect("notice");
+        assert!(error && text.contains("SCAN_WORKER_ENABLED"), "{text}");
+        let (error, text) = grype_absence_notice(false, true, false).expect("notice");
+        assert!(!error && text.contains("fail closed"), "{text}");
     }
 }
