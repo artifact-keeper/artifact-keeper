@@ -15,9 +15,11 @@
 #   A scheduled run goes ahead unless another scheduled run of the same
 #   workflow, created in the last ONCE_WINDOW_HOURS (default 12), already
 #   REPORTED a gate: its `Report nightly gate results` job (ONCE_REPORT_JOB)
-#   ended success or failure. A run that skipped, was pre-empted by a
-#   candidate (cancelled) or never got that far does not count, so the next
-#   trigger tries again.
+#   ended success, or ended failure but still uploaded the verdict record
+#   (ONCE_VERDICT_ARTIFACT, `nightly-gate-verdict`). A run that skipped, was
+#   pre-empted by a candidate (cancelled), whose report failed before
+#   writing a verdict, or that never got that far does not count, so the
+#   next trigger tries again.
 #
 # The workflow's concurrency group runs these one at a time, so an earlier
 # run has finished by the time a later one gets here. The window has to be
@@ -43,6 +45,7 @@
 #   ONCE_RUN_ID        this run, never counted
 #   ONCE_WINDOW_HOURS  default 12
 #   ONCE_REPORT_JOB    default "Report nightly gate results"
+#   ONCE_VERDICT_ARTIFACT  default nightly-gate-verdict
 #   ONCE_CRON          the cron expression that fired, optional
 #   ONCE_NOW           epoch seconds (tests; default now)
 #
@@ -52,6 +55,7 @@ REPO="${ONCE_REPO:-artifact-keeper/artifact-keeper}"
 WF="${ONCE_WORKFLOW:-nightly-release-gate.yml}"
 WINDOW="${ONCE_WINDOW_HOURS:-12}"
 REPORT_JOB="${ONCE_REPORT_JOB:-Report nightly gate results}"
+VERDICT_ARTIFACT="${ONCE_VERDICT_ARTIFACT:-nightly-gate-verdict}"
 NOW="${ONCE_NOW:-$(date +%s)}"
 SERVER="${GITHUB_SERVER_URL:-https://github.com}"
 
@@ -102,17 +106,32 @@ while read -r id created; do
     echo "::warning title=Could not check for tonight's gate::reading the jobs of run ${id} failed. Running the gate; at worst it runs twice tonight." >&2
     exit 30
   fi
+  reported=""
   while IFS=$'\t' read -r conclusion name; do
     [[ "$name" == "$REPORT_JOB" ]] || continue
-    if [[ "$conclusion" == success || "$conclusion" == failure ]]; then
-      url="${SERVER}/${REPO}/actions/runs/${id}"
-      emit "already=true"
-      emit "already_by=${url}"
-      echo "::notice title=Nightly gate already ran::the scheduled run ${id} (created ${created}) reported tonight's gate (${url}). This trigger is a backstop; nothing more runs." >&2
-      summary "### Nightly gate already ran"$'\n\n'"Scheduled run ${url} (created ${created}) reported tonight's gate. This later trigger is a backstop and skips."
-      exit 3
-    fi
+    case "$conclusion" in
+      success) reported=yes ;;
+      failure)
+        # A report that failed counts only if it still wrote the verdict
+        # record (its upload step is `if: always()`). One that died before
+        # writing it recorded nothing, so the next trigger tries again.
+        if ! arts="$(gh api "repos/${REPO}/actions/runs/${id}/artifacts?per_page=100" \
+            --jq '.artifacts[].name' 2>/dev/null)"; then
+          emit "already=false"
+          echo "::warning title=Could not check for tonight's gate::reading the artifacts of run ${id} failed. Running the gate; at worst it runs twice tonight." >&2
+          exit 30
+        fi
+        grep -qxF -- "$VERDICT_ARTIFACT" <<<"$arts" && reported=yes ;;
+    esac
   done <<<"$jobs"
+  if [[ -n "$reported" ]]; then
+    url="${SERVER}/${REPO}/actions/runs/${id}"
+    emit "already=true"
+    emit "already_by=${url}"
+    echo "::notice title=Nightly gate already ran::the scheduled run ${id} (created ${created}) reported tonight's gate (${url}). This trigger is a backstop; nothing more runs." >&2
+    summary "### Nightly gate already ran"$'\n\n'"Scheduled run ${url} (created ${created}) reported tonight's gate. This later trigger is a backstop and skips."
+    exit 3
+  fi
 done <<<"$runs"
 
 emit "already=false"

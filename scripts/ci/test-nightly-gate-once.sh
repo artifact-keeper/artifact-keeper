@@ -25,6 +25,7 @@ STUB="$WORK/bin"; mkdir -p "$STUB"
 # FAKE_RUNS: lines "<id> <created_at>" (the stub applies no filter).
 # FAKE_LIST_FAIL=1: listing runs fails. FAKE_JOBS_FAIL=<id>: that run's jobs fail.
 # $WORK/jobs-<id>: lines "<conclusion>\t<name>" for run <id>.
+# $WORK/arts-<id>: artifact names of run <id>. FAKE_ARTS_FAIL=<id>: they fail.
 # Every call is logged to $WORK/calls.
 cat > "$STUB/gh" <<'STUBGH'
 #!/usr/bin/env bash
@@ -36,6 +37,11 @@ case "$1" in
   *actions/workflows/*/runs*)
     [ "${FAKE_LIST_FAIL:-0}" = "1" ] && exit 1
     [ -n "${FAKE_RUNS-}" ] && printf '%s\n' "$FAKE_RUNS"
+    exit 0 ;;
+  *actions/runs/*/artifacts*)
+    id="${1#*actions/runs/}"; id="${id%%/*}"
+    [ "${FAKE_ARTS_FAIL:-}" = "$id" ] && exit 1
+    [ -f "$FAKE_DIR/arts-$id" ] && cat "$FAKE_DIR/arts-$id"
     exit 0 ;;
   *actions/runs/*/jobs*)
     id="${1#*actions/runs/}"; id="${id%%/*}"
@@ -75,8 +81,18 @@ FAKE_RUNS=$'500 2026-11-21T07:52:00Z\n401 2026-11-21T03:40:00Z' run
 check "an earlier trigger reported a green gate: skip" 3 "already_by=https://github.com/o/r/actions/runs/401"
 
 jobs_for 402 failure 'Report nightly gate results'
+printf 'nightly-gate-verdict\n' > "$WORK/arts-402"
 FAKE_RUNS='402 2026-11-21T03:40:00Z' run
-check "an earlier trigger reported a red gate: skip" 3 "already=true"
+check "an earlier report failed after writing its verdict: skip" 3 "already=true"
+
+jobs_for 408 failure 'Report nightly gate results'
+printf 'some-other-artifact\n' > "$WORK/arts-408"
+FAKE_RUNS='408 2026-11-21T03:40:00Z' run
+check "an earlier report failed without writing a verdict: run" 0 "already=false"
+
+jobs_for 409 failure 'Report nightly gate results'
+FAKE_ARTS_FAIL=409 FAKE_RUNS='409 2026-11-21T03:40:00Z' run
+check "reading a failed report's artifacts fails: run (INFRA)" 30 "already=false"
 
 jobs_for 403 skipped 'Resolve the lines and their images' 'Report nightly gate results' 'Nightly finished'
 FAKE_RUNS='403 2026-11-21T03:40:00Z' run

@@ -676,7 +676,8 @@ same gate once a night on `main` and on every `release/X.Y.x` with a commit
 in the last 30 days (#6155: three scheduled triggers, 23:17, 03:17 and
 07:17 UTC, the first to arrive runs the gate and the others are backstops;
 GitHub has been starting them 7-9 hours late, so the gate usually starts
-around 07:00-08:40 UTC and finishes within about an hour), against the newest Docker Publish image
+around 07:00-08:40 UTC; a whole night took 52-71 minutes on 2026-11-17..21
+and a slow one runs about 4 hours), against the newest Docker Publish image
 of each, with the tests ref a candidate would use (`switch-tests-ref.sh`:
 the tests' `release/X.Y.x` when it exists, else the tests' `main`). Each red
 tier has one open issue (label `release-gate`, title `Nightly gate [<line>]:
