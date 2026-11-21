@@ -112,6 +112,27 @@ fn score_recalc_lock_key(repository_id: Uuid) -> String {
     format!("repo-security-score:{repository_id}")
 }
 
+/// Per-repository turn for score recalculations inside this process (#6315).
+/// Taken before a pool connection is acquired, so the waiters of one
+/// repository queue here instead of each holding a pooled connection idle in
+/// `pg_advisory_lock`. The advisory lock still orders recalculations across
+/// replicas. An entry evicted while held only lets a second waiter through to
+/// the advisory lock, which keeps the ordering
+static SCORE_RECALC_TURNS: std::sync::LazyLock<
+    moka::future::Cache<Uuid, std::sync::Arc<tokio::sync::Mutex<()>>>,
+> = std::sync::LazyLock::new(|| {
+    moka::future::Cache::builder()
+        .max_capacity(10_000)
+        .time_to_idle(Duration::from_secs(10 * 60))
+        .build()
+});
+
+async fn score_recalc_turn(repository_id: Uuid) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    SCORE_RECALC_TURNS
+        .get_with(repository_id, async { Default::default() })
+        .await
+}
+
 /// Whether a failed score recalculation lost a race with a concurrent writer
 /// and is safe to run again: a serialization failure (`40001`) or a deadlock
 /// (`40P01`). The recalculation commits atomically, so a retry never leaves a
@@ -3179,7 +3200,23 @@ impl ScanResultService {
     /// and start over, it counted against the attempt cap, and the last
     /// attempt computed from the stale snapshot and failed with 40001. A burst
     /// of 6 or more recalculations of one repository answered 500 (#5891).
+    ///
+    /// Waiters in one process queue on [`score_recalc_turn`] before they take
+    /// a pool connection, so a burst in one repository holds one connection
+    /// per replica, not one per waiter (#6315)
     pub async fn recalculate_score(&self, repository_id: Uuid) -> Result<RepoSecurityScore> {
+        let turn = score_recalc_turn(repository_id).await;
+        let _turn = turn.lock().await;
+        self.recalculate_score_under_advisory_lock(repository_id)
+            .await
+    }
+
+    /// [`Self::recalculate_score`] without the in-process turn: what waiters
+    /// on different replicas run against each other
+    async fn recalculate_score_under_advisory_lock(
+        &self,
+        repository_id: Uuid,
+    ) -> Result<RepoSecurityScore> {
         let lock_key = score_recalc_lock_key(repository_id);
         let mut guard = ScoreRecalcLock {
             conn: Some(
@@ -7511,7 +7548,8 @@ mod tests {
         /// completes and its recalculation R2 starts. Before the fix R1
         /// committed the stale score and R2 failed with 40001, so the score
         /// kept counting the jar as unscanned. Now R2 waits for R1 and
-        /// recomputes from a fresh snapshot.
+        /// recomputes from a fresh snapshot. In one process R2 waits on the
+        /// in-process turn (#6315), the snapshot rule is the same
         #[tokio::test]
         async fn concurrent_recalculations_keep_every_completed_scan_5006() {
             let Some(pool) = crate::testing::try_pool_with(8).await else {
@@ -7547,7 +7585,7 @@ mod tests {
                 let svc = ScanResultService::new(pool.clone());
                 async move { svc.recalculate_score(repo_id).await }
             });
-            let r1_pid = wait_for_blocked_backend_5006(&pool, &[blocker_pid], &[]).await;
+            wait_for_blocked_backend_5006(&pool, &[blocker_pid], &[]).await;
 
             // Second scan completion: the jar, cataloged with one finding.
             seed_scan_4338(
@@ -7562,7 +7600,8 @@ mod tests {
                 let svc = ScanResultService::new(pool.clone());
                 async move { svc.recalculate_score(repo_id).await }
             });
-            wait_for_blocked_backend_5006(&pool, &[blocker_pid, r1_pid], &[r1_pid]).await;
+            // R2 waits for R1 on the in-process turn (#6315)
+            wait_for_turn_holders_6315(repo_id, 2).await;
 
             blocker.commit().await.expect("release score row");
             let r1 = r1.await.expect("join r1");
@@ -7631,7 +7670,9 @@ mod tests {
                                 &[(Severity::High, Some(cve.as_str()), "t", "lib")],
                             )
                             .await;
-                            svc.recalculate_score(repo_id).await
+                            // Every waiter meets on the advisory lock, as
+                            // waiters on different replicas do (#6315)
+                            svc.recalculate_score_under_advisory_lock(repo_id).await
                         })
                     })
                     .collect();
@@ -7700,6 +7741,87 @@ mod tests {
                     .expect("the next recalculation must not wait on a cancelled one's lock");
             next.expect("the next recalculation succeeds");
             cleanup_repo(&pool, repo_id).await;
+        }
+
+        /// Poll until `n` recalculations of `repo_id` hold its in-process turn
+        /// handle, the one running and the ones queued behind it (#6315)
+        async fn wait_for_turn_holders_6315(repo_id: Uuid, n: usize) {
+            let turn = score_recalc_turn(repo_id).await;
+            let deadline = std::time::Instant::now() + Duration::from_secs(15);
+            // The cache and this function hold a handle each
+            while std::sync::Arc::strong_count(&turn) < n + 2 {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{n} recalculations did not queue on the in-process turn within 15 s"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+
+        /// #6315: recalculations of one repository waiting for its score lock,
+        /// held here by another replica, take one pool connection between them.
+        /// Before the fix each waiter held a connection idle in
+        /// `pg_advisory_lock` and a request on the same pool timed out
+        #[tokio::test]
+        async fn waiting_recalculations_leave_the_pool_free_6315() {
+            const WAITERS: usize = 6;
+            let Some(setup) = crate::testing::try_pool_with(2).await else {
+                return;
+            };
+            let repo_id = insert_test_repo(&setup).await;
+            let url = std::env::var("DATABASE_URL").expect("DATABASE_URL");
+            let pool = sqlx::postgres::PgPoolOptions::new()
+                .max_connections(3)
+                .acquire_timeout(Duration::from_secs(30))
+                .connect(&url)
+                .await
+                .expect("pool of 3");
+
+            let mut other_replica = crate::testing::bounded_connect(&url)
+                .await
+                .expect("connect");
+            sqlx::query("SELECT pg_advisory_lock(hashtextextended($1, 0))")
+                .bind(score_recalc_lock_key(repo_id))
+                .execute(&mut other_replica)
+                .await
+                .expect("hold the score lock");
+            let holder_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+                .fetch_one(&mut other_replica)
+                .await
+                .expect("holder pid");
+
+            let tasks: Vec<_> = (0..WAITERS)
+                .map(|_| {
+                    let svc = ScanResultService::new(pool.clone());
+                    tokio::spawn(async move { svc.recalculate_score(repo_id).await })
+                })
+                .collect();
+            wait_for_blocked_backend_5006(&setup, &[holder_pid], &[]).await;
+            wait_for_turn_holders_6315(repo_id, WAITERS).await;
+
+            let in_use = pool.size() as usize - pool.num_idle();
+            let fresh = tokio::time::timeout(Duration::from_secs(1), pool.acquire()).await;
+            assert!(
+                matches!(fresh, Ok(Ok(_))),
+                "a request on the pool must get a connection while {WAITERS} recalculations wait"
+            );
+            drop(fresh);
+            assert!(
+                in_use <= 1,
+                "{in_use} pool connections held by recalculations waiting for one lock"
+            );
+
+            sqlx::query("SELECT pg_advisory_unlock(hashtextextended($1, 0))")
+                .bind(score_recalc_lock_key(repo_id))
+                .execute(&mut other_replica)
+                .await
+                .expect("release the score lock");
+            for task in tasks {
+                task.await.expect("join").expect("recalculation succeeds");
+            }
+            sqlx::Connection::close(other_replica).await.ok();
+            pool.close().await;
+            cleanup_repo(&setup, repo_id).await;
         }
 
         async fn svc_score(pool: &PgPool, repo_id: Uuid) -> RepoSecurityScore {
