@@ -24,7 +24,7 @@ use crate::services::proxy_scan_service::CacheScanGate;
 pub(crate) use crate::services::proxy_service::CachedBody;
 pub use crate::services::proxy_service::StreamingFetchResult;
 use crate::services::proxy_service::{DeferredCommitSlot, DirectUpstreamBody, ProxyService};
-use crate::services::virtual_member_breaker::{fetch_error_trips_breaker, MemberBreaker};
+use crate::services::virtual_member_breaker::MemberBreaker;
 // Re-export the per-format buffered-metadata byte ceilings (#1608 Phase 4b /
 // #2181) so format handlers select a cap via `proxy_helpers::<CONST>`.
 pub use crate::services::proxy_service::{DEFAULT_METADATA_MAX_BYTES, LARGE_METADATA_MAX_BYTES};
@@ -2093,11 +2093,9 @@ async fn proxy_fetch_streaming_member(
         proxy_service.fetch_artifact_streaming(member, path).await
     };
     // #5810: the member's answer, for its download breaker.
-    proxy_service.member_breaker().record(
-        member.id,
-        &member.key,
-        fetched.as_ref().is_err_and(fetch_error_trips_breaker),
-    );
+    proxy_service
+        .member_breaker()
+        .record_fetch(member.id, &member.key, &fetched);
     streaming_fetch_response(
         fetched,
         &member.key,
@@ -3920,7 +3918,9 @@ where
             let Some(deadline) = walk.deadline else {
                 return fetch.await;
             };
-            match tokio::time::timeout(deadline, fetch).await {
+            // #5013: our own deadline, so a request still waiting inside
+            // counts against the member's upstream circuit.
+            match crate::services::upstream_circuit::within_own_deadline(deadline, fetch).await {
                 Ok(outcome) => outcome,
                 Err(_) => {
                     record_virtual_member_download_deadline_miss(&member.key, walk.path, deadline);
@@ -4669,11 +4669,9 @@ where
                         None => proxy.fetch_artifact_streaming(member, path).await,
                     };
                     // #5810: the member's answer, for its download breaker.
-                    proxy.member_breaker().record(
-                        member.id,
-                        &member.key,
-                        fetch.as_ref().is_err_and(fetch_error_trips_breaker),
-                    );
+                    proxy
+                        .member_breaker()
+                        .record_fetch(member.id, &member.key, &fetch);
                     // #6214: read a refusal of the member's own credentials
                     // as unavailable, for a caller that asked for it.
                     let refused = refusals_db.is_some()
@@ -5366,7 +5364,8 @@ pub async fn within_virtual_member_deadline<F: std::future::Future>(
     fut: F,
 ) -> Result<F::Output, std::time::Duration> {
     let deadline = virtual_member_metadata_timeout();
-    tokio::time::timeout(deadline, fut)
+    // #5013: our own deadline (see `within_own_deadline`).
+    crate::services::upstream_circuit::within_own_deadline(deadline, fut)
         .await
         .map_err(|_| deadline)
 }

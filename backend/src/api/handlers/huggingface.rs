@@ -1312,7 +1312,12 @@ async fn fetch_upstream_commit_sha(
     );
 
     // Own deadline, not the shared client's: see `COMMIT_SHA_FALLBACK_TIMEOUT`.
-    let bytes = match tokio::time::timeout(COMMIT_SHA_FALLBACK_TIMEOUT, fetch).await {
+    let bytes = match crate::services::upstream_circuit::within_own_deadline(
+        COMMIT_SHA_FALLBACK_TIMEOUT,
+        fetch,
+    )
+    .await
+    {
         Ok(Ok((bytes, _content_type))) => bytes,
         Ok(Err(_response)) => {
             tracing::debug!(
