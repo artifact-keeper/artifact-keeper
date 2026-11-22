@@ -21272,9 +21272,9 @@ mod repodata_byte_stability_tests {
         let mut zip_buf = Vec::new();
         {
             let mut writer = zip::ZipWriter::new(std::io::Cursor::new(&mut zip_buf));
-            // Pin the entry timestamp: the zip default is the wall clock,
-            // which would make the fixture's checksums nondeterministic and
-            // the golden assertion below impossible.
+            // Pin the entry timestamp: the zip default is the wall clock.
+            // The golden takes its checksums from these bytes, but a
+            // deterministic fixture keeps a failure reproducible.
             let options = zip::write::SimpleFileOptions::default()
                 .compression_method(zip::CompressionMethod::Stored)
                 .last_modified_time(zip::DateTime::default());
@@ -21316,11 +21316,16 @@ mod repodata_byte_stability_tests {
     }
 
     /// Golden documents captured from the PRE-MIGRATION implementation
-    /// (#4040). `{key}` is interpolated with the fixture's random repo key;
-    /// every other byte — pretty-print layout, key order, field presence,
-    /// value spelling, the stored checksums of the deterministic fixture
-    /// packages — is asserted exactly. A migration that changes served
-    /// repodata bytes trips this test and must be justified in the PR.
+    /// (#4040). `{key}` is interpolated with the fixture's random repo key,
+    /// and `{md5}`, `{sha256}` and `{size}` with the digests and length of
+    /// the package bytes this run built and uploaded: those bytes come from
+    /// the compression crates (bzip2, zstd, zip), whose output may change
+    /// with a dependency bump without the server changing at all (zstd
+    /// 0.14.4 started recording the frame content size). Every other byte —
+    /// pretty-print layout, key order, field presence, value spelling — is
+    /// asserted exactly, and the checksums must still be the ones of the
+    /// uploaded bytes. A migration that changes served repodata bytes trips
+    /// this test and must be justified in the PR.
     const GOLDEN_NOARCH: &str = r#"{
   "info": {
     "subdir": "noarch"
@@ -21336,10 +21341,10 @@ mod repodata_byte_stability_tests {
       "fn": "zlib-1.2.13-hd590300_5.tar.bz2",
       "indexed_timestamp": {ts},
       "license": "MIT",
-      "md5": "171767ec5672ea594e1ef29d1211f3d7",
+      "md5": "{md5}",
       "name": "zlib",
-      "sha256": "2afa994d506a49f05cbbe00fd76c42992f7f26f66520d5083ecb7459cbcfac27",
-      "size": 222,
+      "sha256": "{sha256}",
+      "size": {size},
       "subdir": "noarch",
       "version": "1.2.13"
     }
@@ -21368,10 +21373,10 @@ mod repodata_byte_stability_tests {
       "fn": "rattlerpy-0.4.1-py312h02b7e37_1.conda",
       "indexed_timestamp": {ts},
       "license": "BSD-3-Clause",
-      "md5": "9f2993fb3eeeebbb9128a5c6b6b537d4",
+      "md5": "{md5}",
       "name": "rattlerpy",
-      "sha256": "ca5792b5733e64ca5de5776440792fd6b531ed9b2ded6a928a82682646d71a55",
-      "size": 523,
+      "sha256": "{sha256}",
+      "size": {size},
       "subdir": "linux-64",
       "version": "0.4.1"
     }
@@ -21382,11 +21387,23 @@ mod repodata_byte_stability_tests {
 
     /// `{ts}` is the record's CEP-47 `indexed_timestamp`: the artifact row's
     /// `created_at` in milliseconds, which differs per run but is fixed for a
-    /// stored package.
-    fn golden(template: &str, key: &str, ts: i64) -> Vec<u8> {
+    /// stored package. `package` is the uploaded package's bytes, whose md5,
+    /// sha256 and length the record must carry.
+    fn golden(template: &str, key: &str, ts: i64, package: &[u8]) -> Vec<u8> {
+        use sha2::{Digest, Sha256};
+        let md5 = {
+            use md5::Md5;
+            let mut hasher = Md5::new();
+            md5::Digest::update(&mut hasher, package);
+            format!("{:x}", md5::Digest::finalize(hasher))
+        };
+        let sha256 = format!("{:x}", Sha256::digest(package));
         template
             .replace("{key}", key)
             .replace("{ts}", &ts.to_string())
+            .replace("{md5}", &md5)
+            .replace("{sha256}", &sha256)
+            .replace("{size}", &package.len().to_string())
             .into_bytes()
     }
 
@@ -21408,18 +21425,20 @@ mod repodata_byte_stability_tests {
             return;
         };
 
+        let zlib_pkg = conda_v1_package("zlib", "1.2.13", "hd590300_5");
+        let rattler_pkg = conda_v2_package("rattlerpy", "0.4.1", "py312h02b7e37_1");
         upload(
             &fx,
             "noarch",
             "zlib-1.2.13-hd590300_5.tar.bz2",
-            conda_v1_package("zlib", "1.2.13", "hd590300_5"),
+            zlib_pkg.clone(),
         )
         .await;
         upload(
             &fx,
             "linux-64",
             "rattlerpy-0.4.1-py312h02b7e37_1.conda",
-            conda_v2_package("rattlerpy", "0.4.1", "py312h02b7e37_1"),
+            rattler_pkg.clone(),
         )
         .await;
 
@@ -21450,18 +21469,18 @@ mod repodata_byte_stability_tests {
 
         assert_eq!(
             noarch,
-            golden(GOLDEN_NOARCH, &key, zlib_ts),
+            golden(GOLDEN_NOARCH, &key, zlib_ts, &zlib_pkg),
             "noarch/repodata.json bytes changed"
         );
         assert_eq!(
             linux64,
-            golden(GOLDEN_LINUX64, &key, rattler_ts),
+            golden(GOLDEN_LINUX64, &key, rattler_ts, &rattler_pkg),
             "linux-64/repodata.json bytes changed"
         );
         // One version per name here, so current_repodata is the same document.
         assert_eq!(
             current,
-            golden(GOLDEN_LINUX64, &key, rattler_ts),
+            golden(GOLDEN_LINUX64, &key, rattler_ts, &rattler_pkg),
             "linux-64/current_repodata.json bytes changed"
         );
     }
