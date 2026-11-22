@@ -1314,7 +1314,7 @@ pub fn spawn_all(
                     };
                     let (renewal, lost) = lease
                         .spawn_renewal_with_cancellation(db.clone(), recatalog::LEASE_TTL_SECS);
-                    match sweep.run_pass(Some(&lost)).await {
+                    match sweep.run_pass(Some(&lost), Some(&lease)).await {
                         Ok(report) => {
                             recatalog::log_pass(&report);
                             mid_walk = !report.complete && !report.interrupted;

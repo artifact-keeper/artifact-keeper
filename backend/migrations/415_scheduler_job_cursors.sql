@@ -12,6 +12,9 @@
 CREATE TABLE IF NOT EXISTS scheduler_job_cursors (
     job_name      TEXT PRIMARY KEY,
     repository_id UUID,
+    -- The repository's key when the cursor was saved: its cache root, which a
+    -- rename changes, so a cursor saved under another key is discarded.
+    repository_key TEXT,
     cursor        TEXT,
     updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );

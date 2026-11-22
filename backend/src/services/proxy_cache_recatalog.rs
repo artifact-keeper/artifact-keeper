@@ -71,6 +71,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::error::{AppError, Result};
+use crate::services::cluster_work::SchedulerLease;
 use crate::services::metrics_service;
 use crate::services::proxy_cache_scope::ProxyCacheScope;
 use crate::services::proxy_catalog;
@@ -224,6 +225,9 @@ pub struct SweepReport {
     pub interrupted: bool,
     /// How long the pass took.
     pub elapsed_ms: u64,
+    /// Whether the chunk's end position was saved (not when the lease was
+    /// lost by then).
+    pub position_saved: bool,
 }
 
 impl SweepReport {
@@ -351,7 +355,21 @@ pub enum RemoteSweep {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Position {
     pub remote: Option<Uuid>,
+    /// The Remote's key when the cursor was saved. A cursor names a place in
+    /// that key's cache tree (an S3 start-after key, an Azure marker), so it
+    /// is dropped when the Remote has been renamed since.
+    pub remote_key: Option<String>,
     pub cursor: Option<String>,
+}
+
+impl Position {
+    /// The saved cursor for `remote`, if this position stopped in it under
+    /// its current key.
+    pub fn cursor_for(&self, remote: &Remote) -> Option<String> {
+        (self.remote == Some(remote.id) && self.remote_key.as_deref() == Some(remote.key.as_str()))
+            .then(|| self.cursor.clone())
+            .flatten()
+    }
 }
 
 /// The sweep: its handles, settings and the name its position is kept under.
@@ -399,29 +417,52 @@ impl RecatalogSweep {
 
     /// The saved position; the start when none is saved.
     pub async fn load_position(&self) -> Result<Position> {
-        let row: Option<(Option<Uuid>, Option<String>)> = sqlx::query_as(
-            "SELECT repository_id, cursor FROM scheduler_job_cursors WHERE job_name = $1",
+        let row: Option<(Option<Uuid>, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT repository_id, repository_key, cursor FROM scheduler_job_cursors \
+             WHERE job_name = $1",
         )
         .bind(&self.job_name)
         .fetch_optional(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
         Ok(row
-            .map(|(remote, cursor)| Position { remote, cursor })
+            .map(|(remote, remote_key, cursor)| Position {
+                remote,
+                remote_key,
+                cursor,
+            })
             .unwrap_or_default())
     }
 
-    async fn save_position(&self, position: &Position) -> Result<()> {
-        sqlx::query(
-            "INSERT INTO scheduler_job_cursors (job_name, repository_id, cursor, updated_at)              VALUES ($1, $2, $3, now())              ON CONFLICT (job_name) DO UPDATE SET repository_id = EXCLUDED.repository_id,                  cursor = EXCLUDED.cursor, updated_at = now()",
+    /// Save `position`, only while `lease` (when given) is still this
+    /// holder's: a holder that lost the lease must not overwrite the newer
+    /// position of the replica that took it over. Returns whether it saved.
+    async fn save_position(
+        &self,
+        position: &Position,
+        lease: Option<&SchedulerLease>,
+    ) -> Result<bool> {
+        let res = sqlx::query(
+            "INSERT INTO scheduler_job_cursors \
+                 (job_name, repository_id, repository_key, cursor, updated_at) \
+             SELECT $1, $2, $3, $4, now() \
+             WHERE $5::text IS NULL OR EXISTS ( \
+                 SELECT 1 FROM scheduler_leases \
+                 WHERE job_name = $5 AND claim_token = $6 AND lease_expires_at > now()) \
+             ON CONFLICT (job_name) DO UPDATE SET repository_id = EXCLUDED.repository_id, \
+                 repository_key = EXCLUDED.repository_key, cursor = EXCLUDED.cursor, \
+                 updated_at = now()",
         )
         .bind(&self.job_name)
         .bind(position.remote)
+        .bind(position.remote_key.as_deref())
         .bind(position.cursor.as_deref())
+        .bind(lease.map(|l| l.job_name()))
+        .bind(lease.map(|l| l.lease_claim_token()))
         .execute(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
-        Ok(())
+        Ok(res.rows_affected() > 0)
     }
 
     /// One chunk of the walk over every Remote: from the saved position, at
@@ -431,7 +472,11 @@ impl RecatalogSweep {
     /// listing or catalog queries fail is logged, counted (`remote_errors`)
     /// and skipped, so it never blocks the Remotes after it. `lost` stops the
     /// chunk between pages.
-    pub async fn run_pass(&self, lost: Option<&CancellationToken>) -> Result<SweepReport> {
+    pub async fn run_pass(
+        &self,
+        lost: Option<&CancellationToken>,
+        lease: Option<&SchedulerLease>,
+    ) -> Result<SweepReport> {
         let started = std::time::Instant::now();
         let start = self.load_position().await?;
         let remotes: Vec<Remote> = sqlx::query_as(
@@ -447,9 +492,7 @@ impl RecatalogSweep {
         let mut budget = self.config.budget;
         let mut next = Position::default();
         for remote in &remotes {
-            let cursor = (start.remote == Some(remote.id))
-                .then(|| start.cursor.clone())
-                .flatten();
+            let cursor = start.cursor_for(remote);
             report.remotes += 1;
             match self
                 .sweep_remote(remote, cursor, &mut budget, &mut report, lost)
@@ -459,6 +502,7 @@ impl RecatalogSweep {
                 Ok(RemoteSweep::Stopped(cursor)) => {
                     next = Position {
                         remote: Some(remote.id),
+                        remote_key: Some(remote.key.clone()),
                         cursor,
                     };
                     break;
@@ -476,7 +520,12 @@ impl RecatalogSweep {
         report.complete = next == Position::default();
         report.elapsed_ms = started.elapsed().as_millis() as u64;
         report.record_metrics();
-        self.save_position(&next).await?;
+        report.position_saved = self.save_position(&next, lease).await?;
+        if !report.position_saved {
+            tracing::warn!(
+                "proxy-cache re-catalog: the lease was lost; not saving this chunk's position"
+            );
+        }
         Ok(report)
     }
 

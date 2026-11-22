@@ -457,7 +457,7 @@ async fn run_pass_restores_rows_across_remotes_6429() {
     let Some(rig) = Rig::new().await else { return };
     rig.put_old("q/one.bin", 7);
     let sweep = rig.sweep(1000, usize::MAX);
-    let report = sweep.run_pass(None).await.unwrap();
+    let report = sweep.run_pass(None, None).await.unwrap();
     assert!(report.remotes >= 1);
     assert!(report.complete, "{report:?}");
     assert!(rig.row("q/one.bin").await.is_some());
@@ -593,7 +593,7 @@ async fn a_failing_remote_does_not_block_the_others_6429() {
     let mut store = Faulty::new(&good.dir);
     store.fail_listing_under = Some(bad.scope.repo_root(&bad.key));
     let sweep = good.sweep_on(Arc::new(store), 1000, usize::MAX);
-    let report = sweep.run_pass(None).await.unwrap();
+    let report = sweep.run_pass(None, None).await.unwrap();
     assert!(report.remote_errors >= 1, "{report:?}");
     assert!(report.complete, "{report:?}");
     assert!(good.row("g/one.bin").await.is_some(), "{report:?}");
@@ -611,14 +611,18 @@ async fn the_position_survives_a_restart_6429() {
     for i in 0..5 {
         rig.put_old(&format!("c/{i}.bin"), 20 + i);
     }
-    let first = rig.sweep(3, 4).run_pass(None).await.unwrap();
+    let first = rig.sweep(3, 4).run_pass(None, None).await.unwrap();
     assert!(!first.complete, "{first:?}");
     assert_eq!(first.scanned, 4, "{first:?}");
     let saved = rig.sweep(3, 4).load_position().await.unwrap();
     assert_eq!(saved.remote, Some(rig.repo));
     assert!(saved.cursor.is_some());
     // A fresh instance: nothing carried over in memory.
-    let second = rig.sweep(1000, usize::MAX).run_pass(None).await.unwrap();
+    let second = rig
+        .sweep(1000, usize::MAX)
+        .run_pass(None, None)
+        .await
+        .unwrap();
     assert!(second.complete, "{second:?}");
     assert_eq!(second.scanned, 6, "resumed, not restarted: {second:?}");
     assert_eq!(first.recataloged + second.recataloged, 5);
@@ -662,5 +666,107 @@ async fn a_sidecar_with_a_wrong_size_is_not_recataloged_6429() {
     assert_eq!(report.skipped_size_mismatch, 2, "{report:?}");
     assert_eq!(rig.row("z/short.bin").await, None);
     assert_eq!(rig.row("z/negative.bin").await, None);
+    rig.cleanup().await;
+}
+
+#[test]
+fn a_cursor_is_used_only_under_the_key_it_was_saved_with_6429() {
+    let remote = |key: &str| Remote {
+        id: Uuid::from_u128(7),
+        key: key.to_string(),
+        created_at: Utc::now(),
+    };
+    let saved = Position {
+        remote: Some(Uuid::from_u128(7)),
+        remote_key: Some("npm-remote".into()),
+        cursor: Some("proxy-cache/npm-remote/z/__content__".into()),
+    };
+    assert_eq!(saved.cursor_for(&remote("npm-remote")), saved.cursor);
+    // Renamed since: the cursor names a place in the old key's tree.
+    assert_eq!(saved.cursor_for(&remote("npm-mirror")), None);
+    // Another Remote, or a position saved before the key was recorded.
+    let other = Remote {
+        id: Uuid::from_u128(8),
+        ..remote("npm-remote")
+    };
+    assert_eq!(saved.cursor_for(&other), None);
+    let keyless = Position {
+        remote_key: None,
+        ..saved.clone()
+    };
+    assert_eq!(keyless.cursor_for(&remote("npm-remote")), None);
+}
+
+/// A Remote renamed after a chunk stopped in it is walked from its start
+/// under the new key, not from the stale cursor.
+#[tokio::test]
+async fn a_renamed_remote_restarts_its_walk_6429() {
+    let Some(mut rig) = Rig::new().await else {
+        return;
+    };
+    for i in 0..4 {
+        rig.put_old(&format!("n/{i}.bin"), 30 + i);
+    }
+    let first = rig.sweep(2, 2).run_pass(None, None).await.unwrap();
+    assert!(!first.complete, "{first:?}");
+    let saved = rig.sweep(2, 2).load_position().await.unwrap();
+    assert_eq!(saved.remote_key.as_deref(), Some(rig.key.as_str()));
+    // Rename the Remote and move its cache tree, as the files now live under
+    // the new key's root.
+    let new_key = format!("{}-renamed", rig.key);
+    sqlx::query("UPDATE repositories SET key = $1 WHERE id = $2")
+        .bind(&new_key)
+        .bind(rig.repo)
+        .execute(&rig.pool)
+        .await
+        .unwrap();
+    std::fs::rename(
+        rig.dir.join(rig.scope.repo_root(&rig.key)),
+        rig.dir.join(rig.scope.repo_root(&new_key)),
+    )
+    .unwrap();
+    rig.key = new_key;
+    assert_eq!(saved.cursor_for(&rig.remote().await), None);
+    let second = rig
+        .sweep(1000, usize::MAX)
+        .run_pass(None, None)
+        .await
+        .unwrap();
+    assert!(second.complete, "{second:?}");
+    // The whole new tree was listed, not the tail after the old cursor.
+    assert_eq!(second.scanned, 8, "{second:?}");
+    rig.cleanup().await;
+}
+
+/// A chunk that ends after its lease was lost does not save its position,
+/// so it cannot overwrite the position of the replica that took over.
+#[tokio::test]
+async fn a_chunk_that_lost_its_lease_does_not_save_its_position_6429() {
+    let Some(rig) = Rig::new().await else { return };
+    for i in 0..3 {
+        rig.put_old(&format!("l/{i}.bin"), 40 + i);
+    }
+    let job = format!("test-lease-{}", rig.repo);
+    let lease =
+        crate::services::cluster_work::try_acquire_scheduler_lease_quiet(&rig.pool, &job, 60.0)
+            .await
+            .expect("lease");
+    let held = rig.sweep(2, 2).run_pass(None, Some(&lease)).await.unwrap();
+    assert!(held.position_saved, "{held:?}");
+    let before = rig.sweep(2, 2).load_position().await.unwrap();
+    assert!(before.cursor.is_some());
+    // The lease expires (another replica may take it over).
+    sqlx::query("UPDATE scheduler_leases SET lease_expires_at = now() - INTERVAL '1 second' WHERE job_name = $1")
+        .bind(&job)
+        .execute(&rig.pool)
+        .await
+        .unwrap();
+    let late = rig.sweep(2, 2).run_pass(None, Some(&lease)).await.unwrap();
+    assert!(!late.position_saved, "{late:?}");
+    assert_eq!(rig.sweep(2, 2).load_position().await.unwrap(), before);
+    let _ = sqlx::query("DELETE FROM scheduler_leases WHERE job_name = $1")
+        .bind(&job)
+        .execute(&rig.pool)
+        .await;
     rig.cleanup().await;
 }
