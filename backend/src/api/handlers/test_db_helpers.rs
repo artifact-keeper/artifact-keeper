@@ -5111,3 +5111,158 @@ mod poll_tests {
         assert_eq!(row.details["late"], true);
     }
 }
+
+/// Pool checkouts counted by [`counting_pool`] (#6318).
+#[derive(Clone, Default)]
+pub struct AcquireCounter {
+    count: Arc<std::sync::atomic::AtomicUsize>,
+    sites: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl AcquireCounter {
+    /// Checkouts since the pool was built.
+    pub fn get(&self) -> usize {
+        self.count.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// With `AK_TEST_TRACE_ACQUIRES=1`, the backend frames of each checkout
+    /// from index `from` on, one line per checkout (diagnostics only).
+    pub fn sites_since(&self, from: usize) -> Vec<String> {
+        self.sites
+            .lock()
+            .unwrap()
+            .iter()
+            .skip(from)
+            .cloned()
+            .collect()
+    }
+
+    fn record(&self) {
+        self.count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if std::env::var_os("AK_TEST_TRACE_ACQUIRES").is_some() {
+            let trace = std::backtrace::Backtrace::force_capture().to_string();
+            let frames: Vec<&str> = trace
+                .lines()
+                .map(str::trim)
+                .filter(|l| {
+                    l.contains("artifact_keeper_backend::") && !l.contains("test_db_helpers")
+                })
+                .map(|l| l.split_once(": ").map_or(l, |(_, f)| f))
+                .take(4)
+                .collect();
+            self.sites.lock().unwrap().push(frames.join(" <- "));
+        } else {
+            self.sites.lock().unwrap().push(String::new());
+        }
+    }
+}
+
+/// A pool on the test database that counts every checkout (#6318): an idle
+/// connection handed out runs `before_acquire`, a new one `after_connect`, so
+/// each acquire increments the counter exactly once. Used to pin how many
+/// times one upload goes back to the pool, the per-upload connection demand
+/// that sets the concurrency limit under a small pool.
+pub(crate) async fn counting_pool(max_connections: u32) -> Option<(PgPool, AcquireCounter)> {
+    // The shared probe (skip or fail on an unreachable database).
+    try_pool().await?;
+    let url = crate::testing::require_db_url()?;
+    let counter = AcquireCounter::default();
+    let on_acquire = counter.clone();
+    let on_connect = counter.clone();
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(max_connections)
+        .acquire_timeout(std::time::Duration::from_secs(30))
+        .before_acquire(move |_, _| {
+            on_acquire.record();
+            Box::pin(async { Ok(true) })
+        })
+        .after_connect(move |_, _| {
+            on_connect.record();
+            Box::pin(async { Ok(()) })
+        })
+        .connect(&url)
+        .await
+        .expect("counting pool");
+    Some((pool, counter))
+}
+
+impl Fixture {
+    /// [`Fixture::setup`] whose state runs on a [`counting_pool`] (#6318).
+    pub(crate) async fn setup_counting(
+        repo_type: &str,
+        format: &str,
+    ) -> Option<(Self, AcquireCounter)> {
+        let (pool, counter) = counting_pool(4).await?;
+        let (user_id, username) = create_user(&pool).await;
+        let (repo_id, repo_key, storage_dir) = create_repo(&pool, repo_type, format).await;
+        grant_repo_access(&pool, repo_id, user_id).await;
+        let state = build_state(pool.clone(), storage_dir.to_str().unwrap());
+        Some((
+            Self {
+                pool,
+                user_id,
+                username,
+                repo_id,
+                repo_key,
+                storage_dir,
+                state,
+            },
+            counter,
+        ))
+    }
+}
+
+/// A write fault on one table for rows that name `marker` (#6383): a
+/// `BEFORE INSERT OR UPDATE` trigger that raises when the row's `column`, as
+/// text, contains it. Rows of other tests never carry the marker, so the
+/// shared test database is unaffected. Call [`WriteFault::remove`] when done.
+pub(crate) struct WriteFault {
+    pool: PgPool,
+    table: &'static str,
+    name: String,
+}
+
+pub(crate) async fn install_write_fault(
+    pool: &PgPool,
+    table: &'static str,
+    column: &'static str,
+    marker: &str,
+) -> WriteFault {
+    let name = format!("ak_test_fault_{}", Uuid::new_v4().simple());
+    let function = format!(
+        "CREATE FUNCTION {name}() RETURNS trigger LANGUAGE plpgsql AS $f$ BEGIN \
+         IF NEW.{column}::text LIKE '%{marker}%' THEN \
+         RAISE EXCEPTION 'injected {table} write fault'; END IF; RETURN NEW; END $f$"
+    );
+    sqlx::query(sqlx::AssertSqlSafe(function))
+        .execute(pool)
+        .await
+        .expect("create fault function");
+    let trigger = format!(
+        "CREATE TRIGGER {name} BEFORE INSERT OR UPDATE ON {table} \
+         FOR EACH ROW EXECUTE FUNCTION {name}()"
+    );
+    sqlx::query(sqlx::AssertSqlSafe(trigger))
+        .execute(pool)
+        .await
+        .expect("create fault trigger");
+    WriteFault {
+        pool: pool.clone(),
+        table,
+        name,
+    }
+}
+
+impl WriteFault {
+    pub(crate) async fn remove(self) {
+        for drop in [
+            format!("DROP TRIGGER IF EXISTS {} ON {}", self.name, self.table),
+            format!("DROP FUNCTION IF EXISTS {}()", self.name),
+        ] {
+            sqlx::query(sqlx::AssertSqlSafe(drop))
+                .execute(&self.pool)
+                .await
+                .expect("drop fault trigger");
+        }
+    }
+}

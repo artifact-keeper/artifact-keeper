@@ -1,0 +1,5 @@
+---
+section: Fixed
+issues: [#6383]
+---
+- **A generic PUT of a package into a PyPI, Debian, NuGet or RPM repository, a native RPM upload and a NuGet push commit the format metadata with the artifact row, and a versioned upload commits its revision with it** (#6383). These paths wrote the metadata the format's index is built from after the artifact row committed, and only logged (NuGet: silently dropped) a failure there, for example a pool acquire timeout under load. The package was then stored but missing from its index, and a retry was refused with 409. On a versioning-enabled Generic or ML-model repository the revision was appended after the commit too, so a failure there answered an error for an upload that had already replaced the current content. The metadata and the revision now commit in the same transaction as the row. If either write fails, nothing is stored, the client gets an error, and its retry starts clean. An RPM document too large to store still keeps the "unparseable" repodata marker instead of failing the upload. Responses are unchanged when nothing fails.

@@ -4893,6 +4893,9 @@ async fn persist_debian_upload(
             user_id,
             // #4889: queue below, once the upload has committed.
             false,
+            // #6346: `record_debian_package_extras` registers the catalog row
+            // once, with the control file's description.
+            crate::services::artifact_service::CatalogRegistration::Caller,
             Some(crate::services::artifact_service::CommitMetadata {
                 format: "debian",
                 metadata: upload.metadata.clone(),

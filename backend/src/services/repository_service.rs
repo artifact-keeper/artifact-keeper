@@ -2914,6 +2914,18 @@ impl RepositoryService {
         additional_bytes: i64,
     ) -> Result<Option<QuotaDenial>> {
         let repo = self.get_by_id(repo_id).await?;
+        self.quota_preflight_for(&repo, additional_bytes).await
+    }
+
+    /// [`Self::quota_preflight`] for a caller that already read the
+    /// repository row (the shared upload service, #6318), so the pre-check
+    /// does not read it a second time. Same checks, same answer.
+    pub async fn quota_preflight_for(
+        &self,
+        repo: &Repository,
+        additional_bytes: i64,
+    ) -> Result<Option<QuotaDenial>> {
+        let repo_id = repo.id;
         let repo_quota = finite_quota(repo.quota_bytes);
         // Only hit the DB for usage when a finite quota is actually set.
         let repo_usage = match repo_quota {

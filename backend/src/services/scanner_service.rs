@@ -12700,6 +12700,36 @@ pub async fn trigger_scan_on_upload(
     artifact_id: Uuid,
 ) -> bool {
     record_upload_metrics(db, repository_id, artifact_id).await;
+    trigger_scan_after_upload_metrics(db, scanner, repository_id, artifact_id).await
+}
+
+/// [`trigger_scan_on_upload`] for a caller that already holds the
+/// repository's key and format and the artifact's size (the shared upload
+/// service's finalize, #6318): the upload is counted from them instead of a
+/// lookup, which saved nothing but a pool checkout per upload. The scan gate
+/// and the scan itself are the same code.
+pub async fn trigger_scan_on_upload_for(
+    db: &PgPool,
+    scanner: Option<Arc<ScannerService>>,
+    upload: (&str, &str, i64),
+    repository_id: Uuid,
+    artifact_id: Uuid,
+) -> bool {
+    let (repo_key, format, size_bytes) = upload;
+    crate::services::metrics_service::record_artifact_upload(
+        repo_key,
+        format,
+        u64::try_from(size_bytes).unwrap_or(0),
+    );
+    trigger_scan_after_upload_metrics(db, scanner, repository_id, artifact_id).await
+}
+
+async fn trigger_scan_after_upload_metrics(
+    db: &PgPool,
+    scanner: Option<Arc<ScannerService>>,
+    repository_id: Uuid,
+    artifact_id: Uuid,
+) -> bool {
     let Some(scanner) = scanner else {
         return false;
     };
