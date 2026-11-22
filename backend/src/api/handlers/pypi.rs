@@ -507,12 +507,15 @@ async fn fetch_remote_simple_root(
 
     let index_path = fetch_pypi_upstream_index_path(&state.db, repo_id).await;
     let (effective_upstream, upstream_path) = pypi_upstream_url_and_path(upstream, "", &index_path);
-    let (content, _content_type, _budget_permit) = match proxy_helpers::proxy_fetch_capped_budgeted(
+    // Parsed, never served as fetched: asked for gzip (#5983).
+    let (content, _content_type, _budget_permit) = match proxy_helpers::proxy_fetch_parsed_budgeted(
         proxy,
         repo_id,
         repo_key,
         &effective_upstream,
         &upstream_path,
+        &upstream_path,
+        None,
         proxy_helpers::LARGE_METADATA_MAX_BYTES,
         RepositoryFormat::Pypi,
     )
@@ -783,6 +786,53 @@ async fn pypi_project_tracks_for(
     .unwrap_or_default()
 }
 
+/// The client-facing simple index of `project` from a Remote's upstream,
+/// through the proxy cache: the PEP 691 JSON form for a JSON client, cached
+/// under a format-qualified key so it never collides with the HTML index.
+/// Either form is rewritten before it is served, so it is asked for gzip and
+/// cached decoded (#5983). Returns `(body, content type, budget permit)`.
+async fn fetch_pypi_project_index(
+    proxy: &crate::services::proxy_service::ProxyService,
+    repo_id: uuid::Uuid,
+    repo_key: &str,
+    effective_upstream: &str,
+    upstream_path: &str,
+    wants_json: bool,
+) -> Result<(Bytes, Option<String>, tokio::sync::OwnedSemaphorePermit), Response> {
+    let (cache_path, accept, format) = pypi_index_cache_entry(upstream_path, wants_json);
+    proxy_helpers::proxy_fetch_parsed_budgeted(
+        proxy,
+        repo_id,
+        repo_key,
+        effective_upstream,
+        upstream_path,
+        &cache_path,
+        accept,
+        proxy_helpers::LARGE_METADATA_MAX_BYTES,
+        format,
+    )
+    .await
+}
+
+/// The proxy-cache entry the client-facing simple index of a project is kept
+/// under: `(cache path, Accept asked for, format it is classified under)`.
+/// The JSON form's key is format-qualified and was always fetched through the
+/// generic repository shape; the HTML form through the PyPI one.
+fn pypi_index_cache_entry(
+    upstream_path: &str,
+    json: bool,
+) -> (String, Option<&'static str>, RepositoryFormat) {
+    if json {
+        (
+            format!("{}{}", upstream_path, PEP691_JSON_CACHE_SUFFIX),
+            Some(PEP691_JSON_CONTENT_TYPE),
+            RepositoryFormat::Generic,
+        )
+    } else {
+        (upstream_path.to_string(), None, RepositoryFormat::Pypi)
+    }
+}
+
 async fn simple_project(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
@@ -857,32 +907,17 @@ async fn simple_project(
                     &index_path,
                 );
 
-                let (content, content_type, _budget_permit) = if wants_json {
-                    // Request the PEP 691 JSON form from upstream, cached under a
-                    // format-qualified key so it never collides with the HTML index.
-                    proxy_helpers::proxy_fetch_capped_with_cache_key_and_accept_budgeted(
-                        proxy,
-                        repo.id,
-                        &repo_key,
-                        &effective_upstream,
-                        &upstream_path,
-                        &format!("{}{}", upstream_path, PEP691_JSON_CACHE_SUFFIX),
-                        Some(PEP691_JSON_CONTENT_TYPE),
-                        proxy_helpers::LARGE_METADATA_MAX_BYTES,
-                    )
-                    .await?
-                } else {
-                    proxy_helpers::proxy_fetch_capped_budgeted(
-                        proxy,
-                        repo.id,
-                        &repo_key,
-                        &effective_upstream,
-                        &upstream_path,
-                        proxy_helpers::LARGE_METADATA_MAX_BYTES,
-                        RepositoryFormat::Pypi,
-                    )
-                    .await?
-                };
+                // The index is rewritten, never served as fetched, so it is
+                // asked for gzip and cached decoded (#5983).
+                let (content, content_type, _budget_permit) = fetch_pypi_project_index(
+                    proxy,
+                    repo.id,
+                    &repo_key,
+                    &effective_upstream,
+                    &upstream_path,
+                    wants_json,
+                )
+                .await?;
 
                 let ct = content_type.unwrap_or_else(|| "text/html; charset=utf-8".to_string());
 
@@ -1163,30 +1198,15 @@ async fn simple_project(
                     &format!("{}/", normalized),
                     &member_index_path,
                 );
-                let result = if wants_json {
-                    proxy_helpers::proxy_fetch_capped_with_cache_key_and_accept_budgeted(
-                        proxy,
-                        member.id,
-                        &member.key,
-                        &effective_upstream,
-                        &upstream_path,
-                        &format!("{}{}", upstream_path, PEP691_JSON_CACHE_SUFFIX),
-                        Some(PEP691_JSON_CONTENT_TYPE),
-                        proxy_helpers::LARGE_METADATA_MAX_BYTES,
-                    )
-                    .await
-                } else {
-                    proxy_helpers::proxy_fetch_capped_budgeted(
-                        proxy,
-                        member.id,
-                        &member.key,
-                        &effective_upstream,
-                        &upstream_path,
-                        proxy_helpers::LARGE_METADATA_MAX_BYTES,
-                        RepositoryFormat::Pypi,
-                    )
-                    .await
-                };
+                let result = fetch_pypi_project_index(
+                    proxy,
+                    member.id,
+                    &member.key,
+                    &effective_upstream,
+                    &upstream_path,
+                    wants_json,
+                )
+                .await;
 
                 match result {
                     Ok((content, content_type, _budget_permit)) => {
@@ -4316,25 +4336,40 @@ async fn resolve_pypi_remote_fetch_target(
     // (no prefix). Any other non-empty value is used verbatim as the prefix.
     let (effective_upstream, upstream_index_path) =
         pypi_upstream_url_and_path(upstream_url, &format!("{}/", normalized), index_path);
-    let (index_bytes, effective_url) = fetch_resolver_index(
+
+    // #5983: the index the client-facing route cached for this project, while
+    // it is fresh, names the file's URL and digest without an upstream read.
+    // A file it does not name (published since it was cached) is resolved
+    // from the upstream's current index below, as before.
+    let cached = locate_in_cached_index(
         proxy,
         repo_id,
         repo_key,
         &effective_upstream,
         &upstream_index_path,
-        &normalized,
+        filename,
     )
-    .await?;
-
-    let index_html = String::from_utf8_lossy(&index_bytes);
-
-    // Use the effective URL (after redirects) as the base for resolving
-    // relative hrefs. Some registries (Nexus, Artifactory) redirect the
-    // index request, and the relative paths in the HTML are relative to
-    // the final serving URL, not the originally requested URL.
-    let full_index_url = effective_url;
-    let file_url = find_upstream_url_for_file(&index_html, filename, Some(&full_index_url))
-        .or_else(|| find_upstream_metadata_url(&index_html, filename, Some(&full_index_url)));
+    .await;
+    let (file_url, expected_sha256) = match cached {
+        Some(found) => found,
+        None => {
+            let (index_bytes, effective_url) = fetch_resolver_index(
+                proxy,
+                repo_id,
+                repo_key,
+                &effective_upstream,
+                &upstream_index_path,
+                &normalized,
+            )
+            .await?;
+            // Use the effective URL (after redirects) as the base for
+            // resolving relative hrefs. Some registries (Nexus, Artifactory)
+            // redirect the index request, and the relative paths in the HTML
+            // are relative to the final serving URL, not the originally
+            // requested URL.
+            locate_in_simple_index(&index_bytes, filename, Some(&effective_url))
+        }
+    };
 
     // Validate resolved URL against SSRF before making the outbound request.
     // A malicious upstream index could contain hrefs pointing to internal
@@ -4368,20 +4403,157 @@ async fn resolve_pypi_remote_fetch_target(
         None => pypi_direct_file_location(upstream_url, project, filename, index_path),
     };
 
-    // GHSA-qxv7-p3mq-88fv: the same index page that vouched for the download
-    // URL also pins the file's SHA-256 in the anchor fragment — the digest
-    // pip verifies the download against. Lift it so the streamed fetch gates
-    // the proxy-cache commit on it; before this, the fragment was forwarded
-    // to clients but never checked server-side, so a body that disagreed
-    // with the index was cached and served warm from then on.
-    let expected_sha256 = find_upstream_sha256_for_file(&index_html, filename);
-
     Ok(PypiRemoteFetchTarget {
         fetch_base,
         fetch_path,
         cache_path,
         expected_sha256,
     })
+}
+
+/// Where a PyPI simple index (PEP 503 HTML or PEP 691 JSON) names `filename`:
+/// `(download URL, SHA-256 it pins)`. A `.whl.metadata` the index does not
+/// list is located next to its wheel (PEP 658), with no digest.
+///
+/// GHSA-qxv7-p3mq-88fv: the same index entry that vouches for the download
+/// URL pins the file's SHA-256 (the HTML anchor's fragment, the JSON entry's
+/// `hashes`), the digest pip verifies the download against; the streamed
+/// fetch gates the proxy-cache commit on it.
+///
+/// `index_url` resolves a relative URL; `None` accepts absolute ones only.
+fn locate_in_simple_index(
+    body: &[u8],
+    filename: &str,
+    index_url: Option<&str>,
+) -> (Option<String>, Option<String>) {
+    if sniff_simple_index(body) == SniffedSimpleIndex::Json {
+        return locate_in_simple_json(body, filename, index_url);
+    }
+    let html = String::from_utf8_lossy(body);
+    let url = find_upstream_url_for_file(&html, filename, index_url)
+        .or_else(|| find_upstream_metadata_url(&html, filename, index_url));
+    (url, find_upstream_sha256_for_file(&html, filename))
+}
+
+/// One `files` entry of a PEP 691 project page, as far as resolution reads it.
+#[derive(serde::Deserialize)]
+struct SimpleJsonFile<'a> {
+    #[serde(borrow)]
+    filename: std::borrow::Cow<'a, str>,
+    #[serde(borrow)]
+    url: std::borrow::Cow<'a, str>,
+    #[serde(default)]
+    hashes: std::collections::HashMap<String, String>,
+}
+
+#[derive(serde::Deserialize)]
+struct SimpleJsonPage<'a> {
+    #[serde(borrow, default)]
+    files: Vec<SimpleJsonFile<'a>>,
+}
+
+/// [`locate_in_simple_index`] for a PEP 691 JSON page. Only the fields read
+/// are deserialized, so a large page is not held as a JSON tree.
+fn locate_in_simple_json(
+    body: &[u8],
+    filename: &str,
+    index_url: Option<&str>,
+) -> (Option<String>, Option<String>) {
+    let Ok(page) = serde_json::from_slice::<SimpleJsonPage<'_>>(body) else {
+        return (None, None);
+    };
+    let entry = |name: &str| page.files.iter().find(|f| f.filename == name);
+    let resolve = |href: &str| {
+        let url = match index_url {
+            Some(base) => url::Url::parse(base).ok()?.join(href).ok()?,
+            None => url::Url::parse(href).ok()?,
+        };
+        matches!(url.scheme(), "http" | "https").then_some(url)
+    };
+    if let Some(file) = entry(filename) {
+        let sha = file
+            .hashes
+            .get("sha256")
+            .and_then(|d| proxy_helpers::normalize_expected_sha256(d));
+        return (resolve(file.url.as_ref()).map(String::from), sha);
+    }
+    let Some(wheel) = filename
+        .strip_suffix(".metadata")
+        .filter(|w| w.ends_with(".whl"))
+    else {
+        return (None, None);
+    };
+    let url = entry(wheel)
+        .and_then(|file| resolve(file.url.as_ref()))
+        .map(|mut url| {
+            url.set_path(&format!("{}.metadata", url.path()));
+            url.set_fragment(None);
+            String::from(url)
+        });
+    (url, None)
+}
+
+/// #5983: locate `filename` in the simple index the Remote's client-facing
+/// index route cached for its project, while that entry is fresh: the
+/// PEP 691 JSON form (what uv asks for), then the HTML one (pip). A cold
+/// `.whl.metadata` then costs no upstream read of the index, where it used to
+/// read the whole index again just to find the sidecar's URL.
+///
+/// No staler than the client's own view: it is the document the client
+/// resolved the file from, read under the cache's freshness policy (never
+/// past its TTL, never revalidated here). Only absolute URLs are taken from
+/// it, since the URL a relative one is relative to (after redirects) is not
+/// recorded with the entry. `None` (no fresh entry, the file not named in
+/// it, a relative URL, an unreadable body) leaves resolution to the
+/// upstream read.
+async fn locate_in_cached_index(
+    proxy: &crate::services::proxy_service::ProxyService,
+    repo_id: uuid::Uuid,
+    repo_key: &str,
+    effective_upstream: &str,
+    upstream_index_path: &str,
+    filename: &str,
+) -> Option<(Option<String>, Option<String>)> {
+    for json in [true, false] {
+        let (cache_path, _, format) = pypi_index_cache_entry(upstream_index_path, json);
+        let repo = proxy_helpers::build_remote_repo_with_format(
+            repo_id,
+            repo_key,
+            effective_upstream,
+            format,
+        );
+        // The body is buffered and parsed: reserved against the shared
+        // buffered-metadata budget (#2684), sized to the fresh entry (#5973).
+        // No fresh entry: nothing to read.
+        let Some(size) = proxy.fresh_cached_size(repo_key, &cache_path).await else {
+            continue;
+        };
+        let _budget = proxy_helpers::proxy_metadata_budget()
+            .reserve(usize::try_from(size).unwrap_or(usize::MAX))
+            .await;
+        let Ok(Some(body)) = proxy.cached_metadata_if_servable(&repo, &cache_path).await else {
+            continue;
+        };
+        // An entry recorded coded (by an earlier release) is left to the
+        // upstream read: the index is cached decoded since #5983.
+        if body
+            .content_encoding
+            .as_deref()
+            .is_some_and(|c| !c.eq_ignore_ascii_case("identity"))
+        {
+            continue;
+        }
+        let content = body.content;
+        let wanted = filename.to_string();
+        let found =
+            tokio::task::spawn_blocking(move || locate_in_simple_index(&content, &wanted, None))
+                .await
+                .ok();
+        if let Some((Some(url), sha)) = found {
+            return Some((Some(url), sha));
+        }
+    }
+    None
 }
 
 /// The conventional `{index}/{project}/{filename}` location of a file on a
@@ -5799,7 +5971,8 @@ async fn legacy_json_from_remote(
     let (effective_upstream, upstream_path) = pypi_upstream_legacy_json_target(upstream_url, &tail);
     // Cached under its own path (`pypi/<name>/json`), which cannot collide
     // with the `simple/` keys the index and download paths use.
-    let fetched = proxy_helpers::proxy_fetch_capped_with_cache_key_and_accept_budgeted(
+    // Rewritten, never served as fetched: asked for gzip (#5983).
+    let fetched = proxy_helpers::proxy_fetch_parsed_budgeted(
         proxy,
         repo.id,
         &repo.key,
@@ -5808,6 +5981,7 @@ async fn legacy_json_from_remote(
         &upstream_path,
         Some("application/json"),
         proxy_helpers::LARGE_METADATA_MAX_BYTES,
+        RepositoryFormat::Generic,
     )
     .await;
     let (content, _content_type, _budget_permit) = match fetched {
@@ -18093,6 +18267,368 @@ mod tests {
         assert_eq!(
             reads, 1,
             "concurrent cold sidecars must share one index read"
+        );
+    }
+
+    /// The upstream requests seen for `p`.
+    async fn requests_for_5983(upstream: &wiremock::MockServer, p: &str) -> Vec<wiremock::Request> {
+        upstream
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| r.url.path() == p)
+            .collect()
+    }
+
+    /// Mount a project's simple index (HTML with absolute hrefs, and the
+    /// PEP 691 JSON form for a JSON `Accept`) naming `wheels`, and each
+    /// wheel's PEP 658 sidecar. `priority` lets a later call shadow an
+    /// earlier index (a new release upstream).
+    async fn mount_index_5983(
+        upstream: &wiremock::MockServer,
+        project: &str,
+        wheels: &[&str],
+        relative: bool,
+        priority: u8,
+    ) {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let base = if relative {
+            String::new()
+        } else {
+            upstream.uri()
+        };
+        let sha = "a".repeat(64);
+        let anchors: String = wheels
+            .iter()
+            .map(|w| {
+                format!(
+                    "<a href=\"{base}/packages/{w}#sha256={sha}\" \
+                     data-dist-info-metadata=\"sha256=deadbeef\">{w}</a>\n"
+                )
+            })
+            .collect();
+        let files: Vec<serde_json::Value> = wheels
+            .iter()
+            .map(|w| {
+                serde_json::json!({
+                    "filename": w,
+                    "url": format!("{base}/packages/{w}"),
+                    "hashes": {"sha256": sha},
+                    "core-metadata": {"sha256": "deadbeef"},
+                })
+            })
+            .collect();
+        let json = serde_json::json!({
+            "meta": {"api-version": "1.1"},
+            "name": project,
+            "files": files,
+        });
+        Mock::given(method("GET"))
+            .and(path(format!("/simple/{project}/")))
+            .and(header("accept", PEP691_JSON_CONTENT_TYPE))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", PEP691_JSON_CONTENT_TYPE)
+                    .set_body_string(json.to_string()),
+            )
+            .with_priority(priority)
+            .mount(upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/simple/{project}/")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/html")
+                    .set_body_string(format!("<html><body>{anchors}</body></html>")),
+            )
+            .with_priority(priority + 1)
+            .mount(upstream)
+            .await;
+        for w in wheels {
+            Mock::given(method("GET"))
+                .and(path(format!("/packages/{w}.metadata")))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_string(format!("Metadata-Version: 2.1\nName: {w}\n")),
+                )
+                .mount(upstream)
+                .await;
+        }
+    }
+
+    /// #5983: a cold `.whl.metadata` request is resolved from the simple
+    /// index the client-facing route cached for the project (PEP 691 JSON
+    /// for uv, HTML for pip), with no second upstream read of the index. A
+    /// file the cached index does not name (published since) is still
+    /// resolved, from the upstream's current index; and a cached index whose
+    /// URLs are relative is not used (their base is not recorded).
+    #[tokio::test]
+    async fn test_cold_sidecar_resolves_from_the_cached_index_5983() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
+            return;
+        };
+        let (upstream, _ssrf_allowlist) = non_loopback_upstream().await;
+        mount_index_5983(
+            &upstream,
+            "cjson5983",
+            &["cjson5983-1.0-py3-none-any.whl"],
+            false,
+            10,
+        )
+        .await;
+        mount_index_5983(
+            &upstream,
+            "chtml5983",
+            &["chtml5983-1.0-py3-none-any.whl"],
+            false,
+            10,
+        )
+        .await;
+        mount_index_5983(
+            &upstream,
+            "crel5983",
+            &["crel5983-1.0-py3-none-any.whl"],
+            true,
+            10,
+        )
+        .await;
+
+        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &upstream.uri()).await;
+        let get = |p: String, accept: &'static str| {
+            let req = axum::http::Request::builder()
+                .uri(format!("/{}/simple/{p}", fx.repo_key))
+                .header("accept", accept)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            tdh::send_with_headers(tdh::router_anon(super::router(), state.clone()), req)
+        };
+        let mut out = Vec::new();
+        for (project, accept) in [
+            ("cjson5983", PEP691_JSON_CONTENT_TYPE),
+            ("chtml5983", "text/html"),
+            ("crel5983", "text/html"),
+        ] {
+            let index = get(format!("{project}/"), accept).await.0;
+            let meta = get(
+                format!("{project}/{project}-1.0-py3-none-any.whl.metadata"),
+                "*/*",
+            )
+            .await;
+            let reads = requests_for_5983(&upstream, &format!("/simple/{project}/"))
+                .await
+                .len();
+            out.push((
+                project,
+                index,
+                meta.0,
+                String::from_utf8_lossy(&meta.1).into_owned(),
+                reads,
+            ));
+        }
+        // A new release upstream, after the HTML index was cached.
+        mount_index_5983(
+            &upstream,
+            "chtml5983",
+            &[
+                "chtml5983-1.0-py3-none-any.whl",
+                "chtml5983-2.0-py3-none-any.whl",
+            ],
+            false,
+            1,
+        )
+        .await;
+        let new = get(
+            "chtml5983/chtml5983-2.0-py3-none-any.whl.metadata".into(),
+            "*/*",
+        )
+        .await;
+        let new_reads = requests_for_5983(&upstream, "/simple/chtml5983/")
+            .await
+            .len();
+
+        fx.teardown().await;
+
+        for (project, index, meta, body, reads) in &out {
+            assert_eq!(*index, StatusCode::OK, "{project} index");
+            assert_eq!(*meta, StatusCode::OK, "{project} metadata: {body}");
+            assert!(body.contains("Metadata-Version"), "{project}: {body}");
+            let expected = if *project == "crel5983" { 2 } else { 1 };
+            assert_eq!(
+                *reads, expected,
+                "{project}: index reads (1 = the sidecar resolved from the cached index)"
+            );
+        }
+        assert_eq!(new.0, StatusCode::OK, "{}", String::from_utf8_lossy(&new.1));
+        assert!(String::from_utf8_lossy(&new.1).contains("chtml5983-2.0"));
+        assert_eq!(
+            new_reads, 2,
+            "a file the cached index does not name is resolved from the upstream's index"
+        );
+    }
+
+    /// #5983: the client-facing simple index (HTML and PEP 691 JSON) is
+    /// asked for gzip and decoded before it is rewritten and cached; the
+    /// client gets the plain rewritten index. The mock answers only a gzip
+    /// request (406 otherwise), as a bandwidth-bound upstream would be
+    /// measured here.
+    #[tokio::test]
+    async fn test_client_index_asks_for_gzip_5983() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use std::io::Write;
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
+            return;
+        };
+        let (upstream, _ssrf_allowlist) = non_loopback_upstream().await;
+        let project = "gzclient5983";
+        let wheel = "gzclient5983-1.0-py3-none-any.whl";
+        let gz = |s: String| {
+            let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            enc.write_all(s.as_bytes()).expect("gzip write");
+            enc.finish().expect("gzip finish")
+        };
+        let html = format!(
+            "<html><body><a href=\"{}/packages/{wheel}\">{wheel}</a></body></html>",
+            upstream.uri()
+        );
+        let json = serde_json::json!({
+            "meta": {"api-version": "1.1"},
+            "name": project,
+            "files": [{"filename": wheel, "url": format!("{}/packages/{wheel}", upstream.uri()), "hashes": {}}],
+        })
+        .to_string();
+        for (accept, ct, body) in [
+            (
+                Some(PEP691_JSON_CONTENT_TYPE),
+                PEP691_JSON_CONTENT_TYPE,
+                json,
+            ),
+            (None, "text/html", html),
+        ] {
+            let mut m = Mock::given(method("GET"))
+                .and(path(format!("/simple/{project}/")))
+                .and(header("accept-encoding", "gzip"));
+            if let Some(accept) = accept {
+                m = m.and(header("accept", accept));
+            }
+            m.respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-encoding", "gzip")
+                    .insert_header("content-type", ct)
+                    .set_body_bytes(gz(body)),
+            )
+            .with_priority(if accept.is_some() { 1 } else { 2 })
+            .mount(&upstream)
+            .await;
+        }
+        Mock::given(method("GET"))
+            .and(path(format!("/simple/{project}/")))
+            .respond_with(ResponseTemplate::new(406))
+            .mount(&upstream)
+            .await;
+
+        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &upstream.uri()).await;
+        let get = |accept: &'static str| {
+            let req = axum::http::Request::builder()
+                .uri(format!("/{}/simple/{project}/", fx.repo_key))
+                .header("accept", accept)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            tdh::send_with_headers(tdh::router_anon(super::router(), state.clone()), req)
+        };
+        let (json_status, json_body, json_headers) = get(PEP691_JSON_CONTENT_TYPE).await;
+        let (html_status, html_body, html_headers) = get("text/html").await;
+        let codings: Vec<String> = requests_for_5983(&upstream, &format!("/simple/{project}/"))
+            .await
+            .iter()
+            .map(|r| {
+                r.headers
+                    .get("accept-encoding")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .collect();
+
+        fx.teardown().await;
+
+        let json_body = String::from_utf8_lossy(&json_body).into_owned();
+        let html_body = String::from_utf8_lossy(&html_body).into_owned();
+        assert_eq!(json_status, StatusCode::OK, "{json_body}");
+        assert_eq!(html_status, StatusCode::OK, "{html_body}");
+        assert!(
+            json_body.contains(wheel) && json_body.contains(&fx.repo_key),
+            "{json_body}"
+        );
+        assert!(
+            html_body.contains(wheel) && html_body.contains(&fx.repo_key),
+            "{html_body}"
+        );
+        for headers in [&json_headers, &html_headers] {
+            assert!(
+                headers.get("content-encoding").is_none(),
+                "the client gets the plain rewritten index"
+            );
+        }
+        assert_eq!(codings, vec!["gzip".to_string(), "gzip".to_string()]);
+    }
+
+    /// #5983: where a simple index names a file, from either form.
+    #[test]
+    fn test_locate_in_simple_index_reads_html_and_json_5983() {
+        let sha = "b".repeat(64);
+        let html = format!(
+            "<a href=\"https://files.example/p/x-1.0-py3-none-any.whl#sha256={sha}\">x</a>\
+             <a href=\"../../rel/y-1.0.tar.gz#sha256={sha}\">y</a>"
+        );
+        let json = serde_json::json!({"files": [
+            {"filename": "x-1.0-py3-none-any.whl", "url": "https://files.example/p/x-1.0-py3-none-any.whl", "hashes": {"sha256": sha}},
+            {"filename": "y-1.0.tar.gz", "url": "../../rel/y-1.0.tar.gz", "hashes": {"sha256": sha}},
+            {"filename": "z-1.0.tar.gz", "url": "javascript:alert(1)", "hashes": {}},
+        ]})
+        .to_string();
+        for body in [html.as_bytes(), json.as_bytes()] {
+            let (url, digest) = locate_in_simple_index(body, "x-1.0-py3-none-any.whl", None);
+            assert!(url
+                .unwrap()
+                .starts_with("https://files.example/p/x-1.0-py3-none-any.whl"));
+            assert_eq!(digest.as_deref(), Some(sha.as_str()));
+            let (url, digest) =
+                locate_in_simple_index(body, "x-1.0-py3-none-any.whl.metadata", None);
+            assert!(
+                url.as_deref()
+                    .unwrap()
+                    .starts_with("https://files.example/p/x-1.0-py3-none-any.whl.metadata"),
+                "{url:?}"
+            );
+            assert_eq!(digest, None, "the sidecar's digest is not the wheel's");
+            assert_eq!(
+                locate_in_simple_index(body, "y-1.0.tar.gz", None).0,
+                None,
+                "a relative URL with no base is not taken"
+            );
+            assert_eq!(
+                locate_in_simple_index(body, "y-1.0.tar.gz", Some("https://idx.example/simple/y/"))
+                    .0
+                    .as_deref()
+                    .map(|u| u.split('#').next().unwrap()),
+                Some("https://idx.example/rel/y-1.0.tar.gz")
+            );
+        }
+        assert_eq!(
+            locate_in_simple_index(json.as_bytes(), "z-1.0.tar.gz", None).0,
+            None,
+            "only http(s) URLs"
+        );
+        assert_eq!(
+            locate_in_simple_index(b"{not json", "x", None),
+            (None, None)
         );
     }
 

@@ -4770,6 +4770,22 @@ const EGRESS_CLIENT_CACHE_TTL_SECS: u64 = 60;
 /// Strip the content coding off an upstream body the caller only parses. A
 /// corrupt body or one that inflates past `cap` is the upstream's fault, so it
 /// is a 502, not the 400 the decoder reports
+/// [`decode_parsed_upstream_body`] off the async runtime: inflating up to
+/// `cap` bytes is CPU work, so it runs on a blocking thread (#5983). An
+/// uncoded body is returned as is, with no thread hop.
+async fn decode_parsed_upstream_body_blocking(
+    body: Bytes,
+    coding: Option<String>,
+    cap: u64,
+) -> Result<Bytes> {
+    let Some(coding) = coding else {
+        return Ok(body);
+    };
+    tokio::task::spawn_blocking(move || decode_parsed_upstream_body(body, Some(&coding), cap))
+        .await
+        .map_err(|e| AppError::Internal(format!("decoding an upstream body failed: {e}")))?
+}
+
 fn decode_parsed_upstream_body(body: Bytes, coding: Option<&str>, cap: u64) -> Result<Bytes> {
     use crate::util::content_coding::{strip_content_coding_to, Decoded};
     let decoded = match strip_content_coding_to(&body, coding, cap)
@@ -6061,7 +6077,7 @@ impl UpstreamClient {
         accept: Option<&str>,
     ) -> Result<bool> {
         Ok(self
-            .check_etag_probe(url, cached_etag, repo_id, accept)
+            .check_etag_probe(url, cached_etag, repo_id, accept, None)
             .await?
             .is_changed())
     }
@@ -6079,12 +6095,17 @@ impl UpstreamClient {
     /// the live case — `simple/<project>/` serves HTML or PEP 691 JSON off
     /// `Accept` with per-representation ETags, so probing the JSON variant's
     /// ETag without the JSON `Accept` validates it against the HTML variant.
+    ///
+    /// `accept_encoding` is replayed the same way (#5983): a body fetched
+    /// gzip-coded (and decoded before it was cached) carries the coded
+    /// representation's ETag, which servers mint per coding.
     async fn check_etag_probe(
         &self,
         url: &str,
         cached_etag: &str,
         repo_id: Uuid,
         accept: Option<&str>,
+        accept_encoding: Option<&str>,
     ) -> Result<EtagProbe> {
         let upstream_auth = self
             .upstream_auth_for(
@@ -6100,6 +6121,9 @@ impl UpstreamClient {
         let mut request = client.head(url).header(IF_NONE_MATCH, cached_etag);
         if let Some(accept) = accept {
             request = request.header(ACCEPT, accept);
+        }
+        if let Some(coding) = accept_encoding {
+            request = request.header(reqwest::header::ACCEPT_ENCODING, coding);
         }
         if let Some(ref auth) = upstream_auth {
             request = crate::services::upstream_auth::apply_upstream_auth(request, auth);
@@ -6286,6 +6310,8 @@ struct BufferedFill<'a> {
     cache_key: &'a str,
     metadata_key: &'a str,
     accept: Option<&'a str>,
+    /// A coding asked for, decoded before the body is cached (#5983).
+    accept_encoding: Option<&'a str>,
     max: usize,
     check: Option<&'a CachedBodyCheck>,
     deferred: Option<&'a DeferredCommitSlot>,
@@ -6302,6 +6328,7 @@ struct OwnedBufferedFill {
     cache_key: String,
     metadata_key: String,
     accept: Option<String>,
+    accept_encoding: Option<String>,
     max: usize,
     correlation_id: Option<crate::api::middleware::tracing::CorrelationId>,
 }
@@ -6315,6 +6342,7 @@ impl OwnedBufferedFill {
             cache_key: &self.cache_key,
             metadata_key: &self.metadata_key,
             accept: self.accept.as_deref(),
+            accept_encoding: self.accept_encoding.as_deref(),
             max: self.max,
             check: None,
             deferred: None,
@@ -7454,7 +7482,49 @@ impl ProxyService {
         accept: Option<&'a str>,
         max: usize,
     ) -> impl std::future::Future<Output = Result<CachedBody>> + Send + 'a {
-        self.fetch_buffered_with_cache_path(repo, fetch_path, cache_path, accept, max, None, None)
+        self.fetch_buffered_with_cache_path(
+            repo, fetch_path, cache_path, accept, None, max, None, None,
+        )
+    }
+
+    /// [`Self::fetch_artifact_with_cache_path_and_accept_capped`] for an index
+    /// document the caller parses and never serves as fetched (#5983), such
+    /// as a PyPI simple index it rewrites. The upstream is asked for `gzip`
+    /// (about a fifth of the bytes on the wire for a large index) and a coded
+    /// body is decoded before it is cached, bounded by `max` decoded as on
+    /// the wire, so the cache holds the plain document and its revalidation
+    /// probe replays the coding. A cached entry that still records a coding
+    /// (written by an earlier release, or by an intermediary that coded it
+    /// unasked) is decoded the same way on the read. The result never
+    /// carries a coding. A body that does not decode, or would inflate past
+    /// `max`, is a 502.
+    pub async fn fetch_parsed_document_capped(
+        &self,
+        repo: &Repository,
+        fetch_path: &str,
+        cache_path: &str,
+        accept: Option<&str>,
+        max: usize,
+    ) -> Result<CachedBody> {
+        let mut body = self
+            .fetch_buffered_with_cache_path(
+                repo,
+                fetch_path,
+                cache_path,
+                accept,
+                Some("gzip"),
+                max,
+                None,
+                None,
+            )
+            .await?;
+        body.content = decode_parsed_upstream_body_blocking(
+            body.content,
+            body.content_encoding.take(),
+            max as u64,
+        )
+        .await?;
+        Ok(body)
     }
 
     /// [`Self::fetch_artifact_with_cache_path_capped`] for a resource whose
@@ -7484,6 +7554,7 @@ impl ProxyService {
             repo,
             fetch_path,
             cache_path,
+            None,
             None,
             max,
             Some(check),
@@ -7516,6 +7587,7 @@ impl ProxyService {
             repo,
             fetch_path,
             cache_path,
+            None,
             None,
             max,
             None,
@@ -7594,6 +7666,7 @@ impl ProxyService {
         fetch_path: &str,
         cache_path: &str,
         accept: Option<&str>,
+        accept_encoding: Option<&str>,
         max: usize,
         check: Option<&CachedBodyCheck>,
         deferred: Option<&DeferredCommitSlot>,
@@ -7622,6 +7695,7 @@ impl ProxyService {
                 &cache_key,
                 &metadata_key,
                 accept,
+                accept_encoding,
             )
             .await?
         {
@@ -7767,6 +7841,7 @@ impl ProxyService {
                             cache_key: &cache_key,
                             metadata_key: &metadata_key,
                             accept,
+                            accept_encoding,
                             max,
                             check,
                             deferred,
@@ -7813,6 +7888,7 @@ impl ProxyService {
             cache_key: cache_key.clone(),
             metadata_key: metadata_key.clone(),
             accept: accept.map(str::to_owned),
+            accept_encoding: accept_encoding.map(str::to_owned),
             max,
             correlation_id: crate::api::middleware::tracing::current_correlation_id(),
         };
@@ -7845,6 +7921,7 @@ impl ProxyService {
             cache_key,
             metadata_key,
             accept,
+            accept_encoding,
             max,
             check,
             deferred,
@@ -7858,7 +7935,7 @@ impl ProxyService {
         // #5013: our own deadline (see `within_own_deadline`).
         let upstream_result = match crate::services::upstream_circuit::within_own_deadline(
             deadline,
-            self.fetch_from_upstream_with_accept(full_url, repo.id, accept, max),
+            self.fetch_from_upstream_negotiated(full_url, repo.id, accept, accept_encoding, max),
         )
         .await
         {
@@ -8803,7 +8880,7 @@ impl ProxyService {
                 // `Accept` is threaded to it), so there is no selecting header
                 // to replay on the probe (#3290).
                 let verdict = self
-                    .revalidate_verdict(repo, fetch_path, metadata_key, &metadata, None)
+                    .revalidate_verdict(repo, fetch_path, metadata_key, &metadata, None, None)
                     .await;
                 match verdict {
                     // 304 extended the TTL; stream the cached body. #4640: a
@@ -11516,6 +11593,7 @@ impl ProxyService {
     ///
     /// B6 is preserved: a transient body/metadata read error surfaces as a
     /// cache `Miss` (via `get_cached_artifact`), never a propagated 502.
+    #[allow(clippy::too_many_arguments)]
     async fn read_cached_with_revalidation(
         &self,
         repo: &Repository,
@@ -11524,6 +11602,7 @@ impl ProxyService {
         cache_key: &str,
         metadata_key: &str,
         accept: Option<&str>,
+        accept_encoding: Option<&str>,
     ) -> Result<CacheReadOutcome> {
         // #3832: fold in the repository's current TTL override so a lowered
         // TTL is honoured by entries written under the old one.
@@ -11601,6 +11680,7 @@ impl ProxyService {
                         metadata_key,
                         stale_metadata,
                         accept,
+                        accept_encoding,
                     )
                     .await?;
                 // Package Age Policy (#1770): gate a revalidated /
@@ -11673,6 +11753,7 @@ impl ProxyService {
     ///   body within [`cache_classifier::STALE_IF_ERROR_GRACE_SECS`] of expiry,
     ///   else `Miss`.
     /// * **no validators** -> `Miss` (cannot revalidate cheaply; refill).
+    #[allow(clippy::too_many_arguments)]
     async fn revalidate_stale(
         &self,
         repo: &Repository,
@@ -11681,9 +11762,17 @@ impl ProxyService {
         metadata_key: &str,
         metadata: &CacheMetadata,
         accept: Option<&str>,
+        accept_encoding: Option<&str>,
     ) -> Result<CacheReadOutcome> {
         match self
-            .revalidate_verdict(repo, fetch_path, metadata_key, metadata, accept)
+            .revalidate_verdict(
+                repo,
+                fetch_path,
+                metadata_key,
+                metadata,
+                accept,
+                accept_encoding,
+            )
             .await
         {
             RevalidationVerdict::Refill => Ok(CacheReadOutcome::Miss),
@@ -11785,6 +11874,7 @@ impl ProxyService {
         metadata_key: &str,
         metadata: &CacheMetadata,
         accept: Option<&str>,
+        accept_encoding: Option<&str>,
     ) -> RevalidationVerdict {
         // #5282: a cache-only Remote never revalidates. It serves the entry it
         // holds, with or without a validator, instead of falling to a refill
@@ -11805,7 +11895,7 @@ impl ProxyService {
         };
 
         match self
-            .check_etag_probe(&full_url, &etag, repo.id, accept)
+            .check_etag_probe(&full_url, &etag, repo.id, accept, accept_encoding)
             .await
         {
             Ok(EtagProbe::Unchanged) => {
@@ -12133,15 +12223,45 @@ impl ProxyService {
         accept: Option<&str>,
         max: usize,
     ) -> Result<UpstreamResponse> {
-        self.upstream_client
-            .fetch_buffered(
+        self.fetch_from_upstream_negotiated(url, repo_id, accept, None, max)
+            .await
+    }
+
+    /// [`Self::fetch_from_upstream_with_accept`] that may also ask for a
+    /// content coding (#5983). A body that arrives coded under one asked for
+    /// is decoded here, before anything is cached, and bounded by `max` once
+    /// decoded as it was on the wire ([`decode_parsed_upstream_body`]): the
+    /// response then carries the decoded bytes and no coding. Only for a
+    /// document the caller parses; a body served on as fetched keeps
+    /// `identity` (#2915).
+    async fn fetch_from_upstream_negotiated(
+        &self,
+        url: &str,
+        repo_id: Uuid,
+        accept: Option<&str>,
+        accept_encoding: Option<&str>,
+        max: usize,
+    ) -> Result<UpstreamResponse> {
+        let mut resp = self
+            .upstream_client
+            .fetch_buffered_coded(
                 url,
                 repo_id,
                 accept,
+                accept_encoding,
                 max,
                 crate::services::upstream_auth::UpstreamAuthMode::RepoConfigured,
             )
-            .await
+            .await?;
+        if accept_encoding.is_some() {
+            resp.content = decode_parsed_upstream_body_blocking(
+                resp.content,
+                resp.content_encoding.take(),
+                max as u64,
+            )
+            .await?;
+        }
+        Ok(resp)
     }
 
     /// Buffered, byte-capped upstream metadata fetch that NEVER attaches the
@@ -12511,9 +12631,10 @@ impl ProxyService {
         cached_etag: &str,
         repo_id: Uuid,
         accept: Option<&str>,
+        accept_encoding: Option<&str>,
     ) -> Result<EtagProbe> {
         self.upstream_client
-            .check_etag_probe(url, cached_etag, repo_id, accept)
+            .check_etag_probe(url, cached_etag, repo_id, accept, accept_encoding)
             .await
     }
 }
@@ -30535,6 +30656,7 @@ mod tests {
                 &metadata_key,
                 &metadata,
                 Some(json_accept),
+                None,
             )
             .await;
         assert!(
@@ -30545,13 +30667,191 @@ mod tests {
         // Without it, the probe validates against the WRONG representation
         // (the pre-#3290 behaviour): the ETags disagree and the entry refills.
         let verdict = svc
-            .revalidate_verdict(&repo, "simple/proj3290/", &metadata_key, &metadata, None)
+            .revalidate_verdict(
+                &repo,
+                "simple/proj3290/",
+                &metadata_key,
+                &metadata,
+                None,
+                None,
+            )
             .await;
         assert!(
             matches!(verdict, RevalidationVerdict::Refill),
             "a probe without the selecting header is answered for a different \
              representation and must not 304-extend the JSON variant"
         );
+    }
+
+    /// #5983: an entry filled gzip-coded carries the coded representation's
+    /// ETag, so its probe replays `Accept-Encoding` as it replays `Accept`
+    /// (#3290): with it the upstream answers 304; without it, the identity
+    /// representation's validator, and the entry would be refilled.
+    #[tokio::test]
+    async fn test_revalidate_verdict_replays_accept_encoding_5983() {
+        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+            return;
+        };
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let gz_etag = "W/\"etag-gzip-5983\"";
+        let upstream = MockServer::start().await;
+        Mock::given(method("HEAD"))
+            .and(path("/simple/proj5983/"))
+            .and(header("if-none-match", gz_etag))
+            .and(header("accept-encoding", "gzip"))
+            .respond_with(ResponseTemplate::new(304))
+            .mount(&upstream)
+            .await;
+        Mock::given(method("HEAD"))
+            .and(path("/simple/proj5983/"))
+            .respond_with(ResponseTemplate::new(200).insert_header("etag", "\"etag-plain-5983\""))
+            .mount(&upstream)
+            .await;
+
+        let storage = Arc::new(MutableMapStorage {
+            entries: std::sync::Mutex::new(std::collections::HashMap::new()),
+        });
+        let svc = ProxyService::new(
+            pool,
+            Arc::new(StorageService::new(storage)),
+            ProxyCacheScope::unscoped(),
+        );
+        let mut repo = remote_repo_for(
+            &format!("pypi-5983-{}", Uuid::new_v4()),
+            &upstream.uri(),
+            "/tmp/x",
+        );
+        repo.format = RepositoryFormat::Pypi;
+        let metadata = stale_metadata_with_etag(gz_etag);
+        let metadata_key = format!(
+            "proxy-cache/{}/simple/proj5983/__cache_meta__.json",
+            repo.key
+        );
+        let probe = |coding| {
+            svc.revalidate_verdict(
+                &repo,
+                "simple/proj5983/",
+                &metadata_key,
+                &metadata,
+                None,
+                coding,
+            )
+        };
+        assert!(
+            matches!(
+                probe(Some("gzip")).await,
+                RevalidationVerdict::ServeRevalidated
+            ),
+            "the probe must replay the coding the entry was fetched under and see the 304"
+        );
+        assert!(matches!(probe(None).await, RevalidationVerdict::Refill));
+    }
+
+    fn gzip_5983(data: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+        enc.write_all(data).expect("gzip write");
+        enc.finish().expect("gzip finish")
+    }
+
+    /// #5983: a parsed document is asked for gzip, decoded before it is
+    /// cached (the cache holds the plain document and records no coding), and
+    /// served from the cache on a repeat. One that would inflate past `max`
+    /// is refused with a 502 and not cached.
+    #[tokio::test]
+    async fn test_fetch_parsed_document_asks_gzip_and_caches_decoded_5983() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let html = "<a href=\"https://files.example/p-1.0.whl\">p-1.0.whl</a>\n".repeat(400);
+        let bomb = vec![b'a'; 64 * 1024];
+        let server = MockServer::start().await;
+        for (p, body) in [
+            ("/simple/gz5983/", html.as_bytes()),
+            ("/simple/bomb5983/", &bomb[..]),
+        ] {
+            Mock::given(method("GET"))
+                .and(path(p))
+                .and(header("accept-encoding", "gzip"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("content-encoding", "gzip")
+                        .insert_header("content-type", "text/html")
+                        .set_body_bytes(gzip_5983(body)),
+                )
+                .with_priority(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path(p))
+                .respond_with(ResponseTemplate::new(406))
+                .mount(&server)
+                .await;
+        }
+
+        let tmp = std::env::temp_dir().join(format!("ak-5983-gz-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("create tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let mut repo = remote_repo_for("pypi-gz-5983", &server.uri(), tmp.to_str().unwrap());
+        repo.format = RepositoryFormat::Pypi;
+
+        let first = proxy
+            .fetch_parsed_document_capped(&repo, "simple/gz5983/", "simple/gz5983/", None, 1 << 20)
+            .await
+            .expect("gzip index");
+        let cached = proxy
+            .get_cached_artifact_by_path(&repo.key, "simple/gz5983/")
+            .await
+            .expect("cache read")
+            .expect("cached");
+        let again = proxy
+            .fetch_parsed_document_capped(&repo, "simple/gz5983/", "simple/gz5983/", None, 1 << 20)
+            .await
+            .expect("repeat");
+        let bomb_result = proxy
+            .fetch_parsed_document_capped(
+                &repo,
+                "simple/bomb5983/",
+                "simple/bomb5983/",
+                None,
+                16 * 1024,
+            )
+            .await;
+        let bomb_cached = proxy
+            .get_cached_artifact_by_path(&repo.key, "simple/bomb5983/")
+            .await
+            .expect("cache read");
+        let gets = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|r| r.url.path() == "/simple/gz5983/")
+            .count();
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert_eq!(&first.content[..], html.as_bytes());
+        assert_eq!(first.content_encoding, None);
+        assert_eq!(
+            &cached.content[..],
+            html.as_bytes(),
+            "the cache holds the plain document"
+        );
+        assert_eq!(cached.content_encoding, None, "and records no coding");
+        assert_eq!(&again.content[..], html.as_bytes());
+        assert_eq!(gets, 1, "the repeat is served from the cache");
+        assert!(
+            matches!(bomb_result, Err(AppError::BadGateway(_))),
+            "a body inflating past the cap is refused (ok: {})",
+            bomb_result.is_ok()
+        );
+        assert!(bomb_cached.is_none(), "and never cached");
     }
 
     // =====================================================================
@@ -31854,7 +32154,15 @@ mod cache_read_overlap_tests {
         let proxy = service(Arc::clone(&backend));
 
         let outcome = proxy
-            .read_cached_with_revalidation(&repo(&repo_key), path, path, &content, &metadata, None)
+            .read_cached_with_revalidation(
+                &repo(&repo_key),
+                path,
+                path,
+                &content,
+                &metadata,
+                None,
+                None,
+            )
             .await
             .expect("read");
         let CacheReadOutcome::Hit(bytes, ..) = outcome else {
