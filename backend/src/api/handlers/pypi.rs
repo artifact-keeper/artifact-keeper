@@ -8431,13 +8431,15 @@ mod tests {
             ">=3.9",
         );
         let app = fx.router_with_auth(super::router());
-        let before = acquires.get();
-        let (status, resp) = tdh::send(
-            app,
-            tdh::post(format!("/{}/", fx.repo_key), &content_type, body),
-        )
-        .await;
-        let used = acquires.get() - before;
+        // Only the request's own checkouts: the detached audit insert it
+        // spawns races the end of the request and is not part of its
+        // critical path (it made this count 11 or 12 depending on the host).
+        let ((status, resp), used) = acquires
+            .scoped(tdh::send(
+                app,
+                tdh::post(format!("/{}/", fx.repo_key), &content_type, body),
+            ))
+            .await;
         assert_eq!(
             status,
             StatusCode::OK,
@@ -8445,7 +8447,10 @@ mod tests {
             String::from_utf8_lossy(&resp)
         );
         eprintln!("#6318 PyPI upload pool checkouts: {used}");
-        for site in acquires.sites_since(before) {
+        // Let detached work settle so the trace shows it (not asserted).
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        eprintln!("  detached checkouts so far: {}", acquires.detached());
+        for site in acquires.sites() {
             eprintln!("  checkout: {site}");
         }
 
