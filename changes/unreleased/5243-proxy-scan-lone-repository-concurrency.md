@@ -1,0 +1,5 @@
+---
+section: Fixed
+issues: [#5243]
+---
+- **A single repository's scans now use all `MAX_CONCURRENT_SCAN_EXTRACTIONS` slots, not just the first wave** (#5243). When only one repository was scanning, for example during a first install through a `scan_on_proxy` Remote, its first 4 scans ran together. After that it ran 2 at a time (its fair share, `MAX_CONCURRENT_SCAN_EXTRACTIONS_PER_TENANT`), because a scan waiting beyond the fair share only woke when one of the repository's fair-share scans finished. A slot freed by any other scan stayed idle. Now a waiting scan takes a freed slot whenever no other scan is queued for it, so a lone repository runs up to 4 scans at a time after the first wave as well. Fairness is unchanged: while another repository's scans are waiting, a freed slot goes to them first. The limits and their defaults are unchanged. In the artifact-keeper-test `scan-on-proxy-repo-concurrency` benchmark, 12 concurrent first pulls through one Maven Remote, with each scan held for 6 s, took 27.3 s instead of 44.2 s, and the mean number of scans running went from 1.40 to 2.75.

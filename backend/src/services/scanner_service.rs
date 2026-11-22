@@ -23,7 +23,7 @@ use regex::Regex;
 use reqwest::Client;
 use serde::Deserialize;
 use sqlx::PgPool;
-use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore};
+use tokio::sync::{Notify, OwnedSemaphorePermit, RwLock, Semaphore};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
@@ -4039,6 +4039,16 @@ fn scan_extraction_semaphore() -> &'static Arc<Semaphore> {
     SEM.get_or_init(|| Arc::new(Semaphore::new(max_concurrent_scan_extractions())))
 }
 
+/// Signalled each time a scan returns a [`scan_extraction_semaphore`] permit
+/// (#5243), so a scan waiting over its tenant's fair share can take a permit no
+/// other scan is queued for. Without it such a scan woke only when one of its
+/// own tenant's fair-share scans finished, and a lone repository settled at its
+/// fair share (2 of the default 4) after its first burst.
+fn scan_extraction_freed() -> &'static Arc<Notify> {
+    static FREED: OnceLock<Arc<Notify>> = OnceLock::new();
+    FREED.get_or_init(|| Arc::new(Notify::new()))
+}
+
 /// Env var pinning the per-tenant fair-share floor used by the #2555 fairness
 /// layer. A blank, non-numeric, or zero value falls back to the computed
 /// `ceil(N/2)` default (see [`scan_extraction_per_tenant_fair_share`]).
@@ -4055,7 +4065,9 @@ const MAX_CONCURRENT_SCAN_EXTRACTIONS_PER_TENANT_ENV: &str =
 ///
 /// * When a tenant is alone, the opportunistic path in
 ///   [`acquire_scan_extraction_permit_from`] lets it burst to the full global
-///   `N` (no throttle without contention).
+///   `N` (no throttle without contention), and keep it there: a scan over its
+///   share takes any permit that frees while no other scan is queued for one
+///   (#5243).
 /// * When multiple tenants contend, each tenant only ever crowds up to
 ///   `fair_share` requests into the global FIFO, so the remaining backlog waits
 ///   on the tenant's *own* semaphore instead of blocking peers. Under sustained
@@ -4079,6 +4091,10 @@ fn scan_extraction_per_tenant_fair_share() -> usize {
 /// map stays bounded even with many short-lived tenants.
 struct TenantExtractionEntry {
     sem: Arc<Semaphore>,
+    /// One permit: held by the tenant's one over-share scan that watches the
+    /// global pool for a free permit (#5243), so a freed permit wakes one task
+    /// per tenant rather than the tenant's whole backlog.
+    burst: Arc<Semaphore>,
     refs: usize,
 }
 
@@ -4106,6 +4122,8 @@ fn scan_extraction_tenant_registry() -> TenantExtractionRegistry {
 struct ScanExtractionPermit {
     repository_id: Uuid,
     registry: TenantExtractionRegistry,
+    // Told when `_global` is returned (#5243).
+    freed: Arc<Notify>,
     // Held for the whole scan; `None` only in the impossible closed-semaphore
     // case (we fall through rather than shed a legitimate scan, matching the
     // prior `.ok()` behaviour).
@@ -4128,7 +4146,12 @@ impl Drop for ScanExtractionPermit {
                 }
             }
         }
-        // `_global` releases when the field drops after this method returns.
+        // Return the global permit, then wake the over-share scans watching for
+        // one (#5243). A scan queued on the global semaphore is handed the
+        // permit first, so the over-share scans only find it when none is.
+        if self._global.take().is_some() {
+            self.freed.notify_waiters();
+        }
     }
 }
 
@@ -4142,6 +4165,7 @@ async fn acquire_scan_extraction_permit_from(
     repository_id: Uuid,
     global: Arc<Semaphore>,
     registry: TenantExtractionRegistry,
+    freed: Arc<Notify>,
     fair_share: usize,
 ) -> ScanExtractionPermit {
     // Register this scan against its tenant and fetch the tenant's semaphore.
@@ -4149,20 +4173,23 @@ async fn acquire_scan_extraction_permit_from(
     // refcount bump: if this future is dropped at a later `.await` (permit
     // acquisition), the guard's `Drop` still decrements the refcount and prunes
     // the entry, keeping acquire/release symmetric on every exit path (#2595).
-    let (tenant_sem, mut permit) = {
+    let (tenant_sem, burst_gate, mut permit) = {
         let mut reg = registry.lock().expect("tenant registry mutex poisoned");
         let entry = reg
             .entry(repository_id)
             .or_insert_with(|| TenantExtractionEntry {
                 sem: Arc::new(Semaphore::new(fair_share.max(1))),
+                burst: Arc::new(Semaphore::new(1)),
                 refs: 0,
             });
         entry.refs += 1;
         (
             entry.sem.clone(),
+            entry.burst.clone(),
             ScanExtractionPermit {
                 repository_id,
                 registry: registry.clone(),
+                freed: freed.clone(),
                 _global: None,
                 _tenant: None,
             },
@@ -4183,20 +4210,60 @@ async fn acquire_scan_extraction_permit_from(
         Err(_) => match global.clone().try_acquire_owned() {
             Ok(gp) => (None, Some(gp)),
             // Global is contended too, so do NOT jump the FIFO ahead of other
-            // tenants: wait for this tenant's OWN fair-share slot first, then the
+            // tenants: wait for this tenant's OWN fair-share slot, then the
             // global slot. This bounds a busy tenant to `fair_share` requests in
-            // the global queue, leaving room for peers.
-            Err(_) => {
-                let tp = tenant_sem.acquire_owned().await.ok();
-                let gp = global.acquire_owned().await.ok();
-                (tp, gp)
-            }
+            // the global queue, leaving room for peers. Meanwhile take a global
+            // permit that frees while nobody is queued for it (#5243), as the
+            // burst above does, so a lone tenant stays at `N`.
+            Err(_) => wait_over_share(tenant_sem, burst_gate, global, &freed).await,
         },
     };
 
     permit._global = global_permit;
     permit._tenant = tenant_permit;
     permit
+}
+
+/// The wait of a scan over its tenant's fair share while the global pool is
+/// full: `(tenant permit, global permit)` once it has its turn.
+///
+/// The scan queues for a tenant slot, then the global slot, as before (#2555).
+/// While it waits, the tenant's first such scan also watches the pool: each
+/// time a permit is returned it tries to take one at once (#5243).
+/// `try_acquire` only succeeds when no scan is queued on the global semaphore,
+/// since a returned permit goes to the head of that queue first, so this never
+/// overtakes another tenant's queued scan. Before it, a scan here woke only
+/// when one of its own tenant's fair-share scans finished, so the permits its
+/// burst scans returned sat idle and a lone repository ran `fair_share` scans
+/// at a time after the first wave.
+async fn wait_over_share(
+    tenant_sem: Arc<Semaphore>,
+    burst_gate: Arc<Semaphore>,
+    global: Arc<Semaphore>,
+    freed: &Notify,
+) -> (Option<OwnedSemaphorePermit>, Option<OwnedSemaphorePermit>) {
+    let tenant_turn = tenant_sem.acquire_owned();
+    tokio::pin!(tenant_turn);
+    let _watching = tokio::select! {
+        biased;
+        tp = &mut tenant_turn => return (tp.ok(), global.acquire_owned().await.ok()),
+        gate = burst_gate.acquire_owned() => gate.ok(),
+    };
+    loop {
+        // Registered before the try, so a permit returned between the two is
+        // not missed.
+        let returned = freed.notified();
+        tokio::pin!(returned);
+        returned.as_mut().enable();
+        if let Ok(gp) = global.clone().try_acquire_owned() {
+            return (None, Some(gp));
+        }
+        tokio::select! {
+            biased;
+            tp = &mut tenant_turn => return (tp.ok(), global.acquire_owned().await.ok()),
+            _ = &mut returned => {}
+        }
+    }
 }
 
 /// Process-wired entry point for [`acquire_scan_extraction_permit_from`], using
@@ -4207,6 +4274,7 @@ async fn acquire_scan_extraction_permit(repository_id: Uuid) -> ScanExtractionPe
         repository_id,
         scan_extraction_semaphore().clone(),
         scan_extraction_tenant_registry(),
+        scan_extraction_freed().clone(),
         scan_extraction_per_tenant_fair_share(),
     )
     .await
@@ -26098,6 +26166,7 @@ tonic-build = "0.12"
     async fn test_scan_extraction_lone_tenant_reaches_full_global() {
         let global = Arc::new(Semaphore::new(4));
         let registry: TenantExtractionRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let freed = Arc::new(Notify::new());
         let fair = 2; // ceil(4/2)
         let tenant = Uuid::new_v4();
 
@@ -26105,7 +26174,13 @@ tonic-build = "0.12"
         for i in 0..4 {
             let permit = tokio::time::timeout(
                 Duration::from_millis(500),
-                acquire_scan_extraction_permit_from(tenant, global.clone(), registry.clone(), fair),
+                acquire_scan_extraction_permit_from(
+                    tenant,
+                    global.clone(),
+                    registry.clone(),
+                    freed.clone(),
+                    fair,
+                ),
             )
             .await
             .unwrap_or_else(|_| panic!("lone tenant throttled at permit {} of N=4", i));
@@ -26120,7 +26195,13 @@ tonic-build = "0.12"
         // The 5th scan is correctly bounded by the GLOBAL cap, not per-tenant.
         let blocked = tokio::time::timeout(
             Duration::from_millis(150),
-            acquire_scan_extraction_permit_from(tenant, global.clone(), registry.clone(), fair),
+            acquire_scan_extraction_permit_from(
+                tenant,
+                global.clone(),
+                registry.clone(),
+                freed.clone(),
+                fair,
+            ),
         )
         .await;
         assert!(
@@ -26131,6 +26212,102 @@ tonic-build = "0.12"
         drop(held);
     }
 
+    /// #5243: a lone tenant STAYS at `N` past its first wave. With N=4 and a
+    /// fair share of 2, its first four scans are two fair-share scans and two
+    /// bursts, and the rest wait over its share. When the bursts finish, the
+    /// waiting scans take the two permits they returned. Before the fix those
+    /// scans woke only when a fair-share scan finished, so the permits sat
+    /// idle and the tenant ran two scans at a time from then on. A second
+    /// tenant queued on the pool still gets the next permit ahead of the first
+    /// tenant's backlog.
+    #[tokio::test]
+    async fn test_scan_extraction_lone_tenant_stays_at_full_global_after_first_wave() {
+        let global = Arc::new(Semaphore::new(4));
+        let registry: TenantExtractionRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let freed = Arc::new(Notify::new());
+        let fair = 2;
+        let tenant = Uuid::new_v4();
+        let acquire = |t: Uuid| {
+            let (g, r, f) = (global.clone(), registry.clone(), freed.clone());
+            tokio::spawn(async move { acquire_scan_extraction_permit_from(t, g, r, f, fair).await })
+        };
+
+        let mut wave = Vec::new();
+        for _ in 0..4 {
+            wave.push(
+                acquire_scan_extraction_permit_from(
+                    tenant,
+                    global.clone(),
+                    registry.clone(),
+                    freed.clone(),
+                    fair,
+                )
+                .await,
+            );
+        }
+        let bursts: Vec<_> = wave.split_off(2);
+        assert!(
+            bursts.iter().all(|p| p._tenant.is_none()),
+            "scans 3 and 4 burst"
+        );
+        let backlog: Vec<_> = (0..4).map(|_| acquire(tenant)).collect();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(backlog.iter().all(|h| !h.is_finished()), "the pool is full");
+
+        // The two bursts finish: two of the waiting scans take their permits.
+        drop(bursts);
+        let mut started = Vec::new();
+        let mut waiting = Vec::new();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        for h in backlog {
+            if h.is_finished() {
+                started.push(h.await.expect("scan task"));
+            } else {
+                waiting.push(h);
+            }
+        }
+        assert_eq!(
+            started.len(),
+            2,
+            "a lone tenant fell back to its fair share once its bursts finished"
+        );
+        assert_eq!(
+            global.available_permits(),
+            0,
+            "every permit is in use again"
+        );
+
+        // Contention: a second tenant queues on the pool, and the next permit a
+        // first-tenant burst returns goes to it, not to the first tenant's
+        // remaining backlog.
+        let peer = acquire(Uuid::new_v4());
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let burst = started.pop().expect("a burst");
+        assert!(burst._tenant.is_none());
+        drop(burst);
+        let peer_permit = tokio::time::timeout(Duration::from_millis(1000), peer)
+            .await
+            .expect("the second tenant starved behind the first tenant's backlog")
+            .expect("peer task");
+        assert!(
+            waiting.iter().all(|h| !h.is_finished()),
+            "the first tenant's backlog overtook the queued second tenant"
+        );
+
+        drop(peer_permit);
+        drop(started);
+        drop(wave);
+        for h in waiting {
+            drop(
+                tokio::time::timeout(Duration::from_millis(1000), h)
+                    .await
+                    .expect("backlog drains")
+                    .expect("scan task"),
+            );
+        }
+        assert_eq!(global.available_permits(), 4);
+    }
+
     /// Under contention a busy tenant cannot monopolize the FIFO: a second
     /// tenant's single scan acquires a global permit ahead of the first tenant's
     /// backlog, because that backlog waits on tenant 1's OWN semaphore rather
@@ -26139,18 +26316,29 @@ tonic-build = "0.12"
     async fn test_scan_extraction_second_tenant_not_starved_by_backlog() {
         let global = Arc::new(Semaphore::new(2));
         let registry: TenantExtractionRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let freed = Arc::new(Notify::new());
         let fair = 1; // ceil(2/2)
         let tenant1 = Uuid::new_v4();
         let tenant2 = Uuid::new_v4();
 
         // Tenant 1 saturates the global pool alone: one fair-share permit plus
         // one opportunistic burst permit.
-        let p1_fair =
-            acquire_scan_extraction_permit_from(tenant1, global.clone(), registry.clone(), fair)
-                .await;
-        let p1_burst =
-            acquire_scan_extraction_permit_from(tenant1, global.clone(), registry.clone(), fair)
-                .await;
+        let p1_fair = acquire_scan_extraction_permit_from(
+            tenant1,
+            global.clone(),
+            registry.clone(),
+            freed.clone(),
+            fair,
+        )
+        .await;
+        let p1_burst = acquire_scan_extraction_permit_from(
+            tenant1,
+            global.clone(),
+            registry.clone(),
+            freed.clone(),
+            fair,
+        )
+        .await;
         assert_eq!(
             global.available_permits(),
             0,
@@ -26161,18 +26349,20 @@ tonic-build = "0.12"
         let backlog = {
             let g = global.clone();
             let r = registry.clone();
-            tokio::spawn(
-                async move { acquire_scan_extraction_permit_from(tenant1, g, r, fair).await },
-            )
+            let f = freed.clone();
+            tokio::spawn(async move {
+                acquire_scan_extraction_permit_from(tenant1, g, r, f, fair).await
+            })
         };
 
         // Tenant 2 arrives and queues on the global semaphore.
         let t2 = {
             let g = global.clone();
             let r = registry.clone();
-            tokio::spawn(
-                async move { acquire_scan_extraction_permit_from(tenant2, g, r, fair).await },
-            )
+            let f = freed.clone();
+            tokio::spawn(async move {
+                acquire_scan_extraction_permit_from(tenant2, g, r, f, fair).await
+            })
         };
 
         // Let both queued tasks register their waiters.
@@ -26200,6 +26390,7 @@ tonic-build = "0.12"
     async fn test_scan_extraction_no_deadlock_and_prunes_idle_tenants() {
         let global = Arc::new(Semaphore::new(4));
         let registry: TenantExtractionRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let freed = Arc::new(Notify::new());
         let fair = 2;
         let tenants: Vec<Uuid> = (0..5).map(|_| Uuid::new_v4()).collect();
 
@@ -26208,8 +26399,9 @@ tonic-build = "0.12"
             let tenant = tenants[i % tenants.len()];
             let g = global.clone();
             let r = registry.clone();
+            let f = freed.clone();
             handles.push(tokio::spawn(async move {
-                let _permit = acquire_scan_extraction_permit_from(tenant, g, r, fair).await;
+                let _permit = acquire_scan_extraction_permit_from(tenant, g, r, f, fair).await;
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }));
         }
@@ -26240,21 +26432,33 @@ tonic-build = "0.12"
     async fn test_scan_extraction_cancelled_acquire_does_not_leak_refcount() {
         let global = Arc::new(Semaphore::new(1));
         let registry: TenantExtractionRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let freed = Arc::new(Notify::new());
         let fair = 1;
         let blocker = Uuid::new_v4();
         let victim = Uuid::new_v4();
 
         // Saturate the global pool so the next acquire parks on the global await.
-        let held =
-            acquire_scan_extraction_permit_from(blocker, global.clone(), registry.clone(), fair)
-                .await;
+        let held = acquire_scan_extraction_permit_from(
+            blocker,
+            global.clone(),
+            registry.clone(),
+            freed.clone(),
+            fair,
+        )
+        .await;
 
         // The victim is within its fair share (fresh tenant), so it reserves its
         // tenant slot and then blocks at `global.acquire_owned().await`. The
         // timeout drops the acquire future at exactly that cancellation point.
         let cancelled = tokio::time::timeout(
             Duration::from_millis(100),
-            acquire_scan_extraction_permit_from(victim, global.clone(), registry.clone(), fair),
+            acquire_scan_extraction_permit_from(
+                victim,
+                global.clone(),
+                registry.clone(),
+                freed.clone(),
+                fair,
+            ),
         )
         .await;
         assert!(
@@ -26270,9 +26474,14 @@ tonic-build = "0.12"
 
         // Normal acquire/release cycle stays symmetric after the cancellation.
         drop(held);
-        let permit =
-            acquire_scan_extraction_permit_from(victim, global.clone(), registry.clone(), fair)
-                .await;
+        let permit = acquire_scan_extraction_permit_from(
+            victim,
+            global.clone(),
+            registry.clone(),
+            freed.clone(),
+            fair,
+        )
+        .await;
         assert_eq!(
             registry.lock().unwrap().get(&victim).map(|e| e.refs),
             Some(1),
