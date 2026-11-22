@@ -2737,6 +2737,7 @@ async fn apply_pypi_download_age_gate(
 /// through the unscanned redirect / stream / refetch below. `virtual_id` names
 /// the Virtual repository when `repo` is one of its members, so the
 /// stricter-of-two policy applies as it does to the member's other files.
+#[allow(clippy::too_many_arguments)]
 async fn enforce_pypi_download_age_gate(
     state: &SharedState,
     repo: &RepoInfo,
@@ -2745,6 +2746,7 @@ async fn enforce_pypi_download_age_gate(
     filename: &str,
     virtual_id: Option<uuid::Uuid>,
     ctx: Option<&crate::api::middleware::download_telemetry::DownloadContext>,
+    is_head: bool,
 ) -> Result<AgeGateOutcome<Response>, Response> {
     let (upstream_url, proxy) = match (&repo.upstream_url, &state.proxy_service) {
         (Some(u), Some(p)) => (u, p),
@@ -2795,7 +2797,8 @@ async fn enforce_pypi_download_age_gate(
     // #1555 ordering holds on the LKG fallback too: presigned redirect on a
     // fresh cache hit BEFORE the streaming cache check, so a cached LKG wheel is
     // not streamed through the backend.
-    if let Some(redirect) = pypi_proxy_cache_redirect(state, proxy, repo_key, &lkg_cache_path).await
+    if let Some(redirect) =
+        pypi_proxy_cache_redirect(state, proxy, repo_key, &lkg_cache_path, is_head).await
     {
         // #3649: a presigned redirect IS the serve — the client's subsequent
         // object-store GET is invisible to us — so it counts here, exactly as
@@ -2832,7 +2835,7 @@ async fn enforce_pypi_download_age_gate(
         &lkg_filename,
         &index_path,
         RepositoryFormat::Pypi,
-        ctx.is_some_and(|c| c.is_head),
+        is_head,
     )
     .await?;
     // #3649: and so is the cold fetch that substituted it.
@@ -2931,6 +2934,7 @@ async fn serve_file(
                         filename,
                         None,
                         Some(ctx),
+                        ctx.is_head,
                     )
                     .await?
                     {
@@ -2975,8 +2979,14 @@ async fn serve_file(
 
                     // #1555: redirect to a presigned URL on a fresh cache hit
                     // before falling back to streaming.
-                    if let Some(redirect) =
-                        pypi_proxy_cache_redirect(state, proxy, repo_key, &local_cache_path).await
+                    if let Some(redirect) = pypi_proxy_cache_redirect(
+                        state,
+                        proxy,
+                        repo_key,
+                        &local_cache_path,
+                        ctx.is_head,
+                    )
+                    .await
                     {
                         // #3649: a presigned redirect IS the serve — the
                         // client's subsequent object-store GET never reaches
@@ -3214,6 +3224,9 @@ async fn serve_file(
                         filename,
                         Some(repo.id),
                         None,
+                        // #6418: `None` above only leaves the serve uncounted;
+                        // a HEAD is still a HEAD.
+                        ctx.is_head,
                     )
                     .await?
                     {
@@ -3361,6 +3374,7 @@ async fn serve_file(
                                 proxy,
                                 &member.key,
                                 &local_cache_path,
+                                ctx.is_head,
                             )
                             .await
                             {
@@ -3437,6 +3451,7 @@ async fn serve_file(
             filename,
             None,
             Some(ctx),
+            ctx.is_head,
         )
         .await?
         {
@@ -4168,13 +4183,20 @@ fn pypi_cached_fetch_target(
 /// `None` on a miss/disabled so the caller falls back to the streaming path,
 /// which resolves the real upstream URL via the simple index — never via a
 /// presumed download URL.
+///
+/// A `HEAD` is never redirected (#6418, the #3209 class): the URL is signed
+/// for `GET` and the signature covers the method, so the object store refuses
+/// the client's `HEAD` on it with 403. The file routes are registered `get(..)`,
+/// so axum runs this for a `HEAD` too; the streaming path answers it with the
+/// cached entry's headers and no body.
 async fn pypi_proxy_cache_redirect(
     state: &SharedState,
     proxy: &crate::services::proxy_service::ProxyService,
     repo_key: &str,
     cache_path: &str,
+    is_head: bool,
 ) -> Option<Response> {
-    if !state.config.presigned_downloads_enabled {
+    if is_head || !state.config.presigned_downloads_enabled {
         return None;
     }
     // #1555: resolve the no-prefix presign handle and confirm redirect support
@@ -12925,8 +12947,8 @@ mod tests {
             "remote",
             Some(upstream_uri),
         );
-        let storage_key = format!("proxy-cache/{}/simple/{}/{}", member_key, project, filename);
         let artifact_path = format!("simple/{}/{}", project, filename);
+        let storage_key = format!("proxy-cache/{member_key}/{artifact_path}/__content__");
         crate::api::handlers::proxy_helpers::put_artifact_bytes(
             state,
             &member_info,
@@ -18098,6 +18120,7 @@ mod tests {
             proxy.as_ref(),
             "pypi-remote",
             "simple/foo/foo-1.0-py3-none-any.whl",
+            false,
         )
         .await;
         assert!(
@@ -18142,9 +18165,18 @@ mod tests {
         let state =
             tdh::build_state_with_proxy_presigned(pool.clone(), &storage_path, proxy.clone());
 
-        let resp = super::pypi_proxy_cache_redirect(&state, proxy.as_ref(), repo_key, cache_path)
-            .await
-            .expect("a fresh presign-capable pypi cache hit must 302-redirect");
+        // #6418: a HEAD of the same fresh entry is not redirected: the URL
+        // would be signed for GET, which the object store refuses for a HEAD.
+        assert!(
+            super::pypi_proxy_cache_redirect(&state, proxy.as_ref(), repo_key, cache_path, true)
+                .await
+                .is_none(),
+            "a HEAD must not be redirected to a URL signed for GET (#6418)"
+        );
+        let resp =
+            super::pypi_proxy_cache_redirect(&state, proxy.as_ref(), repo_key, cache_path, false)
+                .await
+                .expect("a fresh presign-capable pypi cache hit must 302-redirect");
         let loc = resp
             .headers()
             .get(axum::http::header::LOCATION)
@@ -18184,6 +18216,7 @@ mod tests {
             proxy.as_ref(),
             "pypi-remote",
             "simple/foo/foo-1.0-py3-none-any.whl",
+            false,
         )
         .await;
         assert!(
@@ -20376,6 +20409,129 @@ mod tests {
     /// A young version is withheld, the substitute's bytes carry a blocking
     /// verdict, and the pull must be refused, never answered with the
     /// substitute's bytes or a redirect to them.
+    /// #6418: the age gate's last-known-good substitute for a virtual's member
+    /// is served uncounted (`ctx: None`), but a HEAD is still a HEAD: a fresh
+    /// cached substitute on a presign-capable backend is not redirected to a
+    /// URL signed for GET. The GET of the same substitute still redirects.
+    #[tokio::test]
+    async fn test_virtual_member_age_gate_substitute_head_is_not_redirected_6418() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
+            return;
+        };
+        let (virtual_id, _vkey, vdir) = tdh::create_repo(&fx.pool, "virtual", "pypi").await;
+        let project = "agedhead";
+        let young = "agedhead-2.0.0-py3-none-any.whl";
+        let lkg = "agedhead-1.0.0-py3-none-any.whl";
+        let upstream = wiremock::MockServer::start().await;
+        let old = (Utc::now() - chrono::Duration::days(3650)).to_rfc3339();
+        let now = Utc::now().to_rfc3339();
+        Mock::given(method("GET"))
+            .and(path(format!("/pypi/{project}/json")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "releases": {
+                    "1.0.0": [ { "upload_time_iso_8601": old } ],
+                    "2.0.0": [ { "upload_time_iso_8601": now } ],
+                }
+            })))
+            .mount(&upstream)
+            .await;
+        sqlx::query(
+            "UPDATE repositories SET upstream_url = $1, age_gate_enabled = true, \
+             age_gate_min_age_days = 30 WHERE id = $2",
+        )
+        .bind(upstream.uri())
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .expect("enable age gate");
+        // The last-known-good version is the newest older row the member holds.
+        sqlx::query(
+            "INSERT INTO artifacts ( \
+                 repository_id, path, name, version, size_bytes, \
+                 checksum_sha256, content_type, storage_key, uploaded_by \
+             ) VALUES ($1, $2, $3, '1.0.0', 11, 'test-lkg', 'application/zip', $4, $5)",
+        )
+        .bind(fx.repo_id)
+        .bind(format!("simple/{project}/{lkg}"))
+        .bind(project)
+        .bind(format!("rows/{}", uuid::Uuid::new_v4()))
+        .bind(fx.user_id)
+        .execute(&fx.pool)
+        .await
+        .expect("seed last-known-good row");
+
+        let scope = crate::services::proxy_cache_scope::ProxyCacheScope::unscoped();
+        let (proxy, backend) = tdh::build_scoped_presign_proxy(fx.pool.clone(), scope.clone());
+        let cache_path = build_pypi_proxy_cache_path(&proj(project), lkg);
+        backend.seed_fresh_entry(
+            &crate::services::proxy_service::ProxyService::cache_storage_key(
+                &scope,
+                &fx.repo_key,
+                &cache_path,
+            )
+            .unwrap(),
+            &crate::services::proxy_service::ProxyService::cache_metadata_key(
+                &scope,
+                &fx.repo_key,
+                &cache_path,
+            )
+            .unwrap(),
+        );
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let state =
+            tdh::build_state_with_proxy_age_gate_presigned(fx.pool.clone(), &storage_path, proxy);
+        let mut member = fx.repo_info("remote", Some(&upstream.uri()));
+        member.format = "pypi".to_string();
+        member.age_gate_enabled = true;
+        member.age_gate_min_age_days = 30;
+
+        let mut statuses = Vec::new();
+        for is_head in [true, false] {
+            let outcome = super::enforce_pypi_download_age_gate(
+                &state,
+                &member,
+                &fx.repo_key,
+                &proj(project),
+                young,
+                Some(virtual_id),
+                None,
+                is_head,
+            )
+            .await;
+            statuses.push(match outcome {
+                Ok(AgeGateOutcome::Substitute(resp)) => (
+                    resp.status(),
+                    resp.headers().get(axum::http::header::LOCATION).is_some(),
+                ),
+                Ok(_) => (StatusCode::IM_A_TEAPOT, false),
+                Err(resp) => (resp.status(), false),
+            });
+        }
+
+        let _ = sqlx::query("DELETE FROM age_gate_reviews WHERE repository_id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await;
+        tdh::cleanup(&fx.pool, virtual_id, fx.user_id).await;
+        let _ = std::fs::remove_dir_all(&vdir);
+        fx.teardown().await;
+
+        assert_eq!(
+            statuses[0],
+            (StatusCode::OK, false),
+            "a HEAD of the substitute is answered from the cache, not redirected"
+        );
+        assert_eq!(
+            statuses[1],
+            (StatusCode::FOUND, true),
+            "the GET of the same substitute still redirects (the fast path is active)"
+        );
+    }
+
     #[tokio::test]
     async fn test_serve_file_age_gate_substitute_goes_through_the_scan_gate() {
         use crate::api::handlers::test_db_helpers as tdh;
