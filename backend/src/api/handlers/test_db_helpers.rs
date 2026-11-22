@@ -621,6 +621,32 @@ pub(crate) async fn device_expiry_serial_lock() -> DeviceExpirySerialGuard {
     }
 }
 
+/// Advisory-lock key for [`sync_claim_recovery_serial_lock`] (#5671).
+const SYNC_CLAIM_RECOVERY_TEST_LOCK_KEY: i64 = 0x5343_5671; // "SC" + issue #5671
+
+/// Cross-process serialization guard for the tests that run the sync-task
+/// claim recovery sweep, or need an unclaimed `in_progress` row of theirs to
+/// survive one (#5671).
+///
+/// `recover_expired_sync_task_claims` resets every lapsed `in_progress` row in
+/// the database, not just the caller's. Run concurrently, one test's sweep
+/// resets a row another test has just seeded before that test's own sweep
+/// runs, or holds the row's lock while the other test claims it, so the
+/// claim's `SKIP LOCKED` passes over it. The `db-serial` nextest group keeps
+/// them apart in CI; this lock also does under a single-process
+/// `cargo test`. Tests take it for their whole body.
+pub struct SyncClaimRecoverySerialGuard {
+    _conn: Option<sqlx::PgConnection>,
+}
+
+/// Acquire the sync claim-recovery test lock, blocking until it is free.
+/// Inert when no database is configured, like [`try_pool`].
+pub(crate) async fn sync_claim_recovery_serial_lock() -> SyncClaimRecoverySerialGuard {
+    SyncClaimRecoverySerialGuard {
+        _conn: serial_lock_session(SYNC_CLAIM_RECOVERY_TEST_LOCK_KEY).await,
+    }
+}
+
 /// Refresh the materialized storage stats for a test, absorbing transient
 /// cross-suite interference.
 ///
@@ -4927,6 +4953,29 @@ pub fn expected_after_label_write_5625() -> Vec<(String, String, Option<String>,
     ]
 }
 
+/// Drop a trigger, and its function, that a test put on a shared table
+/// (#5647).
+///
+/// A bare `DROP TRIGGER` opens the table with `AccessShareLock` and only then
+/// asks for the `AccessExclusiveLock` it needs, so two tests dropping their
+/// triggers from the same table at once can each hold the weak lock the
+/// other's upgrade waits for, and Postgres aborts one of them with 40P01.
+/// Taking the exclusive lock first, in the same transaction, makes them queue.
+pub(crate) async fn drop_test_trigger(pool: &PgPool, table: &str, trigger: &str, function: &str) {
+    let mut tx = pool.begin().await.expect("begin test trigger drop");
+    for sql in [
+        format!("LOCK TABLE {table} IN ACCESS EXCLUSIVE MODE"),
+        format!("DROP TRIGGER IF EXISTS {trigger} ON {table}"),
+        format!("DROP FUNCTION IF EXISTS {function}()"),
+    ] {
+        sqlx::query(sqlx::AssertSqlSafe(sql))
+            .execute(&mut *tx)
+            .await
+            .expect("drop test trigger");
+    }
+    tx.commit().await.expect("commit test trigger drop");
+}
+
 /// Install an `INSERT OR UPDATE` row trigger on `artifacts`, fired at
 /// `timing` (`"BEFORE"` or `"AFTER"`), that runs the PL/pgSQL `body` for the
 /// row whose SHA-256 is `checksum_sha256` (#4892, #5399). A test uses it to
@@ -4934,7 +4983,8 @@ pub fn expected_after_label_write_5625() -> Vec<(String, String, Option<String>,
 /// per-key publish lock, without delaying any other artifact. An `AFTER`
 /// trigger parks it with its row already in the unique index, so a competing
 /// insert of the same path waits for it instead of committing first. Returns
-/// the SQL that removes it again.
+/// the trigger's name, which is also its function's: remove both with
+/// [`drop_test_trigger`] on `artifacts`.
 pub(crate) async fn install_artifact_row_fault(
     pool: &sqlx::PgPool,
     suffix: &str,
@@ -4961,7 +5011,7 @@ pub(crate) async fn install_artifact_row_fault(
     .execute(pool)
     .await
     .expect("create artifact fault trigger");
-    format!("DROP TRIGGER IF EXISTS {func} ON artifacts; DROP FUNCTION IF EXISTS {func}()")
+    func
 }
 
 // In a `#[cfg(test)]` module (this whole file is test-only anyway) so the
@@ -5298,14 +5348,6 @@ pub(crate) async fn install_write_fault(
 
 impl WriteFault {
     pub(crate) async fn remove(self) {
-        for drop in [
-            format!("DROP TRIGGER IF EXISTS {} ON {}", self.name, self.table),
-            format!("DROP FUNCTION IF EXISTS {}()", self.name),
-        ] {
-            sqlx::query(sqlx::AssertSqlSafe(drop))
-                .execute(&self.pool)
-                .await
-                .expect("drop fault trigger");
-        }
+        drop_test_trigger(&self.pool, self.table, &self.name, &self.name).await;
     }
 }

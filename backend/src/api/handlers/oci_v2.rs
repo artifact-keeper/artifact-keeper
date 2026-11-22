@@ -25414,15 +25414,12 @@ mod manifest_digest_db_tests {
         .await
         .expect("count refs");
 
-        let _ = sqlx::query(sqlx::AssertSqlSafe(&*format!(
-            "DROP TRIGGER IF EXISTS {trigger_name} ON manifest_blob_refs"
-        )))
-        .execute(&fx.pool)
-        .await;
-        let _ = sqlx::query(sqlx::AssertSqlSafe(&*format!(
-            "DROP FUNCTION IF EXISTS {function_name}()"
-        )))
-        .execute(&fx.pool)
+        crate::api::handlers::test_db_helpers::drop_test_trigger(
+            &fx.pool,
+            "manifest_blob_refs",
+            &trigger_name,
+            &function_name,
+        )
         .await;
         cleanup(&fx).await;
 
@@ -27050,18 +27047,13 @@ mod oci_blob_upload_streaming_tests {
         }
 
         async fn drop(self, pool: &PgPool) {
-            let drop_trigger = format!(
-                "DROP TRIGGER IF EXISTS {} ON {}",
-                self.trigger_name, self.table
-            );
-            let _ = sqlx::query(sqlx::AssertSqlSafe(&*drop_trigger))
-                .execute(pool)
-                .await;
-
-            let drop_function = format!("DROP FUNCTION IF EXISTS {}()", self.function_name);
-            let _ = sqlx::query(sqlx::AssertSqlSafe(&*drop_function))
-                .execute(pool)
-                .await;
+            crate::api::handlers::test_db_helpers::drop_test_trigger(
+                pool,
+                self.table,
+                &self.trigger_name,
+                &self.function_name,
+            )
+            .await;
         }
 
         async fn create(pool: &PgPool, table: &'static str) -> Self {
@@ -27642,18 +27634,13 @@ mod oci_blob_upload_streaming_tests {
     }
 
     async fn drop_reject_blob_insert_trigger(pool: &PgPool, trigger_name: &str) {
-        sqlx::query(sqlx::AssertSqlSafe(&*format!(
-            "DROP TRIGGER IF EXISTS {trigger_name} ON oci_blobs"
-        )))
-        .execute(pool)
-        .await
-        .expect("drop reject-blob trigger");
-        sqlx::query(sqlx::AssertSqlSafe(&*format!(
-            "DROP FUNCTION IF EXISTS {trigger_name}_fn()"
-        )))
-        .execute(pool)
-        .await
-        .expect("drop reject-blob function");
+        crate::api::handlers::test_db_helpers::drop_test_trigger(
+            pool,
+            "oci_blobs",
+            trigger_name,
+            &format!("{trigger_name}_fn"),
+        )
+        .await;
     }
 
     /// Storage backend whose `copy` succeeds (so the `oci-blobs/<digest>`
@@ -29473,20 +29460,7 @@ mod oci_blob_upload_streaming_tests {
 
         // Drop the injected trigger so it cannot affect other tests sharing the
         // `oci_blobs` table.
-        sqlx::query(sqlx::AssertSqlSafe(&*format!(
-            "DROP TRIGGER IF EXISTS {trig} ON oci_blobs",
-            trig = storage.trigger_name
-        )))
-        .execute(&f.inner.pool)
-        .await
-        .expect("drop injected trigger");
-        sqlx::query(sqlx::AssertSqlSafe(&*format!(
-            "DROP FUNCTION IF EXISTS {trig}_fn()",
-            trig = storage.trigger_name
-        )))
-        .execute(&f.inner.pool)
-        .await
-        .expect("drop injected trigger function");
+        drop_reject_blob_insert_trigger(&f.inner.pool, &storage.trigger_name).await;
 
         f.teardown().await;
     }
@@ -35360,15 +35334,12 @@ mod proxy_manifest_artifact_indexing_tests {
                 .expect("count refs");
 
         // Cleanup (trigger first, so the cascade delete on repositories works).
-        let _ = sqlx::query(sqlx::AssertSqlSafe(&*format!(
-            "DROP TRIGGER IF EXISTS {trigger_name} ON manifest_blob_refs"
-        )))
-        .execute(&pool)
-        .await;
-        let _ = sqlx::query(sqlx::AssertSqlSafe(&*format!(
-            "DROP FUNCTION IF EXISTS {function_name}()"
-        )))
-        .execute(&pool)
+        crate::api::handlers::test_db_helpers::drop_test_trigger(
+            &pool,
+            "manifest_blob_refs",
+            &trigger_name,
+            &function_name,
+        )
         .await;
         let _ = sqlx::query("DELETE FROM oci_tags WHERE repository_id = $1")
             .bind(repo_id)

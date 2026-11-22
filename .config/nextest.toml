@@ -24,9 +24,12 @@
 #     `expired_sync_task_claims_recover_and_fence_stale_owner` and
 #     `legacy_in_progress_sync_task_without_claim_metadata_recovers` tests seed an
 #     expired / legacy `in_progress` `sync_tasks` row, then call the recovery
-#     sweep, which UPDATEs *every* stale claim in the DB (no peer scope) and assert
-#     on the exact global count (`recovered == 1`). A sibling test's stale row is
-#     swept in the same pass, failing the count/fence assertions. (The peer-scoped
+#     sweep, which UPDATEs *every* stale claim in the DB (no peer scope). They
+#     assert only on their own row (#5818), but the sweep resets any other
+#     test's unclaimed `in_progress` row too (the `trash_service` tests seed
+#     one), and two sweeps at once race each other's seed and claim (#5671;
+#     `tdh::sync_claim_recovery_serial_lock` also serializes them, which a
+#     single-process `cargo test` needs). (The peer-scoped
 #     `claim_pending_sync_tasks` concurrency tests only touch their own unique
 #     peer's rows via `WHERE peer_instance_id = $1` and hold live-TTL claims the
 #     sweep cannot match, so they stay parallel.)
