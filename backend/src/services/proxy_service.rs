@@ -9834,11 +9834,15 @@ impl ProxyService {
     /// identical, so it lives here as a single source of truth (#1618 S3).
     async fn invalidate_cache_keys(&self, repo_key: &str, path: &str) -> Result<()> {
         let keys = CacheKeys::derive(&self.cache_scope, repo_key, path)?;
+        // Objects first, row second (#6429), as the cache-cap and lifecycle
+        // evictions do: the re-catalog sweep restores the row of a sidecar
+        // that has none, so the sidecar has to be gone before its row is, or
+        // a sweep between the two would catalog the entry being purged.
+        let evicted = self.cache_store.invalidate(&keys).await;
         // #2218/#2270: drop the persisted catalog row for the purged object so
         // storage accounting does not drift after an eviction. Keyed on the
         // physical content storage key (the catalog's `storage_key`). Best-
-        // effort: a catalog delete failure must not abort the blob eviction,
-        // which is the primary invalidation contract.
+        // effort: a catalog delete failure must not fail the invalidation.
         if let Err(e) = proxy_catalog::delete_by_key(&self.db, &keys.content).await {
             tracing::warn!(
                 storage_key = %keys.content,
@@ -9847,7 +9851,7 @@ impl ProxyService {
                  transiently overcount until the next reconcile"
             );
         }
-        self.cache_store.invalidate(&keys).await
+        evicted
     }
 
     /// Retention eviction of one cataloged proxy-cache entry (#3734): delete

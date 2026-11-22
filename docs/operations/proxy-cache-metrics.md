@@ -13,6 +13,8 @@ healthy from monitoring while every request was a cache miss (#4319).
 | `ak_proxy_cache_lookups_total` | counter | `repository`, `result` | a cache lookup ends (`hit`, `miss`, `miss_*`, `negative_hit`, `error`); see below |
 | `ak_proxy_cache_checksum_mismatch_total` | counter | `repository` | a body did not match the checksum its path promises and was not cached |
 | `ak_proxy_cache_quota_exceeded_total` | counter | `repository` | an object larger than the repository quota was served without a cache write |
+| `ak_proxy_cache_recatalog_total` | counter | `outcome` | the re-catalog sweep listed keys (`scanned`), restored a lost catalog row (`recataloged`), left a sidecar alone (`skipped_negative`, `skipped_young`, `skipped_stale`, `skipped_no_content`, `skipped_unreadable`, `skipped_deleted`), met a row written meanwhile (`met_row`), took back a row for an entry purged meanwhile (`raced`) or failed a write (`failed`); see `docs/operations/proxy-cache-ha.md` |
+| `ak_proxy_cache_recatalog_bytes_total` | counter | | bytes the re-catalog sweep put back on Remotes' usage ledgers |
 
 `backend` is the storage backend the proxy cache runs on (`filesystem`, `s3`,
 `gcs`; see `STORAGE_BACKEND`). `class` says which step failed:

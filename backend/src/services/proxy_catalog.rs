@@ -320,6 +320,45 @@ pub async fn backfill_from_sidecar(
     content_type: Option<&str>,
     quarantine_until: Option<chrono::DateTime<chrono::Utc>>,
 ) -> Result<()> {
+    backfill_from_sidecar_returning(
+        db,
+        repository_id,
+        path,
+        storage_key,
+        metadata_key,
+        size_bytes,
+        checksum_sha256,
+        content_type,
+        quarantine_until,
+    )
+    .await
+    .map(|_| ())
+}
+
+/// The row [`backfill_from_sidecar_returning`] left in place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BackfilledRow {
+    pub id: Uuid,
+    pub cached_at: chrono::DateTime<chrono::Utc>,
+    /// Whether this call inserted the row (rather than meeting one).
+    pub inserted: bool,
+}
+
+/// [`backfill_from_sidecar`] reporting the row it left in place, for the
+/// re-catalog sweep (#6429), which has to know whether it created the row so
+/// it can take it back if the entry is purged under it.
+#[allow(clippy::too_many_arguments)]
+pub async fn backfill_from_sidecar_returning(
+    db: &PgPool,
+    repository_id: Uuid,
+    path: &str,
+    storage_key: &str,
+    metadata_key: &str,
+    size_bytes: i64,
+    checksum_sha256: Option<&str>,
+    content_type: Option<&str>,
+    quarantine_until: Option<chrono::DateTime<chrono::Utc>>,
+) -> Result<BackfilledRow> {
     // Runtime-checked (not `sqlx::query!`) so the offline `.sqlx` cache is
     // untouched; the DB-backed tests in this module exercise the statement.
     //
@@ -327,8 +366,9 @@ pub async fn backfill_from_sidecar(
     // fields (#3912): a placeholder gets the sidecar's hold, an authoritative
     // row keeps what the commit wrote, and a manual release
     // (`quarantine_released_at`) is never clobbered by a backfill.
-    sqlx::query(
-        r#"
+    let (id, cached_at, inserted) =
+        sqlx::query_as::<_, (Uuid, chrono::DateTime<chrono::Utc>, bool)>(
+            r#"
         INSERT INTO proxy_cache_artifacts
             (repository_id, path, storage_key, metadata_key, size_bytes,
              checksum_sha256, content_type, cached_at, last_accessed_at,
@@ -364,20 +404,38 @@ pub async fn backfill_from_sidecar(
                  AND proxy_cache_artifacts.checksum_sha256 IS NULL
                 THEN EXCLUDED.checksum_sha256 ELSE proxy_cache_artifacts.checksum_sha256 END,
             last_accessed_at = now()
+        RETURNING id, cached_at, (xmax = 0)
         "#,
-    )
-    .bind(repository_id)
-    .bind(path)
-    .bind(storage_key)
-    .bind(metadata_key)
-    .bind(size_bytes)
-    .bind(checksum_sha256)
-    .bind(content_type)
-    .bind(quarantine_until)
-    .execute(db)
-    .await
-    .map_err(|e| AppError::Database(e.to_string()))?;
-    Ok(())
+        )
+        .bind(repository_id)
+        .bind(path)
+        .bind(storage_key)
+        .bind(metadata_key)
+        .bind(size_bytes)
+        .bind(checksum_sha256)
+        .bind(content_type)
+        .bind(quarantine_until)
+        .fetch_one(db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+    Ok(BackfilledRow {
+        id,
+        cached_at,
+        inserted,
+    })
+}
+
+/// Delete a row the re-catalog sweep inserted (#6429) when the entry it
+/// described was purged while it was being written. Guarded on `id` and
+/// `cached_at`, so a fill that has rewritten the row since keeps it.
+pub async fn delete_backfilled(db: &PgPool, row: &BackfilledRow) -> Result<u64> {
+    let res = sqlx::query("DELETE FROM proxy_cache_artifacts WHERE id = $1 AND cached_at = $2")
+        .bind(row.id)
+        .bind(row.cached_at)
+        .execute(db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+    Ok(res.rows_affected())
 }
 
 /// Delete the catalog row for a purged cache entry, keyed on the physical

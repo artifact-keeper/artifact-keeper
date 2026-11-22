@@ -572,6 +572,9 @@ fn put_blob_from_url_timeout(size: u64, floor: Duration) -> Duration {
     .max(floor)
 }
 
+/// The most blobs one List Blobs request returns (the service maximum).
+const AZURE_LIST_MAX_RESULTS: usize = 5000;
+
 /// One page of a List Blobs response (#4320).
 #[derive(Debug, Default, PartialEq)]
 struct ListBlobsPage {
@@ -1699,31 +1702,9 @@ impl AzureBackend {
         let mut keys = Vec::new();
         let mut marker: Option<String> = None;
         loop {
-            let mut query = String::from("restype=container&comp=list&maxresults=5000");
-            if let Some(prefix) = prefix.filter(|p| !p.is_empty()) {
-                query.push_str("&prefix=");
-                query.push_str(&urlencoding::encode(prefix));
-            }
-            if let Some(marker) = marker.as_deref() {
-                query.push_str("&marker=");
-                query.push_str(&urlencoding::encode(marker));
-            }
-            let url = self.list_url(&query)?;
-            let response = self.authorized_get(&url).await?;
-            if !response.status().is_success() {
-                let status = response.status();
-                let detail = azure_error_detail(response).await;
-                return Err(crate::storage::failure::status_storage_error(
-                    status.as_u16(),
-                    azure_error_code(&detail),
-                    format!("Azure List Blobs failed with status {}: {}", status, detail),
-                ));
-            }
-            let body = response
-                .text()
-                .await
-                .map_err(|e| request_error("Azure List Blobs body", e))?;
-            let page = parse_list_blobs_result(&body)?;
+            let page = self
+                .list_blobs_page(prefix, marker.as_deref(), AZURE_LIST_MAX_RESULTS)
+                .await?;
             keys.extend(page.keys);
             match page.next_marker {
                 Some(next) => marker = Some(next),
@@ -1731,6 +1712,58 @@ impl AzureBackend {
             }
         }
         Ok(keys)
+    }
+
+    /// One bounded page of [`Self::list`] (#6429): one List Blobs request with
+    /// `maxresults` set to the page size. The cursor is the service's
+    /// `NextMarker`, passed back as `marker`.
+    pub async fn list_page(
+        &self,
+        prefix: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<crate::services::storage_service::KeyPage> {
+        let limit = limit.clamp(1, AZURE_LIST_MAX_RESULTS);
+        let page = self.list_blobs_page(Some(prefix), cursor, limit).await?;
+        Ok(crate::services::storage_service::KeyPage {
+            keys: page.keys.into_iter().map(|k| k.key).collect(),
+            next: page.next_marker,
+        })
+    }
+
+    /// One List Blobs request: at most `max_results` blobs under `prefix`,
+    /// from `marker` on.
+    async fn list_blobs_page(
+        &self,
+        prefix: Option<&str>,
+        marker: Option<&str>,
+        max_results: usize,
+    ) -> Result<ListBlobsPage> {
+        let mut query = format!("restype=container&comp=list&maxresults={max_results}");
+        if let Some(prefix) = prefix.filter(|p| !p.is_empty()) {
+            query.push_str("&prefix=");
+            query.push_str(&urlencoding::encode(prefix));
+        }
+        if let Some(marker) = marker {
+            query.push_str("&marker=");
+            query.push_str(&urlencoding::encode(marker));
+        }
+        let url = self.list_url(&query)?;
+        let response = self.authorized_get(&url).await?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let detail = azure_error_detail(response).await;
+            return Err(crate::storage::failure::status_storage_error(
+                status.as_u16(),
+                azure_error_code(&detail),
+                format!("Azure List Blobs failed with status {}: {}", status, detail),
+            ));
+        }
+        let body = response
+            .text()
+            .await
+            .map_err(|e| request_error("Azure List Blobs body", e))?;
+        parse_list_blobs_result(&body)
     }
 
     /// URL of a List Blobs request carrying `query` (`restype=container&...`).
@@ -3214,6 +3247,49 @@ mod tests {
             .expect("list_keys")
             .expect("Azure can enumerate its blobs");
         assert_eq!(listed.len(), 2);
+    }
+
+    /// #6429: `list_page` is one List Blobs request with `maxresults` set to
+    /// the page size, resumed from the marker it returned.
+    #[tokio::test]
+    async fn test_list_page_is_one_bounded_request_6429() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/testcontainer"))
+            .and(query_param("prefix", "proxy-cache/r/"))
+            .and(query_param("maxresults", "2"))
+            .and(query_param("marker", "m2"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<EnumerationResults><Blobs><Blob><Name>proxy-cache/r/c</Name></Blob></Blobs>\
+                 <NextMarker/></EnumerationResults>",
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/testcontainer"))
+            .and(query_param("prefix", "proxy-cache/r/"))
+            .and(query_param("maxresults", "2"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<EnumerationResults><Blobs><Blob><Name>proxy-cache/r/a</Name></Blob>\
+                 <Blob><Name>proxy-cache/r/b</Name></Blob></Blobs>\
+                 <NextMarker>m2</NextMarker></EnumerationResults>",
+            ))
+            .mount(&server)
+            .await;
+
+        let backend = create_cached_rbac_backend_with_endpoint(server.uri());
+        let first = backend.list_page("proxy-cache/r/", None, 2).await.unwrap();
+        assert_eq!(first.keys, vec!["proxy-cache/r/a", "proxy-cache/r/b"]);
+        assert_eq!(first.next.as_deref(), Some("m2"));
+        let last = backend
+            .list_page("proxy-cache/r/", first.next.as_deref(), 2)
+            .await
+            .unwrap();
+        assert_eq!(last.keys, vec!["proxy-cache/r/c"]);
+        assert_eq!(last.next, None);
     }
 
     /// #4320: a Shared Key List Blobs request carries a container SAS

@@ -2963,6 +2963,75 @@ impl S3Backend {
             .collect())
     }
 
+    /// The full listing prefix for a caller's `prefix`: composed through
+    /// `make_full_key` so a listing resolves the same physical location a
+    /// `get`/`put` of a key under it would (#3368).
+    fn search_prefix(&self, prefix: Option<&str>) -> String {
+        match (&self.prefix, prefix) {
+            (Some(_), Some(p)) => make_full_key(self.prefix.as_deref(), p),
+            (Some(base), None) => format!("{}/", base.trim_end_matches('/')),
+            (None, Some(p)) => p.to_string(),
+            (None, None) => String::new(),
+        }
+    }
+
+    /// One bounded page of [`Self::list`] (#6429): `ListObjectsV2` with
+    /// `start-after` set to the cursor, read only until the page is full. The
+    /// cursor is the stored form of the last object listed. Behind the #3593
+    /// REST fallback the whole prefix is listed and sliced instead.
+    pub async fn list_page(
+        &self,
+        prefix: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<crate::services::storage_service::KeyPage> {
+        use crate::services::storage_service::KeyPage;
+        let limit = limit.max(1);
+        if !self.list_fallback_latched.load(Ordering::Relaxed) {
+            let list_path: ObjectPath = self.search_prefix(Some(prefix)).into();
+            let mut stream = match cursor.map(ObjectPath::parse).transpose() {
+                Ok(Some(offset)) => self.store.list_with_offset(Some(&list_path), &offset),
+                Ok(None) => self.store.list(Some(&list_path)),
+                Err(e) => {
+                    return Err(AppError::Storage(format!(
+                        "S3 listing cursor is not an object path: {e}"
+                    )))
+                }
+            };
+            let (mut keys, mut last, mut taken) = (Vec::new(), None, 0usize);
+            let mut failed = None;
+            while let Some(item) = stream.next().await {
+                match item {
+                    Ok(_) if taken == limit => {
+                        return Ok(KeyPage { keys, next: last });
+                    }
+                    Ok(meta) => {
+                        taken += 1;
+                        let stored = meta.location.as_ref().to_owned();
+                        if let Some(listed) = self.listed_key(&stored, None) {
+                            keys.push(listed.key);
+                        }
+                        last = Some(stored);
+                    }
+                    Err(e) => {
+                        failed = Some(e);
+                        break;
+                    }
+                }
+            }
+            match failed {
+                None => return Ok(KeyPage { keys, next: None }),
+                Some(e) if list_response_is_unparsable(&e.to_string()) => {
+                    self.list_fallback_latched.store(true, Ordering::Relaxed);
+                }
+                Some(e) => return Err(s3_storage_error("Failed to list objects", &e)),
+            }
+        }
+        let mut keys = self.list(Some(prefix)).await?;
+        keys.sort_unstable();
+        Ok(KeyPage::from_sorted(keys, cursor, limit))
+    }
+
     /// [`Self::list`] that also carries each object's last-modified time
     /// when the listing reports it (`None` on the #3593 REST fallback).
     pub async fn list_with_modified(&self, prefix: Option<&str>) -> Result<Vec<super::ListedKey>> {
@@ -2979,12 +3048,7 @@ impl S3Backend {
         // this arm with a reserved key today. It is kept so that the FIRST one
         // that does resolves the same object `get`/`put` would, rather than
         // silently listing an empty prefix.
-        let search_prefix = match (&self.prefix, prefix) {
-            (Some(_), Some(p)) => make_full_key(self.prefix.as_deref(), p),
-            (Some(base), None) => format!("{}/", base.trim_end_matches('/')),
-            (None, Some(p)) => p.to_string(),
-            (None, None) => String::new(),
-        };
+        let search_prefix = self.search_prefix(prefix);
 
         // Alibaba Cloud OSS returns a ListObjectsV2 body that object_store
         // 0.13's deserialiser rejects with "Got invalid list response:
