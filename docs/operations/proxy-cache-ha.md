@@ -70,6 +70,10 @@ replica waits for, and a waiting replica cannot serve from a fill in progress)
 are described, with a proposed design, in
 `docs/plans/2026-10-24-proxy-cross-replica-single-flight-design.md` (#4533).
 
+## Catalog durability on a database failover
+
+Since 1.13.0, a fill's catalog row commits without waiting for the WAL flush (`PROXY_CACHE_CATALOG_SYNC_COMMIT`, #5635). A database failover can therefore lose the last few hundred milliseconds of catalog rows. The cached files stay, and nothing is served ungated. See `docs/security/proxy-cache-commit-after-gate.md` for what is lost, what it costs and how to turn it off.
+
 ## NFS mount options
 
 A replica that loses the race for a cold object on the buffered path (small

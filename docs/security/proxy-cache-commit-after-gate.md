@@ -120,3 +120,25 @@ streams what its cache or its upstream hold, including a package the Virtual
 refused (a refused body stays in the member's cache). To enforce the
 Virtual's policy for every client, enable scan-on-proxy on the member too, or
 do not grant clients read access to the member.
+
+## Catalog writes commit asynchronously (1.13.0, #5635)
+
+A fill that the gate serves is committed in three steps: the content object, then its sidecar, then its `proxy_cache_artifacts` row. That row's upsert also charges the Remote's `repository_usage_ledger` row, which every fill into the Remote shares. Since 1.13.0 that single statement runs with `synchronous_commit = off`, for its own transaction only. Concurrent fills therefore no longer queue on the ledger row one WAL flush at a time. Every other write, including the hold row that `mark_hold_fetching` records before a held fill answers `409`, commits synchronously as before.
+
+**What can be lost.** A crash of the database server, or a failover to a standby (which is the same thing for an unflushed commit), can lose the catalog rows of up to about 3 x `wal_writer_delay` of fills. That is 600 ms with the default 200 ms. Each row is lost together with its ledger charge, so the ledger stays consistent with the catalog. The object and sidecar stay in storage, and storage GC never deletes `proxy-cache/` keys.
+
+**What that costs.** A lost row comes back only if its file is read again: a read re-catalogs it from the sidecar (`backfill_from_sidecar`). Until then the file's bytes are missing from:
+- the Remote's quota and cache-cap figures;
+- cache-cap eviction;
+- the periodic re-scan.
+
+An explicit cache purge removes the file. A sweep that re-catalogs such files without waiting for a read is tracked in #6429. Moving `proxy_bytes` to an insert-only delta ledger, so that fills can commit synchronously without the queue, is tracked in #6430.
+
+**Why nothing is served ungated.** No serve-time check reads the lost row:
+- the scan gate looks verdicts up by the sidecar's `checksum_sha256` in `proxy_scan_results`;
+- the Package Age Policy hold is read from the sidecar, and from the hold row committed synchronously before the fill;
+- authentication and authorization do not involve the catalog.
+
+A lost row can make the file invisible to accounting, but never servable past a check.
+
+**Turning it off.** Set `PROXY_CACHE_CATALOG_SYNC_COMMIT=true` to commit these rows synchronously, as before 1.13.0. The cost is that concurrent cold fills into one Remote queue on its ledger row again. Measured at 64 concurrent fills, the upsert p99 goes back from 13-50 ms to 1.2-1.3 s (`scripts/perf/proxy-fill-catalog-contention.sh`).
