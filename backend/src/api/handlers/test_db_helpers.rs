@@ -3163,17 +3163,25 @@ pub struct PresignMemBackend {
     /// entry evicted (by another replica, or a lifecycle rule) between two
     /// reads of the same request.
     pub evict_after_read: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Successful `get`s per key, so a test can count the sidecar reads one
+    /// request costs (#6361).
+    pub reads: std::sync::Mutex<std::collections::HashMap<String, usize>>,
 }
 
 impl PresignMemBackend {
     /// Seed a fresh positive cache entry (body + `__cache_meta__.json` sidecar)
     /// at the given keys, so `ProxyService::is_cache_fresh` returns true,
-    /// `ProxyService::fresh_cache_redirect_size` returns the recorded size, and
+    /// `ProxyService::fresh_cache_redirect` returns the recorded sidecar, and
     /// the redirect/epoch paths proceed to derive and act on the scoped key.
     pub fn seed_fresh_entry(&self, content_key: &str, metadata_key: &str) {
         let mut g = self.objects.lock().unwrap();
         g.insert(content_key.to_string(), Bytes::from_static(b"cached-body"));
         g.insert(metadata_key.to_string(), fresh_cache_sidecar_bytes());
+    }
+
+    /// How many times `key` was read successfully.
+    pub fn read_count(&self, key: &str) -> usize {
+        self.reads.lock().unwrap().get(key).copied().unwrap_or(0)
     }
 }
 
@@ -3192,6 +3200,12 @@ impl crate::services::storage_service::StorageBackend for PresignMemBackend {
             .get(key)
             .cloned()
             .ok_or_else(|| crate::error::AppError::NotFound(key.to_string()))?;
+        *self
+            .reads
+            .lock()
+            .unwrap()
+            .entry(key.to_string())
+            .or_default() += 1;
         if self.evict_after_read.lock().unwrap().contains(key) {
             objects.remove(key);
         }
@@ -3250,7 +3264,7 @@ impl crate::services::storage_service::StorageBackend for PresignMemBackend {
 }
 
 /// A fresh, non-expired positive proxy-cache sidecar (no pinned `storage_etag`,
-/// so `is_cache_fresh` and `fresh_cache_redirect_size` fall back to an
+/// so `is_cache_fresh` and `fresh_cache_redirect` fall back to an
 /// existence check of the body key).
 pub fn fresh_cache_sidecar_bytes() -> Bytes {
     let meta = crate::services::proxy_service::CacheMetadata {

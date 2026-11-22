@@ -13361,6 +13361,25 @@ fn range_is_whole_object(range_header: Option<&str>, total: u64) -> bool {
     }
 }
 
+/// The byte length of the object stored at `key`, without holding it in
+/// memory (#6358): object metadata where the backend reports it
+/// (`StorageBackend::stored_size`: filesystem, S3, Azure, GCS), otherwise a
+/// read of the object that counts its bytes and drops each chunk.
+pub(crate) async fn stored_object_length(
+    storage: &dyn crate::storage::StorageBackend,
+    key: &str,
+) -> Result<u64> {
+    if let Some(len) = storage.stored_size(key).await? {
+        return Ok(len);
+    }
+    let mut stream = storage.get_stream(key).await?;
+    let mut len = 0u64;
+    while let Some(chunk) = futures::StreamExt::next(&mut stream).await {
+        len += chunk?.len() as u64;
+    }
+    Ok(len)
+}
+
 /// [`ranged_stream_response_verified`] that verifies a small whole-object
 /// serve BEFORE the status is chosen (#4323): an object of at most
 /// [`crate::storage::verify::VERIFY_BEFORE_HEADERS_MAX_BYTES`] that fails
@@ -13995,40 +14014,55 @@ pub async fn download_artifact(
     }
 
     // Fall back to proxied download (filesystem or S3 without redirect)
-    let artifact_service = ArtifactService::new(state.db.clone(), storage);
+    let artifact_service = ArtifactService::new(state.db.clone(), storage.clone());
 
     // #5594: a Docker/OCI manifest's artifact row records the IMAGE size
     // (config + layers) in `size_bytes`, not the byte length of the manifest
     // stored at `storage_key`, while `checksum_sha256` is the manifest digest.
     // Serving with `artifact.size_bytes` as the content length makes integrity
     // verification fail (and would advertise a wrong Content-Length). Serve the
-    // actual manifest bytes with their real size instead. The read still goes
+    // actual manifest bytes with their real size instead. A GET still reads
     // through `download_stream`, so the download gate, the statistics row, the
-    // ARTIFACT_DOWNLOADED audit event and the AfterDownload hooks all apply.
+    // ARTIFACT_DOWNLOADED audit event and the AfterDownload hooks all apply; a
+    // HEAD runs the same gate without opening the object.
+    //
+    // #6358: the length comes from object metadata, and the body is streamed.
+    // Nothing caps what is stored at a manifest path (the manifest PUT takes up
+    // to `max_upload_size_bytes`), so this used to buffer the whole object to
+    // learn its length, on a HEAD too.
     if repo.repo_type != RepositoryType::Virtual
         && repo.format == RepositoryFormat::Docker
         && crate::services::oci_manifests::is_manifest_path(&path)
     {
-        match artifact_service
-            .download_stream(
-                repo.id,
-                &path,
-                auth.as_ref().map(|a| a.user_id),
-                client_ip_str.clone(),
-                user_agent.as_deref(),
-                // #2260 §5: a HEAD serves no body, so it must not count.
-                !is_head,
-            )
-            .await
-        {
-            Ok((artifact, stream)) => {
-                // A manifest is small (the OCI push path caps it), so buffering
-                // it to learn its real length is cheap.
-                use futures::TryStreamExt;
-                let bytes = Bytes::from(stream.map_ok(|b| b.to_vec()).try_concat().await?);
-                let total = bytes.len() as u64;
-                let body: futures::stream::BoxStream<'static, crate::error::Result<Bytes>> =
-                    Box::pin(futures::stream::once(async move { Ok(bytes) }));
+        let opened = if is_head {
+            artifact_service
+                .prepare_head(repo.id, &path)
+                .await
+                .map(|artifact| (artifact, None))
+        } else {
+            artifact_service
+                .download_stream(
+                    repo.id,
+                    &path,
+                    auth.as_ref().map(|a| a.user_id),
+                    client_ip_str.clone(),
+                    user_agent.as_deref(),
+                    true,
+                )
+                .await
+                .map(|(artifact, stream)| (artifact, Some(stream)))
+        };
+        // A HEAD has not opened the object, so a missing one shows up here
+        // and falls through below like a failed open.
+        let opened = match opened {
+            Ok((artifact, stream)) => stored_object_length(storage.as_ref(), &artifact.storage_key)
+                .await
+                .map(|total| (artifact, stream, total)),
+            Err(e) => Err(e),
+        };
+        match opened {
+            Ok((artifact, stream, total)) => {
+                let body = stream.unwrap_or_else(|| Box::pin(futures::stream::empty()));
                 let range_header = request
                     .headers()
                     .get(header::RANGE)
@@ -39737,29 +39771,74 @@ mod tests {
             .await
             .unwrap();
         let push_status = pushed.status();
-        let (status, body, headers) = tdh::send_with_headers(
-            tdh::router_with_auth(
-                download_router(),
-                state.clone(),
-                tdh::make_auth(user_id, &username),
-            ),
-            tdh::get(format!("/{key}/download/v2/acme/app/manifests/1.0")),
-        )
-        .await;
+        let uri = format!("/{key}/download/v2/acme/app/manifests/1.0");
+        let send = |request| {
+            tdh::send_with_headers(
+                tdh::router_with_auth(
+                    download_router(),
+                    state.clone(),
+                    tdh::make_auth(user_id, &username),
+                ),
+                request,
+            )
+        };
+        // #6358: a HEAD answers the stored length from object metadata, with
+        // no body. (It never reaches the download recorder: `prepare_head`.)
+        let (head_status, head_body, head_headers) = send(tdh::head(uri.clone())).await;
+        let (status, body, headers) = send(tdh::get(uri)).await;
 
         tdh::cleanup(&pool, repo_id, user_id).await;
         let _ = std::fs::remove_dir_all(&dir);
 
+        let content_length = |h: &axum::http::HeaderMap| {
+            h.get(header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+        };
         assert_eq!(push_status, StatusCode::CREATED, "push the manifest");
         assert_eq!(status, StatusCode::OK, "generic download: {body:?}");
         assert_eq!(body, manifest.as_bytes(), "the manifest bytes");
         assert_eq!(
-            headers
-                .get(header::CONTENT_LENGTH)
-                .and_then(|v| v.to_str().ok()),
-            Some(manifest.len().to_string().as_str()),
+            content_length(&headers),
+            Some(manifest.len().to_string()),
             "Content-Length is the manifest length, not the image size"
         );
+        assert_eq!(head_status, StatusCode::OK, "HEAD: {head_body:?}");
+        assert!(head_body.is_empty(), "a HEAD has no body");
+        assert_eq!(
+            content_length(&head_headers),
+            Some(manifest.len().to_string())
+        );
+    }
+
+    /// #6358: the stored length of an object, from metadata where the backend
+    /// reports it and otherwise by counting a streamed read; a missing object
+    /// is NotFound either way.
+    #[tokio::test]
+    async fn stored_object_length_without_holding_the_object_6358() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::storage::StorageBackend;
+        let mem = tdh::MemStorage::default();
+        mem.put("m", Bytes::from(vec![7u8; 4096])).await.unwrap();
+        assert_eq!(
+            mem.stored_size("m").await.unwrap(),
+            None,
+            "no metadata size"
+        );
+        assert_eq!(stored_object_length(&mem, "m").await.unwrap(), 4096);
+        assert!(matches!(
+            stored_object_length(&mem, "gone").await,
+            Err(AppError::NotFound(_))
+        ));
+
+        let dir = tempfile::tempdir().unwrap();
+        let fs = crate::storage::filesystem::FilesystemStorage::new(dir.path());
+        fs.put("m", Bytes::from(vec![7u8; 513])).await.unwrap();
+        assert_eq!(stored_object_length(&fs, "m").await.unwrap(), 513);
+        assert!(matches!(
+            stored_object_length(&fs, "gone").await,
+            Err(AppError::NotFound(_))
+        ));
     }
 }
 

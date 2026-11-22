@@ -2573,6 +2573,17 @@ impl ArtifactService {
         Ok((artifact, body))
     }
 
+    /// The download gate of [`Self::download_stream`] for a `HEAD`, which
+    /// serves no body: the row is resolved and gated (NotFound, quarantine,
+    /// scan policy) exactly as for a download, but the stored object is not
+    /// opened and no download is counted (#2260 §5). The caller takes the
+    /// length from object metadata (`StorageBackend::stored_size`) instead of
+    /// reading the bytes (#6358).
+    pub async fn prepare_head(&self, repository_id: Uuid, path: &str) -> Result<Artifact> {
+        let (artifact, _info) = self.prepare_download(repository_id, path).await?;
+        Ok(artifact)
+    }
+
     /// Get artifact by ID
     pub async fn get_by_id(&self, id: Uuid) -> Result<Artifact> {
         let artifact = sqlx::query_as!(

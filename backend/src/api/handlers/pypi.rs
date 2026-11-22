@@ -1106,6 +1106,10 @@ async fn simple_project(
 
             // Second pass: fetch a remote index from every remote member, but
             // narrow a suppressed member's contribution to its Case-A unions.
+            // #5620: whether a remote member could not answer, so an empty
+            // union answers 503 + Retry-After instead of a 404 pip reports as
+            // "no matching distribution".
+            let mut remote_unavailable = false;
             for member in &members {
                 if member.repo_type != RepositoryType::Remote {
                     continue;
@@ -1234,11 +1238,12 @@ async fn simple_project(
                         };
                         remote_response = Some((content, content_type));
                     }
-                    Err(_e) => {
+                    Err(e) => {
                         debug!(
                             member_key = %member.key,
                             "simple index proxy fetch missed for virtual member"
                         );
+                        remote_unavailable |= proxy_helpers::is_member_unavailable_response(&e);
                     }
                 }
             }
@@ -1255,6 +1260,9 @@ async fn simple_project(
 
             // Render the union.
             match (local_artifacts.is_empty(), remote_response) {
+                (true, None) if remote_unavailable => {
+                    return Err(proxy_helpers::member_unavailable_response());
+                }
                 (true, None) => {
                     return Err(AppError::NotFound(
                         "Package not found in any member repository".to_string(),
@@ -4075,18 +4083,22 @@ async fn pypi_proxy_cache_redirect(
         return None;
     }
     // #1555: resolve the no-prefix presign handle and confirm redirect support
-    // BEFORE the `fresh_cache_redirect_size` probe — the probe loads the
+    // BEFORE the `fresh_cache_redirect` probe — the probe loads the
     // cache-meta sidecar, so we avoid a wasted S3 GET when we can't redirect
     // anyway (the streaming fallback re-reads the same sidecar).
     let storage = proxy.cache_storage_backend();
     if !storage.supports_redirect() {
         return None;
     }
-    // #6035: the freshness probe also yields the size its sidecar records,
-    // which the transfer meter counts when the URL is issued.
-    let size_bytes = proxy
-        .fresh_cache_redirect_size(repo_key, cache_path)
-        .await?;
+    // #6035: the freshness probe also yields the sidecar it read: the size
+    // the transfer meter counts when the URL is issued, the hold and the
+    // digest whose verdict is checked below.
+    let entry = proxy.fresh_cache_redirect(repo_key, cache_path).await?;
+    // #6361: a file inside its Package Age Policy hold is not redirected to,
+    // as on the other fast paths; the streaming path below answers the hold.
+    if entry.quarantine_gate().is_err() {
+        return None;
+    }
     // #4506: a Remote whose origin policy refuses its content gets no
     // redirect; the gated fetch below answers the 403.
     if proxy.cache_origin_policy_gate(repo_key).await.is_err() {
@@ -4094,7 +4106,8 @@ async fn pypi_proxy_cache_redirect(
     }
     // #4514: nor does a body its stored scan verdict refuses, or, under
     // fail-closed, one with no reusable clean verdict.
-    if !proxy_helpers::cache_scan_allows_redirect(state, proxy, repo_key, cache_path).await {
+    if !proxy_helpers::cache_scan_allows_redirect(state, proxy, repo_key, cache_path, &entry).await
+    {
         return None;
     }
     let cache_key = crate::services::proxy_service::ProxyService::cache_storage_key(
@@ -4110,7 +4123,7 @@ async fn pypi_proxy_cache_redirect(
         /* presigned_enabled = */ true,
         expiry,
         /* cache_is_fresh = */ true,
-        size_bytes,
+        entry.size_bytes(),
     )
     .await
 }
@@ -17895,12 +17908,12 @@ mod tests {
             "pypi_proxy_cache_redirect MUST sign via cache_storage_backend() \
              (no-prefix handle), not a prefixed repo handle (#1555).",
         );
-        // #6035: `fresh_cache_redirect_size(` is the same metadata-only probe,
-        // returning the sidecar's size alongside the verdict.
+        // #6035/#6361: `fresh_cache_redirect(` is the same metadata-only
+        // probe, returning the sidecar it read alongside the verdict.
         assert!(
-            window.contains("fresh_cache_redirect_size("),
+            window.contains("fresh_cache_redirect("),
             "pypi_proxy_cache_redirect MUST gate on the metadata-only freshness \
-             probe `fresh_cache_redirect_size` (#1555).",
+             probe `fresh_cache_redirect` (#1555).",
         );
     }
 
@@ -18002,7 +18015,7 @@ mod tests {
         let proxy = tdh::build_proxy_service_with_fs(pool.clone(), &storage_path);
         // Presigned ENABLED, but the filesystem proxy backend reports
         // supports_redirect() == false, so the helper must still return None
-        // without touching the DB (the fresh_cache_redirect_size probe is
+        // without touching the DB (the fresh_cache_redirect probe is
         // never reached).
         let state =
             tdh::build_state_with_proxy_presigned(pool.clone(), &storage_path, proxy.clone());
