@@ -78,10 +78,10 @@ Since 1.13.0, a fill's catalog row commits without waiting for the WAL flush (`P
 
 A background sweep restores those rows without waiting for the file to be read again (#6429). It also restores a row that a failed best-effort catalog write never wrote. One replica runs it at a time, under the `proxy_cache_recatalog` scheduler lease.
 
-Each pass walks every Remote's cache tree (this deployment's scope only) in pages of 1,000 keys, with a short pause between pages, and resumes where the previous pass stopped. For a sidecar whose content key has no catalog row it writes the row from the sidecar: size, digest, content type and any Package Age Policy hold. It reads the sidecar and checks that the body exists; it never reads the body. The row's insert charges the Remote's usage ledger, so `proxy_bytes` matches the live sum again. A row written by a concurrent fill is never overwritten.
+It walks every Remote's cache tree (this deployment's scope only) in pages of 1,000 keys, with a short pause between pages, in chunks of at most `PROXY_CACHE_RECATALOG_BUDGET` keys. Where a chunk stops is saved in the database (`scheduler_job_cursors`), so the next chunk resumes there on any replica, after a restart or a lease handover. A chunk that stopped mid-walk is followed by the next one 30 seconds later; the interval separates complete walks. A Remote whose listing or queries fail is logged, counted (`outcome="remote_error"`) and skipped, and the walk goes on. For a sidecar whose content key has no catalog row it writes the row from the sidecar: size, digest, content type and any Package Age Policy hold. It reads the sidecar and checks that the body exists; it never reads the body. The row's insert charges the Remote's usage ledger, so `proxy_bytes` matches the live sum again. A row written by a concurrent fill is never overwritten.
 
 It leaves these alone:
-- a cached upstream 404 (negative-cache sidecar), or a sidecar whose body is gone;
+- a cached upstream 404 (negative-cache sidecar), a sidecar whose body is gone, or one whose recorded size is negative or not the body's size;
 - a sidecar younger than `PROXY_CACHE_RECATALOG_MIN_AGE_SECS`, whose own fill may still be committing;
 - a sidecar written before its Remote was created (left by a deleted repository with the same key);
 - an entry whose legacy `artifacts` row an operator deleted (in the trash) or rejected;
@@ -89,11 +89,13 @@ It leaves these alone:
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `PROXY_CACHE_RECATALOG_INTERVAL_SECS` | `21600` (6 h) | time between passes; the first runs within 5 minutes of startup. `0` or `off` turns the sweep off. At least 10 s. |
-| `PROXY_CACHE_RECATALOG_BUDGET` | `100000` | keys one pass may list; a larger cache is covered over several passes |
+| `PROXY_CACHE_RECATALOG_INTERVAL_SECS` | `21600` (6 h) | time between complete walks; the first starts within 5 minutes of startup. `0` or `off` turns the sweep off. At least 10 s. |
+| `PROXY_CACHE_RECATALOG_BUDGET` | `100000` | keys one chunk may list; chunks of a walk follow each other 30 s apart |
 | `PROXY_CACHE_RECATALOG_MIN_AGE_SECS` | `600` | sidecars younger than this are skipped |
 
-Each pass logs one `Proxy-cache re-catalog pass` line (`info` when it restored or failed anything, `debug` otherwise) and counts `ak_proxy_cache_recatalog_total{outcome}` and `ak_proxy_cache_recatalog_bytes_total` (see `docs/operations/proxy-cache-metrics.md`).
+How long a walk takes: listing a filesystem cache measured 0.1-0.14 ms per key, so a 100,000-key chunk takes about 15-20 s with its page pauses and a walk about 50 s per 100,000 keys, including the 30 s between chunks: about 1.5 hours for 10 million keys. Object-store listings are slower per key.
+
+Each chunk logs one `Proxy-cache re-catalog pass` line (`info` when it restored or failed anything, `debug` otherwise) and counts `ak_proxy_cache_recatalog_total{outcome}` and `ak_proxy_cache_recatalog_bytes_total` (see `docs/operations/proxy-cache-metrics.md`).
 
 A restored row's `cached_at` and `last_accessed_at` are the time of the sweep, as with the read-time backfill. A cached index response whose catalog path ended in `/` is restored under the path without it.
 

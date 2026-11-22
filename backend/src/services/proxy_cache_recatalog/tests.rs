@@ -163,14 +163,30 @@ impl Rig {
     }
 
     fn sweep(&self, page_size: usize, budget: usize) -> RecatalogSweep {
+        self.sweep_on(
+            Arc::new(FilesystemBackend::new(self.dir.clone())),
+            page_size,
+            budget,
+        )
+    }
+
+    /// A sweep over `storage` whose position is this rig's own, so tests
+    /// running side by side never share one.
+    fn sweep_on(
+        &self,
+        storage: Arc<dyn StorageBackend>,
+        page_size: usize,
+        budget: usize,
+    ) -> RecatalogSweep {
         let mut config = SweepConfig::from_values(None, Some(&budget.to_string()), None);
         config.page_size = page_size;
         config.page_pause = Duration::ZERO;
-        RecatalogSweep::new(
+        RecatalogSweep::with_job_name(
             self.pool.clone(),
-            Arc::new(FilesystemBackend::new(self.dir.clone())),
+            storage,
             self.scope.clone(),
             config,
+            &format!("test-{}", self.repo),
         )
     }
 
@@ -258,6 +274,10 @@ impl Rig {
     }
 
     async fn cleanup(self) {
+        let _ = sqlx::query("DELETE FROM scheduler_job_cursors WHERE job_name = $1")
+            .bind(format!("test-{}", self.repo))
+            .execute(&self.pool)
+            .await;
         let _ = sqlx::query("DELETE FROM artifacts WHERE repository_id = $1")
             .bind(self.repo)
             .execute(&self.pool)
@@ -489,5 +509,158 @@ async fn delete_backfilled_spares_a_rewritten_row_6429() {
         1
     );
     assert_eq!(rig.row("r/x.bin").await, None);
+    rig.cleanup().await;
+}
+
+/// A filesystem store that can fail one Remote's listing, or purge an entry
+/// the moment the sweep checks its body (an invalidation racing the sweep).
+struct Faulty {
+    inner: FilesystemBackend,
+    base: std::path::PathBuf,
+    fail_listing_under: Option<String>,
+    purge_on_size: Option<CacheKeys>,
+}
+
+impl Faulty {
+    fn new(base: &Path) -> Self {
+        Self {
+            inner: FilesystemBackend::new(base.to_path_buf()),
+            base: base.to_path_buf(),
+            fail_listing_under: None,
+            purge_on_size: None,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl StorageBackend for Faulty {
+    async fn put(&self, key: &str, content: bytes::Bytes) -> Result<()> {
+        self.inner.put(key, content).await
+    }
+    async fn get(&self, key: &str) -> Result<bytes::Bytes> {
+        self.inner.get(key).await
+    }
+    async fn exists(&self, key: &str) -> Result<bool> {
+        self.inner.exists(key).await
+    }
+    async fn delete(&self, key: &str) -> Result<()> {
+        self.inner.delete(key).await
+    }
+    async fn list(&self, prefix: Option<&str>) -> Result<Vec<String>> {
+        self.inner.list(prefix).await
+    }
+    async fn copy(&self, source: &str, dest: &str) -> Result<()> {
+        self.inner.copy(source, dest).await
+    }
+    async fn size(&self, key: &str) -> Result<u64> {
+        let size = self.inner.size(key).await;
+        if let Some(keys) = self.purge_on_size.as_ref().filter(|k| k.content == key) {
+            // Invalidation: objects first (the row comes after, and there is none).
+            let _ = std::fs::remove_file(self.base.join(&keys.content));
+            let _ = std::fs::remove_file(self.base.join(&keys.metadata));
+        }
+        size
+    }
+    async fn list_page(
+        &self,
+        prefix: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<crate::services::storage_service::KeyPage> {
+        if self.fail_listing_under.as_deref() == Some(prefix) {
+            return Err(AppError::Storage("listing refused".into()));
+        }
+        self.inner.list_page(prefix, cursor, limit).await
+    }
+}
+
+/// A Remote whose listing fails is counted and skipped; the walk goes on to
+/// the other Remotes and completes.
+#[tokio::test]
+async fn a_failing_remote_does_not_block_the_others_6429() {
+    let Some(bad) = Rig::new().await else { return };
+    let Some(good) = Rig::new().await else { return };
+    // Both Remotes' entries in one store; the bad one's listing fails.
+    let (good_keys, _) = good.put_old("g/one.bin", 9);
+    let bad_keys = bad.keys("b/one.bin");
+    let _ = good_keys;
+    write(&good.dir, &bad_keys.content, b"bbbbbbbbb");
+    write(
+        &good.dir,
+        &bad_keys.metadata,
+        &serde_json::to_vec(&meta_json(old(), 9, "b")).unwrap(),
+    );
+    let mut store = Faulty::new(&good.dir);
+    store.fail_listing_under = Some(bad.scope.repo_root(&bad.key));
+    let sweep = good.sweep_on(Arc::new(store), 1000, usize::MAX);
+    let report = sweep.run_pass(None).await.unwrap();
+    assert!(report.remote_errors >= 1, "{report:?}");
+    assert!(report.complete, "{report:?}");
+    assert!(good.row("g/one.bin").await.is_some(), "{report:?}");
+    assert_eq!(bad.row("b/one.bin").await, None);
+    assert_eq!(sweep.load_position().await.unwrap(), Position::default());
+    bad.cleanup().await;
+    good.cleanup().await;
+}
+
+/// A chunk that runs out of budget saves where it stopped; a new sweep (a
+/// restart, or another replica) resumes there instead of starting over.
+#[tokio::test]
+async fn the_position_survives_a_restart_6429() {
+    let Some(rig) = Rig::new().await else { return };
+    for i in 0..5 {
+        rig.put_old(&format!("c/{i}.bin"), 20 + i);
+    }
+    let first = rig.sweep(3, 4).run_pass(None).await.unwrap();
+    assert!(!first.complete, "{first:?}");
+    assert_eq!(first.scanned, 4, "{first:?}");
+    let saved = rig.sweep(3, 4).load_position().await.unwrap();
+    assert_eq!(saved.remote, Some(rig.repo));
+    assert!(saved.cursor.is_some());
+    // A fresh instance: nothing carried over in memory.
+    let second = rig.sweep(1000, usize::MAX).run_pass(None).await.unwrap();
+    assert!(second.complete, "{second:?}");
+    assert_eq!(second.scanned, 6, "resumed, not restarted: {second:?}");
+    assert_eq!(first.recataloged + second.recataloged, 5);
+    assert_eq!(rig.ledger_and_live().await, (110, 110));
+    rig.cleanup().await;
+}
+
+/// An entry purged while the sweep writes its row: the row the sweep
+/// inserted is taken back through the real path.
+#[tokio::test]
+async fn an_entry_purged_mid_write_is_taken_back_6429() {
+    let Some(rig) = Rig::new().await else { return };
+    let (keys, _) = rig.put_old("x/purged.bin", 12);
+    let mut store = Faulty::new(&rig.dir);
+    store.purge_on_size = Some(keys);
+    let (report, _) = {
+        let sweep = rig.sweep_on(Arc::new(store), 1000, 1000);
+        let mut report = SweepReport::default();
+        let mut budget = 1000;
+        let outcome = sweep
+            .sweep_remote(&rig.remote().await, None, &mut budget, &mut report, None)
+            .await
+            .unwrap();
+        (report, outcome)
+    };
+    assert_eq!(report.raced, 1, "{report:?}");
+    assert_eq!(report.recataloged, 0, "{report:?}");
+    assert_eq!(rig.row("x/purged.bin").await, None);
+    assert_eq!(rig.ledger_and_live().await, (0, 0));
+    rig.cleanup().await;
+}
+
+/// A sidecar whose size is negative or not the body's never reaches the
+/// ledger.
+#[tokio::test]
+async fn a_sidecar_with_a_wrong_size_is_not_recataloged_6429() {
+    let Some(rig) = Rig::new().await else { return };
+    rig.put("z/short.bin", b"12345", meta_json(old(), 10, "s"));
+    rig.put("z/negative.bin", b"", meta_json(old(), -1, "n"));
+    let (report, _) = rig.run(&rig.sweep(1000, 1000)).await;
+    assert_eq!(report.skipped_size_mismatch, 2, "{report:?}");
+    assert_eq!(rig.row("z/short.bin").await, None);
+    assert_eq!(rig.row("z/negative.bin").await, None);
     rig.cleanup().await;
 }

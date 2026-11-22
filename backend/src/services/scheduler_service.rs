@@ -1291,8 +1291,16 @@ pub fn spawn_all(
                 tokio::time::sleep(jittered_startup_delay(startup)).await;
                 let mut ticker = interval(every);
                 ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+                // A chunk that stopped mid-walk is continued after a short
+                // pause; the interval separates complete walks.
+                let mut mid_walk = false;
                 loop {
-                    ticker.tick().await;
+                    if mid_walk {
+                        tokio::time::sleep(recatalog::CONTINUE_DELAY).await;
+                    } else {
+                        ticker.tick().await;
+                    }
+                    mid_walk = false;
                     let Some(lease) =
                         crate::services::cluster_work::try_acquire_scheduler_lease_quiet(
                             &db,
@@ -1307,7 +1315,15 @@ pub fn spawn_all(
                     let (renewal, lost) = lease
                         .spawn_renewal_with_cancellation(db.clone(), recatalog::LEASE_TTL_SECS);
                     match sweep.run_pass(Some(&lost)).await {
-                        Ok(report) => recatalog::log_pass(&report),
+                        Ok(report) => {
+                            recatalog::log_pass(&report);
+                            mid_walk = !report.complete && !report.interrupted;
+                            if report.complete {
+                                // The next walk starts a full interval after
+                                // this one ended, however long it took.
+                                ticker.reset();
+                            }
+                        }
                         Err(e) => tracing::warn!("Proxy-cache re-catalog pass failed: {}", e),
                     }
                     drop(renewal);

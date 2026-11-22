@@ -22,8 +22,9 @@
 //!
 //! # What it never re-catalogs
 //!
-//! * A negative-cache sidecar (a cached upstream 404) or one whose content
-//!   object is gone.
+//! * A negative-cache sidecar (a cached upstream 404), one whose content
+//!   object is gone, or one whose recorded size is negative or not the
+//!   object's size.
 //! * A sidecar written less than `PROXY_CACHE_RECATALOG_MIN_AGE_SECS` ago: its
 //!   fill may still be committing its own row.
 //! * A sidecar written before its Remote was created: it was left by a
@@ -40,17 +41,28 @@
 //!
 //! # Cost and safety
 //!
-//! A pass lists at most `PROXY_CACHE_RECATALOG_BUDGET` keys, `PAGE_SIZE` per
-//! listing call with a pause between pages, and resumes where the previous
-//! pass on this replica stopped. Per page it runs one catalog query; the
-//! sidecar and existence reads and the artifacts check happen only for keys
-//! with no row. It runs on one replica at a time under a scheduler lease,
-//! renewed for the whole pass; a lost lease stops it between pages.
+//! The walk over every Remote runs in chunks of at most
+//! `PROXY_CACHE_RECATALOG_BUDGET` listed keys, `PAGE_SIZE` per listing call
+//! with a pause between pages. Where a chunk stops is saved in
+//! `scheduler_job_cursors`, so the next chunk, on any replica and after any
+//! restart, resumes there. A chunk that ran out of budget mid-walk is followed
+//! by the next one after [`CONTINUE_DELAY`] (30 s), not the full interval; the
+//! interval applies between complete walks. At the 0.1-0.14 ms per key
+//! measured on a filesystem cache, a 100,000-key chunk takes about 15-20 s with
+//! its page pauses, so a walk costs about 50 s per 100,000 keys: about 1.5
+//! hours for 10 million (object-store listings are slower per key). Per page
+//! the sweep runs one catalog query; the sidecar read, the body size check and
+//! the artifacts check happen only for keys with no row. A Remote whose
+//! listing or queries fail is logged, counted and skipped for that walk. It
+//! runs on one replica at a time under a scheduler lease, renewed for the
+//! whole chunk; a lost lease stops it between pages.
 //!
-//! `PROXY_CACHE_RECATALOG_INTERVAL_SECS` sets the period (default six hours,
-//! first pass a few minutes after startup); `0` or `off` turns it off.
+//! `PROXY_CACHE_RECATALOG_INTERVAL_SECS` sets the time between walks (default
+//! six hours, first chunk a few minutes after startup); `0` or `off` turns it
+//! off.
 
-use std::sync::{Arc, Mutex};
+use std::collections::HashSet;
+use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -89,6 +101,9 @@ pub const DEFAULT_MIN_AGE_SECS: i64 = 600;
 pub const PAGE_SIZE: usize = 1000;
 /// Pause between listing calls, so a pass never runs storage or the pool hot.
 pub const PAGE_PAUSE: Duration = Duration::from_millis(50);
+/// The pause before the next chunk when a chunk ran out of budget mid-walk,
+/// instead of the full interval, so a large cache is walked end to end.
+pub const CONTINUE_DELAY: Duration = Duration::from_secs(30);
 /// Consecutive failed re-catalog writes after which a pass stops.
 const MAX_CONSECUTIVE_FAILURES: u32 = 20;
 
@@ -192,6 +207,10 @@ pub struct SweepReport {
     pub skipped_no_content: u64,
     pub skipped_unreadable: u64,
     pub skipped_deleted: u64,
+    /// The body's size is not the sidecar's (or the sidecar's is negative).
+    pub skipped_size_mismatch: u64,
+    /// Remotes skipped because their listing or catalog queries failed.
+    pub remote_errors: u64,
     /// The sidecar had a row by the time the sweep wrote one (a concurrent
     /// fill or serve), so nothing was inserted.
     pub met_row: u64,
@@ -218,6 +237,8 @@ impl SweepReport {
             ("skipped_no_content", self.skipped_no_content),
             ("skipped_unreadable", self.skipped_unreadable),
             ("skipped_deleted", self.skipped_deleted),
+            ("skipped_size_mismatch", self.skipped_size_mismatch),
+            ("remote_error", self.remote_errors),
             ("met_row", self.met_row),
             ("raced", self.raced),
             ("failed", self.failed),
@@ -324,36 +345,50 @@ pub enum RemoteSweep {
     Stopped(Option<String>),
 }
 
-/// Where the next pass on this replica picks up.
+/// Where the next chunk picks up: the Remote it stopped in and that Remote's
+/// listing cursor. Kept in `scheduler_job_cursors` (migration 415), so a
+/// restart or a lease handover resumes instead of starting over.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct Position {
-    remote: Option<Uuid>,
-    cursor: Option<String>,
+pub struct Position {
+    pub remote: Option<Uuid>,
+    pub cursor: Option<String>,
 }
 
-/// The sweep: its handles, settings and resume position.
+/// The sweep: its handles, settings and the name its position is kept under.
 pub struct RecatalogSweep {
     db: PgPool,
     storage: Arc<dyn StorageBackend>,
     scope: ProxyCacheScope,
     config: SweepConfig,
-    position: Mutex<Position>,
+    job_name: String,
 }
 
 impl RecatalogSweep {
-    /// A sweep over the proxy cache that `storage` holds under `scope`.
+    /// A sweep over the proxy cache that `storage` holds under `scope`, its
+    /// position kept under [`LEASE_NAME`].
     pub fn new(
         db: PgPool,
         storage: Arc<dyn StorageBackend>,
         scope: ProxyCacheScope,
         config: SweepConfig,
     ) -> Self {
+        Self::with_job_name(db, storage, scope, config, LEASE_NAME)
+    }
+
+    /// [`Self::new`] keeping its position under `job_name`.
+    pub fn with_job_name(
+        db: PgPool,
+        storage: Arc<dyn StorageBackend>,
+        scope: ProxyCacheScope,
+        config: SweepConfig,
+        job_name: &str,
+    ) -> Self {
         Self {
             db,
             storage,
             scope,
             config,
-            position: Mutex::new(Position::default()),
+            job_name: job_name.to_string(),
         }
     }
 
@@ -362,11 +397,43 @@ impl RecatalogSweep {
         &self.config
     }
 
-    /// One pass over every Remote, from where the last pass stopped, within
-    /// the key budget. `lost` stops it between pages.
+    /// The saved position; the start when none is saved.
+    pub async fn load_position(&self) -> Result<Position> {
+        let row: Option<(Option<Uuid>, Option<String>)> = sqlx::query_as(
+            "SELECT repository_id, cursor FROM scheduler_job_cursors WHERE job_name = $1",
+        )
+        .bind(&self.job_name)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+        Ok(row
+            .map(|(remote, cursor)| Position { remote, cursor })
+            .unwrap_or_default())
+    }
+
+    async fn save_position(&self, position: &Position) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO scheduler_job_cursors (job_name, repository_id, cursor, updated_at)              VALUES ($1, $2, $3, now())              ON CONFLICT (job_name) DO UPDATE SET repository_id = EXCLUDED.repository_id,                  cursor = EXCLUDED.cursor, updated_at = now()",
+        )
+        .bind(&self.job_name)
+        .bind(position.remote)
+        .bind(position.cursor.as_deref())
+        .execute(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    /// One chunk of the walk over every Remote: from the saved position, at
+    /// most the key budget. `complete` in the report says the walk reached the
+    /// end of the last Remote; otherwise the scheduler runs the next chunk
+    /// after [`CONTINUE_DELAY`] instead of the full interval. A Remote whose
+    /// listing or catalog queries fail is logged, counted (`remote_errors`)
+    /// and skipped, so it never blocks the Remotes after it. `lost` stops the
+    /// chunk between pages.
     pub async fn run_pass(&self, lost: Option<&CancellationToken>) -> Result<SweepReport> {
         let started = std::time::Instant::now();
-        let start = self.position.lock().map(|p| p.clone()).unwrap_or_default();
+        let start = self.load_position().await?;
         let remotes: Vec<Remote> = sqlx::query_as(
             "SELECT id, key, created_at FROM repositories \
              WHERE repo_type = 'remote'::repository_type AND id >= $1 ORDER BY id",
@@ -384,23 +451,32 @@ impl RecatalogSweep {
                 .then(|| start.cursor.clone())
                 .flatten();
             report.remotes += 1;
-            let outcome = self
+            match self
                 .sweep_remote(remote, cursor, &mut budget, &mut report, lost)
-                .await?;
-            if let RemoteSweep::Stopped(cursor) = outcome {
-                next = Position {
-                    remote: Some(remote.id),
-                    cursor,
-                };
-                break;
+                .await
+            {
+                Ok(RemoteSweep::Done) => {}
+                Ok(RemoteSweep::Stopped(cursor)) => {
+                    next = Position {
+                        remote: Some(remote.id),
+                        cursor,
+                    };
+                    break;
+                }
+                Err(e) => {
+                    report.remote_errors += 1;
+                    tracing::warn!(
+                        repository = %remote.key,
+                        error = %e,
+                        "proxy-cache re-catalog: skipping this Remote for this pass"
+                    );
+                }
             }
         }
         report.complete = next == Position::default();
         report.elapsed_ms = started.elapsed().as_millis() as u64;
-        if let Ok(mut position) = self.position.lock() {
-            *position = next;
-        }
         report.record_metrics();
+        self.save_position(&next).await?;
         Ok(report)
     }
 
@@ -464,13 +540,15 @@ impl RecatalogSweep {
             return Ok(failures);
         }
         let content_keys: Vec<&str> = entries.iter().map(|e| e.content_key.as_str()).collect();
-        let cataloged: Vec<String> = sqlx::query_scalar(
+        let cataloged: HashSet<String> = sqlx::query_scalar(
             "SELECT storage_key FROM proxy_cache_artifacts WHERE storage_key = ANY($1)",
         )
         .bind(&content_keys)
         .fetch_all(&self.db)
         .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
+        .map_err(|e| AppError::Database(e.to_string()))?
+        .into_iter()
+        .collect();
         let missing: Vec<ListedEntry> = entries
             .into_iter()
             .filter(|e| !cataloged.contains(&e.content_key))
@@ -481,7 +559,7 @@ impl RecatalogSweep {
         let missing_keys: Vec<&str> = missing.iter().map(|e| e.content_key.as_str()).collect();
         // An operator removed these: a trashed or rejected `artifacts` row (a
         // pre-1.2.0 proxy row) on the same object.
-        let removed: Vec<String> = sqlx::query_scalar(
+        let removed: HashSet<String> = sqlx::query_scalar(
             "SELECT DISTINCT storage_key FROM artifacts \
              WHERE repository_id = $1 AND storage_key = ANY($2) \
                AND (is_deleted OR quarantine_status = 'rejected')",
@@ -490,7 +568,9 @@ impl RecatalogSweep {
         .bind(&missing_keys)
         .fetch_all(&self.db)
         .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
+        .map_err(|e| AppError::Database(e.to_string()))?
+        .into_iter()
+        .collect();
 
         for entry in missing {
             if removed.contains(&entry.content_key) {
@@ -537,9 +617,20 @@ impl RecatalogSweep {
             report.count_skip(skip);
             return Ok(());
         }
-        if !self.storage.exists(&entry.content_key).await? {
-            report.skipped_no_content += 1;
-            return Ok(());
+        // The body must be there and be the size the sidecar records: a
+        // sidecar's figure goes onto the ledger, so a negative or wrong one
+        // is never written.
+        match self.storage.size(&entry.content_key).await {
+            Ok(size) if meta.size_bytes >= 0 && size == meta.size_bytes as u64 => {}
+            Ok(_) => {
+                report.skipped_size_mismatch += 1;
+                return Ok(());
+            }
+            Err(AppError::NotFound(_)) => {
+                report.skipped_no_content += 1;
+                return Ok(());
+            }
+            Err(e) => return Err(e),
         }
         let row = proxy_catalog::backfill_from_sidecar_returning(
             &self.db,
@@ -589,7 +680,7 @@ impl RecatalogSweep {
 /// Log one pass's outcome: `info` when it changed something, `debug`
 /// otherwise.
 pub fn log_pass(report: &SweepReport) {
-    if report.recataloged > 0 || report.raced > 0 || report.failed > 0 {
+    if report.recataloged > 0 || report.raced > 0 || report.failed > 0 || report.remote_errors > 0 {
         tracing::info!(
             remotes = report.remotes,
             scanned = report.scanned,
@@ -602,6 +693,8 @@ pub fn log_pass(report: &SweepReport) {
             skipped_stale = report.skipped_stale,
             skipped_no_content = report.skipped_no_content,
             skipped_unreadable = report.skipped_unreadable,
+            skipped_size_mismatch = report.skipped_size_mismatch,
+            remote_errors = report.remote_errors,
             met_row = report.met_row,
             raced = report.raced,
             failed = report.failed,
