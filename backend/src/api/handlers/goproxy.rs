@@ -530,6 +530,7 @@ async fn serve_sumdb(
                 content_type,
                 content_encoding,
                 stale_since,
+                ..
             }) => {
                 return Ok(proxy_helpers::forward_verbatim_metadata(
                     content,
@@ -700,6 +701,7 @@ async fn try_proxy_go_metadata(
                 content_type,
                 content_encoding,
                 stale_since,
+                ..
             } = match fetched {
                 Ok(body) => body,
                 Err(resp) => return Err(go_fetch_failure(state, repo.id, upstream_url, resp).await),
@@ -878,6 +880,7 @@ async fn fetch_go_metadata_with_source(
             content_type: _content_type,
             content_encoding,
             stale_since,
+            ..
         } = match fetched {
             Ok(body) => body,
             Err(resp) => {
@@ -919,6 +922,7 @@ async fn fetch_go_metadata_with_source(
                     content_type: _content_type,
                     content_encoding,
                     stale_since,
+                    ..
                 }) => return Ok(Some((member.id, content, content_encoding, stale_since))),
                 // A lower-priority member may still serve; only when none
                 // does is the outage the answer.
@@ -1644,6 +1648,7 @@ async fn get_mod_file(
                         content_type,
                         content_encoding,
                         stale_since,
+                        ..
                     } = proxy_helpers::proxy_fetch_capped_encoded_with_format(
                         proxy,
                         repo.id,

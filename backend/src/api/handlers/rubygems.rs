@@ -20,12 +20,17 @@
 use crate::api::handlers::upload_body::UploadBody;
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
-use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::header::{
+    ACCEPT_RANGES, CACHE_CONTROL, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE,
+    ETAG, IF_NONE_MATCH, IF_RANGE, RANGE,
+};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Extension;
 use axum::Router;
+use base64::prelude::BASE64_STANDARD;
+use base64::Engine as _;
 use bytes::Bytes;
 use flate2::write::GzEncoder;
 use flate2::Compression;
@@ -34,6 +39,7 @@ use sqlx::{PgPool, Row};
 use std::io::Write as IoWrite;
 use tracing::info;
 
+use crate::api::handlers::cache_headers;
 use crate::api::handlers::proxy_helpers::{
     self, RepoInfo, DEFAULT_METADATA_MAX_BYTES, LARGE_METADATA_MAX_BYTES,
 };
@@ -1604,10 +1610,53 @@ async fn proxy_remote_document(
         repo,
         path,
         max_bytes,
-        default_content_type,
+        RemoteDocumentMode::Verbatim {
+            default_content_type,
+        },
         RemoteDocumentBudget::process(),
     )
     .await
+}
+
+/// Compact Index variant of [`proxy_remote_document`] (#5974): same cached
+/// bytes and budget, but the response carries the upstream validator and
+/// honours the client's conditional and range headers. Only `/versions` is
+/// appended to by Bundler, so only that document advertises byte ranges.
+async fn proxy_compact_document(
+    state: &SharedState,
+    repo: &RepoInfo,
+    path: &str,
+    max_bytes: usize,
+    headers: &HeaderMap,
+) -> Result<Response, Response> {
+    proxy_remote_document_in(
+        state,
+        repo,
+        path,
+        max_bytes,
+        RemoteDocumentMode::CompactIndex(CompactIndexRequest {
+            default_content_type: "text/plain; charset=utf-8",
+            headers,
+            allow_ranges: path == "versions",
+        }),
+        RemoteDocumentBudget::process(),
+    )
+    .await
+}
+
+/// The client request inputs needed to build a Compact Index response.
+#[derive(Clone, Copy)]
+struct CompactIndexRequest<'a> {
+    default_content_type: &'a str,
+    headers: &'a HeaderMap,
+    allow_ranges: bool,
+}
+
+/// How a buffered Remote document is turned into a client response.
+#[derive(Clone, Copy)]
+enum RemoteDocumentMode<'a> {
+    Verbatim { default_content_type: &'a str },
+    CompactIndex(CompactIndexRequest<'a>),
 }
 
 /// Where a Remote document's buffered bytes are accounted (#5973).
@@ -1655,7 +1704,7 @@ async fn proxy_remote_document_in(
     repo: &RepoInfo,
     path: &str,
     max_bytes: usize,
-    default_content_type: &str,
+    mode: RemoteDocumentMode<'_>,
     budget: RemoteDocumentBudget,
 ) -> Result<Response, Response> {
     let (Some(proxy), Some(upstream)) =
@@ -1686,15 +1735,28 @@ async fn proxy_remote_document_in(
             content,
             content_type,
             content_encoding,
+            upstream_etag,
             stale_since,
             budget_permit: _budget_permit,
-        } => Ok(proxy_helpers::forward_verbatim_metadata(
-            content,
-            content_type,
-            default_content_type,
-            content_encoding,
-            stale_since,
-        )),
+        } => Ok(match mode {
+            RemoteDocumentMode::Verbatim {
+                default_content_type,
+            } => proxy_helpers::forward_verbatim_metadata(
+                content,
+                content_type,
+                default_content_type,
+                content_encoding,
+                stale_since,
+            ),
+            RemoteDocumentMode::CompactIndex(request) => forward_compact_index(
+                content,
+                content_type,
+                content_encoding,
+                upstream_etag.as_deref(),
+                stale_since,
+                &request,
+            ),
+        }),
         // No streaming fallback for these documents: the same 502 the
         // buffered helper rendered for an over-cap document.
         proxy_helpers::CappedMetadataGet::OverCap => {
@@ -1710,20 +1772,37 @@ async fn proxy_remote_document_in(
 async fn compact_versions(
     State(state): State<SharedState>,
     Path(repo_key): Path<String>,
+    headers: HeaderMap,
 ) -> Result<Response, Response> {
-    serve_compact_index(&state, &repo_key, "versions", LARGE_METADATA_MAX_BYTES).await
+    serve_compact_index(
+        &state,
+        &repo_key,
+        "versions",
+        LARGE_METADATA_MAX_BYTES,
+        &headers,
+    )
+    .await
 }
 
 async fn compact_names(
     State(state): State<SharedState>,
     Path(repo_key): Path<String>,
+    headers: HeaderMap,
 ) -> Result<Response, Response> {
-    serve_compact_index(&state, &repo_key, "names", LARGE_METADATA_MAX_BYTES).await
+    serve_compact_index(
+        &state,
+        &repo_key,
+        "names",
+        LARGE_METADATA_MAX_BYTES,
+        &headers,
+    )
+    .await
 }
 
 async fn compact_info(
     State(state): State<SharedState>,
     Path((repo_key, name)): Path<(String, String)>,
+    headers: HeaderMap,
 ) -> Result<Response, Response> {
     if !is_safe_path_segment(&name) {
         return Err(compact_index_not_served());
@@ -1733,6 +1812,7 @@ async fn compact_info(
         &repo_key,
         &format!("info/{name}"),
         DEFAULT_METADATA_MAX_BYTES,
+        &headers,
     )
     .await
 }
@@ -1750,12 +1830,13 @@ async fn serve_compact_index(
     repo_key: &str,
     path: &str,
     max_bytes: usize,
+    headers: &HeaderMap,
 ) -> Result<Response, Response> {
     let repo = resolve_rubygems_repo(&state.db, repo_key).await?;
     if repo.repo_type != RepositoryType::Remote {
         return Err(compact_index_not_served());
     }
-    proxy_remote_document(state, &repo, path, max_bytes, "text/plain; charset=utf-8").await
+    proxy_compact_document(state, &repo, path, max_bytes, headers).await
 }
 
 fn compact_index_not_served() -> Response {
@@ -1772,6 +1853,232 @@ fn dependency_api_not_served() -> Response {
         "Dependency API is not served for Remote RubyGems repositories; use the Compact Index",
     )
         .into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Compact Index conditional requests (#5974)
+// ---------------------------------------------------------------------------
+
+/// A single `bytes=` range. Bundler sends one open-ended range per request to
+/// extend its local `/versions` copy; multi-range requests are ignored and get
+/// the full document rather than a synthetic multipart body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ByteRange {
+    From(usize),
+    Between(usize, usize),
+    Suffix(usize),
+}
+
+fn parse_single_byte_range(value: &str) -> Option<ByteRange> {
+    let spec = value.trim().strip_prefix("bytes=")?;
+    if spec.contains(',') {
+        return None;
+    }
+    let (start, end) = spec.split_once('-')?;
+    if start.is_empty() {
+        let suffix = end.parse().ok()?;
+        return (suffix > 0).then_some(ByteRange::Suffix(suffix));
+    }
+    let start = start.parse().ok()?;
+    if end.is_empty() {
+        return Some(ByteRange::From(start));
+    }
+    let end = end.parse().ok()?;
+    (end >= start).then_some(ByteRange::Between(start, end))
+}
+
+fn resolve_byte_range(range: ByteRange, len: usize) -> Option<(usize, usize)> {
+    if len == 0 {
+        return None;
+    }
+    match range {
+        ByteRange::From(start) => (start < len).then_some((start, len - 1)),
+        ByteRange::Between(start, end) => (start < len).then_some((start, end.min(len - 1))),
+        ByteRange::Suffix(suffix) => {
+            let start = len.saturating_sub(suffix.min(len));
+            Some((start, len - 1))
+        }
+    }
+}
+
+fn strip_weak_prefix(etag: &str) -> &str {
+    etag.strip_prefix("W/").unwrap_or(etag)
+}
+
+/// `If-None-Match` uses weak comparison (RFC 9110 §13.1.2).
+fn weak_etag_eq(left: &str, right: &str) -> bool {
+    strip_weak_prefix(left) == strip_weak_prefix(right)
+}
+
+fn if_none_matches(headers: &HeaderMap, etag: &str) -> bool {
+    headers
+        .get(IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value == "*"
+                || value
+                    .split(',')
+                    .any(|candidate| weak_etag_eq(candidate.trim(), etag))
+        })
+}
+
+/// `If-Range` uses strong comparison: a weak validator must never authorize a
+/// 206 against a document the client may have cached with different bytes.
+fn if_range_matches(value: Option<&HeaderValue>, etag: &str) -> bool {
+    match value {
+        None => true,
+        Some(value) => value
+            .to_str()
+            .is_ok_and(|candidate| !candidate.starts_with("W/") && candidate == etag),
+    }
+}
+
+fn compact_index_etag(upstream_etag: Option<&str>, content: &[u8]) -> String {
+    upstream_etag
+        .map(str::trim)
+        .filter(|etag| !etag.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| cache_headers::compute_etag(content))
+}
+
+/// `Repr-Digest` over the bytes we actually serve. The proxy caches the
+/// selected representation (including its content coding), so the same hash
+/// stays correct for a full serve and for a 206 slice of it.
+fn compact_index_repr_digest(content: &[u8]) -> String {
+    let digest = Sha256::digest(content);
+    format!("sha-256=\"{}\"", BASE64_STANDARD.encode(digest))
+}
+
+struct CompactIndexResponse {
+    content: Bytes,
+    content_type: String,
+    content_encoding: Option<String>,
+    stale_since: Option<chrono::DateTime<chrono::Utc>>,
+    etag: String,
+    repr_digest: String,
+    cache_control: &'static str,
+    allow_ranges: bool,
+}
+
+impl CompactIndexResponse {
+    fn new(
+        content: Bytes,
+        content_type: Option<String>,
+        content_encoding: Option<String>,
+        upstream_etag: Option<&str>,
+        stale_since: Option<chrono::DateTime<chrono::Utc>>,
+        request: &CompactIndexRequest<'_>,
+    ) -> Self {
+        let etag = compact_index_etag(upstream_etag, &content);
+        let repr_digest = compact_index_repr_digest(&content);
+        Self {
+            content,
+            content_type: content_type.unwrap_or_else(|| request.default_content_type.to_string()),
+            content_encoding,
+            stale_since,
+            etag,
+            repr_digest,
+            cache_control: cache_headers::negotiated_cache_control(request.headers),
+            allow_ranges: request.allow_ranges,
+        }
+    }
+
+    fn base(&self, status: StatusCode) -> axum::http::response::Builder {
+        let mut builder = Response::builder()
+            .status(status)
+            .header(ETAG, &self.etag)
+            .header("repr-digest", &self.repr_digest)
+            .header(CACHE_CONTROL, self.cache_control);
+        if self.allow_ranges {
+            builder = builder.header(ACCEPT_RANGES, "bytes");
+        }
+        builder
+    }
+
+    fn not_modified(&self) -> Response {
+        self.base(StatusCode::NOT_MODIFIED)
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    fn full(&self) -> Response {
+        let mut builder = self
+            .base(StatusCode::OK)
+            .header(CONTENT_TYPE, &self.content_type)
+            .header(CONTENT_LENGTH, self.content.len().to_string());
+        if let Some(encoding) = &self.content_encoding {
+            builder = builder.header(CONTENT_ENCODING, encoding);
+        }
+        proxy_helpers::apply_stale_markers(builder, self.stale_since)
+            .body(Body::from(self.content.clone()))
+            .unwrap()
+    }
+
+    fn partial(&self, start: usize, end: usize) -> Response {
+        let slice = self.content.slice(start..=end);
+        let total = self.content.len();
+        let mut builder = self
+            .base(StatusCode::PARTIAL_CONTENT)
+            .header(CONTENT_TYPE, &self.content_type)
+            .header(CONTENT_LENGTH, slice.len().to_string())
+            .header(CONTENT_RANGE, format!("bytes {start}-{end}/{total}"));
+        if let Some(encoding) = &self.content_encoding {
+            builder = builder.header(CONTENT_ENCODING, encoding);
+        }
+        proxy_helpers::apply_stale_markers(builder, self.stale_since)
+            .body(Body::from(slice))
+            .unwrap()
+    }
+
+    fn unsatisfiable(&self) -> Response {
+        self.base(StatusCode::RANGE_NOT_SATISFIABLE)
+            .header(CONTENT_RANGE, format!("bytes */{}", self.content.len()))
+            .body(Body::empty())
+            .unwrap()
+    }
+}
+
+/// Build a Compact Index response that reuses the cached upstream validator
+/// and serves ranges of the cached bytes. `If-None-Match` wins over `Range`,
+/// `If-Range` guards the 206, and an unusable range falls back to the full
+/// document rather than an error.
+fn forward_compact_index(
+    content: Bytes,
+    content_type: Option<String>,
+    content_encoding: Option<String>,
+    upstream_etag: Option<&str>,
+    stale_since: Option<chrono::DateTime<chrono::Utc>>,
+    request: &CompactIndexRequest<'_>,
+) -> Response {
+    let response = CompactIndexResponse::new(
+        content,
+        content_type,
+        content_encoding,
+        upstream_etag,
+        stale_since,
+        request,
+    );
+    if if_none_matches(request.headers, &response.etag) {
+        return response.not_modified();
+    }
+    if request.allow_ranges {
+        let range = request
+            .headers
+            .get(RANGE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(parse_single_byte_range);
+        let Some(range) = range else {
+            return response.full();
+        };
+        if !if_range_matches(request.headers.get(IF_RANGE), &response.etag) {
+            return response.full();
+        }
+        return match resolve_byte_range(range, response.content.len()) {
+            Some((start, end)) => response.partial(start, end),
+            None => response.unsatisfiable(),
+        };
+    }
+    response.full()
 }
 
 /// True when `segment` can be appended to an upstream URL as one path
@@ -1814,6 +2121,240 @@ mod tests {
         ] {
             assert!(!is_safe_path_segment(bad), "{bad}");
         }
+    }
+
+    #[test]
+    fn test_parse_single_byte_range() {
+        assert_eq!(
+            parse_single_byte_range("bytes=0-9"),
+            Some(ByteRange::Between(0, 9))
+        );
+        assert_eq!(
+            parse_single_byte_range(" bytes=10- "),
+            Some(ByteRange::From(10))
+        );
+        assert_eq!(
+            parse_single_byte_range("bytes=-5"),
+            Some(ByteRange::Suffix(5))
+        );
+        assert_eq!(parse_single_byte_range("bytes=0-1,3-4"), None);
+        assert_eq!(parse_single_byte_range("bytes=5-3"), None);
+        assert_eq!(parse_single_byte_range("bytes=-0"), None);
+        assert_eq!(parse_single_byte_range("items=0-9"), None);
+        assert_eq!(parse_single_byte_range("bytes=abc"), None);
+    }
+
+    #[test]
+    fn test_resolve_byte_range() {
+        assert_eq!(
+            resolve_byte_range(ByteRange::Between(2, 100), 10),
+            Some((2, 9))
+        );
+        assert_eq!(resolve_byte_range(ByteRange::From(9), 10), Some((9, 9)));
+        assert_eq!(resolve_byte_range(ByteRange::From(10), 10), None);
+        assert_eq!(resolve_byte_range(ByteRange::Suffix(4), 10), Some((6, 9)));
+        assert_eq!(resolve_byte_range(ByteRange::Suffix(40), 10), Some((0, 9)));
+        assert_eq!(resolve_byte_range(ByteRange::From(0), 0), None);
+    }
+
+    #[test]
+    fn test_compact_index_validators() {
+        assert_eq!(
+            compact_index_etag(Some("\"upstream-v1\""), b"body"),
+            "\"upstream-v1\""
+        );
+        assert_eq!(
+            compact_index_etag(Some("  "), b"body"),
+            cache_headers::compute_etag(b"body")
+        );
+        assert_eq!(
+            compact_index_repr_digest(b"abc"),
+            "sha-256=\"ungWv48Bz+pBQUDeXa4iI7ADYaOWF3qctBD/YfIAFa0=\""
+        );
+    }
+
+    #[test]
+    fn test_compact_index_conditional_predicates() {
+        let etag = "\"v1\"";
+        let mut headers = HeaderMap::new();
+        headers.insert(IF_NONE_MATCH, HeaderValue::from_static("W/\"v0\", \"v1\""));
+        assert!(if_none_matches(&headers, etag));
+        headers.insert(IF_NONE_MATCH, HeaderValue::from_static("*"));
+        assert!(if_none_matches(&headers, etag));
+        headers.insert(IF_NONE_MATCH, HeaderValue::from_static("\"v2\""));
+        assert!(!if_none_matches(&headers, etag));
+
+        assert!(if_range_matches(None, etag));
+        assert!(if_range_matches(
+            Some(&HeaderValue::from_static("\"v1\"")),
+            etag
+        ));
+        assert!(!if_range_matches(
+            Some(&HeaderValue::from_static("W/\"v1\"")),
+            etag
+        ));
+        assert!(!if_range_matches(
+            Some(&HeaderValue::from_static("\"v2\"")),
+            etag
+        ));
+    }
+
+    #[allow(clippy::disallowed_methods)] // STREAMING-EXEMPT: test-only bounded read of a small synthetic response body.
+    async fn response_body(response: Response) -> Bytes {
+        axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("buffer compact index response")
+    }
+
+    fn compact_request(headers: &HeaderMap, allow_ranges: bool) -> CompactIndexRequest<'_> {
+        CompactIndexRequest {
+            default_content_type: "text/plain; charset=utf-8",
+            headers,
+            allow_ranges,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_forward_compact_index_answers_304_for_matching_etag() {
+        let mut headers = HeaderMap::new();
+        headers.insert(IF_NONE_MATCH, HeaderValue::from_static("\"v1\""));
+        let response = forward_compact_index(
+            Bytes::from_static(b"versions body"),
+            Some("text/plain; charset=utf-8".to_string()),
+            None,
+            Some("\"v1\""),
+            None,
+            &compact_request(&headers, true),
+        );
+
+        assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(
+            response.headers().get(ETAG).unwrap().to_str().unwrap(),
+            "\"v1\""
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("repr-digest")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            compact_index_repr_digest(b"versions body")
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(ACCEPT_RANGES)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "bytes"
+        );
+        assert!(response_body(response).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_forward_compact_index_answers_206_for_single_range() {
+        let mut headers = HeaderMap::new();
+        headers.insert(RANGE, HeaderValue::from_static("bytes=2-5"));
+        headers.insert(IF_RANGE, HeaderValue::from_static("\"v1\""));
+        let response = forward_compact_index(
+            Bytes::from_static(b"0123456789"),
+            None,
+            None,
+            Some("\"v1\""),
+            None,
+            &compact_request(&headers, true),
+        );
+
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            response
+                .headers()
+                .get(CONTENT_RANGE)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "bytes 2-5/10"
+        );
+        assert_eq!(response_body(response).await, Bytes::from_static(b"2345"));
+    }
+
+    #[tokio::test]
+    async fn test_forward_compact_index_falls_back_to_full_document() {
+        for (range, if_range) in [("bytes=0-1,3-4", None), ("bytes=0-1", Some("\"stale\""))] {
+            let mut headers = HeaderMap::new();
+            headers.insert(RANGE, HeaderValue::from_str(range).unwrap());
+            if let Some(if_range) = if_range {
+                headers.insert(IF_RANGE, HeaderValue::from_str(if_range).unwrap());
+            }
+            let response = forward_compact_index(
+                Bytes::from_static(b"versions body"),
+                None,
+                None,
+                Some("\"v1\""),
+                None,
+                &compact_request(&headers, true),
+            );
+
+            assert_eq!(response.status(), StatusCode::OK, "{range} {if_range:?}");
+            assert_eq!(
+                response_body(response).await,
+                Bytes::from_static(b"versions body")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_forward_compact_index_ignores_range_when_not_allowed() {
+        let mut headers = HeaderMap::new();
+        headers.insert(RANGE, HeaderValue::from_static("bytes=0-3"));
+        headers.insert(IF_RANGE, HeaderValue::from_static("\"v1\""));
+        let response = forward_compact_index(
+            Bytes::from_static(b"names body"),
+            None,
+            None,
+            Some("\"v1\""),
+            None,
+            &compact_request(&headers, false),
+        );
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().get(ACCEPT_RANGES).is_none());
+        assert_eq!(
+            response.headers().get(ETAG).unwrap().to_str().unwrap(),
+            "\"v1\""
+        );
+        assert_eq!(
+            response_body(response).await,
+            Bytes::from_static(b"names body")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_forward_compact_index_answers_416_for_unsatisfiable_range() {
+        let mut headers = HeaderMap::new();
+        headers.insert(RANGE, HeaderValue::from_static("bytes=99-"));
+        let response = forward_compact_index(
+            Bytes::from_static(b"short"),
+            None,
+            None,
+            Some("\"v1\""),
+            None,
+            &compact_request(&headers, true),
+        );
+
+        assert_eq!(response.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(
+            response
+                .headers()
+                .get(CONTENT_RANGE)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "bytes */5"
+        );
+        assert!(response_body(response).await.is_empty());
     }
 
     #[test]
@@ -2984,6 +3525,84 @@ mod db_cov_tests {
             .await;
     }
 
+    /// As [`mount_doc`], with the upstream validator the Compact Index now
+    /// stores and replays (#5974).
+    async fn mount_doc_with_etag(
+        server: &wiremock::MockServer,
+        path: &str,
+        ct: &str,
+        body: &[u8],
+        etag: &str,
+    ) {
+        use wiremock::matchers::{method, path as exact_path};
+        use wiremock::{Mock, ResponseTemplate};
+        Mock::given(method("GET"))
+            .and(exact_path(path))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(body.to_vec())
+                    .insert_header("content-type", ct)
+                    .insert_header("etag", etag),
+            )
+            .mount(server)
+            .await;
+    }
+
+    fn get_with_headers(
+        uri: String,
+        headers: &[(&'static str, &str)],
+    ) -> axum::http::Request<axum::body::Body> {
+        let mut request = tdh::get(uri);
+        for (name, value) in headers {
+            request.headers_mut().insert(
+                *name,
+                axum::http::HeaderValue::from_str(value).expect("valid header value"),
+            );
+        }
+        request
+    }
+
+    async fn expire_mutable_paths(pool: &sqlx::PgPool, repo_id: uuid::Uuid) {
+        sqlx::query(
+            "INSERT INTO repository_config (repository_id, key, value) \
+             VALUES ($1, 'cache_ttl_secs', '0')",
+        )
+        .bind(repo_id)
+        .execute(pool)
+        .await
+        .expect("set cache_ttl_secs");
+    }
+
+    struct VersionsFixture {
+        fx: tdh::Fixture,
+        upstream: wiremock::MockServer,
+        state: crate::api::SharedState,
+        _cache_dir: tempfile::TempDir,
+        uri: String,
+    }
+
+    async fn remote_versions_with_etag(etag: &str, body: &[u8]) -> Option<VersionsFixture> {
+        let fx = tdh::Fixture::setup("remote", "rubygems").await?;
+        let upstream = wiremock::MockServer::start().await;
+        mount_doc_with_etag(
+            &upstream,
+            "/versions",
+            "text/plain; charset=utf-8",
+            body,
+            etag,
+        )
+        .await;
+        let (state, cache_dir) = tdh::rewire_remote_proxy(&fx, &upstream.uri()).await;
+        let uri = format!("/{}/versions", fx.repo_key);
+        Some(VersionsFixture {
+            fx,
+            upstream,
+            state,
+            _cache_dir: cache_dir,
+            uri,
+        })
+    }
+
     const VERSIONS_DOC: &[u8] =
         b"created_at: 2026-11-01T00:00:04Z\n---\nrexml 3.4.3,3.4.4 0123456789abcdef0123456789abcdef\n";
     const NAMES_DOC: &[u8] = b"---\nrake\nrexml\n";
@@ -3049,6 +3668,152 @@ mod db_cov_tests {
         for (uri, status) in refused {
             assert_eq!(status, axum::http::StatusCode::NOT_FOUND, "{uri}");
         }
+    }
+
+    /// #5974: Bundler revalidates its local `/versions` copy with the ETag the
+    /// upstream gave us. A hit must be a bodyless 304, not another 24 MB.
+    #[tokio::test]
+    async fn test_rubygems_compact_index_answers_304_for_matching_etag() {
+        let Some(fixture) = remote_versions_with_etag("\"v1\"", VERSIONS_DOC).await else {
+            return;
+        };
+
+        let app = tdh::router_anon(super::router(), fixture.state.clone());
+        let (status, _, headers) = tdh::send_with_headers(app, tdh::get(fixture.uri.clone())).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let etag = headers
+            .get(axum::http::header::ETAG)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(etag, "\"v1\"");
+
+        let app = tdh::router_anon(super::router(), fixture.state.clone());
+        let (status, body, headers) = tdh::send_with_headers(
+            app,
+            get_with_headers(fixture.uri, &[("if-none-match", &etag)]),
+        )
+        .await;
+        fixture.fx.teardown().await;
+
+        assert_eq!(status, axum::http::StatusCode::NOT_MODIFIED);
+        assert!(body.is_empty(), "304 must not carry the versions body");
+        assert_eq!(
+            headers
+                .get(axum::http::header::ETAG)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            etag
+        );
+        assert_eq!(
+            headers.get("repr-digest").unwrap().to_str().unwrap(),
+            super::compact_index_repr_digest(VERSIONS_DOC)
+        );
+    }
+
+    /// #5974: Bundler appends to its local `/versions` copy with a single
+    /// open-ended byte range guarded by the ETag it already has.
+    #[tokio::test]
+    async fn test_rubygems_compact_index_answers_206_for_range_on_versions() {
+        let Some(fixture) = remote_versions_with_etag("\"v1\"", VERSIONS_DOC).await else {
+            return;
+        };
+
+        let app = tdh::router_anon(super::router(), fixture.state.clone());
+        let (status, body, headers) = tdh::send_with_headers(
+            app,
+            get_with_headers(
+                fixture.uri,
+                &[("range", "bytes=0-9"), ("if-range", "\"v1\"")],
+            ),
+        )
+        .await;
+        fixture.fx.teardown().await;
+
+        assert_eq!(status, axum::http::StatusCode::PARTIAL_CONTENT);
+        assert_eq!(&body[..], &VERSIONS_DOC[..10]);
+        assert_eq!(
+            headers
+                .get(axum::http::header::CONTENT_RANGE)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            format!("bytes 0-9/{}", VERSIONS_DOC.len())
+        );
+        assert_eq!(
+            headers
+                .get(axum::http::header::ACCEPT_RANGES)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "bytes"
+        );
+        assert_eq!(
+            headers
+                .get(axum::http::header::ETAG)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "\"v1\""
+        );
+    }
+
+    /// #5974: a stale cached copy revalidated against a changed upstream must
+    /// answer the full 200 with the new bytes and validator, not a 304 against
+    /// the client's now-stale ETag.
+    #[tokio::test]
+    async fn test_rubygems_compact_index_full_200_when_cached_copy_changed() {
+        let Some(fixture) = remote_versions_with_etag("\"v1\"", VERSIONS_DOC).await else {
+            return;
+        };
+        expire_mutable_paths(&fixture.fx.pool, fixture.fx.repo_id).await;
+
+        let app = tdh::router_anon(super::router(), fixture.state.clone());
+        let (status, _, headers) = tdh::send_with_headers(app, tdh::get(fixture.uri.clone())).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let old_etag = headers
+            .get(axum::http::header::ETAG)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        const CHANGED_DOC: &[u8] =
+            b"created_at: 2026-11-22T00:00:04Z\n---\nrexml 3.4.5,3.4.6 abcdef0123456789abcdef01234567\n";
+        use wiremock::matchers::{method, path as exact_path};
+        use wiremock::{Mock, ResponseTemplate};
+        Mock::given(method("GET"))
+            .and(exact_path("/versions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(CHANGED_DOC.to_vec())
+                    .insert_header("content-type", "text/plain; charset=utf-8")
+                    .insert_header("etag", "\"v2\""),
+            )
+            .with_priority(1)
+            .mount(&fixture.upstream)
+            .await;
+
+        let app = tdh::router_anon(super::router(), fixture.state.clone());
+        let (status, body, headers) = tdh::send_with_headers(
+            app,
+            get_with_headers(fixture.uri, &[("if-none-match", &old_etag)]),
+        )
+        .await;
+        fixture.fx.teardown().await;
+
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(&body[..], CHANGED_DOC);
+        assert_eq!(
+            headers
+                .get(axum::http::header::ETAG)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "\"v2\""
+        );
     }
 
     /// The Compact Index is only proxied: a hosted repo still answers 404 on
@@ -3973,7 +4738,9 @@ mod remote_document_budget_5973 {
                         &repo,
                         path,
                         LARGE_METADATA_MAX_BYTES,
-                        "text/plain; charset=utf-8",
+                        RemoteDocumentMode::Verbatim {
+                            default_content_type: "text/plain; charset=utf-8",
+                        },
                         budget,
                     )
                     .await
@@ -4236,7 +5003,9 @@ mod remote_document_budget_5973 {
                     &repo,
                     path,
                     LARGE_METADATA_MAX_BYTES,
-                    "text/plain; charset=utf-8",
+                    RemoteDocumentMode::Verbatim {
+                        default_content_type: "text/plain; charset=utf-8",
+                    },
                     budget,
                 )
                 .await

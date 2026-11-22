@@ -2674,6 +2674,7 @@ async fn download_root(
                 content_type,
                 content_encoding,
                 stale_since,
+                ..
             } = proxy
                 .fetch_artifact_with_cache_path(&remote, "", "_root_")
                 .await
@@ -2705,6 +2706,7 @@ async fn download_root(
                         content_type,
                         content_encoding,
                         stale_since,
+                        ..
                     }) = proxy
                         .fetch_artifact_with_cache_path(&remote, "", "_root_")
                         .await
