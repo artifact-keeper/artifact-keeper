@@ -5126,33 +5126,60 @@ mod poll_tests {
     }
 }
 
-/// Pool checkouts counted by [`counting_pool`] (#6318).
+tokio::task_local! {
+    /// The counter of the request a checkout belongs to, set by
+    /// [`AcquireCounter::scoped`] (#6318).
+    static ACQUIRE_SCOPE: AcquireCounter;
+}
+
+/// Pool checkouts counted by [`counting_pool`] (#6318), split by whether the
+/// checkout was made by the task running [`AcquireCounter::scoped`] (the
+/// request itself) or by a detached task it spawned.
+///
+/// sqlx runs `before_acquire` / `after_connect` inside the acquiring task's
+/// own `acquire()` future, so a task-local tells the two apart. Detached work
+/// (the fire-and-forget audit insert, `tokio::spawn`ed after the commit) races
+/// the end of the request: counting it made the request count 11 on one host
+/// and 12 on another. Those checkouts are kept apart in `detached`.
 #[derive(Clone, Default)]
 pub struct AcquireCounter {
-    count: Arc<std::sync::atomic::AtomicUsize>,
+    scoped: Arc<std::sync::atomic::AtomicUsize>,
+    detached: Arc<std::sync::atomic::AtomicUsize>,
     sites: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 impl AcquireCounter {
-    /// Checkouts since the pool was built.
-    pub fn get(&self) -> usize {
-        self.count.load(std::sync::atomic::Ordering::SeqCst)
+    /// Run `fut` as the request whose checkouts are counted, and return its
+    /// output with the number of checkouts it made on its own task.
+    pub(crate) async fn scoped<F: std::future::Future>(&self, fut: F) -> (F::Output, usize) {
+        let before = self.scoped.load(std::sync::atomic::Ordering::SeqCst);
+        let out = ACQUIRE_SCOPE.scope(self.clone(), fut).await;
+        let after = self.scoped.load(std::sync::atomic::Ordering::SeqCst);
+        (out, after - before)
     }
 
-    /// With `AK_TEST_TRACE_ACQUIRES=1`, the backend frames of each checkout
-    /// from index `from` on, one line per checkout (diagnostics only).
-    pub fn sites_since(&self, from: usize) -> Vec<String> {
-        self.sites
-            .lock()
-            .unwrap()
-            .iter()
-            .skip(from)
-            .cloned()
-            .collect()
+    /// Checkouts made outside any [`Self::scoped`] request (detached tasks,
+    /// fixture setup).
+    pub fn detached(&self) -> usize {
+        self.detached.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// With `AK_TEST_TRACE_ACQUIRES=1`, the backend frames of every checkout
+    /// so far, tagged `request` or `detached` (diagnostics only).
+    pub fn sites(&self) -> Vec<String> {
+        self.sites.lock().unwrap().clone()
     }
 
     fn record(&self) {
-        self.count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let in_scope = ACQUIRE_SCOPE
+            .try_with(|scope| Arc::ptr_eq(&scope.scoped, &self.scoped))
+            .unwrap_or(false);
+        let (counter, tag) = if in_scope {
+            (&self.scoped, "request")
+        } else {
+            (&self.detached, "detached")
+        };
+        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if std::env::var_os("AK_TEST_TRACE_ACQUIRES").is_some() {
             let trace = std::backtrace::Backtrace::force_capture().to_string();
             let frames: Vec<&str> = trace
@@ -5164,16 +5191,18 @@ impl AcquireCounter {
                 .map(|l| l.split_once(": ").map_or(l, |(_, f)| f))
                 .take(4)
                 .collect();
-            self.sites.lock().unwrap().push(frames.join(" <- "));
-        } else {
-            self.sites.lock().unwrap().push(String::new());
+            self.sites
+                .lock()
+                .unwrap()
+                .push(format!("[{tag}] {}", frames.join(" <- ")));
         }
     }
 }
 
 /// A pool on the test database that counts every checkout (#6318): an idle
 /// connection handed out runs `before_acquire`, a new one `after_connect`, so
-/// each acquire increments the counter exactly once. Used to pin how many
+/// each acquire increments the counter exactly once (in the acquiring task,
+/// which is what lets [`AcquireCounter::scoped`] attribute it). Used to pin how many
 /// times one upload goes back to the pool, the per-upload connection demand
 /// that sets the concurrency limit under a small pool.
 pub(crate) async fn counting_pool(max_connections: u32) -> Option<(PgPool, AcquireCounter)> {
