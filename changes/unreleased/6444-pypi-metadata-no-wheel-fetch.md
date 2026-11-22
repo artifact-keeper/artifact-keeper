@@ -1,0 +1,5 @@
+---
+section: Fixed
+issues: [#6444]
+---
+- **A PyPI `.metadata` request no longer downloads the whole wheel under `fail_closed`** (#6444). When a Remote's cached wheel had no usable scan verdict and its cached copy was stale, the PEP 658 metadata gate (#6439) ran the wheel's own download path: it re-read the upstream index and downloaded the whole wheel to answer a request for a few KB of METADATA, so a resolver reading many candidate versions paid one wheel download per candidate. The gate now runs the wheel's scan gate on the bytes already in the proxy cache, fresh or stale, and never contacts the upstream. The metadata still mirrors the wheel: a blocking verdict answers `403`, a scan that cannot conclude answers the wheel's `423`, and a cached body that cannot be read or does not match its sidecar's digest answers `503` with `Retry-After`. The scan is the one the wheel's own request joins or reuses, so the wheel is not scanned twice. Status-code change: while the upstream is unreachable, such a `.metadata` request answered the refetch's `502`; it now answers from the cached copy. There is no setting for this.
