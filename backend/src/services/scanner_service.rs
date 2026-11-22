@@ -1918,10 +1918,10 @@ impl ScanWorkspace {
             // npm there is no merge concern: a lockfile the archive happens to
             // ship stays exactly where it is and is graded on its own, and the
             // pin-scoped `dedupe_findings` collapses the overlap. Cargo is the
-            // exception: every dependency lockfile or manifest a crate ships,
-            // its own `Cargo.lock` and any other ecosystem's, is removed first,
-            // because cargo never installs from any of them (#5143, #6440, see
-            // [`Self::drop_bundled_dependency_files`]).
+            // exception: a crate's own `Cargo.lock` is removed first, and so is
+            // any other ecosystem's lockfile when the crate has no build script
+            // or proc-macro, because cargo never installs from any of them
+            // (#5143, #6440, see [`Self::drop_bundled_dependency_files`]).
             ComponentEcosystem::RubyGems => {
                 Self::write_pin_file(
                     workspace,
@@ -2145,9 +2145,11 @@ impl ScanWorkspace {
         Ok(())
     }
 
-    /// Remove every dependency lockfile or manifest the crate itself ships
-    /// ([`BUNDLED_DEPENDENCY_FILE_NAMES`]), so a pinned `.crate` is graded on its
-    /// own coordinate and nothing else (#5143, #6440).
+    /// Remove the dependency lockfiles and manifests the crate itself ships, so
+    /// a pinned `.crate` is graded on its own coordinate and nothing else
+    /// (#5143, #6440). Its own `Cargo.lock` always goes. The other ecosystems'
+    /// files ([`BUNDLED_DEPENDENCY_FILE_NAMES`]) go only when the crate runs no
+    /// code while a dependent builds it ([`crate_runs_code_at_build`]).
     ///
     /// Many published crates (every binary crate, and libraries whose authors
     /// commit one) ship a `Cargo.lock`. Both engines catalog it, so the crate
@@ -2166,11 +2168,14 @@ impl ScanWorkspace {
     /// dependency's `Cargo.lock`, `cargo install --locked`, downloads every
     /// locked crate through the same registry, where each is graded on its
     /// own coordinate. Nothing in cargo installs the npm, Go, Composer or other
-    /// packages another ecosystem's lockfile names. Removing these files
-    /// therefore loses no coverage for what a consumer installs. Bundled
-    /// binaries and archives (a vendored `.jar`, a prebuilt library) are not
-    /// on the list and stay graded, because a build script can run or link
-    /// them.
+    /// packages another ecosystem's lockfile names. A build script or a
+    /// proc-macro can, though: it runs arbitrary code during the dependent's
+    /// build and could install from a bundled `package-lock.json` or
+    /// `go.mod`. So a crate that declares a build script, or a proc-macro
+    /// library, keeps its foreign lockfiles graded, as does a crate whose
+    /// manifest cannot be read. Bundled binaries and archives (a vendored
+    /// `.jar`, a prebuilt library) are on no list and stay graded, because a
+    /// build script can run or link them.
     ///
     /// The crate's identity was already checked against its own `Cargo.toml`
     /// ([`pin_agrees_with_content`]) before a pin exists, and the pin is
@@ -2186,7 +2191,12 @@ impl ScanWorkspace {
     async fn drop_bundled_dependency_files(extract_root: &Path) {
         let root = extract_root.to_path_buf();
         let removed = tokio::task::spawn_blocking(move || {
-            remove_files_named(&root, BUNDLED_DEPENDENCY_FILE_NAMES)
+            let names: &[&str] = if crate_runs_code_at_build(&root) {
+                &[CARGO_LOCK_NAME]
+            } else {
+                BUNDLED_DEPENDENCY_FILE_NAMES
+            };
+            remove_files_named(&root, names)
         })
         .await;
         match removed {
@@ -2683,6 +2693,51 @@ fn widen_owner_modes(root: &Path) {
     }
 }
 
+/// Whether the crate unpacked under `extract_root` can run code while a
+/// dependent builds it: a build script or a proc-macro library (#6440). Such a
+/// crate keeps its non-Cargo lockfiles graded, because its code could install
+/// from them ([`ScanWorkspace::drop_bundled_dependency_files`]).
+///
+/// Read from the crate's own `Cargo.toml`, the single manifest one level
+/// below `extract_root` (`<name>-<version>/Cargo.toml`, as `cargo package`
+/// lays it out). `cargo package` writes `build = false` when there is no build
+/// script; an absent `build` key falls back to cargo's own rule, a `build.rs`
+/// next to the manifest. Anything that cannot be decided (no manifest, more
+/// than one, unreadable, unparsable, an unexpected `build` value) answers
+/// `true`, so the files stay graded. Blocking; run it off the async workers.
+fn crate_runs_code_at_build(extract_root: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(extract_root) else {
+        return true;
+    };
+    let mut manifests = entries
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .map(|e| e.path().join("Cargo.toml"))
+        .filter(|p| p.is_file());
+    let (Some(manifest), None) = (manifests.next(), manifests.next()) else {
+        return true;
+    };
+    let Some(parsed) = std::fs::read_to_string(&manifest)
+        .ok()
+        .and_then(|body| toml::from_str::<toml::Value>(&body).ok())
+    else {
+        return true;
+    };
+    let is_proc_macro = parsed
+        .get("lib")
+        .and_then(|lib| lib.get("proc-macro").or_else(|| lib.get("proc_macro")))
+        .and_then(toml::Value::as_bool)
+        .unwrap_or(false);
+    if is_proc_macro {
+        return true;
+    }
+    match parsed.get("package").and_then(|p| p.get("build")) {
+        Some(toml::Value::Boolean(false)) => false,
+        None => manifest.with_file_name("build.rs").exists(),
+        Some(_) => true,
+    }
+}
+
 /// Remove every regular file under `root` whose name is exactly one of
 /// `names`, at any depth, and return how many were removed. Symlinks are
 /// neither followed nor removed. Blocking; run it off the async workers.
@@ -2729,13 +2784,14 @@ pub(crate) const GEMFILE_LOCK_NAME: &str = "Gemfile.lock";
 /// one that does ship it has it removed before the pin is written (#5143).
 pub(crate) const CARGO_LOCK_NAME: &str = "Cargo.lock";
 
-/// Dependency lockfiles and manifests that a pinned `.crate` has removed from
-/// its scan workspace before the pin is written (#5143, #6440,
-/// [`ScanWorkspace::drop_bundled_dependency_files`]). Each is a file the
-/// bundled engines catalog in directory mode, and none is ever read by cargo
-/// on a dependent's behalf: the crate's own `Cargo.lock`, then the lockfiles
-/// and dependency manifests of other ecosystems that crates ship as test
-/// fixtures, examples or bindings. Names match exactly, at any depth.
+/// Dependency lockfiles and manifests that a pinned `.crate` with no build
+/// script and no proc-macro has removed from its scan workspace before the pin
+/// is written (#5143, #6440, [`ScanWorkspace::drop_bundled_dependency_files`];
+/// a crate that runs code at build time loses only its `Cargo.lock`). Each is a
+/// file the bundled engines catalog in directory mode, and none is ever read
+/// by cargo on a dependent's behalf: the crate's own `Cargo.lock`, then the
+/// lockfiles and dependency manifests of other ecosystems that crates ship as
+/// test fixtures, examples or bindings. Names match exactly, at any depth.
 /// Binaries and archives are deliberately absent: they stay graded.
 pub(crate) const BUNDLED_DEPENDENCY_FILE_NAMES: &[&str] = &[
     CARGO_LOCK_NAME,
@@ -3031,8 +3087,9 @@ pub(crate) fn gemfile_lock_pin(name: &str, version: &str) -> String {
 /// Many crates do ship a `Cargo.lock` (every binary crate does). That file
 /// describes the author's build, which no consumer resolves against, so it is
 /// removed from the workspace, with any other ecosystem's lockfile the crate
-/// bundles, and this pin is the crate's only gradeable component (#5143,
-/// #6440, [`ScanWorkspace::drop_bundled_dependency_files`]).
+/// bundles when it has no build script or proc-macro, and this pin is the
+/// crate's only gradeable Cargo component (#5143, #6440,
+/// [`ScanWorkspace::drop_bundled_dependency_files`]).
 ///
 /// `checksum` is deliberately omitted: it is absent in real lockfiles for
 /// path/git sources and neither parser requires it, so inventing one would add
@@ -18292,38 +18349,56 @@ mod tests {
     /// each naming a package with a critical advisory, plus a vendored jar and
     /// files whose names only resemble a lockfile.
     fn crate_with_foreign_lockfiles() -> Bytes {
-        Bytes::from(build_tar_gz(&[
-            (
-                "demo-1.0.0/Cargo.toml",
-                b"[package]\nname = \"demo\"\nversion = \"1.0.0\"\n".to_vec(),
-            ),
-            ("demo-1.0.0/Cargo.lock", BUNDLED_CARGO_LOCK.as_bytes().to_vec()),
-            (
-                "demo-1.0.0/src/tests/verification_mock/go.mod",
-                b"module mock\n\ngo 1.17\n\nrequire golang.org/x/crypto v0.0.0-20211117183948-ae814b36b871\n"
-                    .to_vec(),
-            ),
-            (
-                "demo-1.0.0/src/tests/verification_mock/go.sum",
-                b"golang.org/x/crypto v0.0.0-20211117183948-ae814b36b871 h1:x=\n".to_vec(),
-            ),
-            (
-                "demo-1.0.0/examples/frontend/package-lock.json",
-                br#"{"name":"f","lockfileVersion":3,"packages":{"node_modules/form-data":{"version":"4.0.0"}}}"#
-                    .to_vec(),
-            ),
-            (
-                "demo-1.0.0/tests/sakila/composer.lock",
-                br#"{"packages":[{"name":"doctrine/dbal","version":"3.0.0"}]}"#.to_vec(),
-            ),
-            ("demo-1.0.0/android/libs/helper.jar", b"PK\x03\x04".to_vec()),
-            ("demo-1.0.0/tests/go.mod.orig", b"module old\n".to_vec()),
-            ("demo-1.0.0/src/lib.rs", b"// lib\n".to_vec()),
-        ]))
+        crate_with_foreign_lockfiles_and(
+            "[package]\nname = \"demo\"\nversion = \"1.0.0\"\nbuild = false\n",
+            &[],
+        )
     }
 
-    /// #6440: a pinned `.crate` drops every bundled dependency lockfile or
-    /// manifest, not only its own `Cargo.lock`. Cargo never installs from a Go,
+    /// [`crate_with_foreign_lockfiles`] with the given `Cargo.toml` and extra
+    /// entries (paths relative to the crate root).
+    fn crate_with_foreign_lockfiles_and(manifest: &str, extra: &[(&str, &[u8])]) -> Bytes {
+        let mut entries: Vec<(String, Vec<u8>)> = extra
+            .iter()
+            .map(|(path, body)| (format!("demo-1.0.0/{path}"), body.to_vec()))
+            .collect();
+        entries.push(("demo-1.0.0/Cargo.toml".into(), manifest.as_bytes().to_vec()));
+        for (path, body) in FOREIGN_LOCKFILE_CRATE_ENTRIES {
+            entries.push((format!("demo-1.0.0/{path}"), body.to_vec()));
+        }
+        let borrowed: Vec<(&str, Vec<u8>)> = entries
+            .iter()
+            .map(|(p, b)| (p.as_str(), b.clone()))
+            .collect();
+        Bytes::from(build_tar_gz(&borrowed))
+    }
+
+    const FOREIGN_LOCKFILE_CRATE_ENTRIES: &[(&str, &[u8])] = &[
+        ("Cargo.lock", BUNDLED_CARGO_LOCK.as_bytes()),
+        (
+            "src/tests/verification_mock/go.mod",
+            b"module mock\n\ngo 1.17\n\nrequire golang.org/x/crypto v0.0.0-20211117183948-ae814b36b871\n",
+        ),
+        (
+            "src/tests/verification_mock/go.sum",
+            b"golang.org/x/crypto v0.0.0-20211117183948-ae814b36b871 h1:x=\n",
+        ),
+        (
+            "examples/frontend/package-lock.json",
+            br#"{"name":"f","lockfileVersion":3,"packages":{"node_modules/form-data":{"version":"4.0.0"}}}"#,
+        ),
+        (
+            "tests/sakila/composer.lock",
+            br#"{"packages":[{"name":"doctrine/dbal","version":"3.0.0"}]}"#,
+        ),
+        ("android/libs/helper.jar", b"PK\x03\x04"),
+        ("tests/go.mod.orig", b"module old\n"),
+        ("src/lib.rs", b"// lib\n"),
+    ];
+
+    /// #6440: a pinned `.crate` with no build script (`build = false`) drops
+    /// every bundled dependency lockfile or manifest, not only its own
+    /// `Cargo.lock`. Cargo never installs from a Go,
     /// npm or Composer lockfile inside a crate, so none of them may reach
     /// either engine; the pin is the only dependency file left. Everything
     /// else the crate ships, including a vendored jar and look-alike names,
@@ -18416,6 +18491,82 @@ mod tests {
             found.contains(&PathBuf::from(SCAN_ARCHIVE_SUBDIR).join("example.com/m@v1.0.0/go.mod")),
             "{found:?}"
         );
+    }
+
+    /// #6440 guard: a crate that can run code while a dependent builds it (a
+    /// build script or a proc-macro) could install from a bundled lockfile,
+    /// so it keeps its foreign lockfiles graded and loses only its own
+    /// `Cargo.lock` (#5143). A crate whose `Cargo.toml` names no `build`
+    /// follows cargo's own rule: a `build.rs` next to it is a build script. A
+    /// manifest that cannot be read keeps the files too.
+    #[tokio::test]
+    async fn test_crate_running_code_at_build_keeps_foreign_lockfiles_6440() {
+        let pin_file = PathBuf::from(SCAN_PIN_SUBDIR).join(CARGO_LOCK_NAME);
+        let mut foreign_kept: Vec<PathBuf> = [
+            "demo-1.0.0/examples/frontend/package-lock.json",
+            "demo-1.0.0/src/tests/verification_mock/go.mod",
+            "demo-1.0.0/src/tests/verification_mock/go.sum",
+            "demo-1.0.0/tests/sakila/composer.lock",
+        ]
+        .iter()
+        .map(|p| PathBuf::from(SCAN_ARCHIVE_SUBDIR).join(p))
+        .collect();
+        foreign_kept.push(pin_file.clone());
+        foreign_kept.sort();
+        let pin_only = vec![pin_file];
+        let pkg = "[package]\nname = \"demo\"\nversion = \"1.0.0\"\n";
+        let build_rs: &[(&str, &[u8])] = &[("build.rs", b"fn main() {}\n")];
+        type Extra<'a> = &'a [(&'a str, &'a [u8])];
+        let cases: Vec<(&str, String, Extra, &Vec<PathBuf>)> = vec![
+            (
+                "explicit build script",
+                format!("{pkg}build = \"build.rs\"\n"),
+                build_rs,
+                &foreign_kept,
+            ),
+            (
+                "implicit build.rs",
+                pkg.to_string(),
+                build_rs,
+                &foreign_kept,
+            ),
+            (
+                "proc-macro",
+                format!("{pkg}build = false\n\n[lib]\nproc-macro = true\n"),
+                &[],
+                &foreign_kept,
+            ),
+            ("no build key, no build.rs", pkg.to_string(), &[], &pin_only),
+            (
+                "unparsable manifest",
+                "[package\nname = ".to_string(),
+                &[],
+                &foreign_kept,
+            ),
+        ];
+        let pin = ExpectedComponent::new(ComponentEcosystem::Cargo, "demo", "1.0.0");
+        for (i, (label, manifest, extra, want)) in cases.into_iter().enumerate() {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let content = crate_with_foreign_lockfiles_and(&manifest, extra);
+            // The serve path never pins a crate whose manifest it cannot read;
+            // staging one anyway shows the helper keeps the files when it
+            // cannot decide.
+            let ws = pinned_workspace(
+                &tmp.path().join(format!("ws{i}")),
+                "demo-1.0.0.crate",
+                &content,
+                &pin,
+            )
+            .await;
+            assert_eq!(&bundled_dependency_files_under(&ws), want, "{label}");
+            assert!(
+                !ws.join(SCAN_ARCHIVE_SUBDIR)
+                    .join("demo-1.0.0")
+                    .join(CARGO_LOCK_NAME)
+                    .exists(),
+                "{label}: the crate's own Cargo.lock always goes (#5143)"
+            );
+        }
     }
 
     /// #3603: a hosted `.nupkg` must leave a `*.deps.json`. The filename is
