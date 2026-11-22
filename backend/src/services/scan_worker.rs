@@ -386,13 +386,19 @@ async fn run_claimed_job(state: SharedState, queue: ScanQueue, job: Claimed<Scan
             );
             return;
         }
+        // #6232: rows the scan creates carry this claim, so recovery can close
+        // them if the claim lapses, and a late finish cannot overwrite them.
         result = tokio::time::timeout(
             DEFAULT_JOB_BUDGET + JOB_FINALIZE_GRACE,
             // Boxed: the scan future is large, and these wrappers would
             // otherwise each carry it on the polling thread's stack.
             retry_when_scanner_timed_out(
                 started + DEFAULT_JOB_BUDGET,
-                Box::pin(execute(&state, &job)),
+                Box::pin(crate::services::scan_queue::under_claim(
+                    job_id,
+                    claim_token,
+                    execute(&state, &job),
+                )),
             ),
         ) => match result {
             Ok(r) => r,
