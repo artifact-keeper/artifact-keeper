@@ -800,6 +800,11 @@ async fn download_chart_via_index(
             proxy_helpers::try_authorize_virtual_members(&state.db, auth, repo.id, members).await?;
         // #5810: the virtual's member-fallback policy.
         let fallback = proxy_helpers::virtual_member_fallback(&state.db, repo.id).await;
+        // #6417: whether a member could not answer (an upstream 5xx, a
+        // transport failure or timeout, an open circuit, a storage fault), as
+        // opposed to not having the chart. When no member serves, "not found"
+        // is unknowable and the walk answers the retryable 503 (#5504).
+        let mut unavailable = false;
         for member in &members {
             if member.repo_type != RepositoryType::Remote {
                 // Hosted / staging member: check local storage.
@@ -830,7 +835,9 @@ async fn download_chart_via_index(
                         return Err(resp);
                     }
                     // Ordinary miss (404) or infrastructure failure: next member.
-                    Err(_) => {}
+                    Err(resp) => {
+                        unavailable |= proxy_helpers::is_transient_local_failure(&resp);
+                    }
                 }
                 continue;
             }
@@ -866,7 +873,8 @@ async fn download_chart_via_index(
                 {
                     return Err(proxy_helpers::member_unavailable_response());
                 }
-                Err(_) => {
+                Err(resp) => {
+                    unavailable |= proxy_helpers::is_member_unavailable_response(&resp);
                     tracing::debug!(
                         "helm index lookup miss for member '{}' chart '{}-{}'",
                         member.key,
@@ -876,10 +884,22 @@ async fn download_chart_via_index(
                 }
             }
         }
-        return Ok(None);
+        return chart_walk_miss(unavailable);
     }
 
     Ok(None)
+}
+
+/// The answer of a virtual chart walk no member served (#6417): the
+/// retryable 503 when a member could not answer, else `Ok(None)`, which the
+/// caller answers 404 "Chart not found".
+#[allow(clippy::result_large_err)]
+fn chart_walk_miss(unavailable: bool) -> Result<Option<Response>, Response> {
+    if unavailable {
+        Err(proxy_helpers::member_unavailable_response())
+    } else {
+        Ok(None)
+    }
 }
 
 async fn download_chart(
@@ -1475,6 +1495,19 @@ async fn delete_chart(
 mod tests {
     use super::*;
     use sha2::{Digest, Sha256};
+
+    /// #6417: a virtual chart walk no member served answers the retryable
+    /// 503 when a member could not answer, and leaves the 404 to the caller
+    /// otherwise.
+    #[test]
+    fn test_chart_walk_miss_6417() {
+        let down = chart_walk_miss(true).expect_err("an outage is an error");
+        assert_eq!(down.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(down.headers().contains_key(axum::http::header::RETRY_AFTER));
+        assert!(chart_walk_miss(false)
+            .expect("a miss is not an error")
+            .is_none());
+    }
 
     /// Build a gzip-compressed tar (`.tgz`) holding a single `path`/`body`
     /// entry, matching the on-disk layout the upload staging path reads.

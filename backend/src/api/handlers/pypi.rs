@@ -3125,6 +3125,12 @@ async fn serve_file(
                 let strict_unavailable = |resp: &Response| {
                     fallback.is_strict() && proxy_helpers::is_member_unavailable_response(resp)
                 };
+                // #6417: whether a member could not answer (an upstream 5xx,
+                // a transport failure or timeout, an open circuit, a storage
+                // fault) rather than not having the file. A walk no member
+                // served then answers 503 + Retry-After instead of the 404
+                // pip reports as "no matching distribution" (#5504).
+                let mut unavailable = false;
 
                 for member in &members {
                     // #3404: apply the ownership guard BEFORE this member is
@@ -3254,6 +3260,7 @@ async fn serve_file(
                             return Err(e);
                         }
                         Err(e) => {
+                            unavailable |= proxy_helpers::is_transient_local_failure(&e);
                             debug!(
                                 member_key = %member.key,
                                 error = %e.status(),
@@ -3318,6 +3325,8 @@ async fn serve_file(
                                                 proxy_helpers::member_unavailable_response(),
                                             );
                                         }
+                                        unavailable |=
+                                            proxy_helpers::is_member_unavailable_response(&resp);
                                         debug!(
                                             member_key = %member.key,
                                             status = %status,
@@ -3383,6 +3392,8 @@ async fn serve_file(
                                     return Err(proxy_helpers::member_unavailable_response());
                                 }
                                 Err(e) => {
+                                    unavailable |=
+                                        proxy_helpers::is_member_unavailable_response(&e);
                                     debug!(
                                         member_key = %member.key,
                                         error = %e.status(),
@@ -3394,10 +3405,7 @@ async fn serve_file(
                     }
                 }
 
-                return Err(AppError::NotFound(
-                    "Artifact not found in any member repository".to_string(),
-                )
-                .into_response());
+                return Err(file_walk_miss(unavailable));
             }
             return Err(AppError::NotFound("File not found".to_string()).into_response());
         }
@@ -3524,6 +3532,18 @@ async fn serve_file(
         .header("X-PyPI-File-SHA256", &artifact.checksum_sha256)
         .body(Body::from_stream(stream))
         .unwrap())
+}
+
+/// The answer of a virtual distribution walk no member served (#6417): the
+/// retryable 503 + `Retry-After` when a member could not answer, the 404
+/// otherwise.
+fn file_walk_miss(unavailable: bool) -> Response {
+    if unavailable {
+        proxy_helpers::member_unavailable_response()
+    } else {
+        AppError::NotFound("Artifact not found in any member repository".to_string())
+            .into_response()
+    }
 }
 
 /// Streaming variant of the PyPI proxy cache read. Streams a cache hit
@@ -3903,26 +3923,38 @@ async fn fetch_resolver_index(
                 }
                 Err(resp) => {
                     let status = resp.status();
+                    let unavailable = proxy_helpers::is_member_unavailable_response(&resp);
                     leader_error = Some(resp);
-                    Err(status)
+                    Err((status, unavailable))
                 }
             }
         })
         .await;
     match read {
         Ok(hit) => Ok((hit.0.clone(), hit.1.clone())),
-        Err(status) => Err(leader_error.unwrap_or_else(|| shared_resolver_index_error(*status))),
+        Err(failed) => {
+            let (status, unavailable) = *failed;
+            Err(leader_error.unwrap_or_else(|| shared_resolver_index_error(status, unavailable)))
+        }
     }
 }
 
-/// Error for a request that waited on another request's failed index read
-fn shared_resolver_index_error(status: StatusCode) -> Response {
+/// Error for a request that waited on another request's failed index read.
+/// It keeps the leader's [`proxy_helpers::MemberUnavailable`] marker, so a
+/// virtual walk reads a coalesced outage as one (#6417).
+fn shared_resolver_index_error(status: StatusCode, unavailable: bool) -> Response {
     let body = if status == StatusCode::NOT_FOUND {
         "Artifact not found upstream"
     } else {
         "Upstream index fetch failed"
     };
-    (status, body).into_response()
+    let mut response = (status, body).into_response();
+    if unavailable {
+        response
+            .extensions_mut()
+            .insert(proxy_helpers::MemberUnavailable);
+    }
+    response
 }
 
 /// Resolve the real download URL for a file hosted by a remote PyPI
@@ -17593,10 +17625,24 @@ mod tests {
 
     #[test]
     fn test_shared_resolver_index_error_keeps_status_5983() {
-        let not_found = shared_resolver_index_error(StatusCode::NOT_FOUND);
+        let not_found = shared_resolver_index_error(StatusCode::NOT_FOUND, false);
         assert_eq!(not_found.status(), StatusCode::NOT_FOUND);
-        let unavailable = shared_resolver_index_error(StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!proxy_helpers::is_member_unavailable_response(&not_found));
+        let unavailable = shared_resolver_index_error(StatusCode::SERVICE_UNAVAILABLE, true);
         assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
+        // #6417: a request coalesced onto a failed leader read keeps the
+        // leader's outage marker, so a virtual file walk reads it as one.
+        assert!(proxy_helpers::is_member_unavailable_response(&unavailable));
+    }
+
+    /// #6417: a virtual distribution walk no member served answers the
+    /// retryable 503 when a member could not answer, and the 404 otherwise.
+    #[test]
+    fn test_file_walk_miss_6417() {
+        let down = file_walk_miss(true);
+        assert_eq!(down.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(down.headers().contains_key(axum::http::header::RETRY_AFTER));
+        assert_eq!(file_walk_miss(false).status(), StatusCode::NOT_FOUND);
     }
 
     /// #3356 item 3. The #3333 regression test above covers the HANDLER half of
