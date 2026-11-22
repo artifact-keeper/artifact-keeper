@@ -4174,7 +4174,7 @@ pub(crate) fn classify_streaming_cache_probe(
 /// its coordinated hydration path answers `507` when the object is still
 /// absent. A `404` or another permanent client error means the member does not
 /// hold the artifact; anything else means it could not answer and may.
-fn is_transient_local_failure(resp: &Response) -> bool {
+pub(crate) fn is_transient_local_failure(resp: &Response) -> bool {
     if is_member_unavailable_response(resp) {
         return true;
     }
@@ -5092,7 +5092,8 @@ where
 ///
 /// The Go `.info` route needs it because `go` reads a 404 as "this proxy does
 /// not have the module" and falls through to the next `GOPROXY` entry. The
-/// other callers keep the plain form until their own routes are moved (#5620).
+/// other callers (RubyGems, Hex) keep the plain form until their own routes
+/// are moved (#6426).
 pub async fn resolve_virtual_metadata_reporting_unavailable<F, Fut>(
     db: &PgPool,
     auth: Option<&crate::api::middleware::auth::AuthExtension>,
