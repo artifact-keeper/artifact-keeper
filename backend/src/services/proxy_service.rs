@@ -9915,6 +9915,19 @@ impl ProxyService {
         self.load_cache_metadata(&metadata_key).await
     }
 
+    /// [`Self::get_cache_metadata`] for a gate that must fail closed (#6439):
+    /// read straight from storage, past the sidecar LRU (which reads a failed
+    /// load as no entry), so a storage fault or an unparseable sidecar is an
+    /// `Err` and only a missing sidecar is `Ok(None)`.
+    pub async fn get_cache_metadata_strict(
+        &self,
+        repo_key: &str,
+        path: &str,
+    ) -> Result<Option<CacheMetadata>> {
+        let metadata_key = Self::cache_metadata_key(&self.cache_scope, repo_key, path)?;
+        self.cache_store.load_metadata(&metadata_key).await
+    }
+
     /// Fetch an APT dists file with lazy invalidation support.
     ///
     /// Implements the TTL + conditional-request + epoch-based freshness
