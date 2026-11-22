@@ -1836,6 +1836,33 @@ pub async fn proxy_fetch_capped_with_cache_key_and_accept_budgeted(
     Ok((content, content_type, permit))
 }
 
+/// [`proxy_fetch_capped_with_cache_key_and_accept_budgeted`] for a document
+/// the handler parses and never serves as fetched, asking the upstream for
+/// `gzip` and caching the decoded document
+/// ([`ProxyService::fetch_parsed_document_capped`], #5983). `format` is the
+/// one the cache entry is classified under, as the caller's other fetches of
+/// the same key use.
+#[allow(clippy::too_many_arguments)]
+pub async fn proxy_fetch_parsed_budgeted(
+    proxy_service: &ProxyService,
+    repo_id: Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    fetch_path: &str,
+    cache_path: &str,
+    accept: Option<&str>,
+    max: usize,
+    format: RepositoryFormat,
+) -> Result<(Bytes, Option<String>, OwnedSemaphorePermit), Response> {
+    let permit = proxy_metadata_budget().reserve(max).await;
+    let repo = build_remote_repo_with_format(repo_id, repo_key, upstream_url, format);
+    let body = proxy_service
+        .fetch_parsed_document_capped(&repo, fetch_path, cache_path, accept, max)
+        .await
+        .map_err(|e| map_proxy_error(repo_key, fetch_path, e))?;
+    Ok((body.content, body.content_type, permit))
+}
+
 /// Streaming sibling of [`proxy_fetch`] that does NOT buffer the artifact
 /// body in memory (#895). Returns an axum [`Response`] whose body is a
 /// stream the framework drives directly from the upstream HTTP response,
@@ -24852,7 +24879,8 @@ mod tests {
                 let src = include_str!($module_file);
                 assert!(
                     src.contains("proxy_fetch_capped_budgeted(")
-                        || src.contains("proxy_fetch_capped_with_cache_key_and_accept_budgeted("),
+                        || src.contains("proxy_fetch_capped_with_cache_key_and_accept_budgeted(")
+                        || src.contains("proxy_fetch_parsed_budgeted("),
                     "{} MUST route its buffered proxy-metadata fetch through a \
                      `*_budgeted` helper so it reserves against the shared \
                      process-wide byte budget (#2684).",

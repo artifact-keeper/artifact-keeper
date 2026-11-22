@@ -507,12 +507,15 @@ async fn fetch_remote_simple_root(
 
     let index_path = fetch_pypi_upstream_index_path(&state.db, repo_id).await;
     let (effective_upstream, upstream_path) = pypi_upstream_url_and_path(upstream, "", &index_path);
-    let (content, _content_type, _budget_permit) = match proxy_helpers::proxy_fetch_capped_budgeted(
+    // Parsed, never served as fetched: asked for gzip (#5983).
+    let (content, _content_type, _budget_permit) = match proxy_helpers::proxy_fetch_parsed_budgeted(
         proxy,
         repo_id,
         repo_key,
         &effective_upstream,
         &upstream_path,
+        &upstream_path,
+        None,
         proxy_helpers::LARGE_METADATA_MAX_BYTES,
         RepositoryFormat::Pypi,
     )
@@ -783,6 +786,53 @@ async fn pypi_project_tracks_for(
     .unwrap_or_default()
 }
 
+/// The client-facing simple index of `project` from a Remote's upstream,
+/// through the proxy cache: the PEP 691 JSON form for a JSON client, cached
+/// under a format-qualified key so it never collides with the HTML index.
+/// Either form is rewritten before it is served, so it is asked for gzip and
+/// cached decoded (#5983). Returns `(body, content type, budget permit)`.
+async fn fetch_pypi_project_index(
+    proxy: &crate::services::proxy_service::ProxyService,
+    repo_id: uuid::Uuid,
+    repo_key: &str,
+    effective_upstream: &str,
+    upstream_path: &str,
+    wants_json: bool,
+) -> Result<(Bytes, Option<String>, tokio::sync::OwnedSemaphorePermit), Response> {
+    let (cache_path, accept, format) = pypi_index_cache_entry(upstream_path, wants_json);
+    proxy_helpers::proxy_fetch_parsed_budgeted(
+        proxy,
+        repo_id,
+        repo_key,
+        effective_upstream,
+        upstream_path,
+        &cache_path,
+        accept,
+        proxy_helpers::LARGE_METADATA_MAX_BYTES,
+        format,
+    )
+    .await
+}
+
+/// The proxy-cache entry the client-facing simple index of a project is kept
+/// under: `(cache path, Accept asked for, format it is classified under)`.
+/// The JSON form's key is format-qualified and was always fetched through the
+/// generic repository shape; the HTML form through the PyPI one.
+fn pypi_index_cache_entry(
+    upstream_path: &str,
+    json: bool,
+) -> (String, Option<&'static str>, RepositoryFormat) {
+    if json {
+        (
+            format!("{}{}", upstream_path, PEP691_JSON_CACHE_SUFFIX),
+            Some(PEP691_JSON_CONTENT_TYPE),
+            RepositoryFormat::Generic,
+        )
+    } else {
+        (upstream_path.to_string(), None, RepositoryFormat::Pypi)
+    }
+}
+
 async fn simple_project(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
@@ -857,32 +907,17 @@ async fn simple_project(
                     &index_path,
                 );
 
-                let (content, content_type, _budget_permit) = if wants_json {
-                    // Request the PEP 691 JSON form from upstream, cached under a
-                    // format-qualified key so it never collides with the HTML index.
-                    proxy_helpers::proxy_fetch_capped_with_cache_key_and_accept_budgeted(
-                        proxy,
-                        repo.id,
-                        &repo_key,
-                        &effective_upstream,
-                        &upstream_path,
-                        &format!("{}{}", upstream_path, PEP691_JSON_CACHE_SUFFIX),
-                        Some(PEP691_JSON_CONTENT_TYPE),
-                        proxy_helpers::LARGE_METADATA_MAX_BYTES,
-                    )
-                    .await?
-                } else {
-                    proxy_helpers::proxy_fetch_capped_budgeted(
-                        proxy,
-                        repo.id,
-                        &repo_key,
-                        &effective_upstream,
-                        &upstream_path,
-                        proxy_helpers::LARGE_METADATA_MAX_BYTES,
-                        RepositoryFormat::Pypi,
-                    )
-                    .await?
-                };
+                // The index is rewritten, never served as fetched, so it is
+                // asked for gzip and cached decoded (#5983).
+                let (content, content_type, _budget_permit) = fetch_pypi_project_index(
+                    proxy,
+                    repo.id,
+                    &repo_key,
+                    &effective_upstream,
+                    &upstream_path,
+                    wants_json,
+                )
+                .await?;
 
                 let ct = content_type.unwrap_or_else(|| "text/html; charset=utf-8".to_string());
 
@@ -1163,30 +1198,15 @@ async fn simple_project(
                     &format!("{}/", normalized),
                     &member_index_path,
                 );
-                let result = if wants_json {
-                    proxy_helpers::proxy_fetch_capped_with_cache_key_and_accept_budgeted(
-                        proxy,
-                        member.id,
-                        &member.key,
-                        &effective_upstream,
-                        &upstream_path,
-                        &format!("{}{}", upstream_path, PEP691_JSON_CACHE_SUFFIX),
-                        Some(PEP691_JSON_CONTENT_TYPE),
-                        proxy_helpers::LARGE_METADATA_MAX_BYTES,
-                    )
-                    .await
-                } else {
-                    proxy_helpers::proxy_fetch_capped_budgeted(
-                        proxy,
-                        member.id,
-                        &member.key,
-                        &effective_upstream,
-                        &upstream_path,
-                        proxy_helpers::LARGE_METADATA_MAX_BYTES,
-                        RepositoryFormat::Pypi,
-                    )
-                    .await
-                };
+                let result = fetch_pypi_project_index(
+                    proxy,
+                    member.id,
+                    &member.key,
+                    &effective_upstream,
+                    &upstream_path,
+                    wants_json,
+                )
+                .await;
 
                 match result {
                     Ok((content, content_type, _budget_permit)) => {
@@ -1794,6 +1814,15 @@ async fn download_or_metadata(
         }
         if repo.repo_type == RepositoryType::Remote {
             if let (Some(upstream_url), Some(proxy)) = (&repo.upstream_url, &state.proxy_service) {
+                remote_metadata_gate(
+                    &state,
+                    proxy,
+                    &repo,
+                    upstream_url,
+                    &normalized,
+                    real_filename,
+                )
+                .await?;
                 return serve_remote_metadata(
                     &state,
                     proxy,
@@ -1916,13 +1945,12 @@ async fn download_or_metadata(
 /// applying the member authorization filter, the per-member curation gate, and
 /// the PEP 708 dependency-confusion isolation the download path uses.
 ///
-/// It is NOT full parity with the download path, and the difference is worth
-/// stating rather than implying: `serve_file` additionally enforces the
-/// download age gate, the inline scan-and-block gate, and the quarantine check
-/// (`serve_metadata`'s query selects no quarantine columns). So a quarantined
-/// or age-withheld distribution returns 403/451 on download while its METADATA
-/// -- name, version, full `Requires-Dist` -- is served here. That is a
-/// disclosure gap, not an install bypass, and it is tracked separately.
+/// The distribution's refusals apply to its METADATA too (#6439): a member's
+/// row passes the download gate (quarantine hold, rejection, scan policy)
+/// before it is read, and a Remote member's cached distribution that is held
+/// or carries a blocking stored verdict under the stricter-of-two scan policy
+/// refuses its METADATA, ending the walk as the distribution's refusal does.
+/// The download age gate is not applied here.
 ///
 /// A missing distribution falls through to the next member. Other failures are
 /// recorded and returned only if NO member serves, so one misconfigured
@@ -2013,10 +2041,36 @@ async fn serve_virtual_metadata(
         // resolve against one package's dependencies and install another's,
         // with nothing anywhere to detect it.
 
+        // #6439: the stricter-of-two scan policy (virtual OR member, #3023)
+        // the distribution's own walk serves this Remote member under. While
+        // it scans, a proxy-cache row is not read here (its sidecar gate
+        // knows only the member's own policy), and the member's Remote path
+        // below follows the cached distribution's verdict.
+        // #6439: the member's download age gate, as for the distribution: a
+        // withheld version is the walk's answer, a version the member's
+        // upstream does not host skips the member.
+        if !metadata_age_gate(state, &member_info, normalized_project, filename, true).await? {
+            continue;
+        }
+        let member_scan = if member.repo_type == RepositoryType::Remote {
+            proxy_helpers::effective_virtual_scan_policy(&state.db, virtual_repo.id, member.id)
+                .await?
+        } else {
+            None
+        };
+
         // Set when this member owns the name but its bytes are temporarily
         // unavailable; confines the fallback to this member (#3372).
         let mut owns_unavailable_bytes = false;
-        match serve_metadata(state, &state.db, &member_info, filename).await {
+        match serve_metadata_with(
+            state,
+            &state.db,
+            &member_info,
+            filename,
+            member_scan.is_some(),
+        )
+        .await
+        {
             Ok(response) => return Ok(response),
             Err(response) if response.status() == StatusCode::NOT_FOUND => {}
             // #6433: the member's cached row is held or refused: the answer,
@@ -2061,6 +2115,19 @@ async fn serve_virtual_metadata(
             // Suppression already applied at the top of the loop (#3404).
             match (&member.upstream_url, state.proxy_service.as_ref()) {
                 (Some(upstream_url), Some(proxy)) => {
+                    // #6439: the member's cached distribution is held or
+                    // refused: the answer, as for the distribution itself.
+                    metadata_gate_for_cached_file(
+                        state,
+                        proxy,
+                        member.id,
+                        &member.key,
+                        upstream_url,
+                        member_scan,
+                        normalized_project,
+                        filename,
+                    )
+                    .await?;
                     serve_remote_metadata(
                         state,
                         proxy,
@@ -2158,6 +2225,197 @@ async fn serve_virtual_metadata(
             .into_response(),
     )
 }
+/// The refusal a PEP 658 `.metadata` request on a Remote's own route answers
+/// because its distribution would be refused there (#6439), `Ok` to serve it.
+///
+/// The distribution's route runs the download age gate, checks a row the
+/// Remote holds for it (a direct upload, a replica, a promotion, or a cached
+/// file recorded as a row before 1.2.0) with the download gate, and a
+/// cached-file row against its cache sidecar (#6433). The same checks run
+/// here, then [`metadata_gate_for_cached_file`] under the Remote's own scan
+/// policy.
+async fn remote_metadata_gate(
+    state: &SharedState,
+    proxy: &crate::services::proxy_service::ProxyService,
+    repo: &RepoInfo,
+    upstream_url: &str,
+    project: &NormalizedProjectName,
+    filename: &str,
+) -> Result<(), Response> {
+    metadata_age_gate(state, repo, project, filename, false).await?;
+    let row = proxy_helpers::resolve_local_artifact_by_suffix(&state.db, repo.id, filename).await?;
+    if let Some(row) = &row {
+        crate::services::quarantine_service::enforce_download_gate(&state.db, row.id)
+            .await
+            .map_err(|e| e.into_response())?;
+    }
+    proxy_helpers::vouched_row(state, repo.id, row, |r| {
+        proxy_helpers::ServedRowRef::new(&r.storage_key, None)
+    })
+    .await?;
+    let policy = proxy_helpers::remote_scan_policy(&state.db, repo.id).await?;
+    metadata_gate_for_cached_file(
+        state,
+        proxy,
+        repo.id,
+        &repo.key,
+        upstream_url,
+        policy,
+        project,
+        filename,
+    )
+    .await
+}
+
+/// The download age gate of a Remote's distribution, for its PEP 658
+/// metadata (#6439): `Ok(true)` to serve it, `Ok(false)` when a virtual
+/// member's upstream does not host the version (the walk skips the member, as
+/// for the distribution), and the gate's `451` when the version is withheld.
+/// Where the distribution would be answered with the last-known-good wheel,
+/// the requested version's METADATA is still withheld (`451`): it describes a
+/// version the client will not be served.
+async fn metadata_age_gate(
+    state: &SharedState,
+    repo: &RepoInfo,
+    project: &NormalizedProjectName,
+    filename: &str,
+    as_virtual_member: bool,
+) -> Result<bool, Response> {
+    if repo.repo_type != RepositoryType::Remote {
+        return Ok(true);
+    }
+    match apply_pypi_download_age_gate(state, repo, project, filename, as_virtual_member).await? {
+        AgeGateOutcome::Allowed => Ok(true),
+        AgeGateOutcome::NotHosted => Ok(false),
+        AgeGateOutcome::Substitute(_) => Err((
+            StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS,
+            [(axum::http::header::CACHE_CONTROL, "no-store")],
+            "version withheld by the download age gate",
+        )
+            .into_response()),
+    }
+}
+
+/// The retryable `503` a metadata gate answers when it cannot read what it
+/// decides on (#6439): it never serves on an error.
+fn metadata_gate_unavailable(what: &str, error: &dyn std::fmt::Display) -> Response {
+    tracing::warn!(error = %error, "PEP 658 metadata gate could not read {what}; refusing");
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(axum::http::header::RETRY_AFTER, "1")],
+        "metadata gate unavailable; retry later",
+    )
+        .into_response()
+}
+
+/// Whether a PEP 658 `.metadata` request may be served, given the
+/// distribution it describes as the Remote `repo_key` caches it (#6439).
+/// `Err` is the answer the distribution itself gets.
+///
+/// It follows the distribution, as a conda `.sigs` sidecar follows its
+/// package (#4585), and fails closed:
+/// * the cache sidecar is read past the LRU; a storage fault or an
+///   unreadable sidecar is a `503`, never a serve;
+/// * no cached copy: nothing to follow, the metadata is served (the
+///   distribution's own download is gated when it is fetched);
+/// * a cached copy inside its Package Age Policy hold: the hold's `409`;
+/// * while `policy` (the scan policy the distribution is served under)
+///   withholds pulls: a cached copy with no digest, or a verdict lookup that
+///   fails, is a `503`; a stored `vulnerable` verdict that blocks under the
+///   severity gate is the distribution's audited `scan_blocked` `403`; a
+///   `clean` one serves;
+/// * under `fail_closed` with no usable verdict, the distribution's own scan
+///   gate decides ([`serve_scanned_pypi_file`]: on the cached bytes while
+///   the copy is fresh, after a full refetch when it is stale): its `423` or
+///   `403` is the answer, a serve lets the metadata through. Under `fail_open` the distribution is served before it
+///   is scanned, so the metadata is too.
+#[allow(clippy::too_many_arguments)]
+async fn metadata_gate_for_cached_file(
+    state: &SharedState,
+    proxy: &crate::services::proxy_service::ProxyService,
+    repo_id: uuid::Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    policy: Option<proxy_helpers::MemberScanPolicy>,
+    project: &NormalizedProjectName,
+    filename: &str,
+) -> Result<(), Response> {
+    use crate::services::proxy_scan_service::{verdict_blocks, ProxyScanAction, ProxyScanService};
+    let cached = proxy
+        .get_cache_metadata_strict(repo_key, &build_pypi_proxy_cache_path(project, filename))
+        .await
+        .map_err(|e| metadata_gate_unavailable("the distribution's cache sidecar", &e))?;
+    let Some(cached) = cached.filter(|m| m.negative_cached_until.is_none()) else {
+        return Ok(());
+    };
+    if cached
+        .quarantine_until
+        .is_some_and(|until| until > chrono::Utc::now())
+    {
+        return Err(AppError::Conflict(
+            "Artifact is quarantined and pending security review".to_string(),
+        )
+        .into_response());
+    }
+    let Some((action, severity_gate)) = policy else {
+        return Ok(());
+    };
+    if matches!(action, ProxyScanAction::RecordOnly) || severity_gate.is_record_only() {
+        return Ok(());
+    }
+    let digest = cached.checksum_sha256.as_str();
+    if digest.is_empty() {
+        return Err(metadata_gate_unavailable(
+            "a digest for the cached distribution",
+            &"the sidecar records none",
+        ));
+    }
+    let verdict = ProxyScanService::new(state.db.clone())
+        .lookup_verdict(digest, proxy_helpers::PROXY_SCAN_TYPE)
+        .await
+        .map_err(|e| metadata_gate_unavailable("the distribution's scan verdict", &e))?;
+    match verdict {
+        Some(row) if verdict_blocks(&row.verdict) => {
+            if !proxy_helpers::stored_verdict_blocks_under_gate(Some(&row), severity_gate) {
+                return Ok(());
+            }
+            tracing::warn!(
+                repo_key = %repo_key, file = %filename, digest = %digest,
+                "refusing PEP 658 metadata: its distribution has a blocking scan verdict"
+            );
+            Err(proxy_helpers::audited_scan_blocked_response(
+                &state.db, repo_id, filename, digest,
+            ))
+        }
+        Some(row) if row.verdict == crate::services::proxy_scan_service::VERDICT_CLEAN => Ok(()),
+        _ if matches!(action, ProxyScanAction::FailClosed) => {
+            // No usable verdict: the distribution's own gate decides. For a
+            // fresh cached copy it scans the cached bytes; for a stale one it
+            // re-resolves and fetches the whole distribution from the
+            // upstream, as the distribution's own request would. The body it
+            // returns is not read.
+            let wheel = serve_scanned_pypi_file(
+                state,
+                proxy,
+                repo_id,
+                repo_key,
+                upstream_url,
+                project,
+                filename,
+                action,
+                severity_gate,
+                None,
+            )
+            .await;
+            match wheel {
+                Ok(resp) if resp.status().is_success() || resp.status().is_redirection() => Ok(()),
+                Ok(resp) | Err(resp) => Err(resp),
+            }
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Serve a PEP 658 `.metadata` resource from a remote upstream.
 ///
 /// `project` is a [`NormalizedProjectName`] (#3186), so the string this fetches
@@ -4078,25 +4336,40 @@ async fn resolve_pypi_remote_fetch_target(
     // (no prefix). Any other non-empty value is used verbatim as the prefix.
     let (effective_upstream, upstream_index_path) =
         pypi_upstream_url_and_path(upstream_url, &format!("{}/", normalized), index_path);
-    let (index_bytes, effective_url) = fetch_resolver_index(
+
+    // #5983: the index the client-facing route cached for this project, while
+    // it is fresh, names the file's URL and digest without an upstream read.
+    // A file it does not name (published since it was cached) is resolved
+    // from the upstream's current index below, as before.
+    let cached = locate_in_cached_index(
         proxy,
         repo_id,
         repo_key,
         &effective_upstream,
         &upstream_index_path,
-        &normalized,
+        filename,
     )
-    .await?;
-
-    let index_html = String::from_utf8_lossy(&index_bytes);
-
-    // Use the effective URL (after redirects) as the base for resolving
-    // relative hrefs. Some registries (Nexus, Artifactory) redirect the
-    // index request, and the relative paths in the HTML are relative to
-    // the final serving URL, not the originally requested URL.
-    let full_index_url = effective_url;
-    let file_url = find_upstream_url_for_file(&index_html, filename, Some(&full_index_url))
-        .or_else(|| find_upstream_metadata_url(&index_html, filename, Some(&full_index_url)));
+    .await;
+    let (file_url, expected_sha256) = match cached {
+        Some(found) => found,
+        None => {
+            let (index_bytes, effective_url) = fetch_resolver_index(
+                proxy,
+                repo_id,
+                repo_key,
+                &effective_upstream,
+                &upstream_index_path,
+                &normalized,
+            )
+            .await?;
+            // Use the effective URL (after redirects) as the base for
+            // resolving relative hrefs. Some registries (Nexus, Artifactory)
+            // redirect the index request, and the relative paths in the HTML
+            // are relative to the final serving URL, not the originally
+            // requested URL.
+            locate_in_simple_index(&index_bytes, filename, Some(&effective_url))
+        }
+    };
 
     // Validate resolved URL against SSRF before making the outbound request.
     // A malicious upstream index could contain hrefs pointing to internal
@@ -4130,20 +4403,157 @@ async fn resolve_pypi_remote_fetch_target(
         None => pypi_direct_file_location(upstream_url, project, filename, index_path),
     };
 
-    // GHSA-qxv7-p3mq-88fv: the same index page that vouched for the download
-    // URL also pins the file's SHA-256 in the anchor fragment — the digest
-    // pip verifies the download against. Lift it so the streamed fetch gates
-    // the proxy-cache commit on it; before this, the fragment was forwarded
-    // to clients but never checked server-side, so a body that disagreed
-    // with the index was cached and served warm from then on.
-    let expected_sha256 = find_upstream_sha256_for_file(&index_html, filename);
-
     Ok(PypiRemoteFetchTarget {
         fetch_base,
         fetch_path,
         cache_path,
         expected_sha256,
     })
+}
+
+/// Where a PyPI simple index (PEP 503 HTML or PEP 691 JSON) names `filename`:
+/// `(download URL, SHA-256 it pins)`. A `.whl.metadata` the index does not
+/// list is located next to its wheel (PEP 658), with no digest.
+///
+/// GHSA-qxv7-p3mq-88fv: the same index entry that vouches for the download
+/// URL pins the file's SHA-256 (the HTML anchor's fragment, the JSON entry's
+/// `hashes`), the digest pip verifies the download against; the streamed
+/// fetch gates the proxy-cache commit on it.
+///
+/// `index_url` resolves a relative URL; `None` accepts absolute ones only.
+fn locate_in_simple_index(
+    body: &[u8],
+    filename: &str,
+    index_url: Option<&str>,
+) -> (Option<String>, Option<String>) {
+    if sniff_simple_index(body) == SniffedSimpleIndex::Json {
+        return locate_in_simple_json(body, filename, index_url);
+    }
+    let html = String::from_utf8_lossy(body);
+    let url = find_upstream_url_for_file(&html, filename, index_url)
+        .or_else(|| find_upstream_metadata_url(&html, filename, index_url));
+    (url, find_upstream_sha256_for_file(&html, filename))
+}
+
+/// One `files` entry of a PEP 691 project page, as far as resolution reads it.
+#[derive(serde::Deserialize)]
+struct SimpleJsonFile<'a> {
+    #[serde(borrow)]
+    filename: std::borrow::Cow<'a, str>,
+    #[serde(borrow)]
+    url: std::borrow::Cow<'a, str>,
+    #[serde(default)]
+    hashes: std::collections::HashMap<String, String>,
+}
+
+#[derive(serde::Deserialize)]
+struct SimpleJsonPage<'a> {
+    #[serde(borrow, default)]
+    files: Vec<SimpleJsonFile<'a>>,
+}
+
+/// [`locate_in_simple_index`] for a PEP 691 JSON page. Only the fields read
+/// are deserialized, so a large page is not held as a JSON tree.
+fn locate_in_simple_json(
+    body: &[u8],
+    filename: &str,
+    index_url: Option<&str>,
+) -> (Option<String>, Option<String>) {
+    let Ok(page) = serde_json::from_slice::<SimpleJsonPage<'_>>(body) else {
+        return (None, None);
+    };
+    let entry = |name: &str| page.files.iter().find(|f| f.filename == name);
+    let resolve = |href: &str| {
+        let url = match index_url {
+            Some(base) => url::Url::parse(base).ok()?.join(href).ok()?,
+            None => url::Url::parse(href).ok()?,
+        };
+        matches!(url.scheme(), "http" | "https").then_some(url)
+    };
+    if let Some(file) = entry(filename) {
+        let sha = file
+            .hashes
+            .get("sha256")
+            .and_then(|d| proxy_helpers::normalize_expected_sha256(d));
+        return (resolve(file.url.as_ref()).map(String::from), sha);
+    }
+    let Some(wheel) = filename
+        .strip_suffix(".metadata")
+        .filter(|w| w.ends_with(".whl"))
+    else {
+        return (None, None);
+    };
+    let url = entry(wheel)
+        .and_then(|file| resolve(file.url.as_ref()))
+        .map(|mut url| {
+            url.set_path(&format!("{}.metadata", url.path()));
+            url.set_fragment(None);
+            String::from(url)
+        });
+    (url, None)
+}
+
+/// #5983: locate `filename` in the simple index the Remote's client-facing
+/// index route cached for its project, while that entry is fresh: the
+/// PEP 691 JSON form (what uv asks for), then the HTML one (pip). A cold
+/// `.whl.metadata` then costs no upstream read of the index, where it used to
+/// read the whole index again just to find the sidecar's URL.
+///
+/// No staler than the client's own view: it is the document the client
+/// resolved the file from, read under the cache's freshness policy (never
+/// past its TTL, never revalidated here). Only absolute URLs are taken from
+/// it, since the URL a relative one is relative to (after redirects) is not
+/// recorded with the entry. `None` (no fresh entry, the file not named in
+/// it, a relative URL, an unreadable body) leaves resolution to the
+/// upstream read.
+async fn locate_in_cached_index(
+    proxy: &crate::services::proxy_service::ProxyService,
+    repo_id: uuid::Uuid,
+    repo_key: &str,
+    effective_upstream: &str,
+    upstream_index_path: &str,
+    filename: &str,
+) -> Option<(Option<String>, Option<String>)> {
+    for json in [true, false] {
+        let (cache_path, _, format) = pypi_index_cache_entry(upstream_index_path, json);
+        let repo = proxy_helpers::build_remote_repo_with_format(
+            repo_id,
+            repo_key,
+            effective_upstream,
+            format,
+        );
+        // The body is buffered and parsed: reserved against the shared
+        // buffered-metadata budget (#2684), sized to the fresh entry (#5973).
+        // No fresh entry: nothing to read.
+        let Some(size) = proxy.fresh_cached_size(repo_key, &cache_path).await else {
+            continue;
+        };
+        let _budget = proxy_helpers::proxy_metadata_budget()
+            .reserve(usize::try_from(size).unwrap_or(usize::MAX))
+            .await;
+        let Ok(Some(body)) = proxy.cached_metadata_if_servable(&repo, &cache_path).await else {
+            continue;
+        };
+        // An entry recorded coded (by an earlier release) is left to the
+        // upstream read: the index is cached decoded since #5983.
+        if body
+            .content_encoding
+            .as_deref()
+            .is_some_and(|c| !c.eq_ignore_ascii_case("identity"))
+        {
+            continue;
+        }
+        let content = body.content;
+        let wanted = filename.to_string();
+        let found =
+            tokio::task::spawn_blocking(move || locate_in_simple_index(&content, &wanted, None))
+                .await
+                .ok();
+        if let Some((Some(url), sha)) = found {
+            return Some((Some(url), sha));
+        }
+    }
+    None
 }
 
 /// The conventional `{index}/{project}/{filename}` location of a file on a
@@ -4682,6 +5092,20 @@ async fn serve_metadata(
     repo: &RepoInfo,
     filename: &str,
 ) -> Result<Response, Response> {
+    serve_metadata_with(state, db, repo, filename, false).await
+}
+
+/// [`serve_metadata`], declining a proxy-cache row (the non-terminal 404)
+/// when `defer_proxy_cache_rows`: for a virtual walk whose stricter-of-two
+/// scan policy (#3023) scans this Remote member, so the member's Remote path
+/// answers, as the distribution's own walk does (#6416, #6439).
+async fn serve_metadata_with(
+    state: &SharedState,
+    db: &PgPool,
+    repo: &RepoInfo,
+    filename: &str,
+    defer_proxy_cache_rows: bool,
+) -> Result<Response, Response> {
     let repo_id = repo.id;
     let location = &repo.storage_location();
     // Find the artifact through the SAME resolver the distribution download
@@ -4700,6 +5124,19 @@ async fn serve_metadata(
     )
     .await?
     .ok_or_else(|| AppError::NotFound("File not found".to_string()).into_response())?;
+    // #6439: the download gate the distribution's own route runs on its row
+    // (quarantine hold 409, rejection or scan policy 403), before anything
+    // is read from it. The METADATA of a refused or held distribution is
+    // refused with it, and the refusal ends a virtual walk
+    // (`is_member_policy_block_response`).
+    crate::services::quarantine_service::enforce_download_gate(db, artifact.id)
+        .await
+        .map_err(|e| e.into_response())?;
+    if defer_proxy_cache_rows
+        && crate::services::proxy_service::ProxyService::is_proxy_cache_key(&artifact.storage_key)
+    {
+        return Err(crate::api::handlers::proxy_helpers::proxy_cache_row_declined());
+    }
     // #6433: a proxy-cache row is read only after its cache sidecar is
     // checked (the hold's 409, a refusal's 403). One nothing vouches for is
     // this member's name with its bytes unavailable: the 507 the virtual walk
@@ -5534,7 +5971,8 @@ async fn legacy_json_from_remote(
     let (effective_upstream, upstream_path) = pypi_upstream_legacy_json_target(upstream_url, &tail);
     // Cached under its own path (`pypi/<name>/json`), which cannot collide
     // with the `simple/` keys the index and download paths use.
-    let fetched = proxy_helpers::proxy_fetch_capped_with_cache_key_and_accept_budgeted(
+    // Rewritten, never served as fetched: asked for gzip (#5983).
+    let fetched = proxy_helpers::proxy_fetch_parsed_budgeted(
         proxy,
         repo.id,
         &repo.key,
@@ -5543,6 +5981,7 @@ async fn legacy_json_from_remote(
         &upstream_path,
         Some("application/json"),
         proxy_helpers::LARGE_METADATA_MAX_BYTES,
+        RepositoryFormat::Generic,
     )
     .await;
     let (content, _content_type, _budget_permit) = match fetched {
@@ -13116,6 +13555,68 @@ mod tests {
         }
     }
 
+    /// #6439: PEP 658 metadata of a version the download age gate withholds
+    /// answers the wheel's 451, through the virtual and on the Remote's own
+    /// route, for GET and HEAD. Before, the METADATA was served (200).
+    #[tokio::test]
+    async fn test_metadata_applies_the_download_age_gate_6439() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::MockServer;
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "pypi").await else {
+            return;
+        };
+        let project = "gatedmeta";
+        let version = "9.9.9";
+        let filename = "gatedmeta-9.9.9-py3-none-any.whl";
+        let upstream = MockServer::start().await;
+        mount_pypi_publish_times(&upstream, project, version, &Utc::now().to_rfc3339()).await;
+        let (member_id, member_key, member_dir, state) =
+            setup_virtual_pypi_member(&fx, true, &upstream.uri()).await;
+
+        let virtual_info = fx.repo_info("virtual", None);
+        let via_virtual = super::serve_virtual_metadata(
+            &state,
+            None,
+            &virtual_info,
+            &proj(project),
+            Some(version),
+            filename,
+        )
+        .await;
+        let mut direct = Vec::new();
+        for method in ["GET", "HEAD"] {
+            let req = axum::http::Request::builder()
+                .method(method)
+                .uri(format!(
+                    "/{member_key}/simple/{project}/{filename}.metadata"
+                ))
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let (status, _, _) =
+                tdh::send_with_headers(tdh::router_anon(super::router(), state.clone()), req).await;
+            direct.push(status);
+        }
+
+        tdh::cleanup(&fx.pool, fx.repo_id, fx.user_id).await;
+        cleanup_virtual_member(&fx.pool, member_id, &member_dir).await;
+        let _ = std::fs::remove_dir_all(&fx.storage_dir);
+
+        let withheld = StatusCode::from_u16(451).unwrap();
+        assert_eq!(
+            via_virtual
+                .map(|r| r.status())
+                .unwrap_or_else(|r| r.status()),
+            withheld,
+            "through the virtual"
+        );
+        assert_eq!(
+            direct,
+            vec![withheld, withheld],
+            "the Remote's own route, GET and HEAD"
+        );
+    }
+
     #[tokio::test]
     async fn test_serve_file_virtual_gated_member_allows_old() {
         use crate::api::handlers::test_db_helpers as tdh;
@@ -17769,6 +18270,368 @@ mod tests {
         );
     }
 
+    /// The upstream requests seen for `p`.
+    async fn requests_for_5983(upstream: &wiremock::MockServer, p: &str) -> Vec<wiremock::Request> {
+        upstream
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| r.url.path() == p)
+            .collect()
+    }
+
+    /// Mount a project's simple index (HTML with absolute hrefs, and the
+    /// PEP 691 JSON form for a JSON `Accept`) naming `wheels`, and each
+    /// wheel's PEP 658 sidecar. `priority` lets a later call shadow an
+    /// earlier index (a new release upstream).
+    async fn mount_index_5983(
+        upstream: &wiremock::MockServer,
+        project: &str,
+        wheels: &[&str],
+        relative: bool,
+        priority: u8,
+    ) {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let base = if relative {
+            String::new()
+        } else {
+            upstream.uri()
+        };
+        let sha = "a".repeat(64);
+        let anchors: String = wheels
+            .iter()
+            .map(|w| {
+                format!(
+                    "<a href=\"{base}/packages/{w}#sha256={sha}\" \
+                     data-dist-info-metadata=\"sha256=deadbeef\">{w}</a>\n"
+                )
+            })
+            .collect();
+        let files: Vec<serde_json::Value> = wheels
+            .iter()
+            .map(|w| {
+                serde_json::json!({
+                    "filename": w,
+                    "url": format!("{base}/packages/{w}"),
+                    "hashes": {"sha256": sha},
+                    "core-metadata": {"sha256": "deadbeef"},
+                })
+            })
+            .collect();
+        let json = serde_json::json!({
+            "meta": {"api-version": "1.1"},
+            "name": project,
+            "files": files,
+        });
+        Mock::given(method("GET"))
+            .and(path(format!("/simple/{project}/")))
+            .and(header("accept", PEP691_JSON_CONTENT_TYPE))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", PEP691_JSON_CONTENT_TYPE)
+                    .set_body_string(json.to_string()),
+            )
+            .with_priority(priority)
+            .mount(upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/simple/{project}/")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/html")
+                    .set_body_string(format!("<html><body>{anchors}</body></html>")),
+            )
+            .with_priority(priority + 1)
+            .mount(upstream)
+            .await;
+        for w in wheels {
+            Mock::given(method("GET"))
+                .and(path(format!("/packages/{w}.metadata")))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_string(format!("Metadata-Version: 2.1\nName: {w}\n")),
+                )
+                .mount(upstream)
+                .await;
+        }
+    }
+
+    /// #5983: a cold `.whl.metadata` request is resolved from the simple
+    /// index the client-facing route cached for the project (PEP 691 JSON
+    /// for uv, HTML for pip), with no second upstream read of the index. A
+    /// file the cached index does not name (published since) is still
+    /// resolved, from the upstream's current index; and a cached index whose
+    /// URLs are relative is not used (their base is not recorded).
+    #[tokio::test]
+    async fn test_cold_sidecar_resolves_from_the_cached_index_5983() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
+            return;
+        };
+        let (upstream, _ssrf_allowlist) = non_loopback_upstream().await;
+        mount_index_5983(
+            &upstream,
+            "cjson5983",
+            &["cjson5983-1.0-py3-none-any.whl"],
+            false,
+            10,
+        )
+        .await;
+        mount_index_5983(
+            &upstream,
+            "chtml5983",
+            &["chtml5983-1.0-py3-none-any.whl"],
+            false,
+            10,
+        )
+        .await;
+        mount_index_5983(
+            &upstream,
+            "crel5983",
+            &["crel5983-1.0-py3-none-any.whl"],
+            true,
+            10,
+        )
+        .await;
+
+        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &upstream.uri()).await;
+        let get = |p: String, accept: &'static str| {
+            let req = axum::http::Request::builder()
+                .uri(format!("/{}/simple/{p}", fx.repo_key))
+                .header("accept", accept)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            tdh::send_with_headers(tdh::router_anon(super::router(), state.clone()), req)
+        };
+        let mut out = Vec::new();
+        for (project, accept) in [
+            ("cjson5983", PEP691_JSON_CONTENT_TYPE),
+            ("chtml5983", "text/html"),
+            ("crel5983", "text/html"),
+        ] {
+            let index = get(format!("{project}/"), accept).await.0;
+            let meta = get(
+                format!("{project}/{project}-1.0-py3-none-any.whl.metadata"),
+                "*/*",
+            )
+            .await;
+            let reads = requests_for_5983(&upstream, &format!("/simple/{project}/"))
+                .await
+                .len();
+            out.push((
+                project,
+                index,
+                meta.0,
+                String::from_utf8_lossy(&meta.1).into_owned(),
+                reads,
+            ));
+        }
+        // A new release upstream, after the HTML index was cached.
+        mount_index_5983(
+            &upstream,
+            "chtml5983",
+            &[
+                "chtml5983-1.0-py3-none-any.whl",
+                "chtml5983-2.0-py3-none-any.whl",
+            ],
+            false,
+            1,
+        )
+        .await;
+        let new = get(
+            "chtml5983/chtml5983-2.0-py3-none-any.whl.metadata".into(),
+            "*/*",
+        )
+        .await;
+        let new_reads = requests_for_5983(&upstream, "/simple/chtml5983/")
+            .await
+            .len();
+
+        fx.teardown().await;
+
+        for (project, index, meta, body, reads) in &out {
+            assert_eq!(*index, StatusCode::OK, "{project} index");
+            assert_eq!(*meta, StatusCode::OK, "{project} metadata: {body}");
+            assert!(body.contains("Metadata-Version"), "{project}: {body}");
+            let expected = if *project == "crel5983" { 2 } else { 1 };
+            assert_eq!(
+                *reads, expected,
+                "{project}: index reads (1 = the sidecar resolved from the cached index)"
+            );
+        }
+        assert_eq!(new.0, StatusCode::OK, "{}", String::from_utf8_lossy(&new.1));
+        assert!(String::from_utf8_lossy(&new.1).contains("chtml5983-2.0"));
+        assert_eq!(
+            new_reads, 2,
+            "a file the cached index does not name is resolved from the upstream's index"
+        );
+    }
+
+    /// #5983: the client-facing simple index (HTML and PEP 691 JSON) is
+    /// asked for gzip and decoded before it is rewritten and cached; the
+    /// client gets the plain rewritten index. The mock answers only a gzip
+    /// request (406 otherwise), as a bandwidth-bound upstream would be
+    /// measured here.
+    #[tokio::test]
+    async fn test_client_index_asks_for_gzip_5983() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use std::io::Write;
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
+            return;
+        };
+        let (upstream, _ssrf_allowlist) = non_loopback_upstream().await;
+        let project = "gzclient5983";
+        let wheel = "gzclient5983-1.0-py3-none-any.whl";
+        let gz = |s: String| {
+            let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            enc.write_all(s.as_bytes()).expect("gzip write");
+            enc.finish().expect("gzip finish")
+        };
+        let html = format!(
+            "<html><body><a href=\"{}/packages/{wheel}\">{wheel}</a></body></html>",
+            upstream.uri()
+        );
+        let json = serde_json::json!({
+            "meta": {"api-version": "1.1"},
+            "name": project,
+            "files": [{"filename": wheel, "url": format!("{}/packages/{wheel}", upstream.uri()), "hashes": {}}],
+        })
+        .to_string();
+        for (accept, ct, body) in [
+            (
+                Some(PEP691_JSON_CONTENT_TYPE),
+                PEP691_JSON_CONTENT_TYPE,
+                json,
+            ),
+            (None, "text/html", html),
+        ] {
+            let mut m = Mock::given(method("GET"))
+                .and(path(format!("/simple/{project}/")))
+                .and(header("accept-encoding", "gzip"));
+            if let Some(accept) = accept {
+                m = m.and(header("accept", accept));
+            }
+            m.respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-encoding", "gzip")
+                    .insert_header("content-type", ct)
+                    .set_body_bytes(gz(body)),
+            )
+            .with_priority(if accept.is_some() { 1 } else { 2 })
+            .mount(&upstream)
+            .await;
+        }
+        Mock::given(method("GET"))
+            .and(path(format!("/simple/{project}/")))
+            .respond_with(ResponseTemplate::new(406))
+            .mount(&upstream)
+            .await;
+
+        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &upstream.uri()).await;
+        let get = |accept: &'static str| {
+            let req = axum::http::Request::builder()
+                .uri(format!("/{}/simple/{project}/", fx.repo_key))
+                .header("accept", accept)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            tdh::send_with_headers(tdh::router_anon(super::router(), state.clone()), req)
+        };
+        let (json_status, json_body, json_headers) = get(PEP691_JSON_CONTENT_TYPE).await;
+        let (html_status, html_body, html_headers) = get("text/html").await;
+        let codings: Vec<String> = requests_for_5983(&upstream, &format!("/simple/{project}/"))
+            .await
+            .iter()
+            .map(|r| {
+                r.headers
+                    .get("accept-encoding")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .collect();
+
+        fx.teardown().await;
+
+        let json_body = String::from_utf8_lossy(&json_body).into_owned();
+        let html_body = String::from_utf8_lossy(&html_body).into_owned();
+        assert_eq!(json_status, StatusCode::OK, "{json_body}");
+        assert_eq!(html_status, StatusCode::OK, "{html_body}");
+        assert!(
+            json_body.contains(wheel) && json_body.contains(&fx.repo_key),
+            "{json_body}"
+        );
+        assert!(
+            html_body.contains(wheel) && html_body.contains(&fx.repo_key),
+            "{html_body}"
+        );
+        for headers in [&json_headers, &html_headers] {
+            assert!(
+                headers.get("content-encoding").is_none(),
+                "the client gets the plain rewritten index"
+            );
+        }
+        assert_eq!(codings, vec!["gzip".to_string(), "gzip".to_string()]);
+    }
+
+    /// #5983: where a simple index names a file, from either form.
+    #[test]
+    fn test_locate_in_simple_index_reads_html_and_json_5983() {
+        let sha = "b".repeat(64);
+        let html = format!(
+            "<a href=\"https://files.example/p/x-1.0-py3-none-any.whl#sha256={sha}\">x</a>\
+             <a href=\"../../rel/y-1.0.tar.gz#sha256={sha}\">y</a>"
+        );
+        let json = serde_json::json!({"files": [
+            {"filename": "x-1.0-py3-none-any.whl", "url": "https://files.example/p/x-1.0-py3-none-any.whl", "hashes": {"sha256": sha}},
+            {"filename": "y-1.0.tar.gz", "url": "../../rel/y-1.0.tar.gz", "hashes": {"sha256": sha}},
+            {"filename": "z-1.0.tar.gz", "url": "javascript:alert(1)", "hashes": {}},
+        ]})
+        .to_string();
+        for body in [html.as_bytes(), json.as_bytes()] {
+            let (url, digest) = locate_in_simple_index(body, "x-1.0-py3-none-any.whl", None);
+            assert!(url
+                .unwrap()
+                .starts_with("https://files.example/p/x-1.0-py3-none-any.whl"));
+            assert_eq!(digest.as_deref(), Some(sha.as_str()));
+            let (url, digest) =
+                locate_in_simple_index(body, "x-1.0-py3-none-any.whl.metadata", None);
+            assert!(
+                url.as_deref()
+                    .unwrap()
+                    .starts_with("https://files.example/p/x-1.0-py3-none-any.whl.metadata"),
+                "{url:?}"
+            );
+            assert_eq!(digest, None, "the sidecar's digest is not the wheel's");
+            assert_eq!(
+                locate_in_simple_index(body, "y-1.0.tar.gz", None).0,
+                None,
+                "a relative URL with no base is not taken"
+            );
+            assert_eq!(
+                locate_in_simple_index(body, "y-1.0.tar.gz", Some("https://idx.example/simple/y/"))
+                    .0
+                    .as_deref()
+                    .map(|u| u.split('#').next().unwrap()),
+                Some("https://idx.example/rel/y-1.0.tar.gz")
+            );
+        }
+        assert_eq!(
+            locate_in_simple_index(json.as_bytes(), "z-1.0.tar.gz", None).0,
+            None,
+            "only http(s) URLs"
+        );
+        assert_eq!(
+            locate_in_simple_index(b"{not json", "x", None),
+            (None, None)
+        );
+    }
+
     #[test]
     fn test_shared_resolver_index_error_keeps_status_5983() {
         let not_found = shared_resolver_index_error(StatusCode::NOT_FOUND, false);
@@ -22305,6 +23168,431 @@ mod tests {
         rig.teardown().await;
         assert_eq!(held, StatusCode::CONFLICT);
         assert_eq!(stale, StatusCode::INSUFFICIENT_STORAGE);
+    }
+
+    /// #6439: PEP 658 metadata of a hosted distribution passes the download
+    /// gate its distribution passes: a quarantine hold answers 409, a
+    /// rejection or a refusing scan policy 403, directly and through a
+    /// virtual, where the refusal ends the walk. Before, the METADATA was
+    /// extracted from the row (200) while the wheel was refused.
+    #[tokio::test]
+    async fn test_metadata_applies_the_download_gate_6439() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "pypi").await else {
+            return;
+        };
+        let (local_id, local_key, local_dir) = tdh::create_repo(&fx.pool, "local", "pypi").await;
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 0)",
+        )
+        .bind(fx.repo_id)
+        .bind(local_id)
+        .execute(&fx.pool)
+        .await
+        .expect("attach local member");
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+            .bind(local_id)
+            .execute(&fx.pool)
+            .await
+            .expect("publish local member");
+        let state = tdh::build_state(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
+        let local = tdh::make_repo_info(local_id, &local_key, &local_dir, "local", None);
+        let filename = "gated-1.0-py3-none-any.whl";
+        seed_distribution(
+            &state,
+            &fx.pool,
+            fx.user_id,
+            &local,
+            "gated",
+            "1.0",
+            filename,
+            Some("gated/1.0"),
+            &wheel_with_metadata(
+                "gated-1.0",
+                b"Metadata-Version: 2.1\nName: gated\nVersion: 1.0\n",
+            ),
+        )
+        .await;
+        let virtual_info = fx.repo_info("virtual", None);
+        let project = proj("gated");
+        let both = || async {
+            let direct =
+                collect_serve_3220(super::serve_metadata(&state, &fx.pool, &local, filename).await)
+                    .await
+                    .0;
+            let through_virtual = collect_serve_3220(
+                super::serve_virtual_metadata(
+                    &state,
+                    None,
+                    &virtual_info,
+                    &project,
+                    Some("1.0"),
+                    filename,
+                )
+                .await,
+            )
+            .await
+            .0;
+            (direct, through_virtual)
+        };
+        let set_quarantine = |status: Option<&'static str>| {
+            let pool = fx.pool.clone();
+            async move {
+                sqlx::query(
+                    "UPDATE artifacts SET quarantine_status = $2, \
+                     quarantine_until = CASE WHEN $2::text IS NULL THEN NULL \
+                                             ELSE NOW() + INTERVAL '1 hour' END \
+                     WHERE repository_id = $1",
+                )
+                .bind(local_id)
+                .bind(status)
+                .execute(&pool)
+                .await
+                .expect("set quarantine");
+            }
+        };
+
+        let open = both().await;
+        set_quarantine(Some("quarantined")).await;
+        let held = both().await;
+        set_quarantine(Some("rejected")).await;
+        let rejected = both().await;
+        set_quarantine(None).await;
+        sqlx::query(
+            "INSERT INTO scan_policies (name, repository_id, max_severity, block_unscanned, \
+                                        block_on_fail, is_enabled) \
+             VALUES ($1, $2, 'critical', true, false, true)",
+        )
+        .bind(format!("gate-6439-{local_id}"))
+        .bind(local_id)
+        .execute(&fx.pool)
+        .await
+        .expect("insert block_unscanned policy");
+        let policy = both().await;
+
+        let _ = sqlx::query("DELETE FROM scan_policies WHERE repository_id = $1")
+            .bind(local_id)
+            .execute(&fx.pool)
+            .await;
+        cleanup_virtual_member(&fx.pool, local_id, &local_dir).await;
+        fx.teardown().await;
+
+        assert_eq!(
+            open,
+            (StatusCode::OK, StatusCode::OK),
+            "control: an open row"
+        );
+        assert_eq!(held, (StatusCode::CONFLICT, StatusCode::CONFLICT), "held");
+        assert_eq!(
+            rejected,
+            (StatusCode::FORBIDDEN, StatusCode::FORBIDDEN),
+            "rejected"
+        );
+        assert_eq!(
+            policy,
+            (StatusCode::FORBIDDEN, StatusCode::FORBIDDEN),
+            "block_unscanned scan policy"
+        );
+    }
+
+    /// A Remote member's proxy-cache row of a real wheel for the #6439
+    /// virtual tests: the body and its sidecar (recording the body's digest)
+    /// in the Remote's cache, the row keyed on them, and the wheel's own
+    /// `.metadata` entry fresh in the cache. Returns the wheel's digest.
+    async fn seed_cached_wheel_6439(
+        state: &crate::api::SharedState,
+        backend: &crate::api::handlers::test_db_helpers::PresignMemBackend,
+        fx: &crate::api::handlers::test_db_helpers::Fixture,
+        remote: &proxy_helpers::RepoInfo,
+        project: &str,
+        filename: &str,
+        hold: bool,
+    ) -> String {
+        let wheel = Bytes::from(wheel_with_metadata(
+            &format!("{project}-1.0"),
+            format!("Metadata-Version: 2.1\nName: {project}\nVersion: 1.0\nSummary: from-row\n")
+                .as_bytes(),
+        ));
+        let digest = proxy_helpers::sha256_hex(&wheel);
+        let now = chrono::Utc::now();
+        let sidecar = |body: &Bytes, sha: &str, held: bool| {
+            let meta = crate::services::proxy_service::CacheMetadata {
+                cached_at: now,
+                upstream_etag: None,
+                storage_etag: None,
+                last_modified: None,
+                negative_cached_until: None,
+                quarantine_until: held.then(|| now + chrono::Duration::hours(1)),
+                expires_at: now + chrono::Duration::hours(1),
+                content_type: Some("application/octet-stream".to_string()),
+                content_encoding: None,
+                upstream_commit_sha: None,
+                size_bytes: body.len() as i64,
+                checksum_sha256: sha.to_string(),
+            };
+            Bytes::from(serde_json::to_vec(&meta).expect("sidecar"))
+        };
+        let path = format!("simple/{project}/{filename}");
+        let prefix = format!("proxy-cache/{}/{path}", remote.key);
+        let metadata = Bytes::from(format!(
+            "Metadata-Version: 2.1\nName: {project}\nVersion: 1.0\nSummary: from-cache\n"
+        ));
+        let meta_prefix = format!("proxy-cache/{}/{path}.metadata", remote.key);
+        {
+            let mut objects = backend.objects.lock().unwrap();
+            objects.insert(format!("{prefix}/__content__"), wheel.clone());
+            objects.insert(
+                format!("{prefix}/__cache_meta__.json"),
+                sidecar(&wheel, &digest, hold),
+            );
+            objects.insert(format!("{meta_prefix}/__content__"), metadata.clone());
+            objects.insert(
+                format!("{meta_prefix}/__cache_meta__.json"),
+                sidecar(&metadata, &proxy_helpers::sha256_hex(&metadata), false),
+            );
+        }
+        crate::api::handlers::test_db_helpers::seed_artifact(
+            state,
+            &fx.pool,
+            remote,
+            &format!("{prefix}/__content__"),
+            &path,
+            project,
+            "1.0",
+            "application/octet-stream",
+            wheel,
+            fx.user_id,
+        )
+        .await;
+        digest
+    }
+
+    async fn scan_on_proxy_6439(pool: &sqlx::PgPool, repo_id: uuid::Uuid) {
+        sqlx::query(
+            "INSERT INTO scan_configs (repository_id, scan_enabled, scan_on_upload, scan_on_proxy, \
+                                       block_on_policy_violation, severity_threshold, proxy_scan_action) \
+             VALUES ($1, true, false, true, false, 'high', 'fail_closed') \
+             ON CONFLICT (repository_id) DO UPDATE SET scan_enabled = true, scan_on_proxy = true, \
+                 severity_threshold = 'high', proxy_scan_action = 'fail_closed'",
+        )
+        .bind(repo_id)
+        .execute(pool)
+        .await
+        .expect("scan config");
+    }
+
+    /// #6439: through a virtual whose stricter-of-two policy scans (#3023)
+    /// over a Remote member that does not, the METADATA of the member's
+    /// cached wheel follows the wheel. Its row is not read (the wheel is not
+    /// served from it either), and a blocking stored verdict for the wheel's
+    /// digest answers the wheel's 403. Before, the row's METADATA was served
+    /// (200) while the wheel answered 403. A held cached wheel answers 409
+    /// on the Remote's own route, and a blocking verdict 403 there too when
+    /// the Remote scans.
+    #[tokio::test]
+    async fn test_metadata_follows_the_cached_wheel_verdict_6439() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "pypi").await else {
+            return;
+        };
+        let (remote_id, remote_key, remote_dir) =
+            tdh::create_repo(&fx.pool, "remote", "pypi").await;
+        sqlx::query(
+            "UPDATE repositories SET upstream_url = 'http://127.0.0.1:1', is_public = true \
+             WHERE id = $1",
+        )
+        .bind(remote_id)
+        .execute(&fx.pool)
+        .await
+        .expect("configure remote");
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 0)",
+        )
+        .bind(fx.repo_id)
+        .bind(remote_id)
+        .execute(&fx.pool)
+        .await
+        .expect("attach remote member");
+        let (proxy, backend) = tdh::build_scoped_presign_proxy(
+            fx.pool.clone(),
+            crate::services::proxy_cache_scope::ProxyCacheScope::unscoped(),
+        );
+        let state = tdh::build_state_with_proxy(
+            fx.pool.clone(),
+            fx.storage_dir.to_str().unwrap(),
+            proxy.clone(),
+        );
+        let remote = tdh::make_repo_info(
+            remote_id,
+            &remote_key,
+            &remote_dir,
+            "remote",
+            Some("http://127.0.0.1:1"),
+        );
+        let vuln = "vulnwheel-1.0-py3-none-any.whl";
+        let held = "heldwheel-1.0-py3-none-any.whl";
+        let digest =
+            seed_cached_wheel_6439(&state, &backend, &fx, &remote, "vulnwheel", vuln, false).await;
+        seed_cached_wheel_6439(&state, &backend, &fx, &remote, "heldwheel", held, true).await;
+        // M1/M2: a cached wheel with no verdict, one whose sidecar records no
+        // digest, and one whose sidecar does not parse.
+        let unscanned = "unscannedwheel-1.0-py3-none-any.whl";
+        let nodigest = "nodigestwheel-1.0-py3-none-any.whl";
+        let badmeta = "badmetawheel-1.0-py3-none-any.whl";
+        let unscanned_digest = seed_cached_wheel_6439(
+            &state,
+            &backend,
+            &fx,
+            &remote,
+            "unscannedwheel",
+            unscanned,
+            false,
+        )
+        .await;
+        for (project, file, sidecar) in [
+            ("nodigestwheel", nodigest, None),
+            ("badmetawheel", badmeta, Some(b"{not json".to_vec())),
+        ] {
+            seed_cached_wheel_6439(&state, &backend, &fx, &remote, project, file, false).await;
+            let key = format!(
+                "proxy-cache/{}/simple/{project}/{file}/__cache_meta__.json",
+                remote.key
+            );
+            let mut objects = backend.objects.lock().unwrap();
+            let body = match sidecar {
+                Some(raw) => Bytes::from(raw),
+                None => {
+                    let mut meta: serde_json::Value =
+                        serde_json::from_slice(&objects[&key]).expect("sidecar json");
+                    meta["checksum_sha256"] = serde_json::Value::String(String::new());
+                    Bytes::from(serde_json::to_vec(&meta).unwrap())
+                }
+            };
+            objects.insert(key, body);
+        }
+        sqlx::query(
+            "INSERT INTO proxy_scan_results (checksum_sha256, scan_type, verdict, findings_count, \
+                                             critical_count, max_severity) \
+             VALUES ($1, 'grype', 'vulnerable', 1, 1, 'critical') ON CONFLICT DO NOTHING",
+        )
+        .bind(&digest)
+        .execute(&fx.pool)
+        .await
+        .expect("verdict");
+
+        let virtual_info = fx.repo_info("virtual", None);
+        let via_virtual = |project: &'static str, filename: &'static str| {
+            let state = state.clone();
+            let virtual_info = virtual_info.clone();
+            async move {
+                let (status, body) = collect_serve_3220(
+                    super::serve_virtual_metadata(
+                        &state,
+                        None,
+                        &virtual_info,
+                        &proj(project),
+                        Some("1.0"),
+                        filename,
+                    )
+                    .await,
+                )
+                .await;
+                (status, String::from_utf8_lossy(&body).into_owned())
+            }
+        };
+        let gate = |project: &'static str, filename: &'static str| {
+            let state = state.clone();
+            let remote = remote.clone();
+            let proxy = proxy.clone();
+            async move {
+                match super::remote_metadata_gate(
+                    &state,
+                    &proxy,
+                    &remote,
+                    "http://127.0.0.1:1",
+                    &proj(project),
+                    filename,
+                )
+                .await
+                {
+                    Ok(()) => StatusCode::OK,
+                    Err(r) => r.status(),
+                }
+            }
+        };
+
+        // Nothing scans yet: the virtual serves the row's METADATA, the
+        // Remote's route lets the wheel's metadata through.
+        let open = via_virtual("vulnwheel", vuln).await;
+        let open_gate = gate("vulnwheel", vuln).await;
+        let held_gate = gate("heldwheel", held).await;
+        scan_on_proxy_6439(&fx.pool, fx.repo_id).await;
+        let scanned = via_virtual("vulnwheel", vuln).await;
+        let pending = via_virtual("unscannedwheel", unscanned).await;
+        let no_digest = via_virtual("nodigestwheel", nodigest).await;
+        let bad_sidecar = via_virtual("badmetawheel", badmeta).await;
+        let unscanned_gate = gate("vulnwheel", vuln).await;
+        scan_on_proxy_6439(&fx.pool, remote_id).await;
+        let scanned_gate = gate("vulnwheel", vuln).await;
+
+        for id in [fx.repo_id, remote_id] {
+            let _ = sqlx::query("DELETE FROM scan_configs WHERE repository_id = $1")
+                .bind(id)
+                .execute(&fx.pool)
+                .await;
+        }
+        for d in [&digest, &unscanned_digest] {
+            let _ = sqlx::query("DELETE FROM proxy_scan_results WHERE checksum_sha256 = $1")
+                .bind(d)
+                .execute(&fx.pool)
+                .await;
+        }
+        cleanup_virtual_member(&fx.pool, remote_id, &remote_dir).await;
+        fx.teardown().await;
+
+        assert_eq!(open.0, StatusCode::OK, "control: {}", open.1);
+        assert!(
+            open.1.contains("from-row"),
+            "control reads the row: {}",
+            open.1
+        );
+        assert_eq!(open_gate, StatusCode::OK, "control: no hold, no scan");
+        assert_eq!(held_gate, StatusCode::CONFLICT, "a held cached wheel");
+        assert_eq!(
+            scanned.0,
+            StatusCode::FORBIDDEN,
+            "the virtual scans: the wheel's verdict refuses its METADATA: {}",
+            scanned.1
+        );
+        assert!(scanned.1.contains("scan_blocked"), "{}", scanned.1);
+        assert!(
+            matches!(pending.0, StatusCode::LOCKED | StatusCode::FORBIDDEN),
+            "fail_closed, no verdict: the wheel's own gate decides (no scanner here: 423): {:?} {}",
+            pending.0,
+            pending.1
+        );
+        assert_eq!(
+            no_digest.0,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no digest to look a verdict up by: {}",
+            no_digest.1
+        );
+        assert_eq!(
+            bad_sidecar.0,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "an unreadable sidecar: {}",
+            bad_sidecar.1
+        );
+        assert_eq!(
+            unscanned_gate,
+            StatusCode::OK,
+            "the Remote's own route does not scan: its policy is its own"
+        );
+        assert_eq!(scanned_gate, StatusCode::FORBIDDEN, "the Remote scans");
     }
 
     /// #3783: a twine upload stores the wheel's own classifiers — and the
