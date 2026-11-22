@@ -3229,16 +3229,30 @@ async fn serve_file(
                         }
                     }
 
+                    // #3023: the stricter-of-two scan policy (virtual OR
+                    // member) for a Remote member, read once for both serves
+                    // below.
+                    let member_scan = if member.repo_type == RepositoryType::Remote {
+                        proxy_helpers::effective_virtual_scan_policy(&state.db, repo.id, member.id)
+                            .await?
+                    } else {
+                        None
+                    };
+
                     // Try local storage first (works for hosted repos and
                     // cached remote artifacts). #1555: redirect to S3 presigned
-                    // URL instead of streaming when enabled.
-                    match proxy_helpers::local_fetch_or_redirect_by_suffix(
+                    // URL instead of streaming when enabled. #6416: while that
+                    // policy scans, a cached remote file's row is not served
+                    // from here (its sidecar gate knows only the member's own
+                    // policy); the scanned Remote path below answers for it.
+                    match proxy_helpers::local_fetch_or_redirect_by_suffix_for_walk(
                         &state.db,
                         state,
                         member.id,
                         &member.storage_location(),
                         filename,
                         ctx,
+                        member_scan.is_some(),
                     )
                     .await
                     {
@@ -3291,11 +3305,7 @@ async fn serve_file(
                             // a not-found or other error falls through to the next
                             // member. A member with scanning disabled keeps the
                             // untouched streaming cache path below (no regression).
-                            let scan = proxy_helpers::effective_virtual_scan_policy(
-                                &state.db, repo.id, member.id,
-                            )
-                            .await?;
-                            if let Some((action, severity_gate)) = scan {
+                            if let Some((action, severity_gate)) = member_scan {
                                 match serve_scanned_pypi_file(
                                     state,
                                     proxy,
@@ -3463,6 +3473,11 @@ async fn serve_file(
                 .boxed()
         })
     };
+    // The length and digest the response advertises: the row's, or (#6416)
+    // the sidecar's for a cached remote file the gate below vouched for, since
+    // the cache may have been refilled after the row was written.
+    let mut served_size = artifact.size_bytes;
+    let mut served_sha = artifact.checksum_sha256.clone();
     let stream = if repo.repo_type == RepositoryType::Remote {
         if let (Some(ref upstream_url), Some(ref proxy)) =
             (&repo.upstream_url, &state.proxy_service)
@@ -3482,10 +3497,58 @@ async fn serve_file(
                 )
                 .into_response());
             }
+            // #6416: the hold above is one of the sidecar's checks; the
+            // freshness, the origin policy and the stored scan verdict are the
+            // others, read from one copy of the sidecar
+            // (`proxy_cache_row_gate`). A Remote that scans on proxy serves
+            // the file through the scan gate instead, as a request with no
+            // row does, so the bytes are never handed out unscanned.
+            let mut may_serve = verdict.may_serve_stored_object();
+            if crate::services::proxy_service::ProxyService::is_proxy_cache_key(
+                &artifact.storage_key,
+            ) {
+                if let Some((action, severity_gate)) =
+                    proxy_helpers::remote_scan_policy(&state.db, repo.id).await?
+                {
+                    return serve_scanned_pypi_file(
+                        state,
+                        proxy,
+                        repo.id,
+                        repo_key,
+                        upstream_url,
+                        project,
+                        filename,
+                        action,
+                        severity_gate,
+                        Some(ctx),
+                    )
+                    .await;
+                }
+                match proxy_helpers::proxy_cache_row_gate(
+                    &state.db,
+                    state,
+                    repo.id,
+                    &artifact.storage_key,
+                )
+                .await
+                {
+                    Ok(row) => {
+                        served_size = row.size_bytes;
+                        if !row.checksum_sha256.is_empty() {
+                            served_sha = row.checksum_sha256;
+                        }
+                    }
+                    // Stale, no sidecar, not this Remote's entry: not served
+                    // from storage; fetched again below.
+                    Err(resp) if resp.status() == StatusCode::NOT_FOUND => may_serve = false,
+                    // The hold's 409, a refusing origin policy or verdict.
+                    Err(resp) => return Err(resp),
+                }
+            }
             get_remote_cached_or_refetch_stream(
                 storage.clone(),
                 &artifact.storage_key,
-                verdict.may_serve_stored_object(),
+                may_serve,
                 || async move {
                     // Fetched lazily inside the closure: this path serves
                     // cache hits straight from storage, and the index_path is
@@ -3528,8 +3591,8 @@ async fn serve_file(
             "Content-Disposition",
             format!("attachment; filename=\"{}\"", filename),
         )
-        .header(CONTENT_LENGTH, artifact.size_bytes.to_string())
-        .header("X-PyPI-File-SHA256", &artifact.checksum_sha256)
+        .header(CONTENT_LENGTH, served_size.to_string())
+        .header("X-PyPI-File-SHA256", &served_sha)
         .body(Body::from_stream(stream))
         .unwrap())
 }
@@ -12525,12 +12588,30 @@ mod tests {
         // present, `get_remote_cached_or_refetch` must short-circuit on
         // the cache hit and return the bytes without invoking the refetch
         // closure (the unit tests above pin that contract).
-        let storage_key = format!(
-            "proxy-cache/{}/simple/{}/{}",
-            fx.repo_key, project, filename
-        );
         let artifact_path = format!("simple/{}/{}", project, filename);
+        let storage_key = format!("proxy-cache/{}/{artifact_path}/__content__", fx.repo_key);
         let repo_info = fx.repo_info("remote", Some(&upstream));
+        // #6416: the row is served only while its cache entry is fresh.
+        {
+            let mut meta: crate::services::proxy_service::CacheMetadata =
+                serde_json::from_slice(&tdh::fresh_cache_sidecar_bytes()).unwrap();
+            meta.size_bytes = wheel_bytes.len() as i64;
+            meta.checksum_sha256 = sha256_hex(&Bytes::from_static(wheel_bytes));
+            state
+                .proxy_service
+                .as_deref()
+                .expect("proxy service")
+                .cache_storage_backend()
+                .put(
+                    &format!(
+                        "proxy-cache/{}/{artifact_path}/__cache_meta__.json",
+                        fx.repo_key
+                    ),
+                    Bytes::from(serde_json::to_vec(&meta).unwrap()),
+                )
+                .await
+                .expect("seed sidecar");
+        }
         crate::api::handlers::proxy_helpers::put_artifact_bytes(
             &state,
             &repo_info,
@@ -12550,7 +12631,9 @@ mod tests {
         .bind(&artifact_path)
         .bind(project)
         .bind("1.2.3")
-        .bind(wheel_bytes.len() as i64)
+        // #6416: the row records an older fill of the entry; the response
+        // advertises what the sidecar the gate read vouches for.
+        .bind(wheel_bytes.len() as i64 + 7)
         .bind("test-wired")
         .bind("application/zip")
         .bind(&storage_key)
@@ -12610,6 +12693,11 @@ mod tests {
                 .to_str()
                 .unwrap(),
             wheel_bytes.len().to_string(),
+        );
+        assert_eq!(
+            response.headers()["X-PyPI-File-SHA256"],
+            sha256_hex(&Bytes::from_static(wheel_bytes)).as_str(),
+            "the digest advertised is the sidecar's, not the row's (#6416)"
         );
         let body_bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
             .await
@@ -12847,6 +12935,26 @@ mod tests {
         )
         .await
         .expect("seed member payload");
+        // #6416: a proxy-cache row is served only while its cache entry is
+        // fresh, so the entry (body and sidecar) is in the proxy cache too.
+        {
+            let proxy = state.proxy_service.as_deref().expect("proxy service");
+            let mut meta: crate::services::proxy_service::CacheMetadata =
+                serde_json::from_slice(&tdh::fresh_cache_sidecar_bytes()).unwrap();
+            meta.size_bytes = wheel.len() as i64;
+            let cache = proxy.cache_storage_backend();
+            cache
+                .put(&storage_key, Bytes::from_static(wheel))
+                .await
+                .expect("seed member cache body");
+            cache
+                .put(
+                    &format!("proxy-cache/{member_key}/{artifact_path}/__cache_meta__.json"),
+                    Bytes::from(serde_json::to_vec(&meta).unwrap()),
+                )
+                .await
+                .expect("seed member cache sidecar");
+        }
         let _id: uuid::Uuid = sqlx::query_scalar(
             "INSERT INTO artifacts ( \
                  repository_id, path, name, version, size_bytes, \
