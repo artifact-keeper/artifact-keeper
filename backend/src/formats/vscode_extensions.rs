@@ -344,6 +344,10 @@ pub fn extract_vsix_metadata(content: &[u8]) -> Result<VsixMetadata> {
 /// the fallback stores it all the same. Callers hold an ingest-extraction
 /// permit.
 pub fn reject_unsafe_entry_names(content: &[u8]) -> Result<()> {
+    // #5526: refuse an over-ceiling declared count before parsing the whole
+    // directory. A non-ZIP body stays for `extract_vsix_metadata` to report.
+    bounded_archive::check_declared_zip_entry_count(&mut std::io::Cursor::new(content))
+        .map_err(|e| invalid_vsix(&e.to_string()))?;
     let Ok(archive) = zip::ZipArchive::new(std::io::Cursor::new(content)) else {
         return Ok(());
     };
@@ -358,7 +362,11 @@ pub fn reject_unsafe_entry_names(content: &[u8]) -> Result<()> {
 /// the legacy header identity: a readable manifest that fails validation is a
 /// 400, or breaking it would skip the header-vs-archive check (#3961).
 pub fn has_extension_manifest(content: &[u8]) -> bool {
-    zip::ZipArchive::new(std::io::Cursor::new(content))
+    let mut cursor = std::io::Cursor::new(content);
+    if bounded_archive::check_declared_zip_entry_count(&mut cursor).is_err() {
+        return false;
+    }
+    zip::ZipArchive::new(cursor)
         .is_ok_and(|archive| archive.index_for_name(VSIX_EXTENSION_MANIFEST).is_some())
 }
 

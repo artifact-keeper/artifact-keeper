@@ -50,8 +50,8 @@ use crate::services::package_analysis_service::{
     Completeness, ExtractedComponent, UnanalyzedScript,
 };
 use crate::util::bounded_archive::{
-    max_ingest_archive_entries, read_capped, read_metadata_from_tar_gz, read_metadata_from_zip,
-    MAX_INGEST_METADATA_ENTRY_BYTES,
+    check_declared_zip_entry_count_limited, max_ingest_archive_entries, read_capped,
+    read_metadata_from_tar_gz, read_metadata_from_zip, MAX_INGEST_METADATA_ENTRY_BYTES,
 };
 
 /// Which repair tool put a library in the wheel, inferred from the library's
@@ -395,10 +395,16 @@ pub fn analyze_wheel<R: Read + Seek>(reader: R) -> PypiAnalysis {
 /// tiny fixture instead of building an 8 MiB `RECORD` to prove the cap-breach
 /// path behaves.
 pub fn analyze_wheel_limited<R: Read + Seek>(
-    reader: R,
+    mut reader: R,
     max_entries: u64,
     max_entry: u64,
 ) -> PypiAnalysis {
+    // #5526: check the declared count before parsing the central directory.
+    if let Err(e) = check_declared_zip_entry_count_limited(&mut reader, max_entries) {
+        return PypiAnalysis::empty(Completeness::NotRead {
+            reason: e.to_string(),
+        });
+    }
     let mut archive = match zip::ZipArchive::new(reader) {
         Ok(a) => a,
         Err(e) => {

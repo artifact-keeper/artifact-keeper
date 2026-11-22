@@ -79,7 +79,19 @@ fn extract_manifest_from_zip(zip_bytes: &[u8]) -> Option<String> {
 /// Reader-generic core of [`extract_manifest_from_zip`]. The publish path hands
 /// it the staged scratch FILE so the uploaded archive is never held in memory
 /// (#1608); the serve path hands it a cursor over bytes it already has.
-fn extract_manifest_from_reader<R: std::io::Read + std::io::Seek>(reader: R) -> Option<String> {
+fn extract_manifest_from_reader<R: std::io::Read + std::io::Seek>(mut reader: R) -> Option<String> {
+    // Defence-in-depth entry-count cap (#2556, #5526): the per-entry byte cap
+    // already bounds memory, but reject entry-count bombs before parsing the
+    // central directory as well as before walking the parsed archive.
+    let max_entries = crate::util::bounded_archive::max_ingest_archive_entries();
+    if let Err(e) = crate::util::bounded_archive::check_declared_zip_entry_count_limited(
+        &mut reader,
+        max_entries,
+    ) {
+        tracing::debug!(error = %e, "swift manifest extraction: too many zip entries");
+        return None;
+    }
+
     let mut archive = match zip::ZipArchive::new(reader) {
         Ok(a) => a,
         Err(e) => {
@@ -88,9 +100,6 @@ fn extract_manifest_from_reader<R: std::io::Read + std::io::Seek>(reader: R) -> 
         }
     };
 
-    // Defence-in-depth entry-count cap (#2556): the per-entry byte cap already
-    // bounds memory, but reject entry-count bombs before walking the archive.
-    let max_entries = crate::util::bounded_archive::max_ingest_archive_entries();
     if archive.len() as u64 > max_entries {
         tracing::debug!(
             entries = archive.len(),
