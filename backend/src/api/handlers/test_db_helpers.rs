@@ -5319,14 +5319,6 @@ pub(crate) async fn install_write_fault(
 
 impl WriteFault {
     pub(crate) async fn remove(self) {
-        for drop in [
-            format!("DROP TRIGGER IF EXISTS {} ON {}", self.name, self.table),
-            format!("DROP FUNCTION IF EXISTS {}()", self.name),
-        ] {
-            sqlx::query(sqlx::AssertSqlSafe(drop))
-                .execute(&self.pool)
-                .await
-                .expect("drop fault trigger");
-        }
+        drop_test_trigger(&self.pool, self.table, &self.name, &self.name).await;
     }
 }
