@@ -1197,6 +1197,15 @@ impl MigrationWorker {
 
                 // Skip if already completed in THIS job (resume support within same job)
                 if self.is_item_already_completed(job_id, &source_path).await? {
+                    if artifact.possible_duplicate {
+                        // The source listed this row twice in one walk
+                        // (#6360: a Nexus asset walk past its dedupe cap).
+                        // It is one artifact, already done: take it back out
+                        // of the totals instead of counting it as skipped.
+                        *discovered -= 1;
+                        *discovered_bytes -= size;
+                        continue;
+                    }
                     *skipped += 1;
                     continue;
                 }
@@ -7030,6 +7039,7 @@ mod tests {
                 assert_eq!(repo_key, "dry-src", "source must be read by source key");
                 Ok(AqlResponse {
                     results: vec![AqlResult {
+                        possible_duplicate: false,
                         repo: repo_key.to_string(),
                         path: "pkg/1.0".into(),
                         name: "thing.tar.gz".into(),
@@ -7298,6 +7308,7 @@ mod tests {
             }
             Ok(AqlResponse {
                 results: vec![AqlResult {
+                    possible_duplicate: false,
                     repo: repo_key.to_string(),
                     path: "pkg/1.0".into(),
                     name: "thing.tar.gz".into(),
@@ -7827,6 +7838,7 @@ mod tests {
         let results: Vec<AqlResult> = artifacts[start..end]
             .iter()
             .map(|(name, size)| AqlResult {
+                possible_duplicate: false,
                 repo: repo_key.to_string(),
                 path: "pkg/1.0".into(),
                 name: name.clone(),
@@ -10031,6 +10043,140 @@ mod tests {
             .ok();
     }
 
+    /// Past the Nexus dedupe cap the asset walk lists a component's file a
+    /// second time (#6360). The worker must drop that row without counting it:
+    /// the job's totals and its skipped count describe three artifacts, not
+    /// four.
+    #[tokio::test]
+    async fn test_nexus_duplicate_past_the_dedupe_cap_is_not_counted_6360() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::nexus_client::{NexusAuth, NexusClient, NexusClientConfig};
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (worker, storage, _tmp, _repo_id, target_key) =
+            setup_repo_for_import(&pool, "mig-nexus-dupcap", "generic").await;
+        let (_unused_key, conn_id, job_id) = seed_single_repo_job(&pool, "mig-nexus-dupcap").await;
+
+        let files: [(&str, &[u8]); 3] = [
+            ("com/ex/lib/1.0/lib-1.0.jar", b"jar bytes"),
+            ("com/ex/lib/1.0/lib-1.0.pom", b"<project/>"),
+            ("docs/install.txt", b"read me"),
+        ];
+        let asset = |(p, body): (&str, &[u8])| {
+            serde_json::json!({
+                "id": p,
+                "format": "maven2",
+                "path": p,
+                "checksum": { "sha256": sha256_hex_of(body) },
+                "fileSize": body.len()
+            })
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/service/rest/v1/components"))
+            .and(query_param("repository", "test-data"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "items": [{
+                    "id": "c1", "repository": "test-data", "format": "maven2",
+                    "group": "com.ex", "name": "lib", "version": "1.0",
+                    "assets": [asset(files[0]), asset(files[1])]
+                }],
+                "continuationToken": null
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/service/rest/v1/assets"))
+            .and(query_param("repository", "test-data"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "items": [asset(files[0]), asset(files[1]), asset(files[2])],
+                "continuationToken": null
+            })))
+            .mount(&server)
+            .await;
+        for (p, body) in files {
+            Mock::given(method("GET"))
+                .and(path(format!("/repository/test-data/{p}")))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(body.to_vec()))
+                .mount(&server)
+                .await;
+        }
+        let client = NexusClient::new(NexusClientConfig {
+            base_url: server.uri(),
+            auth: NexusAuth {
+                username: "u".into(),
+                password: "p".into(),
+            },
+            throttle_delay_ms: 0,
+            // The jar is recorded; the pom is not and is listed again.
+            listed_paths_cap: 1,
+            ..Default::default()
+        })
+        .expect("build nexus client");
+
+        let keys = RepoKeys {
+            source: "test-data".to_string(),
+            target: target_key.clone(),
+        };
+        let (mut completed, mut failed, mut skipped, mut transferred) = (0i32, 0i32, 0i32, 0i64);
+        let (mut discovered, mut discovered_bytes) = (0i32, 0i64);
+        let outcome = worker
+            .process_repository_artifacts(
+                job_id,
+                Arc::new(client),
+                storage.clone(),
+                &keys,
+                "generic",
+                None,
+                None,
+                ConflictResolution::Overwrite,
+                false,
+                &mut completed,
+                &mut failed,
+                &mut skipped,
+                &mut transferred,
+                &mut discovered,
+                &mut discovered_bytes,
+                None,
+            )
+            .await
+            .expect("process the Nexus repository");
+
+        assert!(matches!(outcome, RepoProcessOutcome::Completed));
+        let bytes: i64 = files.iter().map(|(_, b)| b.len() as i64).sum();
+        assert_eq!(
+            (discovered, discovered_bytes, completed, failed, skipped),
+            (3, bytes, 3, 0, 0),
+            "three artifacts, each counted once, even with overwrite"
+        );
+        assert_eq!(
+            server
+                .received_requests()
+                .await
+                .expect("wiremock records requests")
+                .iter()
+                .filter(|r| r.url.path().starts_with("/repository/"))
+                .count(),
+            3,
+            "the duplicate row is not downloaded again"
+        );
+
+        sqlx::query("DELETE FROM migration_jobs WHERE id = $1")
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM source_connections WHERE id = $1")
+            .bind(conn_id)
+            .execute(&pool)
+            .await
+            .ok();
+    }
+
     /// End-to-end #2457 import over the Artifactory source layout: a config
     /// blob, a layer blob, and a tagged image manifest must land in the OCI
     /// index (oci_blobs + oci_tags + manifest_blob_refs) with bytes at the
@@ -12199,6 +12345,7 @@ mod tests {
             let results: Vec<AqlResult> = self.files[start..end]
                 .iter()
                 .map(|(dir, name)| AqlResult {
+                    possible_duplicate: false,
                     repo: repo_key.to_string(),
                     path: (*dir).to_string(),
                     name: (*name).to_string(),

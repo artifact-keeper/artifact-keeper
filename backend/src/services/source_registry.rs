@@ -425,6 +425,7 @@ mod tests {
             let end = (offset + limit).min(self.total).max(offset);
             let results: Vec<_> = (offset..end)
                 .map(|i| crate::services::artifactory_client::AqlResult {
+                    possible_duplicate: false,
                     repo: repo_key.to_string(),
                     path: "p".to_string(),
                     name: format!("a{i}.bin"),

@@ -252,6 +252,12 @@ pub struct AqlResult {
     pub modified: Option<String>,
     pub sha256: Option<String>,
     pub actual_sha1: Option<String>,
+    /// The source could not rule out having listed this row already in the
+    /// same walk (#6360: a Nexus asset walk past its dedupe cap). When the
+    /// row turns out to be completed in this job, the worker drops it
+    /// without counting it a second time. Never set by Artifactory.
+    #[serde(default)]
+    pub possible_duplicate: bool,
 }
 
 #[derive(Debug, Deserialize)]
