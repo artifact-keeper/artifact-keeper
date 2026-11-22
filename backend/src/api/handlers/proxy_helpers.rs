@@ -5092,8 +5092,8 @@ where
 ///
 /// The Go `.info` route needs it because `go` reads a 404 as "this proxy does
 /// not have the module" and falls through to the next `GOPROXY` entry. The
-/// other callers (RubyGems, Hex) keep the plain form until their own routes
-/// are moved (#6426).
+/// RubyGems gem info and quick spec routes and the Hex package route use it
+/// too (#6426).
 pub async fn resolve_virtual_metadata_reporting_unavailable<F, Fut>(
     db: &PgPool,
     auth: Option<&crate::api::middleware::auth::AuthExtension>,
