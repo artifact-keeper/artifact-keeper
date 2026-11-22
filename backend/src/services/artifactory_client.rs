@@ -240,6 +240,13 @@ pub struct AqlQuery {
 pub struct AqlResponse {
     pub results: Vec<AqlResult>,
     pub range: AqlRange,
+    /// The source stopped this call on its per-call upstream fetch budget
+    /// before it could fill the page (#6260). The page may be shorter than
+    /// the limit, even empty, and the listing has not ended: the caller lists
+    /// again from `offset + results.len()`. Artifactory answers a whole AQL
+    /// page in one request and never sets it.
+    #[serde(default)]
+    pub incomplete: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -252,6 +259,12 @@ pub struct AqlResult {
     pub modified: Option<String>,
     pub sha256: Option<String>,
     pub actual_sha1: Option<String>,
+    /// The source could not rule out having listed this row already in the
+    /// same walk (#6360: a Nexus asset walk past its dedupe cap). When the
+    /// row turns out to be completed in this job, the worker drops it
+    /// without counting it a second time. Never set by Artifactory.
+    #[serde(default)]
+    pub possible_duplicate: bool,
 }
 
 #[derive(Debug, Deserialize)]
