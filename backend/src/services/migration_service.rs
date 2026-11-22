@@ -4435,6 +4435,7 @@ mod tests {
             crate::services::artifactory_client::ArtifactoryError,
         > {
             Ok(crate::services::artifactory_client::AqlResponse {
+                incomplete: false,
                 results: vec![],
                 range: crate::services::artifactory_client::AqlRange {
                     start_pos: offset,

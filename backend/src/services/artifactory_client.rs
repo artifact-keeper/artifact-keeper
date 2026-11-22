@@ -240,6 +240,13 @@ pub struct AqlQuery {
 pub struct AqlResponse {
     pub results: Vec<AqlResult>,
     pub range: AqlRange,
+    /// The source stopped this call on its per-call upstream fetch budget
+    /// before it could fill the page (#6260). The page may be shorter than
+    /// the limit, even empty, and the listing has not ended: the caller lists
+    /// again from `offset + results.len()`. Artifactory answers a whole AQL
+    /// page in one request and never sets it.
+    #[serde(default)]
+    pub incomplete: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]

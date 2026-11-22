@@ -114,9 +114,9 @@ pub const COUNT_PAGE_SIZE: i64 = 1000;
 /// into a full enumeration — the migration job enumerates anyway, and
 /// publishes the real total as it goes.
 ///
-/// The Nexus client overrides this with a smaller budget
-/// (`nexus_client::NEXUS_COUNT_PAGE_BUDGET`): its listing page is assembled
-/// from many throttled `/components` requests.
+/// The Nexus client counts with its own walk instead
+/// (`NexusClient::count_artifacts`), budgeted in upstream pages: its listing
+/// page is assembled from many throttled `/components` requests.
 pub const COUNT_PAGE_BUDGET: usize = 10;
 
 /// How many artifacts a source repository holds, as far as a bounded listing
@@ -150,7 +150,9 @@ pub async fn count_by_listing<S: SourceRegistry + ?Sized>(
         let page = source.list_artifacts(repo_key, counted, page_size).await?;
         let page_len = page.results.len() as i64;
         counted = counted.saturating_add(page_len);
-        if page_len < page_size {
+        // A page the source cut short on its fetch budget is not the end of
+        // the listing (#6260); it still spends one call of the budget.
+        if page_len < page_size && !page.incomplete {
             return Ok(ArtifactCount {
                 counted,
                 exact: true,
@@ -354,6 +356,7 @@ mod tests {
             limit: i64,
         ) -> Result<AqlResponse, ArtifactoryError> {
             Ok(AqlResponse {
+                incomplete: false,
                 results: vec![],
                 range: AqlRange {
                     start_pos: offset,
@@ -393,6 +396,9 @@ mod tests {
     struct ListingSource {
         total: i64,
         calls: std::sync::atomic::AtomicUsize,
+        /// Rows one call returns at most, flagged `incomplete`, the way a
+        /// source that stops on a fetch budget answers (#6260).
+        chunk: Option<i64>,
     }
 
     impl ListingSource {
@@ -400,6 +406,7 @@ mod tests {
             Self {
                 total,
                 calls: std::sync::atomic::AtomicUsize::new(0),
+                chunk: None,
             }
         }
     }
@@ -422,6 +429,7 @@ mod tests {
             limit: i64,
         ) -> Result<AqlResponse, ArtifactoryError> {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let limit = self.chunk.map_or(limit, |c| c.min(limit));
             let end = (offset + limit).min(self.total).max(offset);
             let results: Vec<_> = (offset..end)
                 .map(|i| crate::services::artifactory_client::AqlResult {
@@ -438,6 +446,7 @@ mod tests {
                 .collect();
             let page = results.len() as i64;
             Ok(AqlResponse {
+                incomplete: self.chunk.is_some() && end < self.total,
                 results,
                 range: AqlRange {
                     start_pos: offset,
@@ -486,6 +495,35 @@ mod tests {
                 counted: 2_345,
                 exact: true
             }
+        );
+    }
+
+    /// A page a source cut short on its fetch budget is not the end of the
+    /// listing (#6260): the count goes on, and a walk the call budget stops
+    /// is a lower bound, not an exact count.
+    #[tokio::test]
+    async fn test_count_by_listing_follows_incomplete_pages_6260() {
+        let source = ListingSource {
+            chunk: Some(30),
+            ..ListingSource::new(100)
+        };
+        let count = count_by_listing(&source, "repo", 1000, 10).await.unwrap();
+        assert_eq!(
+            count,
+            ArtifactCount {
+                counted: 100,
+                exact: true
+            }
+        );
+
+        let short = count_by_listing(&source, "repo", 1000, 2).await.unwrap();
+        assert_eq!(
+            short,
+            ArtifactCount {
+                counted: 60,
+                exact: false
+            },
+            "two cut-short calls are a lower bound"
         );
     }
 
