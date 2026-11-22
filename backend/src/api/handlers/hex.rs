@@ -598,7 +598,9 @@ async fn download_tarball(
     let filename = tarball_file.trim_start_matches('/');
 
     let local_hit =
-        match proxy_helpers::find_local_by_filename_suffix(&state.db, repo.id, filename).await? {
+        match proxy_helpers::find_servable_local_by_filename_suffix(&state, repo.id, filename)
+            .await?
+        {
             Some(a) => Some(a),
             // #2674: a hosted registry advertises every case-variant row's
             // releases under the case-fold winner's spelling (`package_info`

@@ -481,6 +481,31 @@ pub async fn get_content(
         &params.path,
     )
     .await?;
+    // #6433: a proxy-cache row is read only after its cache sidecar is
+    // checked: held is the 409, a refusal the 403, and one nothing vouches
+    // for is not shown.
+    let artifact = match crate::api::handlers::proxy_helpers::vouched_row(
+        &state,
+        repo_id,
+        Some(artifact),
+        |a| {
+            crate::api::handlers::proxy_helpers::ServedRowRef::new(
+                &a.storage_key,
+                Some(a.size_bytes),
+            )
+        },
+    )
+    .await
+    {
+        Ok(Some(artifact)) => artifact,
+        Ok(None) => {
+            return Err(AppError::NotFound(format!(
+                "Artifact '{}' not found",
+                params.path
+            )))
+        }
+        Err(refusal) => return Ok(refusal),
+    };
 
     let content = storage.get(&artifact.storage_key).await?;
 

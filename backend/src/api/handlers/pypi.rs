@@ -2019,6 +2019,11 @@ async fn serve_virtual_metadata(
         match serve_metadata(state, &state.db, &member_info, filename).await {
             Ok(response) => return Ok(response),
             Err(response) if response.status() == StatusCode::NOT_FOUND => {}
+            // #6433: the member's cached row is held or refused: the answer,
+            // as for its file, not a fault to step past.
+            Err(response) if proxy_helpers::is_member_policy_block_response(&response) => {
+                return Err(response)
+            }
             // 507: this member HAS an `artifacts` row for the file, but
             // storage could not produce the bytes. For a hosted row that is
             // after the coordinated re-read; for a proxy-cache-backed row
@@ -4695,6 +4700,17 @@ async fn serve_metadata(
     )
     .await?
     .ok_or_else(|| AppError::NotFound("File not found".to_string()).into_response())?;
+    // #6433: a proxy-cache row is read only after its cache sidecar is
+    // checked (the hold's 409, a refusal's 403). One nothing vouches for is
+    // this member's name with its bytes unavailable: the 507 the virtual walk
+    // recovers from this member's own upstream (#3463), never a 404 that
+    // would let a lower-priority member answer (#3372).
+    let artifact =
+        crate::api::handlers::proxy_helpers::vouched_row(state, repo_id, Some(artifact), |a| {
+            crate::api::handlers::proxy_helpers::ServedRowRef::new(&a.storage_key, None)
+        })
+        .await?
+        .ok_or_else(insufficient_storage_metadata_response)?;
 
     // Try to extract METADATA from the package file
     let storage = state.storage_for_repo_or_500(location)?;
@@ -22238,9 +22254,10 @@ mod tests {
              the signal it recovers from, not `coordinated_retry_get`'s answer"
         );
         assert_eq!(
-            cached_reads, 1,
-            "#3463: the key must be read once; the coordinated re-read cannot succeed on a \
-             key no local writer owns and only costs a lease plus a second round trip"
+            cached_reads, 0,
+            "#3463: the coordinated re-read cannot succeed on a key no local writer owns; \
+             #6433: and a proxy-cache row nothing vouches for (no proxy cache here) is not \
+             read at all"
         );
 
         assert_eq!(
@@ -22260,6 +22277,34 @@ mod tests {
              (observed {hosted_reads} reads vs {cached_reads} for the proxy-cache row); an \
              exact count is not pinned because it is an internal of the coordinator"
         );
+    }
+
+    /// #6433: the PEP 658 metadata of a proxy-cache row is read only after
+    /// its cache sidecar is checked. A held row answers the hold's 409, which
+    /// ends a virtual walk; one nothing vouches for answers the 507 the walk
+    /// recovers from this member's own upstream (#3463), never a 404 that
+    /// would let a lower-priority member answer (#3372). Before, both were
+    /// extracted from the row's bytes.
+    #[tokio::test]
+    async fn test_serve_metadata_gates_proxy_cache_rows_6433() {
+        use crate::api::handlers::test_db_helpers::{CacheRowRig, CacheRowSidecar as S};
+        let Some(rig) = CacheRowRig::setup("pypi").await else {
+            return;
+        };
+        let held = "held-1.0-py3-none-any.whl";
+        let stale = "stale-1.0-py3-none-any.whl";
+        rig.row(&format!("simple/held/{held}"), "held", "1.0", S::Held)
+            .await;
+        rig.row(&format!("simple/stale/{stale}"), "stale", "1.0", S::Stale)
+            .await;
+        let status = |r: Result<Response, Response>| match r {
+            Ok(r) | Err(r) => r.status(),
+        };
+        let held = status(super::serve_metadata(&rig.state, &rig.fx.pool, &rig.repo, held).await);
+        let stale = status(super::serve_metadata(&rig.state, &rig.fx.pool, &rig.repo, stale).await);
+        rig.teardown().await;
+        assert_eq!(held, StatusCode::CONFLICT);
+        assert_eq!(stale, StatusCode::INSUFFICIENT_STORAGE);
     }
 
     /// #3783: a twine upload stores the wheel's own classifiers — and the

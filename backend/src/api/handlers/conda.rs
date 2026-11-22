@@ -6958,6 +6958,13 @@ async fn download_package(
         return serve_sidecar(&state, auth.as_ref(), &repo, &subdir, &filename, request).await;
     }
 
+    // #6433: a proxy-cache row is served only after its cache sidecar is
+    // checked; one nothing vouches for is no row, so a Remote resolves the
+    // package through its proxy path below.
+    let artifact = proxy_helpers::vouched_row(&state, repo.id, artifact, |a| {
+        proxy_helpers::ServedRowRef::new(&a.storage_key, Some(a.size_bytes))
+    })
+    .await?;
     let not_found = || (StatusCode::NOT_FOUND, "Package not found").into_response();
     let artifact = match artifact {
         Some(a) => a,
