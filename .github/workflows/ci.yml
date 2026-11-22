@@ -853,6 +853,13 @@ jobs:
           ./scripts/ci/memory-watch.sh stop "$RUNNER_TEMP/memory-watch.tsv"
           ./scripts/ci/memory-watch.sh report "$RUNNER_TEMP/memory-watch.tsv"
 
+      # The heap and CPU profile routes are compiled only with `profiling`,
+      # which is not in any default clippy or test-shard build. Check the
+      # feature here so a change to those admin-only handlers cannot rot
+      # unnoticed until an operator builds it.
+      - name: Check profiling feature
+        run: cargo check -p artifact-keeper-backend --lib --features profiling
+
   # WINDOWS CROSS-CHECK (#6022). Every other Rust job here compiles for
   # Linux only, so code that needs a Unix-only API without a cfg guard
   # (`std::os::unix::*`, `PermissionsExt`, `symlink`) passed every PR check.

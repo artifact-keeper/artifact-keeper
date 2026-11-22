@@ -25,7 +25,7 @@ harness = false
 vendored-openssl = ["openssl/vendored"]
 jemalloc = ["dep:tikv-jemallocator"]
 mimalloc = ["dep:mimalloc"]
-profiling = ["jemalloc", "dep:tikv-jemalloc-ctl", "dep:tikv-jemalloc-sys", "tikv-jemallocator/profiling"]
+profiling = ["jemalloc", "dep:pprof", "dep:tikv-jemalloc-ctl", "dep:tikv-jemalloc-sys", "tikv-jemallocator/profiling"]
 
 # CI test shards. Each one selects a subset of the inline `#[cfg(test)]`
 # modules (see scripts/ci/test-shards.py for which and why): the unit-test
@@ -267,6 +267,9 @@ serde_json_canonicalizer = "0.3"
 sigstore_protobuf_specs = "=0.5.2"
 
 [target.'cfg(not(windows))'.dependencies]
+# pprof-rs uses setitimer and Unix signals, so the CPU profile route is
+# unavailable on Windows even though the `profiling` feature can be enabled.
+pprof = { version = "0.15", default-features = false, features = ["protobuf", "prost-codec"], optional = true }
 tikv-jemallocator = { version = "0.6", optional = true }
 tikv-jemalloc-ctl = { version = "0.6", optional = true, features = ["stats"] }
 tikv-jemalloc-sys = { version = "0.6", optional = true }

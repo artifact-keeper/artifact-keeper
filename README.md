@@ -304,6 +304,7 @@ Get running in 5 minutes with Docker Compose: **[Quickstart Guide](https://artif
 - **[Bazel module registries](docs/bazel.md)** — `--registry=` setup, and how a hosted module name hides the upstream versions in a virtual repository
 - **[Air-gapped deployments](docs/air-gapped.md)**: Seed-then-disconnect, low-side/high-side peer replication, offline Remote and scanner settings, the background jobs that reach out, and a verification checklist
 - **[Proxy cache freshness](docs/proxy-cache-freshness.md)** — How mutable metadata and immutable artifacts expire on different schedules, and why an upstream yank surfaces as a resolution failure while the artifact still serves
+- **[CPU profiling](docs/operations/cpu-profiling.md)** — Build an opt-in profiling binary with symbols and capture a pprof-compatible CPU profile from the admin API
 
 ## Project Structure
 

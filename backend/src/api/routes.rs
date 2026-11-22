@@ -1537,6 +1537,8 @@ fn api_v1_routes(
                 let admin = admin
                     .route("/memory-stats", get(handlers::health::memory_stats))
                     .route("/heap-profile", get(handlers::health::heap_profile));
+                #[cfg(all(feature = "profiling", not(target_os = "windows")))]
+                let admin = admin.route("/cpu-profile", get(handlers::health::cpu_profile));
                 admin
             }
             .nest("/analytics", handlers::analytics::router())
