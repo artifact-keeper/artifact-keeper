@@ -1088,14 +1088,13 @@ mod db_tests {
         }
         let svc = StorageScrubService::new(fx.pool.clone(), fx.state.storage_registry.clone());
         let res = svc.run(&opts(&fx, false)).await;
-        for sql in [
-            format!("DROP TRIGGER {func} ON storage_scrub_findings"),
-            format!("DROP FUNCTION {func}()"),
-        ] {
-            let _ = sqlx::query(sqlx::AssertSqlSafe(&*sql))
-                .execute(&fx.pool)
-                .await;
-        }
+        crate::api::handlers::test_db_helpers::drop_test_trigger(
+            &fx.pool,
+            "storage_scrub_findings",
+            &func,
+            &func,
+        )
+        .await;
         fx.teardown().await;
         let res = res.expect("scrub run");
         assert_eq!(res.errors.len(), 1, "{res:?}");

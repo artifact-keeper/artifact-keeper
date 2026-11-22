@@ -621,6 +621,32 @@ pub(crate) async fn device_expiry_serial_lock() -> DeviceExpirySerialGuard {
     }
 }
 
+/// Advisory-lock key for [`sync_claim_recovery_serial_lock`] (#5671).
+const SYNC_CLAIM_RECOVERY_TEST_LOCK_KEY: i64 = 0x5343_5671; // "SC" + issue #5671
+
+/// Cross-process serialization guard for the tests that run the sync-task
+/// claim recovery sweep, or need an unclaimed `in_progress` row of theirs to
+/// survive one (#5671).
+///
+/// `recover_expired_sync_task_claims` resets every lapsed `in_progress` row in
+/// the database, not just the caller's. Run concurrently, one test's sweep
+/// resets a row another test has just seeded before that test's own sweep
+/// runs, or holds the row's lock while the other test claims it, so the
+/// claim's `SKIP LOCKED` passes over it. The `db-serial` nextest group keeps
+/// them apart in CI; this lock also does under a single-process
+/// `cargo test`. Tests take it for their whole body.
+pub struct SyncClaimRecoverySerialGuard {
+    _conn: Option<sqlx::PgConnection>,
+}
+
+/// Acquire the sync claim-recovery test lock, blocking until it is free.
+/// Inert when no database is configured, like [`try_pool`].
+pub(crate) async fn sync_claim_recovery_serial_lock() -> SyncClaimRecoverySerialGuard {
+    SyncClaimRecoverySerialGuard {
+        _conn: serial_lock_session(SYNC_CLAIM_RECOVERY_TEST_LOCK_KEY).await,
+    }
+}
+
 /// Refresh the materialized storage stats for a test, absorbing transient
 /// cross-suite interference.
 ///
@@ -3163,17 +3189,25 @@ pub struct PresignMemBackend {
     /// entry evicted (by another replica, or a lifecycle rule) between two
     /// reads of the same request.
     pub evict_after_read: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Successful `get`s per key, so a test can count the sidecar reads one
+    /// request costs (#6361).
+    pub reads: std::sync::Mutex<std::collections::HashMap<String, usize>>,
 }
 
 impl PresignMemBackend {
     /// Seed a fresh positive cache entry (body + `__cache_meta__.json` sidecar)
     /// at the given keys, so `ProxyService::is_cache_fresh` returns true,
-    /// `ProxyService::fresh_cache_redirect_size` returns the recorded size, and
+    /// `ProxyService::fresh_cache_redirect` returns the recorded sidecar, and
     /// the redirect/epoch paths proceed to derive and act on the scoped key.
     pub fn seed_fresh_entry(&self, content_key: &str, metadata_key: &str) {
         let mut g = self.objects.lock().unwrap();
         g.insert(content_key.to_string(), Bytes::from_static(b"cached-body"));
         g.insert(metadata_key.to_string(), fresh_cache_sidecar_bytes());
+    }
+
+    /// How many times `key` was read successfully.
+    pub fn read_count(&self, key: &str) -> usize {
+        self.reads.lock().unwrap().get(key).copied().unwrap_or(0)
     }
 }
 
@@ -3192,6 +3226,12 @@ impl crate::services::storage_service::StorageBackend for PresignMemBackend {
             .get(key)
             .cloned()
             .ok_or_else(|| crate::error::AppError::NotFound(key.to_string()))?;
+        *self
+            .reads
+            .lock()
+            .unwrap()
+            .entry(key.to_string())
+            .or_default() += 1;
         if self.evict_after_read.lock().unwrap().contains(key) {
             objects.remove(key);
         }
@@ -3250,7 +3290,7 @@ impl crate::services::storage_service::StorageBackend for PresignMemBackend {
 }
 
 /// A fresh, non-expired positive proxy-cache sidecar (no pinned `storage_etag`,
-/// so `is_cache_fresh` and `fresh_cache_redirect_size` fall back to an
+/// so `is_cache_fresh` and `fresh_cache_redirect` fall back to an
 /// existence check of the body key).
 pub fn fresh_cache_sidecar_bytes() -> Bytes {
     let meta = crate::services::proxy_service::CacheMetadata {
@@ -4913,6 +4953,29 @@ pub fn expected_after_label_write_5625() -> Vec<(String, String, Option<String>,
     ]
 }
 
+/// Drop a trigger, and its function, that a test put on a shared table
+/// (#5647).
+///
+/// A bare `DROP TRIGGER` opens the table with `AccessShareLock` and only then
+/// asks for the `AccessExclusiveLock` it needs, so two tests dropping their
+/// triggers from the same table at once can each hold the weak lock the
+/// other's upgrade waits for, and Postgres aborts one of them with 40P01.
+/// Taking the exclusive lock first, in the same transaction, makes them queue.
+pub(crate) async fn drop_test_trigger(pool: &PgPool, table: &str, trigger: &str, function: &str) {
+    let mut tx = pool.begin().await.expect("begin test trigger drop");
+    for sql in [
+        format!("LOCK TABLE {table} IN ACCESS EXCLUSIVE MODE"),
+        format!("DROP TRIGGER IF EXISTS {trigger} ON {table}"),
+        format!("DROP FUNCTION IF EXISTS {function}()"),
+    ] {
+        sqlx::query(sqlx::AssertSqlSafe(sql))
+            .execute(&mut *tx)
+            .await
+            .expect("drop test trigger");
+    }
+    tx.commit().await.expect("commit test trigger drop");
+}
+
 /// Install an `INSERT OR UPDATE` row trigger on `artifacts`, fired at
 /// `timing` (`"BEFORE"` or `"AFTER"`), that runs the PL/pgSQL `body` for the
 /// row whose SHA-256 is `checksum_sha256` (#4892, #5399). A test uses it to
@@ -4920,7 +4983,8 @@ pub fn expected_after_label_write_5625() -> Vec<(String, String, Option<String>,
 /// per-key publish lock, without delaying any other artifact. An `AFTER`
 /// trigger parks it with its row already in the unique index, so a competing
 /// insert of the same path waits for it instead of committing first. Returns
-/// the SQL that removes it again.
+/// the trigger's name, which is also its function's: remove both with
+/// [`drop_test_trigger`] on `artifacts`.
 pub(crate) async fn install_artifact_row_fault(
     pool: &sqlx::PgPool,
     suffix: &str,
@@ -4947,7 +5011,7 @@ pub(crate) async fn install_artifact_row_fault(
     .execute(pool)
     .await
     .expect("create artifact fault trigger");
-    format!("DROP TRIGGER IF EXISTS {func} ON artifacts; DROP FUNCTION IF EXISTS {func}()")
+    func
 }
 
 // In a `#[cfg(test)]` module (this whole file is test-only anyway) so the
@@ -5109,5 +5173,181 @@ mod poll_tests {
         assert_eq!(row.user_id, None);
         assert_eq!(row.resource_type, "test");
         assert_eq!(row.details["late"], true);
+    }
+}
+
+tokio::task_local! {
+    /// The counter of the request a checkout belongs to, set by
+    /// [`AcquireCounter::scoped`] (#6318).
+    static ACQUIRE_SCOPE: AcquireCounter;
+}
+
+/// Pool checkouts counted by [`counting_pool`] (#6318), split by whether the
+/// checkout was made by the task running [`AcquireCounter::scoped`] (the
+/// request itself) or by a detached task it spawned.
+///
+/// sqlx runs `before_acquire` / `after_connect` inside the acquiring task's
+/// own `acquire()` future, so a task-local tells the two apart. Detached work
+/// (the fire-and-forget audit insert, `tokio::spawn`ed after the commit) races
+/// the end of the request: counting it made the request count 11 on one host
+/// and 12 on another. Those checkouts are kept apart in `detached`.
+#[derive(Clone, Default)]
+pub struct AcquireCounter {
+    scoped: Arc<std::sync::atomic::AtomicUsize>,
+    detached: Arc<std::sync::atomic::AtomicUsize>,
+    sites: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl AcquireCounter {
+    /// Run `fut` as the request whose checkouts are counted, and return its
+    /// output with the number of checkouts it made on its own task.
+    pub(crate) async fn scoped<F: std::future::Future>(&self, fut: F) -> (F::Output, usize) {
+        let before = self.scoped.load(std::sync::atomic::Ordering::SeqCst);
+        let out = ACQUIRE_SCOPE.scope(self.clone(), fut).await;
+        let after = self.scoped.load(std::sync::atomic::Ordering::SeqCst);
+        (out, after - before)
+    }
+
+    /// Checkouts made outside any [`Self::scoped`] request (detached tasks,
+    /// fixture setup).
+    pub fn detached(&self) -> usize {
+        self.detached.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// With `AK_TEST_TRACE_ACQUIRES=1`, the backend frames of every checkout
+    /// so far, tagged `request` or `detached` (diagnostics only).
+    pub fn sites(&self) -> Vec<String> {
+        self.sites.lock().unwrap().clone()
+    }
+
+    fn record(&self) {
+        let in_scope = ACQUIRE_SCOPE
+            .try_with(|scope| Arc::ptr_eq(&scope.scoped, &self.scoped))
+            .unwrap_or(false);
+        let (counter, tag) = if in_scope {
+            (&self.scoped, "request")
+        } else {
+            (&self.detached, "detached")
+        };
+        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if std::env::var_os("AK_TEST_TRACE_ACQUIRES").is_some() {
+            let trace = std::backtrace::Backtrace::force_capture().to_string();
+            let frames: Vec<&str> = trace
+                .lines()
+                .map(str::trim)
+                .filter(|l| {
+                    l.contains("artifact_keeper_backend::") && !l.contains("test_db_helpers")
+                })
+                .map(|l| l.split_once(": ").map_or(l, |(_, f)| f))
+                .take(4)
+                .collect();
+            self.sites
+                .lock()
+                .unwrap()
+                .push(format!("[{tag}] {}", frames.join(" <- ")));
+        }
+    }
+}
+
+/// A pool on the test database that counts every checkout (#6318): an idle
+/// connection handed out runs `before_acquire`, a new one `after_connect`, so
+/// each acquire increments the counter exactly once (in the acquiring task,
+/// which is what lets [`AcquireCounter::scoped`] attribute it). Used to pin how many
+/// times one upload goes back to the pool, the per-upload connection demand
+/// that sets the concurrency limit under a small pool.
+pub(crate) async fn counting_pool(max_connections: u32) -> Option<(PgPool, AcquireCounter)> {
+    // The shared probe (skip or fail on an unreachable database).
+    try_pool().await?;
+    let url = crate::testing::require_db_url()?;
+    let counter = AcquireCounter::default();
+    let on_acquire = counter.clone();
+    let on_connect = counter.clone();
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(max_connections)
+        .acquire_timeout(std::time::Duration::from_secs(30))
+        .before_acquire(move |_, _| {
+            on_acquire.record();
+            Box::pin(async { Ok(true) })
+        })
+        .after_connect(move |_, _| {
+            on_connect.record();
+            Box::pin(async { Ok(()) })
+        })
+        .connect(&url)
+        .await
+        .expect("counting pool");
+    Some((pool, counter))
+}
+
+impl Fixture {
+    /// [`Fixture::setup`] whose state runs on a [`counting_pool`] (#6318).
+    pub(crate) async fn setup_counting(
+        repo_type: &str,
+        format: &str,
+    ) -> Option<(Self, AcquireCounter)> {
+        let (pool, counter) = counting_pool(4).await?;
+        let (user_id, username) = create_user(&pool).await;
+        let (repo_id, repo_key, storage_dir) = create_repo(&pool, repo_type, format).await;
+        grant_repo_access(&pool, repo_id, user_id).await;
+        let state = build_state(pool.clone(), storage_dir.to_str().unwrap());
+        Some((
+            Self {
+                pool,
+                user_id,
+                username,
+                repo_id,
+                repo_key,
+                storage_dir,
+                state,
+            },
+            counter,
+        ))
+    }
+}
+
+/// A write fault on one table for rows that name `marker` (#6383): a
+/// `BEFORE INSERT OR UPDATE` trigger that raises when the row's `column`, as
+/// text, contains it. Rows of other tests never carry the marker, so the
+/// shared test database is unaffected. Call [`WriteFault::remove`] when done.
+pub(crate) struct WriteFault {
+    pool: PgPool,
+    table: &'static str,
+    name: String,
+}
+
+pub(crate) async fn install_write_fault(
+    pool: &PgPool,
+    table: &'static str,
+    column: &'static str,
+    marker: &str,
+) -> WriteFault {
+    let name = format!("ak_test_fault_{}", Uuid::new_v4().simple());
+    let function = format!(
+        "CREATE FUNCTION {name}() RETURNS trigger LANGUAGE plpgsql AS $f$ BEGIN \
+         IF NEW.{column}::text LIKE '%{marker}%' THEN \
+         RAISE EXCEPTION 'injected {table} write fault'; END IF; RETURN NEW; END $f$"
+    );
+    sqlx::query(sqlx::AssertSqlSafe(function))
+        .execute(pool)
+        .await
+        .expect("create fault function");
+    let trigger = format!(
+        "CREATE TRIGGER {name} BEFORE INSERT OR UPDATE ON {table} \
+         FOR EACH ROW EXECUTE FUNCTION {name}()"
+    );
+    sqlx::query(sqlx::AssertSqlSafe(trigger))
+        .execute(pool)
+        .await
+        .expect("create fault trigger");
+    WriteFault {
+        pool: pool.clone(),
+        table,
+        name,
+    }
+}
+
+impl WriteFault {
+    pub(crate) async fn remove(self) {
+        drop_test_trigger(&self.pool, self.table, &self.name, &self.name).await;
     }
 }

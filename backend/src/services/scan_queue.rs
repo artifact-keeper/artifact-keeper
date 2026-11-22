@@ -100,6 +100,7 @@ tokio::task_local! {
     static BACKGROUND_BAND: ();
     static ENGINE_UNAVAILABLE: std::cell::Cell<bool>;
     static JOB_BUDGET: JobBudget;
+    static JOB_CLAIM: JobClaim;
 }
 
 /// The queued job a scan runs in (#5942): when its budget ends, and whether a
@@ -167,6 +168,73 @@ pub async fn within_job_deadline<T>(
     }
 }
 
+/// The claim a queued job runs under (#6232): the job row and its token.
+#[derive(Clone, Copy)]
+struct JobClaim {
+    job_id: Uuid,
+    token: Uuid,
+}
+
+/// Run `fut` as the holder of one job claim (#6232). A `running` scan_results
+/// row created inside it records the claim token, so when the claim lapses
+/// [`ScanQueue::recover_expired_claims`] can close the rows that claim left
+/// behind, and only those. The scan's final writes to its rows check
+/// [`claim_still_held`] first, so a worker that was only slow, not dead,
+/// cannot overwrite what recovery recorded once the claim is gone.
+pub async fn under_claim<F: std::future::Future>(
+    job_id: Uuid,
+    claim_token: Uuid,
+    fut: F,
+) -> F::Output {
+    JOB_CLAIM
+        .scope(
+            JobClaim {
+                job_id,
+                token: claim_token,
+            },
+            fut,
+        )
+        .await
+}
+
+/// The claim token of the queued job the current task runs (see
+/// [`under_claim`]). `None` outside a queued job, so an in-process scan
+/// records none. Task-local: a task spawned from inside the scan does not
+/// inherit it.
+pub fn current_claim() -> Option<Uuid> {
+    JOB_CLAIM.try_with(|c| c.token).ok()
+}
+
+/// Whether the queued job the current task runs still holds its claim, taking
+/// a share lock on the job row for the rest of `conn`'s transaction (#6232).
+///
+/// Call it first in the transaction of a write that settles a scan row. While
+/// the lock is held, [`ScanQueue::recover_expired_claims`] (`FOR UPDATE SKIP
+/// LOCKED`) cannot revoke the claim, so the write lands before any recovery or
+/// not at all. `false` means recovery already revoked it: the job has been
+/// requeued, its rows were failed, and the caller must leave them alone.
+/// Always `true` outside a queued job (an in-process scan has no claim).
+pub async fn claim_still_held(conn: &mut sqlx::PgConnection) -> Result<bool> {
+    let Ok(claim) = JOB_CLAIM.try_with(|c| *c) else {
+        return Ok(true);
+    };
+    let held: Option<(i32,)> =
+        sqlx::query_as("SELECT 1 FROM scan_queue WHERE id = $1 AND claim_token = $2 FOR SHARE")
+            .bind(claim.job_id)
+            .bind(claim.token)
+            .fetch_optional(conn)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+    if held.is_none() {
+        tracing::warn!(
+            job_id = %claim.job_id,
+            "scan finished after its scan-job claim was recovered; leaving its rows as \
+             recovery recorded them for the rerun"
+        );
+    }
+    Ok(held.is_some())
+}
+
 /// Run `fut`, reporting whether a scanner engine said it was unavailable while
 /// it ran (#5994): unreachable, or not ready within its readiness wait. The
 /// orchestrator records such a scan `failed`, which is right for a request
@@ -209,6 +277,11 @@ pub const BACKGROUND_PRIORITY_FIELD: (&str, &str) = ("priority", "background");
 /// `(name, value)` sent on an adapter filesystem upload for a background-band
 /// scan. Absent means interactive.
 pub const BACKGROUND_PRIORITY_HEADER: (&str, &str) = ("X-Scan-Priority", "background");
+
+/// `error_message` of a scan_results row whose queued job was recovered from a
+/// lapsed claim (#6232). The rerun records its verdict in a new row.
+pub const RECOVERED_SCAN_REASON: &str = "scan worker vanished mid-scan (its scan-job claim \
+     lapsed); the recovered job reruns the scan";
 
 /// Claim extension for one job. Binds `$1 = id`, `$2 = token`, `$3 = ttl`.
 pub const RENEW_CLAIM_SQL: &str = r#"
@@ -982,31 +1055,79 @@ impl ScanQueue {
 
     /// Requeue work abandoned by a crashed replica, charging the lost attempt so a
     /// job that kills its worker cannot spin forever. Safe from every replica.
+    ///
+    /// The same statement fails each `running` scan_results row the lapsed
+    /// claim created (#6232), since the rerun writes rows of its own. Rows are
+    /// matched on the claim token, which this statement revokes, so a row a
+    /// live claim is writing, or one an in-process scan created, is never
+    /// touched. The lock skips a job another replica is recovering or
+    /// finalizing right now, and the `running` guard makes a repeat a no-op.
+    ///
+    /// A claim that lapses on the job's last attempt does not end the job
+    /// (#6423): its worker may only have been slow, and [`claim_still_held`]
+    /// refuses that worker's late verdict, so ending the job would leave its
+    /// rows `failed` with nothing to rerun them. Recovery grants it ONE more
+    /// run instead (`attempts` reaches `max_attempts`). That run is a last
+    /// attempt in every finalizer, and a second lapse ends the job, so a job
+    /// that kills its worker still stops, after at most one extra run.
     pub async fn recover_expired_claims(&self, backoff_secs: f64) -> Result<u64> {
-        let result = sqlx::query(
+        let (jobs, rows): (i64, i64) = sqlx::query_as(
             r#"
-            UPDATE scan_queue
-            SET attempts = CASE WHEN requeue THEN 0 ELSE attempts + 1 END,
-                state = CASE
-                    WHEN requeue OR attempts + 1 < max_attempts THEN 'pending'
-                    ELSE 'failed'
-                END,
-                requeue = false,
-                last_error = COALESCE(last_error, 'claim expired; worker vanished mid-scan'),
-                next_attempt_at = NOW() + make_interval(secs => $1),
-                claimed_by = NULL,
-                claim_token = NULL,
-                claim_expires_at = NULL,
-                updated_at = NOW()
-            WHERE state = 'running'
-              AND (claim_expires_at IS NULL OR claim_expires_at <= NOW())
+            WITH lapsed AS (
+                SELECT id, claim_token
+                FROM scan_queue
+                WHERE state = 'running'
+                  AND (claim_expires_at IS NULL OR claim_expires_at <= NOW())
+                FOR UPDATE SKIP LOCKED
+            ),
+            recovered AS (
+                UPDATE scan_queue q
+                SET attempts = CASE WHEN q.requeue THEN 0 ELSE q.attempts + 1 END,
+                    state = CASE
+                        WHEN q.requeue OR q.attempts + 1 < q.max_attempts THEN 'pending'
+                        -- #6423: a claim that lapses on the last attempt gets
+                        -- one more run, since the late finish is refused.
+                        WHEN q.attempts < q.max_attempts THEN 'pending'
+                        ELSE 'failed'
+                    END,
+                    requeue = false,
+                    last_error = COALESCE(q.last_error, 'claim expired; worker vanished mid-scan'),
+                    next_attempt_at = NOW() + make_interval(secs => $1),
+                    claimed_by = NULL,
+                    claim_token = NULL,
+                    claim_expires_at = NULL,
+                    updated_at = NOW()
+                FROM lapsed l
+                WHERE q.id = l.id
+                RETURNING q.id
+            ),
+            closed AS (
+                UPDATE scan_results r
+                SET status = 'failed',
+                    error_message = $2,
+                    completed_at = NOW()
+                WHERE r.status = 'running'
+                  AND r.queue_claim_token IN (
+                      SELECT claim_token FROM lapsed WHERE claim_token IS NOT NULL
+                  )
+                RETURNING r.id
+            )
+            SELECT (SELECT COUNT(*) FROM recovered), (SELECT COUNT(*) FROM closed)
             "#,
         )
         .bind(backoff_secs)
-        .execute(&self.db)
+        .bind(RECOVERED_SCAN_REASON)
+        .fetch_one(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
-        Ok(result.rows_affected())
+        if rows > 0 {
+            tracing::info!(
+                jobs,
+                scans = rows,
+                "failed the scans a lapsed scan-job claim left running; the recovered job reruns them"
+            );
+        }
+        Ok(jobs as u64)
     }
 
     /// One page of live queue rows. A completed job is deleted, so never history.
@@ -2204,6 +2325,405 @@ mod tests {
                 .await
                 .expect("kinds");
         assert_eq!(kinds, vec!["hosted_artifact", "hosted_upload"]);
+
+        drop_repo(&pool, repo).await;
+    }
+
+    async fn scan_row(pool: &sqlx::PgPool, id: Uuid) -> (String, Option<String>) {
+        sqlx::query_as("SELECT status, error_message FROM scan_results WHERE id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .expect("scan row")
+    }
+
+    /// #6232: recovering a lapsed claim fails the `running` scan row that claim
+    /// created, at once, instead of leaving it for the 1800 s janitor. A row a
+    /// live claim is writing, and one an in-process scan created, stay
+    /// `running`, and a second sweep (another replica racing) changes nothing.
+    #[tokio::test]
+    async fn recovering_a_lapsed_claim_fails_the_scan_row_it_left_running() {
+        use crate::services::scan_result_service::ScanResultService;
+        let Some(pool) = try_pool().await else { return };
+        let repo = fresh_queue(&pool).await;
+        let q = ScanQueue::new(pool.clone());
+        let scans = ScanResultService::new(pool.clone());
+
+        let dead_art = seed_artifact(&pool, repo, "orphan-6232.jar").await;
+        let live_art = seed_artifact(&pool, repo, "live-6232.jar").await;
+        q.enqueue_hosted_upload(dead_art, PRIORITY_HOSTED)
+            .await
+            .expect("enqueue");
+        let dead = q
+            .claim(1, "doomed-pod", CLAIM_TTL_SECS)
+            .await
+            .expect("claim")
+            .pop()
+            .expect("one job");
+        q.enqueue_hosted_upload(live_art, PRIORITY_HOSTED)
+            .await
+            .expect("enqueue");
+        let live = q
+            .claim(1, "healthy-pod", CLAIM_TTL_SECS)
+            .await
+            .expect("claim")
+            .pop()
+            .expect("one job");
+
+        // Each worker opens its scan row under its own claim, as the worker does.
+        let orphan = under_claim(
+            dead.id,
+            dead.claim_token(),
+            scans.create_scan_result_with_checksum(dead_art, repo, "grype", None),
+        )
+        .await
+        .expect("orphan row");
+        let in_flight = under_claim(
+            live.id,
+            live.claim_token(),
+            scans.create_scan_result_with_checksum(live_art, repo, "grype", None),
+        )
+        .await
+        .expect("live row");
+        // An in-process scan of the same artifact: no claim, not the queue's.
+        let inline = scans
+            .create_scan_result_with_checksum(dead_art, repo, "grype", None)
+            .await
+            .expect("inline row");
+
+        // The doomed pod dies: its claim lapses.
+        sqlx::query(
+            "UPDATE scan_queue SET claim_expires_at = NOW() - INTERVAL '1 second' WHERE id = $1",
+        )
+        .bind(dead.id)
+        .execute(&pool)
+        .await
+        .expect("expire the claim");
+
+        assert_eq!(q.recover_expired_claims(0.0).await.expect("recover"), 1);
+        let (status, reason) = scan_row(&pool, orphan.id).await;
+        assert_eq!(
+            status, "failed",
+            "the dead claim's row is closed by recovery"
+        );
+        assert_eq!(reason.as_deref(), Some(RECOVERED_SCAN_REASON));
+        assert_eq!(
+            scan_row(&pool, in_flight.id).await.0,
+            "running",
+            "a live claim's row is never closed"
+        );
+        assert_eq!(
+            scan_row(&pool, inline.id).await.0,
+            "running",
+            "a row no queued job created is left to its writer"
+        );
+
+        // A racing or later sweep finds nothing left to do.
+        assert_eq!(q.recover_expired_claims(0.0).await.expect("recover"), 0);
+        assert_eq!(scan_row(&pool, in_flight.id).await.0, "running");
+        assert_eq!(scan_row(&pool, inline.id).await.0, "running");
+
+        drop_repo(&pool, repo).await;
+    }
+
+    /// #6232: a worker that was only slow, not dead, cannot overwrite what
+    /// recovery recorded. Its claim lapsed, recovery failed its row and
+    /// requeued the job, and another replica claimed the rerun; when the slow
+    /// worker finishes, every write that settles a scan row finds its claim
+    /// gone and leaves the row alone. A worker that still holds its claim
+    /// settles its row as before.
+    #[tokio::test]
+    async fn a_slow_worker_cannot_overwrite_the_row_recovery_failed() {
+        use crate::services::scan_result_service::ScanResultService;
+        let Some(pool) = try_pool().await else { return };
+        let repo = fresh_queue(&pool).await;
+        let q = ScanQueue::new(pool.clone());
+        let scans = ScanResultService::new(pool.clone());
+
+        let slow_art = seed_artifact(&pool, repo, "slow-6232.jar").await;
+        let ok_art = seed_artifact(&pool, repo, "ok-6232.jar").await;
+        q.enqueue_hosted_upload(slow_art, PRIORITY_HOSTED)
+            .await
+            .expect("enqueue");
+        let slow = q
+            .claim(1, "slow-pod", CLAIM_TTL_SECS)
+            .await
+            .expect("claim")
+            .pop()
+            .expect("one job");
+        q.enqueue_hosted_upload(ok_art, PRIORITY_HOSTED)
+            .await
+            .expect("enqueue");
+        let ok = q
+            .claim(1, "healthy-pod", CLAIM_TTL_SECS)
+            .await
+            .expect("claim")
+            .pop()
+            .expect("one job");
+        let (slow_id, slow_token) = (slow.id, slow.claim_token());
+        let row = under_claim(
+            slow_id,
+            slow_token,
+            scans.create_scan_result_with_checksum(slow_art, repo, "grype", None),
+        )
+        .await
+        .expect("slow row");
+        let ok_row = under_claim(
+            ok.id,
+            ok.claim_token(),
+            scans.create_scan_result_with_checksum(ok_art, repo, "grype", None),
+        )
+        .await
+        .expect("ok row");
+
+        // The slow pod misses its heartbeats: the claim lapses, recovery fails
+        // the row, and another replica claims the rerun.
+        sqlx::query(
+            "UPDATE scan_queue SET claim_expires_at = NOW() - INTERVAL '1 second' WHERE id = $1",
+        )
+        .bind(slow_id)
+        .execute(&pool)
+        .await
+        .expect("expire the claim");
+        assert_eq!(q.recover_expired_claims(0.0).await.expect("recover"), 1);
+        let rerun = q
+            .claim(1, "rescuer-pod", CLAIM_TTL_SECS)
+            .await
+            .expect("claim")
+            .pop()
+            .expect("the requeued job");
+        assert_eq!(rerun.id, slow_id);
+        assert_ne!(rerun.claim_token(), slow_token);
+
+        // The slow worker finishes now, with a verdict, a failure, a
+        // not-applicable, a retry reopen: none of them lands.
+        under_claim(slow_id, slow_token, async {
+            // #6423: and it says so, so the caller neither logs a completed
+            // scan nor grades quarantine on the discarded totals.
+            assert!(!scans
+                .complete_scan(
+                    row.id,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    Some("grype-slow"),
+                    chrono::Utc::now(),
+                    "complete",
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .expect("complete"));
+            scans
+                .fail_scan(row.id, "slow failure", None, chrono::Utc::now())
+                .await
+                .expect("fail");
+            scans
+                .mark_not_applicable(row.id, "slow n/a", chrono::Utc::now())
+                .await
+                .expect("n/a");
+            assert!(!scans.reopen_failed_scan(row.id).await.expect("reopen"));
+            assert_eq!(
+                scans
+                    .fail_scan_if_running(row.id, "slow failure")
+                    .await
+                    .expect("fail if running"),
+                None
+            );
+        })
+        .await;
+        assert_eq!(
+            scan_row(&pool, row.id).await,
+            (
+                "failed".to_string(),
+                Some(RECOVERED_SCAN_REASON.to_string())
+            ),
+            "the slow worker must not overwrite what recovery recorded"
+        );
+        let version: Option<String> =
+            sqlx::query_scalar("SELECT scanner_version FROM scan_results WHERE id = $1")
+                .bind(row.id)
+                .fetch_one(&pool)
+                .await
+                .expect("version");
+        assert_ne!(version.as_deref(), Some("grype-slow"));
+
+        // A worker that still holds its claim settles its row as before.
+        under_claim(
+            ok.id,
+            ok.claim_token(),
+            scans.complete_scan(
+                ok_row.id,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                Some("grype-ok"),
+                chrono::Utc::now(),
+                "complete",
+                None,
+                None,
+                None,
+            ),
+        )
+        .await
+        .expect("complete");
+        assert_eq!(scan_row(&pool, ok_row.id).await.0, "completed");
+
+        drop_repo(&pool, repo).await;
+    }
+
+    /// #6423: a claim that lapses on the job's LAST attempt no longer ends
+    /// the job. The worker may only have been slow, and the claim guard
+    /// refuses its late verdict, so recovery grants one more run: the job is
+    /// `pending` with `attempts = max_attempts`, the slow worker's late write
+    /// is still refused, and the rerun records the verdict in a row of its
+    /// own, stamped with its claim in the INSERT. A second lapse ends the job,
+    /// so a job that kills its worker stops after at most one extra run.
+    #[tokio::test]
+    async fn a_claim_lapsing_on_the_last_attempt_gets_one_more_run() {
+        use crate::services::scan_result_service::ScanResultService;
+        let Some(pool) = try_pool().await else { return };
+        let repo = fresh_queue(&pool).await;
+        let q = ScanQueue::new(pool.clone());
+        let scans = ScanResultService::new(pool.clone());
+        let complete = |id: Uuid| {
+            scans.complete_scan(
+                id,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                Some("grype-t"),
+                chrono::Utc::now(),
+                "complete",
+                None,
+                None,
+                None,
+            )
+        };
+        let lapse = |id: Uuid| {
+            sqlx::query(
+                "UPDATE scan_queue SET claim_expires_at = NOW() - INTERVAL '1 second' \
+                 WHERE id = $1",
+            )
+            .bind(id)
+            .execute(&pool)
+        };
+
+        let art = seed_artifact(&pool, repo, "last-6423.jar").await;
+        q.enqueue_hosted_upload(art, PRIORITY_HOSTED)
+            .await
+            .expect("enqueue");
+        sqlx::query("UPDATE scan_queue SET attempts = max_attempts - 1 WHERE artifact_id = $1")
+            .bind(art)
+            .execute(&pool)
+            .await
+            .expect("spend all but the last attempt");
+        let slow = q
+            .claim(1, "slow-pod", CLAIM_TTL_SECS)
+            .await
+            .expect("claim")
+            .pop()
+            .expect("one job");
+        assert!(!slow.will_retry_after_failure(), "this is the last attempt");
+        let row = under_claim(
+            slow.id,
+            slow.claim_token(),
+            scans.create_scan_result_with_checksum(art, repo, "grype", None),
+        )
+        .await
+        .expect("row");
+        let stamped: Option<Uuid> =
+            sqlx::query_scalar("SELECT queue_claim_token FROM scan_results WHERE id = $1")
+                .bind(row.id)
+                .fetch_one(&pool)
+                .await
+                .expect("token");
+        assert_eq!(
+            stamped,
+            Some(slow.claim_token()),
+            "the INSERT records the claim"
+        );
+
+        // The slow worker's claim lapses on the last attempt: the job is
+        // requeued once more, not ended, and the row is failed.
+        lapse(slow.id).await.expect("lapse");
+        assert_eq!(q.recover_expired_claims(0.0).await.expect("recover"), 1);
+        let (state, attempts, max): (String, i32, i32) =
+            sqlx::query_as("SELECT state, attempts, max_attempts FROM scan_queue WHERE id = $1")
+                .bind(slow.id)
+                .fetch_one(&pool)
+                .await
+                .expect("job");
+        assert_eq!((state.as_str(), attempts), ("pending", max));
+        assert_eq!(
+            scan_row(&pool, row.id).await,
+            (
+                "failed".to_string(),
+                Some(RECOVERED_SCAN_REASON.to_string())
+            )
+        );
+
+        // The slow worker finishes: still refused, before or after the rerun
+        // is claimed.
+        assert!(!under_claim(slow.id, slow.claim_token(), complete(row.id))
+            .await
+            .expect("late complete"));
+        let rerun = q
+            .claim(1, "rescuer-pod", CLAIM_TTL_SECS)
+            .await
+            .expect("claim")
+            .pop()
+            .expect("the extra run");
+        assert_eq!(rerun.id, slow.id);
+        assert!(
+            !rerun.will_retry_after_failure(),
+            "the extra run is a last attempt"
+        );
+        assert!(!under_claim(slow.id, slow.claim_token(), complete(row.id))
+            .await
+            .expect("late complete"));
+        assert_eq!(scan_row(&pool, row.id).await.0, "failed");
+
+        // The rerun records the verdict in its own row.
+        let fresh = under_claim(
+            rerun.id,
+            rerun.claim_token(),
+            scans.create_scan_result_with_checksum(art, repo, "grype", None),
+        )
+        .await
+        .expect("rerun row");
+        assert!(
+            under_claim(rerun.id, rerun.claim_token(), complete(fresh.id))
+                .await
+                .expect("rerun complete")
+        );
+        assert_eq!(
+            scan_row(&pool, fresh.id).await,
+            ("completed".to_string(), None)
+        );
+
+        // A second lapse ends the job: only one extra run.
+        lapse(rerun.id).await.expect("lapse again");
+        assert_eq!(q.recover_expired_claims(0.0).await.expect("recover"), 1);
+        let state: String = sqlx::query_scalar("SELECT state FROM scan_queue WHERE id = $1")
+            .bind(slow.id)
+            .fetch_one(&pool)
+            .await
+            .expect("job");
+        assert_eq!(
+            state, "failed",
+            "a job that keeps losing its worker still ends"
+        );
 
         drop_repo(&pool, repo).await;
     }

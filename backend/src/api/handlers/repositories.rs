@@ -12665,15 +12665,51 @@ async fn persist_generic_staged_upload(
     // UNIQUE(repository_id, path) constraint is still satisfied without the
     // manual purge.
 
-    let catalog_name = if let Some(native) = &native {
-        super::upload::format_finalize::catalog_name(&state.db, repo.id, &native.staged).await
-    } else {
-        None
-    };
     let size_bytes = staged.size_bytes();
+    let checksum_sha256 = digests.sha256.clone();
+    // #6383: the format metadata a natively finalized package (or an `.rpm`
+    // whose header this path parsed) is served from commits in the same
+    // transaction as its artifact row, as on the native routes (#6317) and the
+    // chunked completion (#5002). Written after the commit with a failure only
+    // logged, a pool timeout there left a stored package out of its format's
+    // index.
+    let commit_document = if let Some(native) = &native {
+        let context = super::upload::format_finalize::FinalizeContext {
+            repository_id: repo.id,
+            repository_key: &key,
+            artifact_path: &path,
+            size_bytes,
+            checksum_sha256: &checksum_sha256,
+        };
+        match super::upload::format_finalize::metadata_document(
+            &native.staged,
+            &native.target,
+            &context,
+            rpm_metadata.as_ref(),
+        ) {
+            Ok(document) => document.map(|document| (document.format, document.metadata)),
+            Err(e) => {
+                tracing::warn!(path = %path, error = %e, "format metadata could not be derived");
+                None
+            }
+        }
+    } else {
+        rpm_metadata.clone().map(|metadata| ("rpm", metadata))
+    };
+    let rpm_document = commit_document
+        .as_ref()
+        .is_some_and(|(format, _)| *format == "rpm");
+    // #6346: a natively finalized package's catalog row is registered once,
+    // by `format_finalize::record` below, with what its parser read; the
+    // upload service writes none of its own.
+    let catalog = if native.is_some() {
+        crate::services::artifact_service::CatalogRegistration::Caller
+    } else {
+        crate::services::artifact_service::CatalogRegistration::Derive
+    };
     let content = staged.upload_content().await?;
     let artifact = artifact_service
-        .upload_content_with_sync_options(
+        .upload_content_with_commit_metadata(
             repo.id,
             &path,
             &name,
@@ -12684,8 +12720,11 @@ async fn persist_generic_staged_upload(
             size_bytes,
             Some(auth.user_id),
             !is_replication_request(headers),
-            catalog_name.as_deref(),
+            catalog,
             precondition.as_ref(),
+            commit_document.map(|(format, metadata)| {
+                crate::services::artifact_service::CommitMetadata { format, metadata }
+            }),
         )
         .await;
     // The staging copy is no longer needed once the service has consumed it,
@@ -12701,21 +12740,16 @@ async fn persist_generic_staged_upload(
         checksum_sha256: &artifact.checksum_sha256,
     };
     if let Some(native) = native {
-        record_generic_native_finalize(
-            state,
-            &artifact_service,
-            &context,
-            artifact.id,
-            native,
-            rpm_metadata.as_ref(),
-        )
-        .await;
-    } else if let Some(metadata) = &rpm_metadata {
-        if let Err(e) =
-            super::rpm::record_rpm_metadata(&state.db, artifact.id, repo.id, metadata).await
-        {
-            tracing::warn!(artifact_id = %artifact.id, error = %e, "RPM metadata could not be recorded");
-        }
+        record_generic_native_finalize(state, &context, artifact.id, native, rpm_metadata.as_ref())
+            .await;
+    }
+    if rpm_document {
+        // The repository timestamp every RPM metadata write bumps; after the
+        // commit, so concurrent uploads do not queue on the repository row.
+        let _ = sqlx::query("UPDATE repositories SET updated_at = NOW() WHERE id = $1")
+            .bind(repo.id)
+            .execute(&state.db)
+            .await;
     }
 
     // #6317: the upload has committed. The reads below only fill the response
@@ -12858,56 +12892,27 @@ async fn stage_generic_native_finalize(
 }
 
 /// Record a natively finalized generic upload's format rows against its
-/// committed artifact (#5254): the `artifact_metadata` document, then the
-/// catalog entry, install-script analysis and index cache invalidation the
-/// native route performs. The artifact is already committed, so a failure is
-/// logged rather than failing the upload, as the RPM metadata write on this
-/// path always was.
+/// committed artifact (#5254): the catalog entry, install-script analysis and
+/// index cache invalidation the native route performs. The `artifact_metadata`
+/// document committed with the row (#6383). The artifact is already
+/// committed, so a failure here is logged rather than failing the upload.
 async fn record_generic_native_finalize(
     state: &SharedState,
-    artifact_service: &ArtifactService,
     context: &super::upload::format_finalize::FinalizeContext<'_>,
     artifact_id: Uuid,
     native: GenericNativeFinalize,
     rpm_metadata: Option<&serde_json::Value>,
 ) {
-    use super::upload::format_finalize;
     let GenericNativeFinalize { target, staged } = native;
-    match format_finalize::metadata_document(&staged, &target, context, rpm_metadata) {
-        Ok(Some(document)) => {
-            let written = if document.format == "rpm" {
-                super::rpm::record_rpm_metadata(
-                    &state.db,
-                    artifact_id,
-                    context.repository_id,
-                    &document.metadata,
-                )
-                .await
-                .map(|_| ())
-                .map_err(|e| e.to_string())
-            } else {
-                artifact_service
-                    .set_metadata(
-                        artifact_id,
-                        document.format,
-                        document.metadata,
-                        document.properties,
-                    )
-                    .await
-                    .map(|_| ())
-                    .map_err(|e| e.to_string())
-            };
-            if let Err(e) = written {
-                tracing::warn!(artifact_id = %artifact_id, error = %e, "format metadata could not be recorded");
-            }
-        }
-        Ok(None) => {}
-        Err(e) => {
-            tracing::warn!(artifact_id = %artifact_id, error = %e, "format metadata could not be derived");
-        }
-    }
-    if let Err(e) =
-        format_finalize::record(state, context, artifact_id, &target, staged, rpm_metadata).await
+    if let Err(e) = super::upload::format_finalize::record(
+        state,
+        context,
+        artifact_id,
+        &target,
+        staged,
+        rpm_metadata,
+    )
+    .await
     {
         tracing::warn!(artifact_id = %artifact_id, error = %e, "format records could not be written");
     }
@@ -13393,6 +13398,25 @@ fn range_is_whole_object(range_header: Option<&str>, total: u64) -> bool {
         RangeOutcome::Satisfiable { start, end } => start == 0 && end + 1 == total,
         RangeOutcome::Unsatisfiable => false,
     }
+}
+
+/// The byte length of the object stored at `key`, without holding it in
+/// memory (#6358): object metadata where the backend reports it
+/// (`StorageBackend::stored_size`: filesystem, S3, Azure, GCS), otherwise a
+/// read of the object that counts its bytes and drops each chunk.
+pub(crate) async fn stored_object_length(
+    storage: &dyn crate::storage::StorageBackend,
+    key: &str,
+) -> Result<u64> {
+    if let Some(len) = storage.stored_size(key).await? {
+        return Ok(len);
+    }
+    let mut stream = storage.get_stream(key).await?;
+    let mut len = 0u64;
+    while let Some(chunk) = futures::StreamExt::next(&mut stream).await {
+        len += chunk?.len() as u64;
+    }
+    Ok(len)
 }
 
 /// [`ranged_stream_response_verified`] that verifies a small whole-object
@@ -14029,40 +14053,55 @@ pub async fn download_artifact(
     }
 
     // Fall back to proxied download (filesystem or S3 without redirect)
-    let artifact_service = ArtifactService::new(state.db.clone(), storage);
+    let artifact_service = ArtifactService::new(state.db.clone(), storage.clone());
 
     // #5594: a Docker/OCI manifest's artifact row records the IMAGE size
     // (config + layers) in `size_bytes`, not the byte length of the manifest
     // stored at `storage_key`, while `checksum_sha256` is the manifest digest.
     // Serving with `artifact.size_bytes` as the content length makes integrity
     // verification fail (and would advertise a wrong Content-Length). Serve the
-    // actual manifest bytes with their real size instead. The read still goes
+    // actual manifest bytes with their real size instead. A GET still reads
     // through `download_stream`, so the download gate, the statistics row, the
-    // ARTIFACT_DOWNLOADED audit event and the AfterDownload hooks all apply.
+    // ARTIFACT_DOWNLOADED audit event and the AfterDownload hooks all apply; a
+    // HEAD runs the same gate without opening the object.
+    //
+    // #6358: the length comes from object metadata, and the body is streamed.
+    // Nothing caps what is stored at a manifest path (the manifest PUT takes up
+    // to `max_upload_size_bytes`), so this used to buffer the whole object to
+    // learn its length, on a HEAD too.
     if repo.repo_type != RepositoryType::Virtual
         && repo.format == RepositoryFormat::Docker
         && crate::services::oci_manifests::is_manifest_path(&path)
     {
-        match artifact_service
-            .download_stream(
-                repo.id,
-                &path,
-                auth.as_ref().map(|a| a.user_id),
-                client_ip_str.clone(),
-                user_agent.as_deref(),
-                // #2260 §5: a HEAD serves no body, so it must not count.
-                !is_head,
-            )
-            .await
-        {
-            Ok((artifact, stream)) => {
-                // A manifest is small (the OCI push path caps it), so buffering
-                // it to learn its real length is cheap.
-                use futures::TryStreamExt;
-                let bytes = Bytes::from(stream.map_ok(|b| b.to_vec()).try_concat().await?);
-                let total = bytes.len() as u64;
-                let body: futures::stream::BoxStream<'static, crate::error::Result<Bytes>> =
-                    Box::pin(futures::stream::once(async move { Ok(bytes) }));
+        let opened = if is_head {
+            artifact_service
+                .prepare_head(repo.id, &path)
+                .await
+                .map(|artifact| (artifact, None))
+        } else {
+            artifact_service
+                .download_stream(
+                    repo.id,
+                    &path,
+                    auth.as_ref().map(|a| a.user_id),
+                    client_ip_str.clone(),
+                    user_agent.as_deref(),
+                    true,
+                )
+                .await
+                .map(|(artifact, stream)| (artifact, Some(stream)))
+        };
+        // A HEAD has not opened the object, so a missing one shows up here
+        // and falls through below like a failed open.
+        let opened = match opened {
+            Ok((artifact, stream)) => stored_object_length(storage.as_ref(), &artifact.storage_key)
+                .await
+                .map(|total| (artifact, stream, total)),
+            Err(e) => Err(e),
+        };
+        match opened {
+            Ok((artifact, stream, total)) => {
+                let body = stream.unwrap_or_else(|| Box::pin(futures::stream::empty()));
                 let range_header = request
                     .headers()
                     .get(header::RANGE)
@@ -26160,11 +26199,15 @@ mod tests {
 
         // Drop first, unconditionally, so a previously panicked run cannot leak
         // the trigger into this one.
-        let drop_trigger = "DROP TRIGGER IF EXISTS ak_test_block_delete_3475 ON artifacts";
-        sqlx::query(sqlx::AssertSqlSafe(drop_trigger))
-            .execute(&rig.pool)
-            .await
-            .ok();
+        let drop_trigger = || {
+            crate::api::handlers::test_db_helpers::drop_test_trigger(
+                &rig.pool,
+                "artifacts",
+                "ak_test_block_delete_3475",
+                "ak_test_block_delete_3475",
+            )
+        };
+        drop_trigger().await;
         sqlx::query(
             "CREATE OR REPLACE FUNCTION ak_test_block_delete_3475() RETURNS trigger AS \
              $$ BEGIN RAISE EXCEPTION 'ak-test-3475 injected failure'; END $$ LANGUAGE plpgsql",
@@ -26183,14 +26226,7 @@ mod tests {
 
         let result = rig.delete(path).await;
 
-        sqlx::query(sqlx::AssertSqlSafe(drop_trigger))
-            .execute(&rig.pool)
-            .await
-            .ok();
-        sqlx::query("DROP FUNCTION IF EXISTS ak_test_block_delete_3475()")
-            .execute(&rig.pool)
-            .await
-            .ok();
+        drop_trigger().await;
 
         assert!(
             result.is_err(),
@@ -31388,16 +31424,13 @@ mod tests {
         );
 
         // Drop the trigger (and function) so the fixture can tear down cleanly.
-        sqlx::query(sqlx::AssertSqlSafe(&*format!(
-            "DROP TRIGGER {trg_name} ON repositories"
-        )))
-        .execute(&fx.pool)
-        .await
-        .expect("drop blocking trigger");
-        sqlx::query(sqlx::AssertSqlSafe(&*format!("DROP FUNCTION {fn_name}()")))
-            .execute(&fx.pool)
-            .await
-            .expect("drop blocking trigger function");
+        crate::api::handlers::test_db_helpers::drop_test_trigger(
+            &fx.pool,
+            "repositories",
+            &trg_name,
+            &fn_name,
+        )
+        .await;
         let _ = storage.delete(&temp_key).await;
         fx.teardown().await;
     }
@@ -39936,29 +39969,74 @@ mod tests {
             .await
             .unwrap();
         let push_status = pushed.status();
-        let (status, body, headers) = tdh::send_with_headers(
-            tdh::router_with_auth(
-                download_router(),
-                state.clone(),
-                tdh::make_auth(user_id, &username),
-            ),
-            tdh::get(format!("/{key}/download/v2/acme/app/manifests/1.0")),
-        )
-        .await;
+        let uri = format!("/{key}/download/v2/acme/app/manifests/1.0");
+        let send = |request| {
+            tdh::send_with_headers(
+                tdh::router_with_auth(
+                    download_router(),
+                    state.clone(),
+                    tdh::make_auth(user_id, &username),
+                ),
+                request,
+            )
+        };
+        // #6358: a HEAD answers the stored length from object metadata, with
+        // no body. (It never reaches the download recorder: `prepare_head`.)
+        let (head_status, head_body, head_headers) = send(tdh::head(uri.clone())).await;
+        let (status, body, headers) = send(tdh::get(uri)).await;
 
         tdh::cleanup(&pool, repo_id, user_id).await;
         let _ = std::fs::remove_dir_all(&dir);
 
+        let content_length = |h: &axum::http::HeaderMap| {
+            h.get(header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+        };
         assert_eq!(push_status, StatusCode::CREATED, "push the manifest");
         assert_eq!(status, StatusCode::OK, "generic download: {body:?}");
         assert_eq!(body, manifest.as_bytes(), "the manifest bytes");
         assert_eq!(
-            headers
-                .get(header::CONTENT_LENGTH)
-                .and_then(|v| v.to_str().ok()),
-            Some(manifest.len().to_string().as_str()),
+            content_length(&headers),
+            Some(manifest.len().to_string()),
             "Content-Length is the manifest length, not the image size"
         );
+        assert_eq!(head_status, StatusCode::OK, "HEAD: {head_body:?}");
+        assert!(head_body.is_empty(), "a HEAD has no body");
+        assert_eq!(
+            content_length(&head_headers),
+            Some(manifest.len().to_string())
+        );
+    }
+
+    /// #6358: the stored length of an object, from metadata where the backend
+    /// reports it and otherwise by counting a streamed read; a missing object
+    /// is NotFound either way.
+    #[tokio::test]
+    async fn stored_object_length_without_holding_the_object_6358() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::storage::StorageBackend;
+        let mem = tdh::MemStorage::default();
+        mem.put("m", Bytes::from(vec![7u8; 4096])).await.unwrap();
+        assert_eq!(
+            mem.stored_size("m").await.unwrap(),
+            None,
+            "no metadata size"
+        );
+        assert_eq!(stored_object_length(&mem, "m").await.unwrap(), 4096);
+        assert!(matches!(
+            stored_object_length(&mem, "gone").await,
+            Err(AppError::NotFound(_))
+        ));
+
+        let dir = tempfile::tempdir().unwrap();
+        let fs = crate::storage::filesystem::FilesystemStorage::new(dir.path());
+        fs.put("m", Bytes::from(vec![7u8; 513])).await.unwrap();
+        assert_eq!(stored_object_length(&fs, "m").await.unwrap(), 513);
+        assert!(matches!(
+            stored_object_length(&fs, "gone").await,
+            Err(AppError::NotFound(_))
+        ));
     }
 }
 

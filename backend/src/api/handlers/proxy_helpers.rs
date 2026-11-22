@@ -23,7 +23,9 @@ use crate::services::proxy_scan_service::CacheScanGate;
 /// (named fields since #4581) without a second import path.
 pub(crate) use crate::services::proxy_service::CachedBody;
 pub use crate::services::proxy_service::StreamingFetchResult;
-use crate::services::proxy_service::{DeferredCommitSlot, DirectUpstreamBody, ProxyService};
+use crate::services::proxy_service::{
+    DeferredCommitSlot, DirectUpstreamBody, FreshCacheEntry, ProxyService,
+};
 use crate::services::virtual_member_breaker::MemberBreaker;
 // Re-export the per-format buffered-metadata byte ceilings (#1608 Phase 4b /
 // #2181) so format handlers select a cap via `proxy_helpers::<CONST>`.
@@ -2150,17 +2152,14 @@ async fn try_member_cache_redirect(
     if !storage.supports_redirect() {
         return None;
     }
-    // #6035: the freshness probe also yields the size its sidecar records,
-    // which the transfer meter counts when the URL is issued.
-    let size_bytes = proxy.fresh_cache_redirect_size(&member.key, path).await?;
+    // #6035: the freshness probe also yields the sidecar it read: the size
+    // the transfer meter counts when the URL is issued, and the hold below.
+    let entry = proxy.fresh_cache_redirect(&member.key, path).await?;
     // #2075: gate the redirect on the hold window (mirrors the gate in
     // `proxy_fetch_or_redirect`). A held entry must not be handed out as a
     // 302; falling through routes it onto the quarantine-surfacing path.
-    if proxy
-        .cache_quarantine_gate(&member.key, path)
-        .await
-        .is_err()
-    {
+    // #6361: on the probe's own copy of the sidecar, never a second read.
+    if entry.quarantine_gate().is_err() {
         return None;
     }
     // #4506: likewise the member's origin policy; the fall-through fetch
@@ -2175,7 +2174,7 @@ async fn try_member_cache_redirect(
         /* presigned_enabled = */ true,
         expiry,
         /* cache_is_fresh = */ true,
-        size_bytes,
+        entry.size_bytes(),
     )
     .await
 }
@@ -2283,17 +2282,20 @@ pub fn stream_fetch_result(
 /// (#4514), with the live CVE-scanner version. `None` when the gate could not
 /// be evaluated (the scan config is unreadable): the redirect declines and
 /// the fall-through path answers. `record_block` as for the gate itself.
+/// `entry` is the freshness probe's sidecar (#6361).
 pub(crate) async fn cache_scan_gate_for_redirect(
     state: &AppState,
     proxy: &ProxyService,
     repo_key: &str,
     cache_path: &str,
+    entry: &FreshCacheEntry,
     record_block: bool,
 ) -> Option<CacheScanGate> {
     proxy
         .cache_scan_gate(
             repo_key,
             cache_path,
+            entry,
             state.scanner_service.as_deref(),
             record_block,
         )
@@ -2310,9 +2312,10 @@ pub(crate) async fn cache_scan_allows_redirect(
     proxy: &ProxyService,
     repo_key: &str,
     cache_path: &str,
+    entry: &FreshCacheEntry,
 ) -> bool {
     matches!(
-        cache_scan_gate_for_redirect(state, proxy, repo_key, cache_path, false).await,
+        cache_scan_gate_for_redirect(state, proxy, repo_key, cache_path, entry, false).await,
         Some(CacheScanGate::Serve)
     )
 }
@@ -2341,19 +2344,19 @@ pub(crate) async fn proxy_cache_fresh_redirect(
     if !storage.supports_redirect() {
         return Ok(None);
     }
-    // #6035: the freshness probe also yields the size its sidecar records,
-    // which the transfer meter counts when the URL is issued.
-    let Some(size_bytes) = proxy_service
-        .fresh_cache_redirect_size(repo_key, cache_path)
+    // #6035: the freshness probe also yields the sidecar it read: the size
+    // the transfer meter counts when the URL is issued, the hold and the
+    // digest whose verdict is checked below.
+    let Some(entry) = proxy_service
+        .fresh_cache_redirect(repo_key, cache_path)
         .await
     else {
         return Ok(None);
     };
     let refused = |e| map_proxy_error(repo_key, cache_path, e);
-    proxy_service
-        .cache_quarantine_gate(repo_key, cache_path)
-        .await
-        .map_err(refused)?;
+    // #6361: the hold on the probe's own copy, so an entry evicted after the
+    // probe is not redirected to as if it had none.
+    entry.quarantine_gate().map_err(refused)?;
     proxy_service
         .cache_origin_policy_gate(repo_key)
         .await
@@ -2361,7 +2364,9 @@ pub(crate) async fn proxy_cache_fresh_redirect(
     // #4514: the stored scan verdict of the cached body. A refusing verdict
     // is the scan gate's 403; fail-closed without a reusable clean verdict
     // is not for a redirect, and the caller serves the request itself.
-    match cache_scan_gate_for_redirect(state, proxy_service, repo_key, cache_path, true).await {
+    match cache_scan_gate_for_redirect(state, proxy_service, repo_key, cache_path, &entry, true)
+        .await
+    {
         Some(CacheScanGate::Serve) => {}
         Some(CacheScanGate::Block) => {
             return Err(scan_blocked_response(
@@ -2382,7 +2387,7 @@ pub(crate) async fn proxy_cache_fresh_redirect(
         /* presigned_enabled = */ true,
         expiry,
         /* cache_is_fresh = */ true,
-        size_bytes,
+        entry.size_bytes(),
     )
     .await)
 }
@@ -3284,6 +3289,23 @@ pub async fn proxy_fetch_uncached(
     .await
 }
 
+/// [`proxy_fetch_uncached`] for a body that is only parsed: fetched with
+/// `Accept-Encoding: gzip` and decoded under a cap (#5983)
+pub async fn proxy_fetch_uncached_decoded(
+    proxy_service: &ProxyService,
+    repo_id: Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    path: &str,
+) -> Result<(Bytes, Option<String>, String), Response> {
+    with_proxy_repo(repo_id, repo_key, upstream_url, path, |repo| async move {
+        proxy_service
+            .fetch_upstream_direct_decoded(&repo, path)
+            .await
+    })
+    .await
+}
+
 /// How long the age gate may reuse one upstream read. This is the longest a
 /// "not hosted" answer can outlive a publish, so it stays in seconds: long
 /// enough that a burst for one project costs one read, short enough that it is
@@ -4152,7 +4174,7 @@ pub(crate) fn classify_streaming_cache_probe(
 /// its coordinated hydration path answers `507` when the object is still
 /// absent. A `404` or another permanent client error means the member does not
 /// hold the artifact; anything else means it could not answer and may.
-fn is_transient_local_failure(resp: &Response) -> bool {
+pub(crate) fn is_transient_local_failure(resp: &Response) -> bool {
     if is_member_unavailable_response(resp) {
         return true;
     }
@@ -5070,7 +5092,8 @@ where
 ///
 /// The Go `.info` route needs it because `go` reads a 404 as "this proxy does
 /// not have the module" and falls through to the next `GOPROXY` entry. The
-/// other callers keep the plain form until their own routes are moved (#5620).
+/// other callers (RubyGems, Hex) keep the plain form until their own routes
+/// are moved (#6426).
 pub async fn resolve_virtual_metadata_reporting_unavailable<F, Fut>(
     db: &PgPool,
     auth: Option<&crate::api::middleware::auth::AuthExtension>,
@@ -7722,11 +7745,11 @@ pub async fn local_fetch_or_redirect(
                 // paths (`proxy_fetch_or_redirect`, `try_member_cache_redirect`)
                 // apply. Those additionally read the `__cache_meta__.json`
                 // sidecar for TTL, revalidate the pinned ETag, and apply
-                // `cache_quarantine_gate` for the #2075 Package Age Policy hold.
-                // None of that happens here, so a present-but-stale or
-                // still-held entry can still be signed. That gap is
+                // the #2075 Package Age Policy hold (from the probe's own read
+                // since #6361). None of that happens here, so a present-but-stale
+                // or still-held entry can still be signed. That gap is
                 // pre-existing (this argument was hardcoded `true`); closing it
-                // needs the repo_key/path pair and is tracked separately. This
+                // needs the repo_key/path pair and is tracked in #6416. This
                 // change only removes the dead-redirect case.
                 //
                 // On a miss the streaming fallback below takes over. Note it
@@ -19812,6 +19835,83 @@ mod tests {
         );
     }
 
+    /// #6361: the redirect fast paths take the Package Age Policy hold from the
+    /// freshness probe's own sidecar read. Before, the hold was read a second
+    /// time and a sidecar evicted between the two reads (another replica, a
+    /// lifecycle rule) read as "no hold known": the held entry was signed and
+    /// redirected to. Now the generic fast path answers the hold's 409, the
+    /// member fast path declines (the streaming probe surfaces the hold), and
+    /// each redirect decision costs one sidecar read.
+    #[tokio::test]
+    async fn fresh_redirects_keep_the_hold_after_eviction_6361() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::storage_service::StorageBackend;
+        let pool = tdh::lazy_pool();
+        let scope = scoped_test_scope();
+        let (proxy, backend) = tdh::build_scoped_presign_proxy(pool.clone(), scope.clone());
+        let dir = tempfile::tempdir().unwrap();
+        let state = tdh::build_state_with_proxy_presigned(
+            pool,
+            dir.path().to_str().unwrap(),
+            proxy.clone(),
+        );
+        let ctx = get_ctx();
+        let mut held: crate::services::proxy_service::CacheMetadata =
+            serde_json::from_slice(&tdh::fresh_cache_sidecar_bytes()).unwrap();
+        held.quarantine_until = Some(chrono::Utc::now() + chrono::Duration::days(7));
+        let held = Bytes::from(serde_json::to_vec(&held).unwrap());
+        let seed = |repo_key: &str, path: &str| {
+            let content_key = ProxyService::cache_storage_key(&scope, repo_key, path).unwrap();
+            let meta_key = ProxyService::cache_metadata_key(&scope, repo_key, path).unwrap();
+            backend.seed_fresh_entry(&content_key, &meta_key);
+            backend
+                .objects
+                .lock()
+                .unwrap()
+                .insert(meta_key.clone(), held.clone());
+            backend
+                .evict_after_read
+                .lock()
+                .unwrap()
+                .insert(meta_key.clone());
+            meta_key
+        };
+
+        const PATH: &str = "ns/ty/1.0.0/linux/amd64/p.zip";
+        let meta_key = seed("tf-proxy", PATH);
+        let refused =
+            proxy_cache_fresh_redirect(proxy.as_ref(), state.as_ref(), "tf-proxy", PATH, &ctx)
+                .await
+                .expect_err("a held entry must not be redirected to after its sidecar is evicted");
+        assert_eq!(refused.status(), StatusCode::CONFLICT);
+        assert_eq!(backend.read_count(&meta_key), 1, "one sidecar read");
+
+        let member = test_local_member("maven-proxy");
+        let path = "org/example/lib/1.0/lib-1.0.jar";
+        let meta_key = seed(&member.key, path);
+        assert!(
+            try_member_cache_redirect(state.as_ref(), proxy.as_ref(), &member, path, &ctx)
+                .await
+                .is_none(),
+            "a held member entry must not be redirected to after its sidecar is evicted"
+        );
+        assert_eq!(backend.read_count(&meta_key), 1, "one sidecar read");
+
+        // Control: an entry with no hold that stays in place is redirected to,
+        // on the probe's read alone (two reads before #6361).
+        let path = "org/example/lib/1.1/lib-1.1.jar";
+        let content_key = ProxyService::cache_storage_key(&scope, &member.key, path).unwrap();
+        let meta_key = ProxyService::cache_metadata_key(&scope, &member.key, path).unwrap();
+        backend.seed_fresh_entry(&content_key, &meta_key);
+        assert!(
+            try_member_cache_redirect(state.as_ref(), proxy.as_ref(), &member, path, &ctx)
+                .await
+                .is_some()
+        );
+        assert_eq!(backend.read_count(&meta_key), 1, "one sidecar read");
+        assert!(backend.exists(&meta_key).await.unwrap());
+    }
+
     /// #4514: the package-file redirect fast paths of a Remote that scans on
     /// proxy consult the verdict stored for the cached body's digest. A
     /// refusing verdict is the scan gate's 403 (the PyPI helper declines);
@@ -19909,8 +20009,19 @@ mod tests {
             );
 
             // The PyPI distribution redirect declines it.
+            let entry = proxy
+                .fresh_cache_redirect(&repo_key, path)
+                .await
+                .expect("the seeded entry is fresh");
             assert!(
-                !cache_scan_allows_redirect(state.as_ref(), proxy.as_ref(), &repo_key, path).await,
+                !cache_scan_allows_redirect(
+                    state.as_ref(),
+                    proxy.as_ref(),
+                    &repo_key,
+                    path,
+                    &entry
+                )
+                .await,
                 "{action}"
             );
         }
@@ -25018,17 +25129,17 @@ mod tests {
 
         // The redirect helper itself must call `try_proxy_cache_redirect(` and
         // gate on a metadata-only freshness probe so it never pulls the body
-        // just to decide whether to redirect (#1555). Since #6035 that probe is
-        // `fresh_cache_redirect_size(`, which also returns the sidecar's size.
+        // just to decide whether to redirect (#1555). Since #6361 that probe is
+        // `fresh_cache_redirect(`, which also returns the sidecar it read.
         let helper_start = src
             .find("async fn try_member_cache_redirect(")
             .expect("try_member_cache_redirect must exist");
         let helper_window = item_body(src, helper_start);
         assert!(
             helper_window.contains("try_proxy_cache_redirect(")
-                && helper_window.contains("fresh_cache_redirect_size("),
+                && helper_window.contains("fresh_cache_redirect("),
             "`try_member_cache_redirect` MUST attempt `try_proxy_cache_redirect(` \
-             gated on the metadata-only `fresh_cache_redirect_size(` probe (#1555).",
+             gated on the metadata-only `fresh_cache_redirect(` probe (#1555).",
         );
     }
 

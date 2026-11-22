@@ -4337,6 +4337,11 @@ async fn try_resolve_virtual_blob(
     // upstream is not evidence that the blob does not exist, and recording it
     // as a negative makes the next request fail without asking anyone.
     let mut indeterminate = false;
+    // #6417: a member that could not answer at all (an upstream 5xx or 429, a
+    // transport failure, the download deadline, an open circuit). A walk no
+    // member served then answers `503 UNAVAILABLE` + `Retry-After`, not the
+    // `404 BLOB_UNKNOWN` a client reports as a missing layer (#5504).
+    let mut unavailable = false;
 
     for member in &members {
         let local = match sqlx::query!(
@@ -4402,6 +4407,7 @@ async fn try_resolve_virtual_blob(
                 let breaker = proxy.member_breaker();
                 let Some(_admission) = breaker.admit(member.id) else {
                     indeterminate = true;
+                    unavailable = true;
                     continue;
                 };
                 for image in candidate_upstream_images(image_name, upstream_url) {
@@ -4448,6 +4454,7 @@ async fn try_resolve_virtual_blob(
                                     breaker.record(member.id, &member.key, true);
                                     // Not evidence the blob is absent (#3836).
                                     indeterminate = true;
+                                    unavailable = true;
                                     break;
                                 }
                             }
@@ -4470,6 +4477,7 @@ async fn try_resolve_virtual_blob(
                         }
                         Err(error) => {
                             indeterminate |= !upstream_error_is_definitive_miss(&error);
+                            unavailable |= upstream_error_is_unavailable(&error);
                             continue;
                         }
                     }
@@ -4480,6 +4488,9 @@ async fn try_resolve_virtual_blob(
 
     if let Some(resp) = lookup_failed {
         return Err(resp);
+    }
+    if unavailable {
+        return Err(oci_member_unavailable());
     }
     if cacheable && !indeterminate {
         virtual_negative_cache_insert(
@@ -4601,6 +4612,11 @@ async fn try_resolve_virtual_manifest(
     // failing upstream, or a digest mismatch we refused to serve). A walk that
     // ends empty is only a NEGATIVE when every member gave a definitive answer.
     let mut indeterminate = false;
+    // #6417: set when a member could not answer at all
+    // ([`UpstreamFetchOutcome::Unavailable`]). A walk no member served then
+    // answers `503 UNAVAILABLE` + `Retry-After` rather than the
+    // `404 MANIFEST_UNKNOWN` docker and containerd report as "not found".
+    let mut any_unavailable = false;
 
     // The `Accept` a Remote member's upstream is asked with: the client's,
     // supplemented with the canonical manifest media types as on the direct
@@ -4749,6 +4765,7 @@ async fn try_resolve_virtual_manifest(
             .await;
             indeterminate |= outcome.is_indeterminate();
             upstream_unavailable = matches!(outcome, UpstreamFetchOutcome::Unavailable);
+            any_unavailable |= upstream_unavailable;
             if let Some((content, content_type)) = outcome.into_fetched() {
                 // #1348 round 1, concern #3 (CRITICAL):
                 // When the manifest reference is itself a digest
@@ -4815,6 +4832,9 @@ async fn try_resolve_virtual_manifest(
 
     if let Some(resp) = lookup_failed {
         return Err(resp);
+    }
+    if any_unavailable {
+        return Err(oci_member_unavailable());
     }
     if cacheable && !indeterminate {
         virtual_negative_cache_insert(
@@ -5498,6 +5518,17 @@ fn upstream_error_is_definitive_miss(error: &Response) -> bool {
     error.status() == StatusCode::NOT_FOUND
 }
 
+/// Whether a `proxy_helpers` error [`Response`] says the upstream could not
+/// answer at all (#5504's [`proxy_helpers::MemberUnavailable`]: a 5xx or 429,
+/// a transport failure or timeout), so "not found" is unknowable (#6417). A
+/// permanent refusal from the token endpoint (the anonymous `401`/`403`
+/// #4527 reads as a miss) carries the marker too and is excluded, as in
+/// [`try_upstream_fetch_with_accept`].
+fn upstream_error_is_unavailable(error: &Response) -> bool {
+    proxy_helpers::is_member_unavailable_response(error)
+        && !proxy_helpers::is_token_endpoint_refusal(error)
+}
+
 /// Blob fetches pass `None` and exercise the unchanged code path.
 async fn try_upstream_fetch_with_accept(
     repo: &OciRepoInfo,
@@ -5543,12 +5574,7 @@ async fn try_upstream_fetch_with_accept(
         }
         // #4527: a permanent refusal from the token endpoint (an anonymous
         // 401/403) is a miss, though it carries `MemberUnavailable`.
-        Err(error)
-            if proxy_helpers::is_member_unavailable_response(&error)
-                && !proxy_helpers::is_token_endpoint_refusal(&error) =>
-        {
-            UpstreamFetchOutcome::Unavailable
-        }
+        Err(error) if upstream_error_is_unavailable(&error) => UpstreamFetchOutcome::Unavailable,
         Err(_) => UpstreamFetchOutcome::Indeterminate,
     }
 }
@@ -5574,10 +5600,14 @@ async fn fetch_remote_manifest(
         Some(accept),
     )
     .await;
-    match outcome.upstream_auth_error() {
-        Some(resp) => Err(resp),
-        None => Ok(outcome.into_fetched()),
+    if let Some(resp) = outcome.upstream_auth_error() {
+        return Err(resp);
     }
+    // #6417: an upstream that could not answer is not a missing manifest.
+    if matches!(outcome, UpstreamFetchOutcome::Unavailable) {
+        return Err(oci_member_unavailable());
+    }
+    Ok(outcome.into_fetched())
 }
 
 /// Canonical set of manifest media types we always advertise to an OCI
@@ -5760,8 +5790,16 @@ async fn try_upstream_fetch_streaming_blob_with_range(
         RepositoryFormat::Docker,
         is_head,
     )
-    .await
-    .ok()?;
+    .await;
+    // #6417: an upstream that could not answer is the retryable 503, not the
+    // caller's `404 BLOB_UNKNOWN`; any other failure stays a miss.
+    let result = match result {
+        Ok(result) => result,
+        Err(error) if upstream_error_is_unavailable(&error) => {
+            return Some(oci_member_unavailable());
+        }
+        Err(_) => return None,
+    };
     Some(build_oci_streaming_proxy_response_with_range(
         result,
         digest,
@@ -14670,6 +14708,15 @@ async fn fetch_upstream_tags_page(
             "NAME_UNKNOWN",
             "repository not found upstream",
         ),
+        // #6417: an upstream that could not answer is the retryable 503,
+        // marked so a virtual's tag walk can tell it from a refusal.
+        _ if upstream_error_is_unavailable(&resp) => {
+            let mut unavailable = oci_member_unavailable();
+            unavailable
+                .extensions_mut()
+                .insert(proxy_helpers::MemberUnavailable);
+            unavailable
+        }
         _ => oci_error(
             StatusCode::BAD_GATEWAY,
             "UNKNOWN",
@@ -14882,25 +14929,50 @@ async fn tags_list_virtual(
                     )
                     .await
                 } else {
+                    // #6417: a member whose own lookup failed could not
+                    // answer; it is not a member without the image.
                     tags_list_local(&state.db, member_id, &image, member_cursor, member_limit)
                         .await
-                        .ok()
                         .map(|page| page.tags)
+                        .map_err(|_| true)
                 }
             }
         })
         .collect();
 
-    let tag_sets: Vec<Vec<String>> = futures::future::join_all(handles)
-        .await
-        .into_iter()
-        .flatten()
-        .collect();
+    let mut tag_sets: Vec<Vec<String>> = Vec::new();
+    let mut unavailable = false;
+    for contribution in futures::future::join_all(handles).await {
+        match contribution {
+            Ok(tags) => tag_sets.push(tags),
+            Err(member_unavailable) => unavailable |= member_unavailable,
+        }
+    }
+    let merged = merge_and_dedup_tags(tag_sets);
+    virtual_tags_walk_result(merged, unavailable)
+}
 
-    Ok(merge_and_dedup_tags(tag_sets))
+/// The tag list of a virtual walk (#6417): the merged tags, or, when no
+/// member contributed one and a member could not answer, the retryable
+/// `503 UNAVAILABLE` + `Retry-After` instead of the empty page the caller
+/// answers `404 NAME_UNKNOWN` (#5504). A member that answered keeps the
+/// merge: its tags are served.
+#[allow(clippy::result_large_err)]
+fn virtual_tags_walk_result(
+    merged: Vec<String>,
+    unavailable: bool,
+) -> Result<Vec<String>, Response> {
+    if merged.is_empty() && unavailable {
+        return Err(oci_member_unavailable());
+    }
+    Ok(merged)
 }
 
 /// Fetch tags from a single remote virtual member via upstream proxy.
+///
+/// `Err(true)` when the member could not answer (#6417: an upstream 5xx or
+/// 429, a transport failure), `Err(false)` for any other failure (a 404, a
+/// refusal, an unparseable page), which reads as "no tags there".
 async fn fetch_tags_from_remote_member(
     state: &SharedState,
     member_id: Uuid,
@@ -14909,8 +14981,8 @@ async fn fetch_tags_from_remote_member(
     image_name: &str,
     n_limit: usize,
     last: Option<&str>,
-) -> Option<Vec<String>> {
-    let upstream_url = upstream_url?;
+) -> Result<Vec<String>, bool> {
+    let upstream_url = upstream_url.ok_or(false)?;
     let image = normalize_docker_image(image_name, upstream_url);
     let ctx = TagsFetchCtx {
         state,
@@ -14919,15 +14991,16 @@ async fn fetch_tags_from_remote_member(
         upstream_url,
         image: &image,
     };
-    let (tags, upstream_has_more) = collect_upstream_tags(&ctx, n_limit, last)
-        .await
-        .map_err(|_| {
-            tracing::debug!(
-                "Virtual member '{}': upstream tags/list failed, skipping",
-                member_key
-            );
-        })
-        .ok()?;
+    let (tags, upstream_has_more) =
+        collect_upstream_tags(&ctx, n_limit, last)
+            .await
+            .map_err(|resp| {
+                tracing::debug!(
+                    "Virtual member '{}': upstream tags/list failed, skipping",
+                    member_key
+                );
+                proxy_helpers::is_member_unavailable_response(&resp)
+            })?;
 
     tracing::debug!(
         "Virtual member '{}': fetched {} tags from upstream (has_more={})",
@@ -14935,7 +15008,7 @@ async fn fetch_tags_from_remote_member(
         tags.len(),
         upstream_has_more
     );
-    Some(tags)
+    Ok(tags)
 }
 
 // ---------------------------------------------------------------------------
@@ -19674,6 +19747,44 @@ mod tests {
         let sets: Vec<Vec<String>> = vec![vec![], vec![]];
         let merged = merge_and_dedup_tags(sets);
         assert!(merged.is_empty());
+    }
+
+    /// #6417: a virtual tag walk with no tags and an unavailable member is
+    /// the retryable 503, not the empty page answered `404 NAME_UNKNOWN`; a
+    /// member that answered keeps the merge, and an empty walk with every
+    /// member answering stays empty.
+    #[test]
+    fn test_virtual_tags_walk_result_6417() {
+        let down = virtual_tags_walk_result(vec![], true).expect_err("an outage is an error");
+        assert_eq!(down.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(down.headers().contains_key(axum::http::header::RETRY_AFTER));
+        assert_eq!(
+            virtual_tags_walk_result(vec!["v1".to_string()], true).unwrap(),
+            vec!["v1".to_string()]
+        );
+        assert!(virtual_tags_walk_result(vec![], false).unwrap().is_empty());
+    }
+
+    /// #6417: only an upstream that could not answer is unavailable: not a
+    /// 404, not an unmarked failure, and not the token endpoint's permanent
+    /// refusal (#4527) though it carries the marker.
+    #[test]
+    fn test_upstream_error_is_unavailable_6417() {
+        assert!(upstream_error_is_unavailable(
+            &proxy_helpers::member_unavailable_response()
+        ));
+        let miss = (StatusCode::NOT_FOUND, "miss").into_response();
+        assert!(!upstream_error_is_unavailable(&miss));
+        let refused = (StatusCode::BAD_GATEWAY, "refused").into_response();
+        assert!(!upstream_error_is_unavailable(&refused));
+        let mut token = (StatusCode::BAD_GATEWAY, "token").into_response();
+        token
+            .extensions_mut()
+            .insert(proxy_helpers::MemberUnavailable);
+        token
+            .extensions_mut()
+            .insert(proxy_helpers::TokenEndpointRefusal);
+        assert!(!upstream_error_is_unavailable(&token));
     }
 
     #[test]
@@ -25414,15 +25525,12 @@ mod manifest_digest_db_tests {
         .await
         .expect("count refs");
 
-        let _ = sqlx::query(sqlx::AssertSqlSafe(&*format!(
-            "DROP TRIGGER IF EXISTS {trigger_name} ON manifest_blob_refs"
-        )))
-        .execute(&fx.pool)
-        .await;
-        let _ = sqlx::query(sqlx::AssertSqlSafe(&*format!(
-            "DROP FUNCTION IF EXISTS {function_name}()"
-        )))
-        .execute(&fx.pool)
+        crate::api::handlers::test_db_helpers::drop_test_trigger(
+            &fx.pool,
+            "manifest_blob_refs",
+            &trigger_name,
+            &function_name,
+        )
         .await;
         cleanup(&fx).await;
 
@@ -27050,18 +27158,13 @@ mod oci_blob_upload_streaming_tests {
         }
 
         async fn drop(self, pool: &PgPool) {
-            let drop_trigger = format!(
-                "DROP TRIGGER IF EXISTS {} ON {}",
-                self.trigger_name, self.table
-            );
-            let _ = sqlx::query(sqlx::AssertSqlSafe(&*drop_trigger))
-                .execute(pool)
-                .await;
-
-            let drop_function = format!("DROP FUNCTION IF EXISTS {}()", self.function_name);
-            let _ = sqlx::query(sqlx::AssertSqlSafe(&*drop_function))
-                .execute(pool)
-                .await;
+            crate::api::handlers::test_db_helpers::drop_test_trigger(
+                pool,
+                self.table,
+                &self.trigger_name,
+                &self.function_name,
+            )
+            .await;
         }
 
         async fn create(pool: &PgPool, table: &'static str) -> Self {
@@ -27642,18 +27745,13 @@ mod oci_blob_upload_streaming_tests {
     }
 
     async fn drop_reject_blob_insert_trigger(pool: &PgPool, trigger_name: &str) {
-        sqlx::query(sqlx::AssertSqlSafe(&*format!(
-            "DROP TRIGGER IF EXISTS {trigger_name} ON oci_blobs"
-        )))
-        .execute(pool)
-        .await
-        .expect("drop reject-blob trigger");
-        sqlx::query(sqlx::AssertSqlSafe(&*format!(
-            "DROP FUNCTION IF EXISTS {trigger_name}_fn()"
-        )))
-        .execute(pool)
-        .await
-        .expect("drop reject-blob function");
+        crate::api::handlers::test_db_helpers::drop_test_trigger(
+            pool,
+            "oci_blobs",
+            trigger_name,
+            &format!("{trigger_name}_fn"),
+        )
+        .await;
     }
 
     /// Storage backend whose `copy` succeeds (so the `oci-blobs/<digest>`
@@ -29473,20 +29571,7 @@ mod oci_blob_upload_streaming_tests {
 
         // Drop the injected trigger so it cannot affect other tests sharing the
         // `oci_blobs` table.
-        sqlx::query(sqlx::AssertSqlSafe(&*format!(
-            "DROP TRIGGER IF EXISTS {trig} ON oci_blobs",
-            trig = storage.trigger_name
-        )))
-        .execute(&f.inner.pool)
-        .await
-        .expect("drop injected trigger");
-        sqlx::query(sqlx::AssertSqlSafe(&*format!(
-            "DROP FUNCTION IF EXISTS {trig}_fn()",
-            trig = storage.trigger_name
-        )))
-        .execute(&f.inner.pool)
-        .await
-        .expect("drop injected trigger function");
+        drop_reject_blob_insert_trigger(&f.inner.pool, &storage.trigger_name).await;
 
         f.teardown().await;
     }
@@ -35360,15 +35445,12 @@ mod proxy_manifest_artifact_indexing_tests {
                 .expect("count refs");
 
         // Cleanup (trigger first, so the cascade delete on repositories works).
-        let _ = sqlx::query(sqlx::AssertSqlSafe(&*format!(
-            "DROP TRIGGER IF EXISTS {trigger_name} ON manifest_blob_refs"
-        )))
-        .execute(&pool)
-        .await;
-        let _ = sqlx::query(sqlx::AssertSqlSafe(&*format!(
-            "DROP FUNCTION IF EXISTS {function_name}()"
-        )))
-        .execute(&pool)
+        crate::api::handlers::test_db_helpers::drop_test_trigger(
+            &pool,
+            "manifest_blob_refs",
+            &trigger_name,
+            &function_name,
+        )
         .await;
         let _ = sqlx::query("DELETE FROM oci_tags WHERE repository_id = $1")
             .bind(repo_id)

@@ -6745,14 +6745,7 @@ mod tests {
         let app = upload_router_with_auth(f.state.clone(), auth);
         let (status, _body) = tdh::send(app, complete_req(session_id)).await;
 
-        let drop_trg = format!("DROP TRIGGER IF EXISTS {trigger} ON artifacts");
-        let _ = sqlx::query(sqlx::AssertSqlSafe(&*drop_trg))
-            .execute(&f.pool)
-            .await;
-        let drop_fn = format!("DROP FUNCTION IF EXISTS {func}()");
-        let _ = sqlx::query(sqlx::AssertSqlSafe(&*drop_fn))
-            .execute(&f.pool)
-            .await;
+        tdh::drop_test_trigger(&f.pool, "artifacts", &trigger, &func).await;
 
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         let (state, token, deadline) = lease_state(&f, session_id).await;

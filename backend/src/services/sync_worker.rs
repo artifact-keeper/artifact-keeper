@@ -7000,6 +7000,8 @@ mod tests {
     /// owner's token can no longer finalize the row afterwards.
     #[tokio::test]
     async fn expired_sync_task_claims_recover_and_fence_stale_owner() {
+        let _serial =
+            crate::api::handlers::test_db_helpers::sync_claim_recovery_serial_lock().await;
         let Some(f) = setup_claim_fixture(1).await else {
             return;
         };
@@ -7050,10 +7052,16 @@ mod tests {
     /// They must not occupy peer capacity forever after the claim columns land.
     #[tokio::test]
     async fn legacy_in_progress_sync_task_without_claim_metadata_recovers() {
+        let _serial =
+            crate::api::handlers::test_db_helpers::sync_claim_recovery_serial_lock().await;
         let Some(f) = setup_claim_fixture(1).await else {
             return;
         };
 
+        // The row and its peer's counter change together, as a transfer's
+        // claim changes them: a sweep between two separate statements would
+        // reset the row before the counter it compensates was set (#5671).
+        let mut seed = f.pool.begin().await.expect("begin seed");
         sqlx::query(
             r#"
             UPDATE sync_tasks
@@ -7066,14 +7074,15 @@ mod tests {
             "#,
         )
         .bind(f.task_ids[0])
-        .execute(&f.pool)
+        .execute(&mut *seed)
         .await
         .expect("seed legacy in_progress task");
         sqlx::query("UPDATE peer_instances SET active_transfers = 1 WHERE id = $1")
             .bind(f.peer_id)
-            .execute(&f.pool)
+            .execute(&mut *seed)
             .await
             .expect("seed active transfer counter");
+        seed.commit().await.expect("commit seed");
 
         // Instance-wide, like the test above: the row and its peer's counter
         // are what this test owns, not the returned count (#5818).

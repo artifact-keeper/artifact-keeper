@@ -915,6 +915,49 @@ pub fn spawn_all(
         });
     }
 
+    // Trigger-kept row counts behind `/admin/stats` (#3094, migration 414).
+    // Seeds any table not seeded yet (the first run after the upgrade; until
+    // then the endpoint keeps its live COUNT(*)), compacts the delta rows
+    // every minute so a read sums a handful of rows, and trues every table up
+    // once a day on one replica (scheduler lease, skipped while fresh): the
+    // drift safety net for writes made with triggers off.
+    {
+        let db = db.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            let mut ticker = interval(Duration::from_secs(60));
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                match crate::services::row_counts::seed_missing(&db).await {
+                    Ok(0) => {}
+                    Ok(n) => tracing::info!(tables = n, "Seeded trigger-kept row counts"),
+                    Err(e) => tracing::warn!("Row-count seeding failed: {}", e),
+                }
+                // Lease-gated and skipped while every table was trued up in
+                // the last 23 h: one full COUNT(*) per table per day for the
+                // whole cluster, not one per replica.
+                match crate::services::row_counts::true_up_if_due(&db).await {
+                    Ok(done) => {
+                        for (table, drift) in done {
+                            if let Some(drift) = drift.filter(|d| *d != 0) {
+                                tracing::warn!(
+                                    table,
+                                    drift,
+                                    "Repaired trigger-kept row-count drift"
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => tracing::warn!("Row-count true-up failed: {}", e),
+                }
+                if let Err(e) = crate::services::row_counts::compact(&db).await {
+                    tracing::warn!("Row-count compaction failed: {}", e);
+                }
+            }
+        });
+    }
+
     // Backup schedule execution (check every 5 minutes)
     {
         let db = db.clone();

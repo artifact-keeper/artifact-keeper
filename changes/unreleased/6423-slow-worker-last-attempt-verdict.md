@@ -1,0 +1,5 @@
+---
+section: Fixed
+issues: [#6423]
+---
+- **A queued scan whose claim lapses on the job's last attempt is now run once more instead of ending `failed`** (#6423). When a scan worker was only slow (it missed its heartbeats) and the sweep recovered its claim on the job's last attempt, the job ended `failed` and nothing reran it. The claim guard from #6232 then discarded the slow worker's late result, so the artifact's `scan_results` row stayed `failed` until someone rescanned it by hand. Recovery now gives such a job one more run (`attempts` reaches `max_attempts`), whose verdict lands in a row of its own. The late result is still refused, so a stale verdict can never overwrite a newer one. A job that loses its worker again on that run ends `failed`, so a job that kills its worker still stops, after at most one extra run. Until the rerun records its verdict, the row stays `failed` and the artifact stays gated. The claim token is now written in the same `INSERT` that creates the scan row. When a late result is discarded, the scanner no longer logs it as a completed scan or runs the quarantine check on its totals.

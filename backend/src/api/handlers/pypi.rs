@@ -1106,6 +1106,10 @@ async fn simple_project(
 
             // Second pass: fetch a remote index from every remote member, but
             // narrow a suppressed member's contribution to its Case-A unions.
+            // #5620: whether a remote member could not answer, so an empty
+            // union answers 503 + Retry-After instead of a 404 pip reports as
+            // "no matching distribution".
+            let mut remote_unavailable = false;
             for member in &members {
                 if member.repo_type != RepositoryType::Remote {
                     continue;
@@ -1234,11 +1238,12 @@ async fn simple_project(
                         };
                         remote_response = Some((content, content_type));
                     }
-                    Err(_e) => {
+                    Err(e) => {
                         debug!(
                             member_key = %member.key,
                             "simple index proxy fetch missed for virtual member"
                         );
+                        remote_unavailable |= proxy_helpers::is_member_unavailable_response(&e);
                     }
                 }
             }
@@ -1255,6 +1260,9 @@ async fn simple_project(
 
             // Render the union.
             match (local_artifacts.is_empty(), remote_response) {
+                (true, None) if remote_unavailable => {
+                    return Err(proxy_helpers::member_unavailable_response());
+                }
                 (true, None) => {
                     return Err(AppError::NotFound(
                         "Package not found in any member repository".to_string(),
@@ -3117,6 +3125,12 @@ async fn serve_file(
                 let strict_unavailable = |resp: &Response| {
                     fallback.is_strict() && proxy_helpers::is_member_unavailable_response(resp)
                 };
+                // #6417: whether a member could not answer (an upstream 5xx,
+                // a transport failure or timeout, an open circuit, a storage
+                // fault) rather than not having the file. A walk no member
+                // served then answers 503 + Retry-After instead of the 404
+                // pip reports as "no matching distribution" (#5504).
+                let mut unavailable = false;
 
                 for member in &members {
                     // #3404: apply the ownership guard BEFORE this member is
@@ -3246,6 +3260,7 @@ async fn serve_file(
                             return Err(e);
                         }
                         Err(e) => {
+                            unavailable |= proxy_helpers::is_transient_local_failure(&e);
                             debug!(
                                 member_key = %member.key,
                                 error = %e.status(),
@@ -3310,6 +3325,8 @@ async fn serve_file(
                                                 proxy_helpers::member_unavailable_response(),
                                             );
                                         }
+                                        unavailable |=
+                                            proxy_helpers::is_member_unavailable_response(&resp);
                                         debug!(
                                             member_key = %member.key,
                                             status = %status,
@@ -3375,6 +3392,8 @@ async fn serve_file(
                                     return Err(proxy_helpers::member_unavailable_response());
                                 }
                                 Err(e) => {
+                                    unavailable |=
+                                        proxy_helpers::is_member_unavailable_response(&e);
                                     debug!(
                                         member_key = %member.key,
                                         error = %e.status(),
@@ -3386,10 +3405,7 @@ async fn serve_file(
                     }
                 }
 
-                return Err(AppError::NotFound(
-                    "Artifact not found in any member repository".to_string(),
-                )
-                .into_response());
+                return Err(file_walk_miss(unavailable));
             }
             return Err(AppError::NotFound("File not found".to_string()).into_response());
         }
@@ -3516,6 +3532,18 @@ async fn serve_file(
         .header("X-PyPI-File-SHA256", &artifact.checksum_sha256)
         .body(Body::from_stream(stream))
         .unwrap())
+}
+
+/// The answer of a virtual distribution walk no member served (#6417): the
+/// retryable 503 + `Retry-After` when a member could not answer, the 404
+/// otherwise.
+fn file_walk_miss(unavailable: bool) -> Response {
+    if unavailable {
+        proxy_helpers::member_unavailable_response()
+    } else {
+        AppError::NotFound("Artifact not found in any member repository".to_string())
+            .into_response()
+    }
 }
 
 /// Streaming variant of the PyPI proxy cache read. Streams a cache hit
@@ -3881,7 +3909,7 @@ async fn fetch_resolver_index(
     let mut leader_error: Option<Response> = None;
     let read = RESOLVER_INDEX_MEMO
         .try_get_with(key, async {
-            match proxy_helpers::proxy_fetch_uncached(
+            match proxy_helpers::proxy_fetch_uncached_decoded(
                 proxy,
                 repo_id,
                 repo_key,
@@ -3895,26 +3923,38 @@ async fn fetch_resolver_index(
                 }
                 Err(resp) => {
                     let status = resp.status();
+                    let unavailable = proxy_helpers::is_member_unavailable_response(&resp);
                     leader_error = Some(resp);
-                    Err(status)
+                    Err((status, unavailable))
                 }
             }
         })
         .await;
     match read {
         Ok(hit) => Ok((hit.0.clone(), hit.1.clone())),
-        Err(status) => Err(leader_error.unwrap_or_else(|| shared_resolver_index_error(*status))),
+        Err(failed) => {
+            let (status, unavailable) = *failed;
+            Err(leader_error.unwrap_or_else(|| shared_resolver_index_error(status, unavailable)))
+        }
     }
 }
 
-/// Error for a request that waited on another request's failed index read
-fn shared_resolver_index_error(status: StatusCode) -> Response {
+/// Error for a request that waited on another request's failed index read.
+/// It keeps the leader's [`proxy_helpers::MemberUnavailable`] marker, so a
+/// virtual walk reads a coalesced outage as one (#6417).
+fn shared_resolver_index_error(status: StatusCode, unavailable: bool) -> Response {
     let body = if status == StatusCode::NOT_FOUND {
         "Artifact not found upstream"
     } else {
         "Upstream index fetch failed"
     };
-    (status, body).into_response()
+    let mut response = (status, body).into_response();
+    if unavailable {
+        response
+            .extensions_mut()
+            .insert(proxy_helpers::MemberUnavailable);
+    }
+    response
 }
 
 /// Resolve the real download URL for a file hosted by a remote PyPI
@@ -4075,18 +4115,22 @@ async fn pypi_proxy_cache_redirect(
         return None;
     }
     // #1555: resolve the no-prefix presign handle and confirm redirect support
-    // BEFORE the `fresh_cache_redirect_size` probe — the probe loads the
+    // BEFORE the `fresh_cache_redirect` probe — the probe loads the
     // cache-meta sidecar, so we avoid a wasted S3 GET when we can't redirect
     // anyway (the streaming fallback re-reads the same sidecar).
     let storage = proxy.cache_storage_backend();
     if !storage.supports_redirect() {
         return None;
     }
-    // #6035: the freshness probe also yields the size its sidecar records,
-    // which the transfer meter counts when the URL is issued.
-    let size_bytes = proxy
-        .fresh_cache_redirect_size(repo_key, cache_path)
-        .await?;
+    // #6035: the freshness probe also yields the sidecar it read: the size
+    // the transfer meter counts when the URL is issued, the hold and the
+    // digest whose verdict is checked below.
+    let entry = proxy.fresh_cache_redirect(repo_key, cache_path).await?;
+    // #6361: a file inside its Package Age Policy hold is not redirected to,
+    // as on the other fast paths; the streaming path below answers the hold.
+    if entry.quarantine_gate().is_err() {
+        return None;
+    }
     // #4506: a Remote whose origin policy refuses its content gets no
     // redirect; the gated fetch below answers the 403.
     if proxy.cache_origin_policy_gate(repo_key).await.is_err() {
@@ -4094,7 +4138,8 @@ async fn pypi_proxy_cache_redirect(
     }
     // #4514: nor does a body its stored scan verdict refuses, or, under
     // fail-closed, one with no reusable clean verdict.
-    if !proxy_helpers::cache_scan_allows_redirect(state, proxy, repo_key, cache_path).await {
+    if !proxy_helpers::cache_scan_allows_redirect(state, proxy, repo_key, cache_path, &entry).await
+    {
         return None;
     }
     let cache_key = crate::services::proxy_service::ProxyService::cache_storage_key(
@@ -4110,7 +4155,7 @@ async fn pypi_proxy_cache_redirect(
         /* presigned_enabled = */ true,
         expiry,
         /* cache_is_fresh = */ true,
-        size_bytes,
+        entry.size_bytes(),
     )
     .await
 }
@@ -6808,7 +6853,9 @@ async fn upload(
             Some(user_id),
             // #4889: queue below, once the upload has committed.
             false,
-            None,
+            // #6346: registered once, below, with the summary and catalog
+            // metadata parsed here.
+            crate::services::artifact_service::CatalogRegistration::Caller,
             None,
             Some(crate::services::artifact_service::CommitMetadata {
                 format: "pypi",
@@ -8389,6 +8436,87 @@ mod tests {
             );
         }
     }
+
+    /// #6318 / #6346: one PyPI upload goes back to the connection pool a
+    /// bounded number of times, and registers its catalog row once, with the
+    /// summary and catalog metadata the handler parsed.
+    ///
+    /// Each checkout is a chance to wait on, or time out on, an exhausted
+    /// pool, so per-upload connection demand sets how many uploads a small
+    /// pool carries. Before #6318 the handler upserted the catalog row a second
+    /// time after the service's finalize had, and wrote the repository
+    /// timestamp and the analysis on separate checkouts. The bound is the
+    /// measured count plus no slack: a change that adds a checkout to the
+    /// upload path has to raise it here, on purpose.
+    #[tokio::test]
+    async fn upload_pool_checkouts_are_bounded_and_catalog_written_once_6318() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some((fx, acquires)) = tdh::Fixture::setup_counting("local", "pypi").await else {
+            return;
+        };
+        let (content_type, body) = pypi_upload_multipart(
+            "acq-6318",
+            "1.0.0",
+            "acq_6318-1.0.0-py3-none-any.whl",
+            b"fake-wheel-bytes-6318",
+            "pool checkout summary 6318",
+            ">=3.9",
+        );
+        let app = fx.router_with_auth(super::router());
+        // Only the request's own checkouts: the detached audit insert it
+        // spawns races the end of the request and is not part of its
+        // critical path (it made this count 11 or 12 depending on the host).
+        let ((status, resp), used) = acquires
+            .scoped(tdh::send(
+                app,
+                tdh::post(format!("/{}/", fx.repo_key), &content_type, body),
+            ))
+            .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "upload: {}",
+            String::from_utf8_lossy(&resp)
+        );
+        eprintln!("#6318 PyPI upload pool checkouts: {used}");
+        // Let detached work settle so the trace shows it (not asserted).
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        eprintln!("  detached checkouts so far: {}", acquires.detached());
+        for site in acquires.sites() {
+            eprintln!("  checkout: {site}");
+        }
+
+        let (description, metadata): (Option<String>, Option<serde_json::Value>) = sqlx::query_as(
+            "SELECT description, metadata FROM packages \
+                 WHERE repository_id = $1 AND name = 'acq-6318'",
+        )
+        .bind(fx.repo_id)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("one catalog row");
+        assert_eq!(description.as_deref(), Some("pool checkout summary 6318"));
+        let metadata = metadata.expect("catalog metadata");
+        assert_eq!(metadata["requires_python"], ">=3.9", "{metadata}");
+        let versions: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM package_versions pv JOIN packages p ON p.id = pv.package_id \
+             WHERE p.repository_id = $1 AND p.name = 'acq-6318' AND pv.version = '1.0.0'",
+        )
+        .bind(fx.repo_id)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("count versions");
+        assert_eq!(versions, 1);
+
+        assert!(
+            used <= PYPI_UPLOAD_MAX_POOL_CHECKOUTS,
+            "a PyPI upload took {used} pool checkouts, more than the {PYPI_UPLOAD_MAX_POOL_CHECKOUTS} \
+             it is pinned at (#6318)"
+        );
+    }
+
+    /// The pool checkouts one PyPI upload is pinned at (#6318): measured, 19
+    /// before the change and 11 after.
+    const PYPI_UPLOAD_MAX_POOL_CHECKOUTS: usize = 11;
 
     fn headers_with_replication(value: &str) -> HeaderMap {
         let mut headers = HeaderMap::new();
@@ -17192,6 +17320,136 @@ mod tests {
         );
     }
 
+    /// #5983: the resolver reads the simple index with `Accept-Encoding: gzip`
+    /// and decodes it, the sidecar download itself stays identity (#2915)
+    #[tokio::test]
+    async fn test_resolver_index_read_asks_for_gzip_5983() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use std::io::Write;
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
+            return;
+        };
+        let (upstream, _ssrf_allowlist) = non_loopback_upstream().await;
+
+        let project = "gzindex5983";
+        let wheel = "gzindex5983-1.0-py3-none-any.whl";
+        let metadata: &[u8] = b"Metadata-Version: 2.1\nName: gzindex5983\nVersion: 1.0\n";
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(pep658_index_html(wheel).as_bytes())
+            .expect("gzip write");
+        let gz_index = enc.finish().expect("gzip finish");
+
+        Mock::given(method("GET"))
+            .and(path(format!("/simple/{project}/")))
+            .and(header("accept-encoding", "gzip"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-encoding", "gzip")
+                    .insert_header("content-type", "text/html")
+                    .set_body_bytes(gz_index),
+            )
+            .with_priority(1)
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/simple/{project}/")))
+            .respond_with(ResponseTemplate::new(406))
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/packages/{wheel}.metadata")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(metadata))
+            .mount(&upstream)
+            .await;
+
+        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &upstream.uri()).await;
+        let (status, body, _) = tdh::send_with_headers(
+            tdh::router_anon(super::router(), state),
+            tdh::get(format!(
+                "/{}/simple/{project}/{wheel}.metadata",
+                fx.repo_key
+            )),
+        )
+        .await;
+        let requests = upstream.received_requests().await.unwrap_or_default();
+        let coding_of = |p: String| {
+            requests
+                .iter()
+                .filter(|r| r.url.path() == p)
+                .map(|r| {
+                    r.headers
+                        .get("accept-encoding")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or_default()
+                        .to_string()
+                })
+                .collect::<Vec<_>>()
+        };
+        let index_codings = coding_of(format!("/simple/{project}/"));
+        let sidecar_codings = coding_of(format!("/packages/{wheel}.metadata"));
+
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "body: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(&body[..], metadata);
+        assert_eq!(index_codings, vec!["gzip".to_string()]);
+        assert_eq!(sidecar_codings, vec!["identity".to_string()]);
+    }
+
+    /// #5983: a gzip-coded index that does not decode is the upstream's
+    /// fault, the client gets a 502, not the decoder's 400
+    #[tokio::test]
+    async fn test_resolver_index_bad_gzip_is_a_bad_gateway_5983() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
+            return;
+        };
+        let (upstream, _ssrf_allowlist) = non_loopback_upstream().await;
+
+        let project = "badgz5983";
+        let wheel = "badgz5983-1.0-py3-none-any.whl";
+        Mock::given(method("GET"))
+            .and(path(format!("/simple/{project}/")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-encoding", "gzip")
+                    .insert_header("content-type", "text/html")
+                    .set_body_bytes(b"this is not a gzip stream".to_vec()),
+            )
+            .mount(&upstream)
+            .await;
+
+        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &upstream.uri()).await;
+        let (status, body, _) = tdh::send_with_headers(
+            tdh::router_anon(super::router(), state),
+            tdh::get(format!(
+                "/{}/simple/{project}/{wheel}.metadata",
+                fx.repo_key
+            )),
+        )
+        .await;
+
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::BAD_GATEWAY,
+            "body: {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+
     /// A repeated `.whl.metadata` request is served from the proxy cache
     /// (#3300), reaching upstream zero times.
     ///
@@ -17367,10 +17625,24 @@ mod tests {
 
     #[test]
     fn test_shared_resolver_index_error_keeps_status_5983() {
-        let not_found = shared_resolver_index_error(StatusCode::NOT_FOUND);
+        let not_found = shared_resolver_index_error(StatusCode::NOT_FOUND, false);
         assert_eq!(not_found.status(), StatusCode::NOT_FOUND);
-        let unavailable = shared_resolver_index_error(StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!proxy_helpers::is_member_unavailable_response(&not_found));
+        let unavailable = shared_resolver_index_error(StatusCode::SERVICE_UNAVAILABLE, true);
         assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
+        // #6417: a request coalesced onto a failed leader read keeps the
+        // leader's outage marker, so a virtual file walk reads it as one.
+        assert!(proxy_helpers::is_member_unavailable_response(&unavailable));
+    }
+
+    /// #6417: a virtual distribution walk no member served answers the
+    /// retryable 503 when a member could not answer, and the 404 otherwise.
+    #[test]
+    fn test_file_walk_miss_6417() {
+        let down = file_walk_miss(true);
+        assert_eq!(down.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(down.headers().contains_key(axum::http::header::RETRY_AFTER));
+        assert_eq!(file_walk_miss(false).status(), StatusCode::NOT_FOUND);
     }
 
     /// #3356 item 3. The #3333 regression test above covers the HANDLER half of
@@ -17687,12 +17959,12 @@ mod tests {
             "pypi_proxy_cache_redirect MUST sign via cache_storage_backend() \
              (no-prefix handle), not a prefixed repo handle (#1555).",
         );
-        // #6035: `fresh_cache_redirect_size(` is the same metadata-only probe,
-        // returning the sidecar's size alongside the verdict.
+        // #6035/#6361: `fresh_cache_redirect(` is the same metadata-only
+        // probe, returning the sidecar it read alongside the verdict.
         assert!(
-            window.contains("fresh_cache_redirect_size("),
+            window.contains("fresh_cache_redirect("),
             "pypi_proxy_cache_redirect MUST gate on the metadata-only freshness \
-             probe `fresh_cache_redirect_size` (#1555).",
+             probe `fresh_cache_redirect` (#1555).",
         );
     }
 
@@ -17794,7 +18066,7 @@ mod tests {
         let proxy = tdh::build_proxy_service_with_fs(pool.clone(), &storage_path);
         // Presigned ENABLED, but the filesystem proxy backend reports
         // supports_redirect() == false, so the helper must still return None
-        // without touching the DB (the fresh_cache_redirect_size probe is
+        // without touching the DB (the fresh_cache_redirect probe is
         // never reached).
         let state =
             tdh::build_state_with_proxy_presigned(pool.clone(), &storage_path, proxy.clone());

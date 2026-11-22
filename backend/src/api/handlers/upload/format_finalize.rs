@@ -166,22 +166,6 @@ pub(crate) fn resolved_target(target: NativeTarget, staged: &StagedNativeFinaliz
     }
 }
 
-/// The catalog identity a staged package writes, when it differs from the
-/// lowercased `artifacts.name` the shared upload service would derive. NuGet
-/// keeps the id's authored casing and reuses an existing row's spelling.
-pub(crate) async fn catalog_name(
-    db: &sqlx::PgPool,
-    repository_id: Uuid,
-    staged: &StagedNativeFinalize,
-) -> Option<String> {
-    match staged {
-        StagedNativeFinalize::Nuget(nuget) => {
-            Some(nuget_catalog_name(db, repository_id, &nuget.info).await)
-        }
-        _ => None,
-    }
-}
-
 async fn nuget_catalog_name(db: &sqlx::PgPool, repository_id: Uuid, info: &NuspecInfo) -> String {
     let lowercased_id = info.id.to_lowercase();
     existing_catalog_name(db, repository_id, &lowercased_id)
@@ -1028,9 +1012,9 @@ async fn stage_pypi(
 /// Record a natively finalized upload's non-metadata format records against
 /// its committed artifact row: catalog entries, script analysis and cache
 /// invalidation. The `artifact_metadata` document itself
-/// ([`metadata_document`]) is written by the caller: inside the artifact-row
-/// transaction on a chunked completion (#5002), right after the commit on the
-/// single generic PUT, as the native routes write theirs (#5254).
+/// ([`metadata_document`]) is written by the caller inside the artifact-row
+/// transaction: on a chunked completion (#5002) and on the single generic PUT
+/// (#6383), as the native routes write theirs (#6317).
 /// `rpm_metadata` is the header metadata the caller's RPM parse produced (RPM
 /// only).
 pub(crate) async fn record(

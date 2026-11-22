@@ -1793,19 +1793,23 @@ pub async fn get_system_stats(
 /// Taking a connection rather than the pool lets a test run the handler's
 /// exact queries inside its own REPEATABLE READ transaction, where rows
 /// other tests commit concurrently are invisible, so its before/after deltas
-/// are exact (#4250). The queries run one after another either way.
+/// are exact (#4250).
+///
+/// #3094: two statements, neither of which reads a large table. The four
+/// counts that used to be a `COUNT(*)` over the catalogue and the download
+/// history (`artifacts`, `proxy_cache_artifacts`, `download_statistics`,
+/// `proxy_download_statistics`) come from the trigger-kept
+/// `row_count_deltas` (migration 414, [`crate::services::row_counts`]). They
+/// are exact, the same figures the live counts return; a table not seeded
+/// yet (the first moments after the upgrade) falls back to its live count.
+/// Everything else is small or indexed and is read in one statement: the
+/// repository, user and online-peer counts, the pending sync tasks (a
+/// partial index on `status = 'pending'`), and the byte totals from the
+/// usage ledger (one row per repository).
 async fn collect_system_stats(conn: &mut sqlx::PgConnection) -> Result<SystemStats> {
-    let repo_count = sqlx::query_scalar!("SELECT COUNT(*) as \"count!\" FROM repositories")
-        .fetch_one(&mut *conn)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
+    use crate::services::row_counts;
 
-    let artifact_count = sqlx::query_scalar!(
-        r#"SELECT COUNT(*) as "count!" FROM artifacts WHERE is_deleted = false"#
-    )
-    .fetch_one(&mut *conn)
-    .await
-    .map_err(|e| AppError::Database(e.to_string()))?;
+    let counted = row_counts::read(&mut *conn).await?;
 
     // #3134: byte totals come from the usage ledger, not a raw `artifacts`
     // aggregate. The `artifacts` table holds no OCI layer/config blobs (only
@@ -1822,72 +1826,82 @@ async fn collect_system_stats(conn: &mut sqlx::PgConnection) -> Result<SystemSta
     // counts once per repository, matching quota; physical dedup on shared
     // backends is the storage-GC footprint report's concern. Virtual
     // repositories own no rows in the source tables, so nothing is
-    // double-counted (#2785). Also the O(repositories) shape #3094 asks for.
-    let storage_totals = sqlx::query!(
+    // double-counted (#2785).
+    let (
+        repo_count,
+        user_count,
+        active_edge_count,
+        pending_sync_count,
+        storage_total,
+        storage_proxy,
+    ): (i64, i64, i64, i64, i64, i64) = sqlx::query_as(
         r#"
         SELECT
-            COALESCE(SUM(hosted_bytes + proxy_bytes + oci_bytes), 0)::BIGINT as "total!",
-            COALESCE(SUM(proxy_bytes), 0)::BIGINT as "proxy!"
+            (SELECT COUNT(*) FROM repositories),
+            (SELECT COUNT(*) FROM users),
+            (SELECT COUNT(*) FROM peer_instances WHERE status = 'online'),
+            (SELECT COUNT(*) FROM sync_tasks WHERE status = 'pending'),
+            COALESCE(SUM(hosted_bytes + proxy_bytes + oci_bytes), 0)::BIGINT,
+            COALESCE(SUM(proxy_bytes), 0)::BIGINT
         FROM repository_usage_ledger
-        "#
+        "#,
     )
     .fetch_one(&mut *conn)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
-    let proxy_count =
-        sqlx::query_scalar!(r#"SELECT COUNT(*) as "count!" FROM proxy_cache_artifacts"#)
-            .fetch_one(&mut *conn)
-            .await
-            .map_err(|e| AppError::Database(e.to_string()))?;
-
-    let hosted_download_count =
-        sqlx::query_scalar!("SELECT COUNT(*) as \"count!\" FROM download_statistics")
-            .fetch_one(&mut *conn)
-            .await
-            .map_err(|e| AppError::Database(e.to_string()))?;
-    let proxy_download_count =
-        sqlx::query_scalar!("SELECT COUNT(*) as \"count!\" FROM proxy_download_statistics")
-            .fetch_one(&mut *conn)
-            .await
-            .map_err(|e| AppError::Database(e.to_string()))?;
-
-    let user_count = sqlx::query_scalar!("SELECT COUNT(*) as \"count!\" FROM users")
-        .fetch_one(&mut *conn)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
-
-    let active_edge_count = sqlx::query_scalar!(
-        "SELECT COUNT(*) as \"count!\" FROM peer_instances WHERE status = 'online'"
+    let artifact_count = counted_or_live(conn, counted.artifacts, row_counts::ARTIFACTS).await?;
+    let proxy_count = counted_or_live(
+        conn,
+        counted.proxy_cache_artifacts,
+        row_counts::PROXY_CACHE_ARTIFACTS,
     )
-    .fetch_one(&mut *conn)
-    .await
-    .map_err(|e| AppError::Database(e.to_string()))?;
-
-    let pending_sync_count = sqlx::query_scalar!(
-        "SELECT COUNT(*) as \"count!\" FROM sync_tasks WHERE status = 'pending'"
+    .await?;
+    let hosted_download_count = counted_or_live(
+        conn,
+        counted.download_statistics,
+        row_counts::DOWNLOAD_STATISTICS,
     )
-    .fetch_one(&mut *conn)
-    .await
-    .map_err(|e| AppError::Database(e.to_string()))?;
-
+    .await?;
+    let proxy_download_count = counted_or_live(
+        conn,
+        counted.proxy_download_statistics,
+        row_counts::PROXY_DOWNLOAD_STATISTICS,
+    )
+    .await?;
     Ok(SystemStats {
         total_repositories: repo_count,
         total_artifacts: artifact_count,
-        total_storage_bytes: storage_totals.total,
+        total_storage_bytes: storage_total,
         total_downloads: hosted_download_count + proxy_download_count,
         proxy_download_count,
         total_users: user_count,
         active_peers: active_edge_count,
         pending_sync_tasks: pending_sync_count,
         proxy_artifact_count: proxy_count,
-        proxy_storage_bytes: storage_totals.proxy,
+        proxy_storage_bytes: storage_proxy,
         // Filled in by `get_system_stats`, which holds the configuration.
-        storage_quota: crate::services::quota::StorageQuotaStatus::unset(storage_totals.total),
+        storage_quota: crate::services::quota::StorageQuotaStatus::unset(storage_total),
         transfer_quota: crate::services::quota::TransferQuotaStatus::unset(),
         max_upload_bytes: 0,
         quota_help_url: None,
     })
+}
+
+/// A trigger-kept count, or the live `COUNT(*)` for a table that has not
+/// been seeded yet (#3094).
+async fn counted_or_live(
+    conn: &mut sqlx::PgConnection,
+    counted: Option<i64>,
+    table: crate::services::row_counts::CountedTable,
+) -> Result<i64> {
+    match counted {
+        Some(n) => Ok(n),
+        None => sqlx::query_scalar(table.live_count_sql)
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(|e| AppError::Database(e.to_string())),
+    }
 }
 
 /// One repository's before/after in a ledger backfill (#3650).
@@ -4123,6 +4137,303 @@ mod tests {
         assert_eq!(json["total_users"], 25);
         assert_eq!(json["proxy_artifact_count"], 12);
         assert_eq!(json["proxy_storage_bytes"], 2_000_000i64);
+    }
+
+    /// The four counts `/admin/stats` reads, by the live `COUNT(*)` queries it
+    /// ran before #3094: (live artifacts, proxy cache rows, hosted downloads,
+    /// proxy downloads).
+    async fn live_stat_counts(pool: &sqlx::PgPool) -> [i64; 4] {
+        let mut out = [0i64; 4];
+        for (i, t) in crate::services::row_counts::COUNTED_TABLES
+            .iter()
+            .enumerate()
+        {
+            out[i] = sqlx::query_scalar(t.live_count_sql)
+                .fetch_one(pool)
+                .await
+                .expect("live count");
+        }
+        out
+    }
+
+    /// The same four figures as `get_system_stats` reports them.
+    async fn reported_stat_counts(pool: &sqlx::PgPool) -> [i64; 4] {
+        let mut conn = pool.acquire().await.expect("acquire");
+        let s = collect_system_stats(&mut conn)
+            .await
+            .expect("collect stats");
+        [
+            s.total_artifacts,
+            s.proxy_artifact_count,
+            s.total_downloads - s.proxy_download_count,
+            s.proxy_download_count,
+        ]
+    }
+
+    async fn assert_stats_match_live(pool: &sqlx::PgPool, step: &str) -> [i64; 4] {
+        let live = live_stat_counts(pool).await;
+        assert_eq!(
+            reported_stat_counts(pool).await,
+            live,
+            "after {step}: /admin/stats counts [artifacts, proxy cache, downloads, \
+             proxy downloads] must equal the live COUNT(*) figures"
+        );
+        live
+    }
+
+    /// #3094: `/admin/stats` reads its four large-table counts from the
+    /// trigger-kept `row_count_deltas` (migration 414) instead of COUNT(*),
+    /// and every figure must stay identical to the live count through every
+    /// kind of write: rows that predate the triggers (seeded once), multi-row
+    /// inserts, soft delete and restore, hard deletes, an upsert that updates
+    /// instead of inserting, a rolled-back transaction, a cascaded repository
+    /// delete, TRUNCATE, compaction, and drift from a write made with triggers
+    /// off (repaired by the true-up). Runs in its own database, since the
+    /// counts are global and the shared test database has concurrent writers.
+    #[tokio::test]
+    async fn test_system_stats_counts_stay_identical_to_live_counts_3094_db() {
+        use crate::services::row_counts;
+
+        let Some(iso) = crate::testing::try_isolated_pool().await else {
+            return;
+        };
+        let pool = &iso.pool;
+
+        let repo = |key: &'static str| async move {
+            sqlx::query_scalar::<_, Uuid>(
+                "INSERT INTO repositories (key, name, format, repo_type, storage_path, \
+                 visibility) VALUES ($1, $1, 'generic', 'local', '/tmp/x', 'private') \
+                 RETURNING id",
+            )
+            .bind(key)
+            .fetch_one(pool)
+            .await
+            .expect("repository")
+        };
+        let hosted = repo("stats-hosted").await;
+        let other = repo("stats-other").await;
+
+        // Rows written before the migration-414 triggers existed: inserted with
+        // triggers off, as on a database that is being upgraded.
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query("SET LOCAL session_replication_role = replica")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO artifacts (repository_id, path, name, size_bytes, checksum_sha256, \
+             content_type, storage_key, is_deleted, origin) \
+             SELECT $1, 'old/' || g, 'old' || g, 10, repeat('a', 64), 'x', 'k/old/' || g, g % 3 = 0, \
+                    jsonb_build_object('kind', 'hosted', 'repository_key', 'stats-hosted') \
+             FROM generate_series(1, 7) g",
+        )
+        .bind(hosted)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO proxy_cache_artifacts (repository_id, path, storage_key, metadata_key, \
+             size_bytes) SELECT $1, 'old/' || g, 'pk/' || g, 'pm/' || g, 5 \
+             FROM generate_series(1, 4) g",
+        )
+        .bind(other)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO download_statistics (artifact_id) \
+             SELECT id FROM artifacts WHERE repository_id = $1",
+        )
+        .bind(hosted)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO proxy_download_statistics (proxy_cache_id, repository_id, path) \
+             SELECT id, repository_id, path FROM proxy_cache_artifacts",
+        )
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+
+        // Not seeded yet: the live fallback.
+        let live = assert_stats_match_live(pool, "pre-trigger rows, unseeded").await;
+        assert_eq!(live, [5, 4, 7, 4], "seeded fixture");
+
+        assert_eq!(row_counts::seed_missing(pool).await.unwrap(), 4);
+        assert_eq!(row_counts::seed_missing(pool).await.unwrap(), 0);
+        assert_stats_match_live(pool, "seeding").await;
+        let seeded: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM row_count_seeds")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert_eq!(seeded, 4, "every counted table is seeded");
+
+        sqlx::query(
+            "INSERT INTO artifacts (repository_id, path, name, size_bytes, checksum_sha256, \
+             content_type, storage_key, is_deleted) \
+             SELECT $1, 'new/' || g, 'new' || g, 10, repeat('b', 64), 'x', 'k/new/' || g, g = 1 \
+             FROM generate_series(1, 6) g",
+        )
+        .bind(hosted)
+        .execute(pool)
+        .await
+        .unwrap();
+        assert_stats_match_live(pool, "multi-row insert, one row born deleted").await;
+
+        sqlx::query("UPDATE artifacts SET is_deleted = true WHERE path IN ('new/2', 'new/3')")
+            .execute(pool)
+            .await
+            .unwrap();
+        assert_stats_match_live(pool, "soft delete").await;
+        sqlx::query("UPDATE artifacts SET is_deleted = false WHERE path = 'new/2'")
+            .execute(pool)
+            .await
+            .unwrap();
+        assert_stats_match_live(pool, "restore").await;
+        sqlx::query("UPDATE artifacts SET is_deleted = true WHERE path = 'old/3'")
+            .execute(pool)
+            .await
+            .unwrap();
+        assert_stats_match_live(pool, "soft delete of a deleted row (no change)").await;
+        sqlx::query("UPDATE artifacts SET size_bytes = size_bytes + 1")
+            .execute(pool)
+            .await
+            .unwrap();
+        assert_stats_match_live(pool, "update of other columns").await;
+        sqlx::query("DELETE FROM artifacts WHERE path IN ('new/4', 'new/1', 'old/6')")
+            .execute(pool)
+            .await
+            .unwrap();
+        assert_stats_match_live(pool, "hard delete of live and deleted rows").await;
+
+        sqlx::query(
+            "INSERT INTO download_statistics (artifact_id) \
+             SELECT id FROM artifacts WHERE repository_id = $1 AND is_deleted = false",
+        )
+        .bind(hosted)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query("DELETE FROM download_statistics WHERE ctid IN (SELECT ctid FROM download_statistics LIMIT 2)")
+            .execute(pool)
+            .await
+            .unwrap();
+        assert_stats_match_live(pool, "downloads recorded and pruned").await;
+
+        // A fill: a placeholder insert, then the commit's upsert updates it.
+        for size in [0i64, 42] {
+            crate::services::proxy_catalog::upsert(
+                pool, other, "new/fill", "pk/fill", "pm/fill", size, None, None, None, None,
+            )
+            .await
+            .unwrap();
+        }
+        crate::services::proxy_catalog::record_proxy_download(
+            pool, other, "new/fill", "pk/fill", "pm/fill", None, None, None,
+        )
+        .await
+        .unwrap();
+        assert_stats_match_live(pool, "proxy fill and serve (insert, then conflict update)").await;
+
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query(
+            "INSERT INTO proxy_cache_artifacts (repository_id, path, storage_key, metadata_key, \
+             size_bytes) VALUES ($1, 'rolled/back', 'k', 'm', 1)",
+        )
+        .bind(other)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        tx.rollback().await.unwrap();
+        assert_stats_match_live(pool, "rolled-back insert").await;
+
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(other)
+            .execute(pool)
+            .await
+            .unwrap();
+        assert_stats_match_live(pool, "repository delete cascading to its cache rows").await;
+
+        let before_compact: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM row_count_deltas")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert!(row_counts::compact(pool).await.unwrap() as i64 == before_compact);
+        let after_compact: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM row_count_deltas")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert!(after_compact <= 4, "one row per table after compaction");
+        assert_stats_match_live(pool, "compaction").await;
+
+        sqlx::query("TRUNCATE proxy_download_statistics")
+            .execute(pool)
+            .await
+            .unwrap();
+        assert_stats_match_live(pool, "TRUNCATE").await;
+
+        for t in row_counts::COUNTED_TABLES {
+            assert_eq!(
+                row_counts::true_up(pool, t).await.unwrap(),
+                Some(0),
+                "{}: no drift through trigger-kept writes",
+                t.name
+            );
+        }
+
+        // Drift: a write with triggers off is invisible to the deltas until
+        // the true-up repairs it.
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query("SET LOCAL session_replication_role = replica")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM download_statistics")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        let drift = row_counts::true_up(pool, row_counts::DOWNLOAD_STATISTICS)
+            .await
+            .unwrap()
+            .expect("not contended");
+        assert!(drift < 0, "the true-up repairs the drift ({drift})");
+        assert_stats_match_live(pool, "true-up after a trigger-less delete").await;
+
+        // The daily true-up: nothing to do while every table is fresh; once
+        // stale, only the holder of the scheduler lease runs it.
+        assert!(row_counts::true_up_if_due(pool).await.unwrap().is_empty());
+        sqlx::query("UPDATE row_count_seeds SET trued_up_at = now() - interval '24 hours'")
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO scheduler_leases (job_name, owner_id, claim_token, lease_expires_at) \
+             VALUES ($1, 'another-replica', gen_random_uuid(), now() + interval '1 hour')",
+        )
+        .bind(row_counts::TRUE_UP_LEASE)
+        .execute(pool)
+        .await
+        .unwrap();
+        assert!(
+            row_counts::true_up_if_due(pool).await.unwrap().is_empty(),
+            "another replica holds the lease"
+        );
+        sqlx::query("DELETE FROM scheduler_leases WHERE job_name = $1")
+            .bind(row_counts::TRUE_UP_LEASE)
+            .execute(pool)
+            .await
+            .unwrap();
+        let done = row_counts::true_up_if_due(pool).await.unwrap();
+        assert_eq!(done.len(), 4, "every stale table is trued up: {done:?}");
+        assert!(done.iter().all(|(_, d)| *d == Some(0)), "{done:?}");
+        assert!(
+            row_counts::true_up_if_due(pool).await.unwrap().is_empty(),
+            "fresh again"
+        );
+        assert_stats_match_live(pool, "daily true-up").await;
     }
 
     /// DB-backed (skips without `DATABASE_URL`): `get_system_stats` must

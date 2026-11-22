@@ -385,8 +385,11 @@ streams unscanned with `X-AK-Scan: pending`.
 
 A first install asks for many never-seen files at once, and only
 `MAX_CONCURRENT_SCAN_EXTRACTIONS` scans (default 4, shared with upload scans)
-run at a time, so most of them queue. A file scan runs in a task of its own and
-requests wait on it:
+run at a time, so most of them queue. A repository whose scans are the only
+ones waiting uses all of them. While other repositories' scans wait too, each
+repository queues at most `MAX_CONCURRENT_SCAN_EXTRACTIONS_PER_TENANT` (default
+half, rounded up) for the shared slots, so one busy repository cannot starve
+the others. A file scan runs in a task of its own and requests wait on it:
 
 | Limit | Value | What happens at the limit |
 | --- | --- | --- |

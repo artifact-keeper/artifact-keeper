@@ -2271,12 +2271,14 @@ jobs:
 
       # The nightly release gate (#6073): which lines and images it tests,
       # how it gives way to a release candidate on the shared pool, and the
-      # one-issue-per-red-tier tracking plus the verdict record #6075 reads.
-      # Stubs `gh`; offline, ~2s.
-      - name: Check the nightly release gate's line resolver, sentinel and report
+      # one-issue-per-red-tier tracking plus the verdict record #6075 reads,
+      # and (#6155) the guard that keeps its scheduled triggers to one gate a
+      # night. Stubs `gh`; offline, ~2s.
+      - name: Check the nightly release gate's line resolver, sentinel, once-a-night guard and report
         run: |
           bash scripts/ci/test-nightly-gate-lines.sh
           bash scripts/ci/test-nightly-gate-sentinel.sh
+          bash scripts/ci/test-nightly-gate-once.sh
           bash scripts/ci/test-nightly-gate-report.sh
 
       # #6080: no merge freeze during a candidate. The stale-run finder
@@ -2869,7 +2871,7 @@ jobs:
           sparse-checkout: docker/scanner-adapter
 
       - name: Set up Go
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version-file: docker/scanner-adapter/go.mod
           # Stdlib-only module with no go.sum: nothing to cache.
@@ -3705,6 +3707,7 @@ jobs:
           build-args: |
             CARGO_BUILD_JOBS=4
             CARGO_PROFILE=ci
+            GIT_SHA=${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Verify image starts
         run: |
@@ -3768,7 +3771,7 @@ jobs:
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
 
       - name: Log in to GHCR
-        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
