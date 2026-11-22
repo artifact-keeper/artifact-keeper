@@ -293,6 +293,12 @@ pub fn forget_listings_for_repo(repo_id: Uuid) {
     let _ = LISTINGS.invalidate_entries_if(move |key, _| key.repo_id == repo_id);
 }
 
+/// Drop every memoized listing: the cache-invalidation listener's
+/// conservative flush, when age-gate decisions may have been missed (#6345).
+pub fn forget_all_listings() {
+    LISTINGS.invalidate_all();
+}
+
 /// Drop one memoized listing (tests that step through successive passes).
 /// Per key, so a test never wipes an entry another test in the same process
 /// relies on.

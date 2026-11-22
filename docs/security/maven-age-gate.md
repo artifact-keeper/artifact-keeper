@@ -105,11 +105,14 @@ What to expect while a GA is being dated:
   version range that points only at them resolves to "No versions available",
   and with `updatePolicy=daily` Maven keeps that answer for the day. Pinned
   versions are not affected (each download decides on its own POM).
-- **Review decisions.** An approval, rejection or reopen drops the reused
-  documents of that repository on the backend that handles it, so the next
-  request there reflects it. Other replicas reflect it within the 15 s window.
-  A public Virtual over the Remote can keep serving its 60 s merge of a fully
-  dated document for up to 60 s after a decision (#6345). On the same
+- **Review decisions.** An approval, rejection or reopen, and a policy
+  write, drops the reused documents of that repository and the 60 s merges of
+  every Virtual that has it as a member, directly or through nested Virtuals
+  (#6345). The backend that handles the decision drops them at once and tells
+  the other replicas over the database's notification channel, so the next
+  request on any replica reflects it. A replica that misses the notification
+  (its database connection dropped at that moment) reflects it within the
+  15 s window, and its Virtuals within 60 s. On the same
   process there is one narrow race: a filter pass that read the reviews just
   before a rejection, and stores its document just after the rejection
   cleared the reused documents, puts the rejected version back in the listing

@@ -262,6 +262,11 @@ pub async fn clear_stored_snapshot_version_metadata(
 // coordinates are immutable and clients already tolerate metadata propagation
 // delay), so the bounded staleness is the intended trade-off rather than active
 // cross-member invalidation.
+//
+// Age-gate review decisions and policy writes are the exception (#6345): they
+// change which versions a gated Remote member lists, so they drop the merges of
+// every Virtual that reaches that member, on every replica
+// (`forget_virtual_metadata_merges`).
 const VIRTUAL_MAVEN_METADATA_CACHE_CAPACITY: u64 = 4_000;
 const VIRTUAL_MAVEN_METADATA_CACHE_TTL: Duration = Duration::from_secs(60);
 
@@ -272,8 +277,69 @@ static VIRTUAL_MAVEN_METADATA_CACHE: Lazy<MokaCache<VirtualMetadataCacheKey, Opt
         MokaCache::builder()
             .max_capacity(VIRTUAL_MAVEN_METADATA_CACHE_CAPACITY)
             .time_to_live(VIRTUAL_MAVEN_METADATA_CACHE_TTL)
+            .support_invalidation_closures()
             .build()
     });
+
+/// Bumped by every [`forget_virtual_metadata_merges`] (#6345). A merge reads
+/// the members' gate state while it fans out, so one that started before a
+/// review decision can finish after the decision dropped the cache. It notes
+/// the epoch before the fan-out and drops its own entry again if the epoch
+/// moved, so it cannot put the pre-decision document back for the TTL.
+static VIRTUAL_MAVEN_METADATA_EPOCH: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn virtual_metadata_epoch() -> u64 {
+    VIRTUAL_MAVEN_METADATA_EPOCH.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Keep a finished Virtual GA merge, unless a gate decision landed since
+/// `epoch` was read before its fan-out (#6345). Re-checked after the insert:
+/// a decision before the re-check is caught here, one after it bumped the
+/// epoch only after the insert, so its invalidation already covers the entry.
+async fn keep_virtual_metadata_merge(
+    key: VirtualMetadataCacheKey,
+    merged: Option<Bytes>,
+    epoch: u64,
+) {
+    VIRTUAL_MAVEN_METADATA_CACHE
+        .insert(key.clone(), merged)
+        .await;
+    if virtual_metadata_epoch() != epoch {
+        VIRTUAL_MAVEN_METADATA_CACHE.invalidate(&key).await;
+    }
+}
+
+/// Move the merge epoch, so no merge whose fan-out is in flight is kept
+/// (#6345). Synchronous: a review decision calls it before its next await,
+/// ahead of the targeted drop in [`forget_virtual_metadata_merges`].
+pub fn begin_virtual_metadata_invalidation() {
+    VIRTUAL_MAVEN_METADATA_EPOCH.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Drop the cached Virtual GA merges of `virtual_ids`, or every cached merge
+/// when `None` (the reaching Virtuals could not be listed). Called on each
+/// age-gate policy write and review decision for a member, locally and on
+/// every other replica through the cache-invalidation channel (#6345).
+pub fn forget_virtual_metadata_merges(virtual_ids: Option<&[Uuid]>) {
+    // Bump first: a merge that inserts after this point sees the new epoch
+    // and drops its entry; one that inserted before it is matched below.
+    begin_virtual_metadata_invalidation();
+    match virtual_ids {
+        None => {
+            metrics::counter!("ak_maven_virtual_metadata_merge_flushes_total").increment(1);
+            tracing::debug!("dropping every Virtual Maven metadata merge");
+            VIRTUAL_MAVEN_METADATA_CACHE.invalidate_all();
+        }
+        Some([]) => {}
+        Some(ids) => {
+            let ids: std::collections::HashSet<Uuid> = ids.iter().copied().collect();
+            // Only fails when the cache was built without closure support.
+            let _ = VIRTUAL_MAVEN_METADATA_CACHE
+                .invalidate_entries_if(move |key, _| ids.contains(&key.0));
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Router
@@ -3451,6 +3517,8 @@ async fn fetch_maven_metadata_bytes(
                 std::collections::HashSet::new();
             let cache_key: VirtualMetadataCacheKey =
                 (repo.id, group_id.clone(), artifact_id.clone());
+            // Before the members' gate state is read (#6345).
+            let merge_epoch = virtual_metadata_epoch();
 
             // Consult the GA-level merge cache before iterating members (#2302).
             // A hit — including a definitive `Some(None)` empty-merge — skips the
@@ -3562,9 +3630,7 @@ async fn fetch_maven_metadata_bytes(
                     // Nor a checksum request's merge, which dated nothing
                     // (#6284).
                     if probe && merge_cacheable && marks.cacheable() {
-                        VIRTUAL_MAVEN_METADATA_CACHE
-                            .insert(cache_key, merged.clone())
-                            .await;
+                        keep_virtual_metadata_merge(cache_key, merged.clone(), merge_epoch).await;
                     }
                     merged
                 }
@@ -19238,5 +19304,267 @@ mod hosted_serve_verification_4989_tests {
         fx.teardown().await;
         tdh::assert_integrity_refusal(get_0, &body_0, b"stored bytes 498X");
         assert_eq!(head_0, StatusCode::OK, "a HEAD reads and verifies nothing");
+    }
+}
+
+/// #6345: age-gate decisions drop the Virtual GA merge cache, locally and on
+/// every replica.
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod virtual_merge_gate_invalidation_6345_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use crate::services::cache_invalidation::{
+        age_gate_decision_changed_payload, handle_notification_payload, parse_invalidation_payload,
+        CacheInvalidationHandles, InvalidationEvent, AGE_GATE_INVALIDATION_CHANNEL,
+    };
+
+    fn ga_key(virtual_id: Uuid) -> VirtualMetadataCacheKey {
+        (
+            virtual_id,
+            "com.example.gate6345".to_string(),
+            format!("a-{}", Uuid::new_v4()),
+        )
+    }
+
+    async fn warm(key: &VirtualMetadataCacheKey) {
+        VIRTUAL_MAVEN_METADATA_CACHE
+            .insert(key.clone(), Some(Bytes::from_static(b"<metadata/>")))
+            .await;
+    }
+
+    async fn cached(key: &VirtualMetadataCacheKey) -> bool {
+        VIRTUAL_MAVEN_METADATA_CACHE.get(key).await.is_some()
+    }
+
+    async fn add_member(pool: &PgPool, virtual_id: Uuid, member_id: Uuid) {
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 1)",
+        )
+        .bind(virtual_id)
+        .bind(member_id)
+        .execute(pool)
+        .await
+        .expect("add virtual member");
+    }
+
+    /// A decision on a gated Remote drops the merges of the Virtual over it
+    /// and of a Virtual nesting that one, keeps an unrelated Virtual's, and
+    /// publishes the same Virtuals to the other replicas.
+    #[tokio::test]
+    async fn decision_drops_merges_of_every_virtual_reaching_the_member() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (remote, _, _) = tdh::create_repo(&pool, "remote", "maven").await;
+        let (inner, _, _) = tdh::create_repo(&pool, "virtual", "maven").await;
+        let (outer, _, _) = tdh::create_repo(&pool, "virtual", "maven").await;
+        let (other, _, _) = tdh::create_repo(&pool, "virtual", "maven").await;
+        let (other_member, _, _) = tdh::create_repo(&pool, "remote", "maven").await;
+        add_member(&pool, inner, remote).await;
+        add_member(&pool, outer, inner).await;
+        add_member(&pool, other, other_member).await;
+
+        let (k_inner, k_outer, k_other) = (ga_key(inner), ga_key(outer), ga_key(other));
+        for k in [&k_inner, &k_outer, &k_other] {
+            warm(k).await;
+        }
+
+        let mut listener = sqlx::postgres::PgListener::connect_with(&pool)
+            .await
+            .expect("listener");
+        listener
+            .listen(AGE_GATE_INVALIDATION_CHANNEL)
+            .await
+            .expect("listen");
+
+        crate::services::age_gate_service::invalidate_decision_memos(&pool, remote)
+            .settle()
+            .await;
+
+        assert!(
+            !cached(&k_inner).await,
+            "the Virtual over the member keeps a stale merge"
+        );
+        assert!(
+            !cached(&k_outer).await,
+            "the nesting Virtual keeps a stale merge"
+        );
+        assert!(
+            cached(&k_other).await,
+            "an unrelated Virtual's merge must stay"
+        );
+
+        // The other replicas are told the same Virtuals.
+        let published = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let n = listener.recv().await.expect("notification");
+                if let Ok(InvalidationEvent::AgeGateDecisionChanged {
+                    repo_id,
+                    virtual_ids,
+                }) = parse_invalidation_payload(n.payload())
+                {
+                    if repo_id == remote {
+                        return virtual_ids;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("the decision must be published on the age gate channel");
+        let mut published = published.expect("the reaching Virtuals were listed");
+        published.sort();
+        let mut expected = vec![inner, outer];
+        expected.sort();
+        assert_eq!(published, expected);
+
+        VIRTUAL_MAVEN_METADATA_CACHE.invalidate(&k_other).await;
+    }
+
+    /// A client that disconnects right after the decision commits drops the
+    /// handler future. The event, the repository's memos and the merge epoch
+    /// must already be done by then, and the spawned merge drop must still
+    /// finish. Polled by hand on this single-threaded runtime: the future is
+    /// dropped the moment the event is out, before the spawned task has run.
+    #[tokio::test]
+    async fn decision_survives_its_request_future_being_dropped() {
+        use crate::services::age_gate_maven::{memo_listing, remember_listing, ListingMemoKey};
+        use crate::services::age_gate_service::AgeGateService;
+        use crate::services::event_bus::EventBus;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (remote, _, _) = tdh::create_repo(&pool, "remote", "maven").await;
+        let (virt, _, _) = tdh::create_repo(&pool, "virtual", "maven").await;
+        add_member(&pool, virt, remote).await;
+        let (reviewer, _) = tdh::create_user(&pool).await;
+        let review: Uuid = sqlx::query_scalar(
+            "INSERT INTO age_gate_reviews (repository_id, package_name, package_version, status) \
+             VALUES ($1, 'com.example.gate6345:widget', '2.0.0', 'approved') RETURNING id",
+        )
+        .bind(remote)
+        .fetch_one(&pool)
+        .await
+        .expect("review row");
+
+        let merge = ga_key(virt);
+        warm(&merge).await;
+        let listing = ListingMemoKey::new(
+            remote,
+            "http://up/",
+            "com/example/gate6345/widget/maven-metadata.xml",
+            7,
+            "upstream_publish_time",
+            b"<metadata/>",
+        );
+        remember_listing(listing.clone(), Bytes::from_static(b"listing")).await;
+
+        let bus = Arc::new(EventBus::new(16));
+        let mut events = bus.subscribe();
+        let svc = AgeGateService::new(pool.clone(), bus);
+        let epoch_before = virtual_metadata_epoch();
+
+        let mut decision = Box::pin(svc.reject(review, reviewer, Some("dtf #6345")));
+        let emitted = loop {
+            if let std::task::Poll::Ready(r) = futures::poll!(decision.as_mut()) {
+                panic!(
+                    "the decision finished before it could be dropped (ok: {})",
+                    r.is_ok()
+                );
+            }
+            if let Ok(event) = events.try_recv() {
+                break event;
+            }
+            tokio::task::yield_now().await;
+        };
+        drop(decision);
+
+        assert_eq!(emitted.event_type, "age_gate.rejected");
+        assert!(
+            memo_listing(&listing).await.is_none(),
+            "the listing memo survived"
+        );
+        assert!(
+            virtual_metadata_epoch() > epoch_before,
+            "the merge epoch did not move"
+        );
+
+        // The spawned drop outlives the request future.
+        let dropped = tokio::time::timeout(Duration::from_secs(10), async {
+            while cached(&merge).await {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(
+            dropped.is_ok(),
+            "the Virtual's merge survived a dropped request"
+        );
+    }
+
+    fn handles() -> CacheInvalidationHandles {
+        let pool = PgPool::connect_lazy("postgresql://unused:unused@127.0.0.1:1/unused")
+            .expect("lazy pool");
+        CacheInvalidationHandles {
+            repo_cache: Arc::new(tokio::sync::RwLock::new(Default::default())),
+            repo_miss_cache: Arc::new(tokio::sync::RwLock::new(Default::default())),
+            permission_service: Arc::new(
+                crate::services::permission_service::PermissionService::new(pool),
+            ),
+            npm_packument_cache: None,
+        }
+    }
+
+    /// The receiving replica drops exactly the listed Virtuals' merges, and
+    /// every merge when the list is absent.
+    #[tokio::test]
+    async fn received_decision_drops_the_listed_virtuals_merges() {
+        let (hit, keep) = (Uuid::new_v4(), Uuid::new_v4());
+        let (k_hit, k_keep) = (ga_key(hit), ga_key(keep));
+        warm(&k_hit).await;
+        warm(&k_keep).await;
+
+        let payload = age_gate_decision_changed_payload(Uuid::new_v4(), Some(vec![hit]));
+        handle_notification_payload(&handles(), &payload).await;
+        assert!(!cached(&k_hit).await, "a listed Virtual keeps its merge");
+        assert!(cached(&k_keep).await, "an unlisted Virtual loses its merge");
+
+        let payload = age_gate_decision_changed_payload(Uuid::new_v4(), None);
+        handle_notification_payload(&handles(), &payload).await;
+        assert!(
+            !cached(&k_keep).await,
+            "an unlisted set must drop every merge"
+        );
+    }
+
+    /// A merge whose fan-out overlapped a decision is not kept: it may have
+    /// read the gate state from before the decision.
+    #[tokio::test]
+    async fn merge_started_before_a_decision_is_not_kept() {
+        let key = ga_key(Uuid::new_v4());
+        let before = virtual_metadata_epoch();
+        forget_virtual_metadata_merges(Some(&[Uuid::new_v4()]));
+        keep_virtual_metadata_merge(key.clone(), Some(Bytes::from_static(b"<old/>")), before).await;
+        assert!(!cached(&key).await, "a pre-decision merge was cached");
+
+        // Without a decision in between, the merge is kept. Retried in case
+        // another test in this process bumps the epoch meanwhile.
+        let mut kept = false;
+        for _ in 0..5 {
+            let epoch = virtual_metadata_epoch();
+            keep_virtual_metadata_merge(key.clone(), Some(Bytes::from_static(b"<new/>")), epoch)
+                .await;
+            if cached(&key).await {
+                kept = true;
+                break;
+            }
+        }
+        assert!(
+            kept,
+            "a merge with no decision during its fan-out must be kept"
+        );
+        VIRTUAL_MAVEN_METADATA_CACHE.invalidate(&key).await;
     }
 }

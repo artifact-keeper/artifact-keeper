@@ -69,6 +69,14 @@ pub const CACHE_INVALIDATION_CHANNEL: &str = "ak_cache_invalidation_v1";
 /// since every conda read checks the subdir revision.
 pub const CONDA_REPODATA_INVALIDATION_CHANNEL: &str = "ak_conda_repodata_invalidation_v1";
 
+/// Channel of [`InvalidationEvent::AgeGateDecisionChanged`] (#6345), same
+/// envelope, same listener. Off [`CACHE_INVALIDATION_CHANNEL`] for the reason
+/// given on [`CONDA_REPODATA_INVALIDATION_CHANNEL`]: an older replica that
+/// does not know the kind would flush its authorization caches on every
+/// review decision during a rolling upgrade. Older replicas do not listen
+/// here and keep converging by their memo TTLs.
+pub const AGE_GATE_INVALIDATION_CHANNEL: &str = "ak_age_gate_invalidation_v1";
+
 /// Payload schema version expected inside each notification envelope.
 pub const CACHE_INVALIDATION_VERSION: u8 = 1;
 
@@ -121,6 +129,17 @@ pub enum InvalidationEvent {
     /// Emitted by the rebuild transaction in `handlers/conda/shard_store.rs`
     /// on [`CONDA_REPODATA_INVALIDATION_CHANNEL`], not on the shared one.
     CondaRepodataInvalidated { repo_id: Uuid, subdirs: Vec<String> },
+    /// An age-gate policy write or review decision (approve, reject, reopen)
+    /// for `repo_id` (#6345). Each replica drops its memos of that
+    /// repository's gate decisions and the Virtual Maven metadata merges of
+    /// `virtual_ids`, the Virtuals that reach `repo_id`; `None` means every
+    /// Virtual (the list could not be read, or would not fit in a payload).
+    ///
+    /// Emitted by `age_gate_service` on [`AGE_GATE_INVALIDATION_CHANNEL`].
+    AgeGateDecisionChanged {
+        repo_id: Uuid,
+        virtual_ids: Option<Vec<Uuid>>,
+    },
 }
 
 /// Versioned wrapper matching the exact JSON the triggers emit.
@@ -202,6 +221,15 @@ pub async fn apply_invalidation_event(
         InvalidationEvent::CondaRepodataInvalidated { repo_id, subdirs } => {
             crate::api::handlers::conda::invalidate_cached_repodata(*repo_id, subdirs).await;
         }
+        InvalidationEvent::AgeGateDecisionChanged {
+            repo_id,
+            virtual_ids,
+        } => {
+            crate::services::age_gate_service::forget_decision_memos(
+                *repo_id,
+                virtual_ids.as_deref(),
+            );
+        }
     }
 }
 
@@ -219,6 +247,10 @@ pub async fn conservative_flush_all(handles: &CacheInvalidationHandles) {
     handles.repo_cache.write().await.clear();
     handles.repo_miss_cache.write().await.clear();
     handles.permission_service.invalidate_cache();
+    // Age-gate decisions (#6345) may have been missed too: a rejected
+    // version must not stay listed for the memo windows.
+    crate::services::age_gate_maven::forget_all_listings();
+    crate::api::handlers::maven::forget_virtual_metadata_merges(None);
     counter!("ak_cache_invalidation_conservative_flushes_total").increment(1);
     tracing::info!(
         flushed_token_entries,
@@ -392,6 +424,59 @@ pub fn conda_repodata_invalidation_payload(repo_id: Uuid, subdirs: &[String]) ->
     }
 }
 
+/// Serialize one [`InvalidationEvent::AgeGateDecisionChanged`] envelope. A
+/// list of Virtuals that would not fit under [`NOTIFY_PAYLOAD_SOFT_MAX_BYTES`]
+/// is sent as `None`, which the receiver reads as "every Virtual".
+pub fn age_gate_decision_changed_payload(repo_id: Uuid, virtual_ids: Option<Vec<Uuid>>) -> String {
+    let payload = |virtual_ids: Option<Vec<Uuid>>| {
+        serde_json::to_string(&InvalidationEnvelope {
+            v: CACHE_INVALIDATION_VERSION,
+            event: InvalidationEvent::AgeGateDecisionChanged {
+                repo_id,
+                virtual_ids,
+            },
+        })
+        .expect("age gate invalidation envelope must serialize")
+    };
+    let full = payload(virtual_ids);
+    if full.len() <= NOTIFY_PAYLOAD_SOFT_MAX_BYTES {
+        full
+    } else {
+        tracing::info!(
+            repository_id = %repo_id,
+            "age gate invalidation: too many Virtuals for one notification; \
+             the other replicas drop every Virtual Maven metadata merge"
+        );
+        payload(None)
+    }
+}
+
+/// Publish an [`InvalidationEvent::AgeGateDecisionChanged`] so every listening
+/// replica drops its memos of `repo_id`'s gate decisions and the Virtual Maven
+/// metadata merges over it (#6345). Best-effort: the caller has already
+/// invalidated locally, and on failure other replicas converge within the
+/// memo TTLs (60 s for the merges).
+pub async fn notify_age_gate_decision_changed(
+    pool: &PgPool,
+    repo_id: Uuid,
+    virtual_ids: Option<Vec<Uuid>>,
+) {
+    if let Err(e) = sqlx::query("SELECT pg_notify($1, $2)")
+        .bind(AGE_GATE_INVALIDATION_CHANNEL)
+        .bind(age_gate_decision_changed_payload(repo_id, virtual_ids))
+        .execute(pool)
+        .await
+    {
+        counter!("ak_cache_invalidation_notify_errors_total").increment(1);
+        tracing::warn!(
+            error = %e,
+            repository_id = %repo_id,
+            "failed to publish age gate invalidation; \
+             other replicas converge within the memo TTLs"
+        );
+    }
+}
+
 /// Serialize one [`InvalidationEvent::UpstreamFilterChanged`] envelope.
 pub fn upstream_filter_changed_payload(repo_id: Uuid) -> String {
     serde_json::to_string(&InvalidationEnvelope {
@@ -521,6 +606,7 @@ async fn connect_and_flush(
         .listen_all([
             CACHE_INVALIDATION_CHANNEL,
             CONDA_REPODATA_INVALIDATION_CHANNEL,
+            AGE_GATE_INVALIDATION_CHANNEL,
         ])
         .await
     {
@@ -916,6 +1002,41 @@ mod tests {
             Ok(InvalidationEvent::NpmPackumentInvalidated {
                 repo_keys,
                 package: "widget".to_string(),
+            })
+        );
+    }
+
+    // -- age gate decision payload (#6345) -----------------------------------
+
+    #[test]
+    fn age_gate_decision_payload_round_trips() {
+        let repo_id = Uuid::new_v4();
+        let virtual_ids = vec![Uuid::new_v4(), Uuid::new_v4()];
+        assert_eq!(
+            parse_invalidation_payload(&age_gate_decision_changed_payload(
+                repo_id,
+                Some(virtual_ids.clone())
+            )),
+            Ok(InvalidationEvent::AgeGateDecisionChanged {
+                repo_id,
+                virtual_ids: Some(virtual_ids),
+            })
+        );
+    }
+
+    /// Too many Virtuals for one notification degrade to "every Virtual",
+    /// never to an undeliverable payload or a truncated list.
+    #[test]
+    fn age_gate_decision_payload_over_the_bound_means_every_virtual() {
+        let repo_id = Uuid::new_v4();
+        let many: Vec<Uuid> = (0..400).map(|_| Uuid::new_v4()).collect();
+        let payload = age_gate_decision_changed_payload(repo_id, Some(many));
+        assert!(payload.len() <= NOTIFY_PAYLOAD_SOFT_MAX_BYTES);
+        assert_eq!(
+            parse_invalidation_payload(&payload),
+            Ok(InvalidationEvent::AgeGateDecisionChanged {
+                repo_id,
+                virtual_ids: None,
             })
         );
     }
