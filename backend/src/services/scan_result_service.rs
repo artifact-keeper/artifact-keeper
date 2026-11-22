@@ -1424,45 +1424,32 @@ impl ScanResultService {
         scan_type: &str,
         checksum_sha256: Option<&str>,
     ) -> Result<ScanResult> {
-        let result = sqlx::query_as!(
-            ScanResult,
+        // #6232, #6423: a row a queued job creates records the job's claim in
+        // the same INSERT, so if the worker dies the claim's recovery fails
+        // this row instead of leaving it `running` for the janitor. Outside a
+        // queued job the token is NULL. Runtime query (not `query!`) so the
+        // `.sqlx/` offline cache needs no new entry.
+        let result = sqlx::query_as::<_, ScanResult>(
             r#"
-            INSERT INTO scan_results (artifact_id, repository_id, scan_type, status, started_at, checksum_sha256)
-            VALUES ($1, $2, $3, 'running', NOW(), $4)
+            INSERT INTO scan_results
+                (artifact_id, repository_id, scan_type, status, started_at, checksum_sha256,
+                 queue_claim_token)
+            VALUES ($1, $2, $3, 'running', NOW(), $4, $5)
             RETURNING id, artifact_id, repository_id, scan_type, status,
                       findings_count, critical_count, high_count, medium_count, low_count, info_count,
                       scanner_version, error_message, started_at, completed_at, created_at,
                       is_reused, source_scan_id, scan_completeness, scan_completeness_reason,
                       vuln_db_version, vuln_db_published_at
             "#,
-            artifact_id,
-            repository_id,
-            scan_type,
-            checksum_sha256,
         )
+        .bind(artifact_id)
+        .bind(repository_id)
+        .bind(scan_type)
+        .bind(checksum_sha256)
+        .bind(crate::services::scan_queue::current_claim())
         .fetch_one(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
-
-        // #6232: a row a queued job creates records the job's claim, so if the
-        // worker dies the claim's recovery fails this row instead of leaving it
-        // `running` for the janitor. Best-effort: unstamped, the janitor still
-        // reaps it.
-        if let Some(claim) = crate::services::scan_queue::current_claim() {
-            if let Err(e) =
-                sqlx::query("UPDATE scan_results SET queue_claim_token = $2 WHERE id = $1")
-                    .bind(result.id)
-                    .bind(claim)
-                    .execute(&self.db)
-                    .await
-            {
-                tracing::warn!(
-                    scan_id = %result.id, error = %e,
-                    "failed to record the scan-job claim on a scan row; the stuck-scan janitor \
-                     reaps it if the worker dies"
-                );
-            }
-        }
 
         Ok(result)
     }
@@ -2276,6 +2263,10 @@ impl ScanResultService {
     /// `vuln_db` (#3014) is the vulnerability database the scanner graded
     /// against; `None` (no database, or not reported) is stored as NULL in
     /// both `vuln_db_version` and `vuln_db_published_at`.
+    ///
+    /// Returns whether the row was settled: `false` when a queued job's claim
+    /// was recovered for a rerun (see `scan_queue::claim_still_held`), and the
+    /// caller must not act on these totals (#6423).
     #[allow(clippy::too_many_arguments)]
     pub async fn complete_scan(
         &self,
@@ -2292,7 +2283,7 @@ impl ScanResultService {
         pin_identity: Option<&str>,
         scan_completeness_reason: Option<&str>,
         vuln_db: Option<&VulnDbProvenance>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         // #6232: a queued job settles its rows only while it holds its claim.
         let mut tx = self
             .db
@@ -2300,7 +2291,7 @@ impl ScanResultService {
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
         if !crate::services::scan_queue::claim_still_held(&mut tx).await? {
-            return Ok(());
+            return Ok(false);
         }
         sqlx::query!(
             r#"
@@ -2337,13 +2328,16 @@ impl ScanResultService {
         .map_err(|e| AppError::Database(e.to_string()))?;
 
         // #5942: a row a retry reopened carried the recorded failure until
-        // now; the completion supersedes it.
+        // now; the completion supersedes it. So does a slow worker's verdict
+        // on a row recovery failed on the job's last attempt (#6423).
         sqlx::query(
             "UPDATE scan_results SET error_message = NULL \
-             WHERE id = $1 AND status = 'completed' AND starts_with(error_message, $2)",
+             WHERE id = $1 AND status = 'completed' \
+               AND (starts_with(error_message, $2) OR error_message = $3)",
         )
         .bind(scan_id)
         .bind(crate::services::scan_state::RETRYING_AFTER_FAILURE_PREFIX)
+        .bind(crate::services::scan_queue::RECOVERED_SCAN_REASON)
         .execute(&mut *tx)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -2352,7 +2346,7 @@ impl ScanResultService {
             .map_err(|e| AppError::Database(e.to_string()))?;
 
         scan_completed();
-        Ok(())
+        Ok(true)
     }
 
     /// Mark a scan as failed with an error message and (when known) the
