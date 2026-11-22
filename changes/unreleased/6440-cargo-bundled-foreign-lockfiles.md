@@ -1,0 +1,5 @@
+---
+section: Fixed
+issues: [#6440]
+---
+- **A scanned `.crate` is no longer graded on the npm, Go, Composer or other non-Cargo lockfiles it bundles** (#6440). Crates ship test fixtures and examples written for other ecosystems, and both engines cataloged them, so common crates were blocked (403 on a `fail_closed` Cargo remote) for advisories in packages no Cargo consumer installs: `rustls-platform-verifier@0.7.1` for `golang.org/x/crypto` in a Go test mock, `sea-orm@2.0.0-rc.41` for `form-data` in an example frontend's `package-lock.json`, and `sea-schema@0.18.0` for `doctrine/dbal` in a test `composer.lock`. When a crate is scanned with its pinned coordinate, every bundled dependency lockfile or manifest on a fixed list (`go.mod`, `go.sum`, `package-lock.json`, `yarn.lock`, `pnpm-lock.yaml`, `composer.lock`, `Gemfile.lock`, `poetry.lock`, `requirements.txt`, `pom.xml` and others) is now removed from the scan workspace along with its own `Cargo.lock` (#5143). Bundled binaries and archives stay graded. A vulnerable verdict already stored for a crate's digest is still reused until it expires (30 days) or the CVE scanner version changes.
