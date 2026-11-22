@@ -5092,8 +5092,8 @@ where
 ///
 /// The Go `.info` route needs it because `go` reads a 404 as "this proxy does
 /// not have the module" and falls through to the next `GOPROXY` entry. The
-/// other callers (RubyGems, Hex) keep the plain form until their own routes
-/// are moved (#6426).
+/// RubyGems gem info and quick spec routes and the Hex package route use it
+/// too (#6426).
 pub async fn resolve_virtual_metadata_reporting_unavailable<F, Fut>(
     db: &PgPool,
     auth: Option<&crate::api::middleware::auth::AuthExtension>,
@@ -7338,6 +7338,31 @@ async fn local_lookup_artifact(
     Ok((artifact, storage))
 }
 
+/// [`local_lookup_artifact`] for the streaming local fetches: a proxy-cache
+/// row its sidecar does not vouch for ([`vouched_row`]) is the non-terminal
+/// [`proxy_cache_row_declined`] 404, as in [`local_fetch_or_redirect`]
+/// (#6433).
+async fn local_lookup_vouched(
+    db: &PgPool,
+    state: &AppState,
+    repo_id: Uuid,
+    location: &StorageLocation,
+    lookup: LocalLookup<'_>,
+) -> Result<
+    (
+        LocalArtifactRow,
+        std::sync::Arc<dyn crate::storage::StorageBackend>,
+    ),
+    Response,
+> {
+    let looked_up = local_lookup_artifact(db, state, repo_id, location, lookup).await?;
+    vouched_row(state, repo_id, Some(looked_up), |(row, _)| {
+        ServedRowRef::new(&row.storage_key, Some(row.size_bytes))
+    })
+    .await?
+    .ok_or_else(proxy_cache_row_declined)
+}
+
 /// Shared skeleton step 2: open the artifact body as a byte stream (so large
 /// artifact bodies never buffer in memory) while keeping the `NotFound` →
 /// coordinated-retry hydration fallback. On a storage miss we still funnel
@@ -7427,7 +7452,7 @@ pub async fn local_fetch_by_path_verifying(
     artifact_path: &str,
     verify: bool,
 ) -> Result<StreamingFetchResult, Response> {
-    let (artifact, storage) = local_lookup_artifact(
+    let (artifact, storage) = local_lookup_vouched(
         db,
         state,
         repo_id,
@@ -7466,7 +7491,7 @@ pub(crate) async fn local_fetch_by_lookup(
     location: &StorageLocation,
     lookup: LocalLookup<'_>,
 ) -> Result<StreamingFetchResult, Response> {
-    let (artifact, storage) = local_lookup_artifact(db, state, repo_id, location, lookup).await?;
+    let (artifact, storage) = local_lookup_vouched(db, state, repo_id, location, lookup).await?;
     read_local_stream(db, &artifact, &*storage).await
 }
 
@@ -7483,7 +7508,7 @@ pub async fn local_fetch_by_name_version_and_suffix(
     version: &str,
     suffix_pattern: &str,
 ) -> Result<StreamingFetchResult, Response> {
-    let (artifact, storage) = local_lookup_artifact(
+    let (artifact, storage) = local_lookup_vouched(
         db,
         state,
         repo_id,
@@ -7605,6 +7630,8 @@ pub struct ResolvedLocalArtifact {
     pub id: Uuid,
     pub path: String,
     pub storage_key: String,
+    /// The size the row records (#6433: checked against the cache sidecar).
+    pub size_bytes: i64,
 }
 
 /// Resolve a single local artifact by trailing path-suffix, with an
@@ -7638,7 +7665,7 @@ pub async fn resolve_local_artifact_by_suffix(
     use sqlx::Row;
     let reversed_pattern = reverse_suffix_for_like(path_suffix);
     let row = sqlx::query(
-        "SELECT id, path, storage_key FROM artifacts \
+        "SELECT id, path, storage_key, size_bytes FROM artifacts \
          WHERE repository_id = $1 \
            AND is_deleted = false \
            AND reverse(path) LIKE $2 || '%' ESCAPE '\\' \
@@ -7653,7 +7680,7 @@ pub async fn resolve_local_artifact_by_suffix(
     let row = match row {
         Some(r) => Some(r),
         None => sqlx::query(
-            "SELECT id, path, storage_key FROM artifacts \
+            "SELECT id, path, storage_key, size_bytes FROM artifacts \
              WHERE repository_id = $1 \
                AND is_deleted = false \
                AND path = $2 \
@@ -7670,6 +7697,7 @@ pub async fn resolve_local_artifact_by_suffix(
         id: r.try_get("id").unwrap_or_default(),
         path: r.try_get("path").unwrap_or_default(),
         storage_key: r.try_get("storage_key").unwrap_or_default(),
+        size_bytes: r.try_get("size_bytes").unwrap_or_default(),
     }))
 }
 
@@ -7766,6 +7794,63 @@ pub(crate) async fn proxy_cache_row_gate<'a>(
         size_bytes: entry.size_bytes(),
         checksum_sha256: entry.checksum_sha256().to_string(),
     })
+}
+
+/// What a format route read of an `artifacts` row it is about to serve
+/// (#6433): the key it reads, and the size it advertises when it has one.
+pub(crate) struct ServedRowRef<'r> {
+    pub(crate) storage_key: &'r str,
+    pub(crate) size_bytes: Option<i64>,
+}
+
+impl<'r> ServedRowRef<'r> {
+    pub(crate) fn new(storage_key: &'r str, size_bytes: Option<i64>) -> Self {
+        Self {
+            storage_key,
+            size_bytes,
+        }
+    }
+}
+
+/// [`proxy_cache_row_gate`] for a format route that resolved an `artifacts`
+/// row itself and serves it from storage in any form: bytes, a range, a
+/// HEAD's headers, a redirect, or metadata extracted from it (#6433). `key`
+/// names the row's storage key and the size the route advertises.
+///
+/// * `Ok(Some(row))`: serve the row. It is not a proxy-cache row (no extra
+///   read), or its cache sidecar vouches for it: fresh, outside its hold,
+///   allowed by the origin policy and the stored verdict, and recording the
+///   size the route advertises (the cache may have been refilled since the row
+///   was written).
+/// * `Ok(None)`: a proxy-cache row nothing vouches for (stale, no sidecar, a
+///   key naming another Remote, a refill of another size, or no reusable clean
+///   verdict under fail-closed scanning). The route answers as though it had
+///   no row, so a Remote's route resolves the file through its proxy path,
+///   which revalidates or refetches it under every gate.
+/// * `Err`: the hold's 409, the origin policy's or verdict's 403 (terminal
+///   for a virtual walk, [`is_member_policy_block_response`]), or a fault.
+pub(crate) async fn vouched_row<R>(
+    state: &AppState,
+    repo_id: Uuid,
+    row: Option<R>,
+    key: impl FnOnce(&R) -> ServedRowRef<'_>,
+) -> Result<Option<R>, Response> {
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let (storage_key, size_bytes) = {
+        let r = key(&row);
+        if !ProxyService::is_proxy_cache_key(r.storage_key) {
+            return Ok(Some(row));
+        }
+        (r.storage_key.to_string(), r.size_bytes)
+    };
+    match proxy_cache_row_gate(&state.db, state, repo_id, &storage_key).await {
+        Ok(gated) if size_bytes.is_none_or(|size| size == gated.size_bytes) => Ok(Some(row)),
+        Ok(_) => Ok(None),
+        Err(resp) if resp.status() == StatusCode::NOT_FOUND => Ok(None),
+        Err(resp) => Err(resp),
+    }
 }
 
 /// Look up a local artifact by path and return a presigned redirect if the
@@ -9327,6 +9412,29 @@ pub async fn find_local_by_filename_suffix(
                 storage_key: r.storage_key,
             }),
     )
+}
+
+/// [`find_local_by_filename_suffix`] for a route that serves the hit: a
+/// proxy-cache row its cache sidecar does not vouch for is a miss, so the
+/// route resolves the file through its proxy path, and a held or refused one
+/// is the gate's 409 / 403 ([`vouched_row`], #6433).
+#[allow(clippy::result_large_err)]
+pub async fn find_servable_local_by_filename_suffix(
+    state: &AppState,
+    repository_id: Uuid,
+    path_suffix: &str,
+) -> Result<Option<LocalArtifactHit>, Response> {
+    let row = resolve_local_artifact_by_suffix(&state.db, repository_id, path_suffix).await?;
+    // The row's size goes to the gate: a cache refilled at another size is a
+    // miss (refetched), not a serve the checksum check would turn into a 502.
+    let row = vouched_row(state, repository_id, row, |r| {
+        ServedRowRef::new(&r.storage_key, Some(r.size_bytes))
+    })
+    .await?;
+    Ok(row.map(|r| LocalArtifactHit {
+        id: r.id,
+        storage_key: r.storage_key,
+    }))
 }
 
 /// Parse a two-field multipart upload (`file` + a named JSON metadata field).
@@ -26587,6 +26695,73 @@ mod tests {
                     .unwrap();
                 assert_eq!(served, body);
             }
+        }
+    }
+
+    /// #6433: a format route that resolved an `artifacts` row itself serves a
+    /// proxy-cache row only through `vouched_row` (the #6416 sidecar gate): a
+    /// fresh entry recording the row's size is served, a held one answers the
+    /// hold's 409 (terminal for a virtual walk), and a stale entry, a missing
+    /// sidecar or a refill of another size is treated as no row, so the
+    /// Remote's proxy path resolves it. The streaming local fetches and the
+    /// filename lookup the format routes share take the same gate, with the
+    /// row's size, so a refill of another size is a miss there too.
+    #[tokio::test]
+    async fn test_vouched_row_takes_the_sidecar_gate_6433() {
+        use crate::api::handlers::test_db_helpers::{CacheRowRig, CacheRowSidecar as S};
+        let Some(rig) = CacheRowRig::setup("pypi").await else {
+            return;
+        };
+        let hosted = super::vouched_row(&rig.state, rig.fx.repo_id, Some("pypi/x/x.whl"), |k| {
+            super::ServedRowRef::new(k, Some(1))
+        })
+        .await;
+        assert!(matches!(hosted, Ok(Some(_))), "a hosted key is not gated");
+
+        let mut outcomes = Vec::new();
+        for (i, case) in [S::Fresh, S::Held, S::Stale, S::Missing, S::OtherSize]
+            .into_iter()
+            .enumerate()
+        {
+            let file = format!("row{i}-1.0.tar.gz");
+            let path = format!("simple/row{i}/{file}");
+            let body = rig.row(&path, &format!("row{i}"), "1.0", case).await;
+            let key = format!("proxy-cache/{}/{path}/__content__", rig.fx.repo_key);
+            let vouched = super::vouched_row(&rig.state, rig.fx.repo_id, Some(key.as_str()), |k| {
+                super::ServedRowRef::new(k, Some(body.len() as i64))
+            })
+            .await
+            .map(|row| row.is_some())
+            .map_err(|r| r.status());
+            let fetched = super::local_fetch_by_path(
+                &rig.fx.pool,
+                &rig.state,
+                rig.fx.repo_id,
+                &rig.repo.storage_location(),
+                &path,
+            )
+            .await
+            .map(|_| ())
+            .map_err(|r| (r.status(), super::is_member_policy_block_response(&r)));
+            let found =
+                super::find_servable_local_by_filename_suffix(&rig.state, rig.fx.repo_id, &file)
+                    .await
+                    .map(|hit| hit.is_some())
+                    .map_err(|r| r.status());
+            outcomes.push((case, vouched, fetched, found));
+        }
+        rig.teardown().await;
+
+        let held = StatusCode::CONFLICT;
+        let declined = Err((StatusCode::NOT_FOUND, false));
+        for (case, vouched, fetched, found) in outcomes {
+            let want = match case {
+                S::Fresh => (Ok(true), Ok(()), Ok(true)),
+                S::Held => (Err(held), Err((held, true)), Err(held)),
+                S::Stale | S::Missing => (Ok(false), declined, Ok(false)),
+                S::OtherSize => (Ok(false), declined, Ok(false)),
+            };
+            assert_eq!((vouched, fetched, found), want, "{case:?}");
         }
     }
 

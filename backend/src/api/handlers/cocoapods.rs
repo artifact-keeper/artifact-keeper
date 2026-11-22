@@ -337,7 +337,13 @@ async fn get_podspec(
     )
     .fetch_optional(&state.db)
     .await
-    .map_err(crate::api::handlers::db_err)?
+    .map_err(crate::api::handlers::db_err)?;
+    // #6433: the podspec of a proxy-cache row is read only after its cache
+    // sidecar is checked.
+    let artifact = proxy_helpers::vouched_row(&state, repo.id, artifact, |a| {
+        proxy_helpers::ServedRowRef::new(&a.storage_key, None)
+    })
+    .await?
     .ok_or_else(|| (StatusCode::NOT_FOUND, "Podspec not found").into_response())?;
 
     // A held pod must not have its podspec served: `download_pod` blocks the
@@ -426,7 +432,14 @@ async fn download_pod(
     )
     .fetch_optional(&state.db)
     .await
-    .map_err(crate::api::handlers::db_err)?
+    .map_err(crate::api::handlers::db_err)?;
+    // #6433: a proxy-cache row is served only after its cache sidecar is
+    // checked: one nothing vouches for is no row (a Remote resolves it through
+    // its proxy path below), a held or refused one is the gate's answer.
+    let artifact = proxy_helpers::vouched_row(&state, repo.id, artifact, |a| {
+        proxy_helpers::ServedRowRef::new(&a.storage_key, Some(a.size_bytes))
+    })
+    .await?
     .ok_or_else(|| (StatusCode::NOT_FOUND, "Pod not found").into_response());
 
     let artifact = match artifact {

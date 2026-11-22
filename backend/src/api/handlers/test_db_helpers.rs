@@ -3310,6 +3310,114 @@ pub fn fresh_cache_sidecar_bytes() -> Bytes {
     Bytes::from(serde_json::to_vec(&meta).expect("serialize fresh sidecar"))
 }
 
+/// How the sidecar of a proxy-cache row seeded by [`CacheRowRig::row`] reads
+/// (#6433).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CacheRowSidecar {
+    /// Fresh, outside any hold, recording the row's size.
+    Fresh,
+    /// Fresh, inside its Package Age Policy hold.
+    Held,
+    /// Expired.
+    Stale,
+    /// No sidecar at all.
+    Missing,
+    /// Fresh, but recording another size: the entry was refilled.
+    OtherSize,
+}
+
+/// A Remote whose proxy cache is a presign-capable in-memory backend, holding
+/// `artifacts` rows keyed on its cache entries the way releases before 1.2.0
+/// recorded a cached file (#6433).
+pub(crate) struct CacheRowRig {
+    pub(crate) fx: Fixture,
+    pub(crate) state: SharedState,
+    pub(crate) backend: Arc<PresignMemBackend>,
+    pub(crate) repo: crate::api::handlers::proxy_helpers::RepoInfo,
+}
+
+impl CacheRowRig {
+    pub(crate) async fn setup(format: &str) -> Option<Self> {
+        let fx = Fixture::setup("remote", format).await?;
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let repo = fx.repo_info("remote", Some("http://127.0.0.1:1"));
+        let (proxy, backend) = build_scoped_presign_proxy(
+            fx.pool.clone(),
+            crate::services::proxy_cache_scope::ProxyCacheScope::unscoped(),
+        );
+        let state = build_state_with_proxy(fx.pool.clone(), &storage_path, proxy);
+        Some(Self {
+            fx,
+            state,
+            backend,
+            repo,
+        })
+    }
+
+    /// Seed `artifact_path` as a proxy-cache row of the Remote: its body in
+    /// the cache and the repository's storage, its sidecar per `sidecar`, and
+    /// the row (`name`, `version`) keyed on the entry. Returns the body.
+    pub(crate) async fn row(
+        &self,
+        artifact_path: &str,
+        name: &str,
+        version: &str,
+        sidecar: CacheRowSidecar,
+    ) -> Bytes {
+        let prefix = format!("proxy-cache/{}/{artifact_path}", self.fx.repo_key);
+        let storage_key = format!("{prefix}/__content__");
+        let body = Bytes::from(format!("cached-row-{}", Uuid::new_v4()));
+        let now = chrono::Utc::now();
+        let hour = chrono::Duration::hours(1);
+        let meta = crate::services::proxy_service::CacheMetadata {
+            cached_at: now,
+            upstream_etag: None,
+            storage_etag: None,
+            last_modified: None,
+            negative_cached_until: None,
+            quarantine_until: (sidecar == CacheRowSidecar::Held).then(|| now + hour),
+            expires_at: if sidecar == CacheRowSidecar::Stale {
+                now - hour
+            } else {
+                now + hour
+            },
+            content_type: Some("application/octet-stream".to_string()),
+            content_encoding: None,
+            upstream_commit_sha: None,
+            size_bytes: body.len() as i64 + i64::from(sidecar == CacheRowSidecar::OtherSize),
+            checksum_sha256: String::new(),
+        };
+        {
+            let mut objects = self.backend.objects.lock().unwrap();
+            objects.insert(storage_key.clone(), body.clone());
+            if sidecar != CacheRowSidecar::Missing {
+                objects.insert(
+                    format!("{prefix}/__cache_meta__.json"),
+                    Bytes::from(serde_json::to_vec(&meta).expect("serialize sidecar")),
+                );
+            }
+        }
+        seed_artifact(
+            &self.state,
+            &self.fx.pool,
+            &self.repo,
+            &storage_key,
+            artifact_path,
+            name,
+            version,
+            "application/octet-stream",
+            body.clone(),
+            self.fx.user_id,
+        )
+        .await;
+        body
+    }
+
+    pub(crate) async fn teardown(self) {
+        self.fx.teardown().await;
+    }
+}
+
 /// A [`ProxyService`] whose proxy cache lives in a presign-capable in-memory
 /// backend under an explicit `scope`. Returns the backend so a test can seed
 /// scoped cache entries and read them back. The returned proxy shares the

@@ -707,6 +707,13 @@ async fn download_archive(
             crate::api::handlers::db_err_message(&e),
         )
     })?;
+    // #6433: a proxy-cache row is served only after its cache sidecar is
+    // checked: one nothing vouches for is no row (a Remote resolves it through
+    // its proxy path below), a held or refused one is the gate's answer.
+    let artifact = proxy_helpers::vouched_row(&state, repo.id, artifact, |a| {
+        proxy_helpers::ServedRowRef::new(&a.storage_key, Some(a.size_bytes))
+    })
+    .await?;
 
     let artifact = match artifact {
         Some(a) => a,
@@ -987,6 +994,14 @@ async fn fetch_manifest(
                     crate::api::handlers::db_err_message(&e),
                 )
             })?;
+            // #6433: the archive of a proxy-cache row is read only after its
+            // cache sidecar is checked.
+            let storage_key =
+                proxy_helpers::vouched_row(&state, owner_id, Some(storage_key), |k| {
+                    proxy_helpers::ServedRowRef::new(k, None)
+                })
+                .await?
+                .ok_or_else(|| swift_error_response(StatusCode::NOT_FOUND, "Package not found"))?;
             let storage = state
                 .storage_for_repo(&owner_location)
                 .map_err(|e| e.into_response())?;

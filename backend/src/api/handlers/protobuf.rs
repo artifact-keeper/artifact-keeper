@@ -2222,6 +2222,17 @@ async fn download(
                 crate::api::handlers::db_err_message(&e),
             )
         })?;
+        // #6433: a proxy-cache row is read only after its cache sidecar is
+        // checked: one nothing vouches for is no row (a Remote fetches the
+        // bundle below), a held or refused one is the gate's answer.
+        let artifact_row = proxy_helpers::vouched_row(&state, repo.id, artifact_row, |r| {
+            use sqlx::Row;
+            proxy_helpers::ServedRowRef::new(
+                r.try_get::<&str, _>("storage_key").unwrap_or_default(),
+                None,
+            )
+        })
+        .await?;
 
         let artifact_row = match artifact_row {
             Some(row) => row,

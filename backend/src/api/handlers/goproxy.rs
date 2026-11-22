@@ -1613,7 +1613,13 @@ async fn get_mod_file(
     )
     .fetch_optional(&state.db)
     .await
-    .map_err(crate::api::handlers::db_err)?
+    .map_err(crate::api::handlers::db_err)?;
+    // #6433: a proxy-cache row nothing vouches for is no row (the proxy path
+    // below resolves it); a held or refused one is the gate's answer.
+    let artifact = proxy_helpers::vouched_row(state, repo.id, artifact, |a| {
+        proxy_helpers::ServedRowRef::new(&a.storage_key, Some(a.size_bytes))
+    })
+    .await?
     .ok_or_else(|| {
         (
             StatusCode::NOT_FOUND,
@@ -1763,7 +1769,13 @@ async fn download_zip(
     )
     .fetch_optional(&state.db)
     .await
-    .map_err(crate::api::handlers::db_err)?
+    .map_err(crate::api::handlers::db_err)?;
+    // #6433: a proxy-cache row nothing vouches for is no row (the proxy path
+    // below resolves it); a held or refused one is the gate's answer.
+    let artifact = proxy_helpers::vouched_row(state, repo.id, artifact, |a| {
+        proxy_helpers::ServedRowRef::new(&a.storage_key, Some(a.size_bytes))
+    })
+    .await?
     .ok_or_else(|| {
         (
             StatusCode::NOT_FOUND,

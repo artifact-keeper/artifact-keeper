@@ -195,6 +195,11 @@ async fn depth_response(
     .fetch_optional(&state.db)
     .await
     .map_err(super::db_err)?;
+    // #6433: a proxy-cache row is served only after its sidecar is checked.
+    let artifact = proxy_helpers::vouched_row(state, repo.id, artifact, |(_, key, size, _)| {
+        proxy_helpers::ServedRowRef::new(key, Some(*size))
+    })
+    .await?;
     let (id, storage_key, size_bytes, checksum) =
         artifact.ok_or_else(|| (StatusCode::NOT_FOUND, "Package not found").into_response())?;
     crate::services::quarantine_service::check_artifact_download(&state.db, id)
@@ -2967,9 +2972,10 @@ async fn upstream_proxy(
         return Err((StatusCode::NOT_FOUND, "Not found").into_response());
     }
 
-    // Cache hit by filename: serve the local copy.
+    // Cache hit by filename: serve the local copy. #6433: a proxy-cache row
+    // nothing vouches for is a miss, fetched through the proxy below.
     if let Some(hit) =
-        proxy_helpers::find_local_by_filename_suffix(&state.db, repo.id, filename).await?
+        proxy_helpers::find_servable_local_by_filename_suffix(&state, repo.id, filename).await?
     {
         let artifact = sqlx::query!(
             "SELECT id, size_bytes, checksum_sha256, storage_key FROM artifacts WHERE id = $1",
@@ -3318,44 +3324,45 @@ async fn download_package(
 
     let filename = pkg_path.rsplit('/').next().unwrap_or(&pkg_path);
 
-    let hit =
-        match proxy_helpers::find_local_by_filename_suffix(&state.db, repo.id, filename).await? {
-            Some(a) => a,
-            None => {
-                let upstream_path = format!("packages/{}", pkg_path);
-                // #4112: scan-on-proxy, Remote and Virtual. `None` when
-                // nothing scans: the untouched path below serves.
-                if let Some(served) =
-                    serve_scanned_rpm_download(&state, auth.as_ref(), &repo, &upstream_path, &ctx)
-                        .await?
-                {
-                    return served;
-                }
-                let (default_ct, cd_filename) = if repo.repo_type == RepositoryType::Virtual {
-                    ("application/x-rpm", Some(filename))
-                } else {
-                    ("application/octet-stream", None)
-                };
-                if let Some(resp) = proxy_helpers::try_remote_or_virtual_download(
-                    &state,
-                    auth.as_ref(),
-                    &repo,
-                    &ctx,
-                    proxy_helpers::DownloadResponseOpts {
-                        upstream_path: &upstream_path,
-                        virtual_lookup: proxy_helpers::VirtualLookup::PathSuffix(filename),
-                        default_content_type: default_ct,
-                        content_disposition_filename: cd_filename,
-                        suppress_upstream_proxy: false,
-                    },
-                )
-                .await?
-                {
-                    return Ok(resp);
-                }
-                return Err((StatusCode::NOT_FOUND, "Package not found").into_response());
+    let hit = match proxy_helpers::find_servable_local_by_filename_suffix(&state, repo.id, filename)
+        .await?
+    {
+        Some(a) => a,
+        None => {
+            let upstream_path = format!("packages/{}", pkg_path);
+            // #4112: scan-on-proxy, Remote and Virtual. `None` when
+            // nothing scans: the untouched path below serves.
+            if let Some(served) =
+                serve_scanned_rpm_download(&state, auth.as_ref(), &repo, &upstream_path, &ctx)
+                    .await?
+            {
+                return served;
             }
-        };
+            let (default_ct, cd_filename) = if repo.repo_type == RepositoryType::Virtual {
+                ("application/x-rpm", Some(filename))
+            } else {
+                ("application/octet-stream", None)
+            };
+            if let Some(resp) = proxy_helpers::try_remote_or_virtual_download(
+                &state,
+                auth.as_ref(),
+                &repo,
+                &ctx,
+                proxy_helpers::DownloadResponseOpts {
+                    upstream_path: &upstream_path,
+                    virtual_lookup: proxy_helpers::VirtualLookup::PathSuffix(filename),
+                    default_content_type: default_ct,
+                    content_disposition_filename: cd_filename,
+                    suppress_upstream_proxy: false,
+                },
+            )
+            .await?
+            {
+                return Ok(resp);
+            }
+            return Err((StatusCode::NOT_FOUND, "Package not found").into_response());
+        }
+    };
 
     // RPM hit-path needs the SHA256 to emit X-Checksum-SHA256, so re-query
     // to pick up the checksum field that the lightweight helper omits.
