@@ -1017,6 +1017,20 @@ pub fn record_proxy_cache_cap_refusing(repo_key: &str) {
     .increment(1);
 }
 
+/// One re-catalog sweep pass's counts (#6429), by `outcome`: `scanned` keys
+/// listed, `recataloged` rows restored from a sidecar, the `skipped_*`
+/// reasons, `met_row`, `raced` and `failed`. A steady `recataloged` rate means
+/// catalog rows are being lost (a database crash or failover under the async
+/// catalog commit, or failing catalog writes).
+pub fn record_proxy_cache_recatalog(outcome: &'static str, count: u64) {
+    counter!("ak_proxy_cache_recatalog_total", "outcome" => outcome).increment(count);
+}
+
+/// Bytes the re-catalog sweep put back on Remotes' ledgers (#6429).
+pub fn record_proxy_cache_recatalog_bytes(bytes: u64) {
+    counter!("ak_proxy_cache_recatalog_bytes_total").increment(bytes);
+}
+
 /// Counters recorded while a test ran, as `(name, labels, value)`; read one
 /// with [`CounterCapture::get`].
 #[cfg(test)]

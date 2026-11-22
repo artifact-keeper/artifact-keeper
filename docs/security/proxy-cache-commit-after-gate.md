@@ -127,12 +127,12 @@ A fill that the gate serves is committed in three steps: the content object, the
 
 **What can be lost.** A crash of the database server, or a failover to a standby (which is the same thing for an unflushed commit), can lose the catalog rows of up to about 3 x `wal_writer_delay` of fills. That is 600 ms with the default 200 ms. Each row is lost together with its ledger charge, so the ledger stays consistent with the catalog. The object and sidecar stay in storage, and storage GC never deletes `proxy-cache/` keys.
 
-**What that costs.** A lost row comes back only if its file is read again: a read re-catalogs it from the sidecar (`backfill_from_sidecar`). Until then the file's bytes are missing from:
+**What that costs.** A lost row comes back when its file is read again (a read re-catalogs it from the sidecar, `backfill_from_sidecar`), or at the next pass of the re-catalog sweep (#6429, every 6 hours by default; see `docs/operations/proxy-cache-ha.md`), whichever comes first. Until then the file's bytes are missing from:
 - the Remote's quota and cache-cap figures;
 - cache-cap eviction;
 - the periodic re-scan.
 
-An explicit cache purge removes the file. A sweep that re-catalogs such files without waiting for a read is tracked in #6429. Moving `proxy_bytes` to an insert-only delta ledger, so that fills can commit synchronously without the queue, is tracked in #6430.
+An explicit cache purge removes the file. The sweep never re-catalogs an entry an operator removed, a cached 404, or one purged while it ran. Moving `proxy_bytes` to an insert-only delta ledger, so that fills can commit synchronously without the queue, is tracked in #6430.
 
 **Why nothing is served ungated.** No serve-time check reads the lost row:
 - the scan gate looks verdicts up by the sidecar's `checksum_sha256` in `proxy_scan_results`;

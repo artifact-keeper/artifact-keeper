@@ -116,6 +116,7 @@ pub mod policy_service;
 pub mod promotion_policy_service;
 pub mod promotion_rule_service;
 pub mod proxy_cache_cap;
+pub mod proxy_cache_recatalog;
 pub mod proxy_cache_scope;
 pub mod proxy_catalog;
 pub mod proxy_hydration;
