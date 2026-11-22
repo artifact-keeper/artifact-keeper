@@ -2033,6 +2033,14 @@ impl FreshCacheEntry {
         check_quarantine_until(self.metadata.quarantine_until)
     }
 
+    /// SHA-256 of the cached body the sidecar records (empty for a sidecar
+    /// written without one). A serve of the stored object verifies against it
+    /// (#6416): the cache may have been refilled since an older record of the
+    /// entry was taken.
+    pub fn checksum_sha256(&self) -> &str {
+        &self.metadata.checksum_sha256
+    }
+
     /// The `Content-Encoding` the cached bytes were stored with (`None` for
     /// identity). A fast path that cannot replay the coding declines to
     /// redirect a coded entry (#3149).
@@ -11248,6 +11256,25 @@ impl ProxyService {
         CacheKeys::derive(scope, repo_key, path).map(|k| k.content)
     }
 
+    /// The `(repo_key, cache_path)` a proxy-cache content key was derived
+    /// from, or `None` unless [`CacheKeys::derive`] under `scope` gives back
+    /// exactly `storage_key` for them (#6416).
+    ///
+    /// For an `artifacts` row whose `storage_key` is a cache key (written
+    /// before #1278): the freshness probe and the redirect are then keyed on
+    /// the same object, and its sidecar is the one next to it. A key under
+    /// another deployment's scope or the legacy unscoped root, or in an older
+    /// shape, gives `None`.
+    pub(crate) fn cache_entry_of_content_key<'k>(
+        scope: &ProxyCacheScope,
+        storage_key: &'k str,
+    ) -> Option<(&'k str, &'k str)> {
+        let (repo_key, tail) = storage_key.strip_prefix(scope.root())?.split_once('/')?;
+        let cache_path = tail.strip_suffix("/__content__")?;
+        let keys = CacheKeys::derive(scope, repo_key, cache_path).ok()?;
+        (keys.content == storage_key).then_some((repo_key, cache_path))
+    }
+
     /// Whether `storage_key` addresses proxy-cache content.
     ///
     /// Proxy-cache keys are `proxy-cache/<repo_key>/<path>/__content__` and live
@@ -12836,6 +12863,55 @@ mod tests {
         ));
         // Bare prefix (defensive): still classified as proxy-cache.
         assert!(ProxyService::is_proxy_cache_key("proxy-cache/"));
+    }
+
+    /// #6416: a cache content key gives back the `(repo_key, cache_path)` it
+    /// was derived from only when deriving them again gives the same key under
+    /// this deployment's scope.
+    #[test]
+    fn cache_entry_of_content_key_round_trips_6416() {
+        let unscoped = ProxyCacheScope::unscoped();
+        let key =
+            ProxyService::cache_storage_key(&unscoped, "pypi-remote", "simple/a/a-1.whl").unwrap();
+        assert_eq!(
+            ProxyService::cache_entry_of_content_key(&unscoped, &key),
+            Some(("pypi-remote", "simple/a/a-1.whl"))
+        );
+        let scoped = ProxyCacheScope::from_env_and_identity(Some("prod"), Uuid::nil()).unwrap();
+        let scoped_key =
+            ProxyService::cache_storage_key(&scoped, "pypi-remote", "simple/a/a-1.whl").unwrap();
+        assert_eq!(
+            ProxyService::cache_entry_of_content_key(&scoped, &scoped_key),
+            Some(("pypi-remote", "simple/a/a-1.whl"))
+        );
+        // Under the unscoped layout a scoped key reads as the legacy entry of
+        // a repository named like the scope segment (#3734): the caller
+        // accepts it only for a row of that repository.
+        assert_eq!(
+            ProxyService::cache_entry_of_content_key(&unscoped, &scoped_key),
+            Some(("prod", "pypi-remote/simple/a/a-1.whl"))
+        );
+        for (scope, key) in [
+            // A legacy unscoped key under a scoped deployment.
+            (&scoped, key.as_str()),
+            // Not a content key, or not in the shape the writer emits.
+            (
+                &unscoped,
+                "proxy-cache/pypi-remote/simple/a/a-1.whl/__cache_meta__.json",
+            ),
+            (&unscoped, "proxy-cache/pypi-remote/simple/a/a-1.whl"),
+            (&unscoped, "proxy-cache/pypi-remote/__content__"),
+            (&unscoped, "proxy-cache/pypi-remote//a/__content__"),
+            (&unscoped, "proxy-cache/pypi-remote/a/../b/__content__"),
+            (&unscoped, "artifact-keeper/cas/ab/cdef"),
+        ] {
+            assert_eq!(
+                ProxyService::cache_entry_of_content_key(scope, key),
+                None,
+                "{key} under {:?}",
+                scope.root()
+            );
+        }
     }
 
     #[test]
