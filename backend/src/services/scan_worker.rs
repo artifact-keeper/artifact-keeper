@@ -382,7 +382,8 @@ async fn run_claimed_job(state: SharedState, queue: ScanQueue, job: Claimed<Scan
         _ = lost_ownership.cancelled() => {
             tracing::warn!(
                 job_id = %job_id, kind = %kind,
-                "abandoning scan job: claim was lost to another replica mid-scan"
+                "abandoning scan job: its claim lapsed and was recovered; the requeued job \
+                 reruns the scan"
             );
             return;
         }

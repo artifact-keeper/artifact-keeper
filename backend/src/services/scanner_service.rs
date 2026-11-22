@@ -10983,7 +10983,7 @@ impl ScannerService {
                     // identity) must fail THIS scan, named, and the set moves
                     // on. The `?` here used to abandon the row `running` and
                     // skip every later scanner.
-                    if let Err(e) = self
+                    let settled = match self
                         .scan_result_service
                         .complete_scan(
                             scan_result.id,
@@ -11004,18 +11004,28 @@ impl ScannerService {
                         )
                         .await
                     {
-                        let reason =
-                            format!("{} could not record its scan result: {e}", scanner.name());
-                        error!("Scan of artifact {}: {}", artifact_id, reason);
-                        self.record_failed_scan(
-                            artifact_id,
-                            &artifact.checksum_sha256,
-                            scan_result.id,
-                            scanner.as_ref(),
-                            &reason,
-                            started_at,
-                        )
-                        .await?;
+                        Ok(settled) => settled,
+                        Err(e) => {
+                            let reason =
+                                format!("{} could not record its scan result: {e}", scanner.name());
+                            error!("Scan of artifact {}: {}", artifact_id, reason);
+                            self.record_failed_scan(
+                                artifact_id,
+                                &artifact.checksum_sha256,
+                                scan_result.id,
+                                scanner.as_ref(),
+                                &reason,
+                                started_at,
+                            )
+                            .await?;
+                            continue;
+                        }
+                    };
+                    // #6423: a queued job whose claim was recovered for a rerun
+                    // left the row as recovery recorded it. These totals were
+                    // discarded, so neither log them as a completed scan nor
+                    // grade quarantine on them: the rerun does both.
+                    if !settled {
                         continue;
                     }
                     catalog_set.record_completed(
