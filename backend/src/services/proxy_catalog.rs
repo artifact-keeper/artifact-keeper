@@ -82,6 +82,38 @@ pub async fn upsert(
     .map(|_| ())
 }
 
+/// [`upsert_fill`]'s statement. `$11` turns off the commit's wait for the
+/// WAL flush for this statement's own transaction (#5635).
+const UPSERT_FILL_SQL: &str = r#"
+        WITH sync AS MATERIALIZED (
+            SELECT CASE WHEN $11 THEN set_config('synchronous_commit', 'off', true) END
+        )
+        INSERT INTO proxy_cache_artifacts
+            (repository_id, path, storage_key, metadata_key, size_bytes,
+             checksum_sha256, content_type, upstream_url, cached_at, last_accessed_at,
+             quarantine_until)
+        SELECT $1, $2, $3, $4, $5, $6, $7, $8, now(), now(), $9 FROM sync
+        ON CONFLICT (repository_id, path) DO UPDATE SET
+            storage_key      = EXCLUDED.storage_key,
+            metadata_key     = EXCLUDED.metadata_key,
+            size_bytes       = EXCLUDED.size_bytes,
+            checksum_sha256  = EXCLUDED.checksum_sha256,
+            content_type     = EXCLUDED.content_type,
+            upstream_url     = EXCLUDED.upstream_url,
+            cached_at        = now(),
+            last_accessed_at = now(),
+            -- A new cache write is a new upstream evaluation: any earlier
+            -- manual release applied to the previous bytes, not these. The
+            -- exception (#5223) is a release made during THIS fill ($10).
+            quarantine_until = CASE
+                WHEN $10 AND proxy_cache_artifacts.quarantine_released_at IS NOT NULL
+                THEN NULL ELSE EXCLUDED.quarantine_until END,
+            quarantine_released_at = CASE
+                WHEN $10 THEN proxy_cache_artifacts.quarantine_released_at
+                ELSE NULL END
+        RETURNING quarantine_released_at IS NOT NULL
+        "#;
+
 /// [`upsert`] for the commit of a fill that recorded its hold up front with
 /// [`mark_hold_fetching`] (#5223).
 ///
@@ -113,47 +145,63 @@ pub async fn upsert_fill(
     // bytes came from, so it never needs the credentials.
     let upstream_url =
         upstream_url.map(|u| crate::services::proxy_service::strip_url_userinfo(u).0);
-    sqlx::query_scalar::<_, bool>(
-        r#"
-        INSERT INTO proxy_cache_artifacts
-            (repository_id, path, storage_key, metadata_key, size_bytes,
-             checksum_sha256, content_type, upstream_url, cached_at, last_accessed_at,
-             quarantine_until)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now(), now(), $9)
-        ON CONFLICT (repository_id, path) DO UPDATE SET
-            storage_key      = EXCLUDED.storage_key,
-            metadata_key     = EXCLUDED.metadata_key,
-            size_bytes       = EXCLUDED.size_bytes,
-            checksum_sha256  = EXCLUDED.checksum_sha256,
-            content_type     = EXCLUDED.content_type,
-            upstream_url     = EXCLUDED.upstream_url,
-            cached_at        = now(),
-            last_accessed_at = now(),
-            -- A new cache write is a new upstream evaluation: any earlier
-            -- manual release applied to the previous bytes, not these. The
-            -- exception (#5223) is a release made during THIS fill ($10).
-            quarantine_until = CASE
-                WHEN $10 AND proxy_cache_artifacts.quarantine_released_at IS NOT NULL
-                THEN NULL ELSE EXCLUDED.quarantine_until END,
-            quarantine_released_at = CASE
-                WHEN $10 THEN proxy_cache_artifacts.quarantine_released_at
-                ELSE NULL END
-        RETURNING quarantine_released_at IS NOT NULL
-        "#,
-    )
-    .bind(repository_id)
-    .bind(path)
-    .bind(storage_key)
-    .bind(metadata_key)
-    .bind(size_bytes)
-    .bind(checksum_sha256)
-    .bind(content_type)
-    .bind(upstream_url)
-    .bind(quarantine_until)
-    .bind(keep_release)
-    .fetch_one(db)
-    .await
-    .map_err(|e| AppError::Database(e.to_string()))
+    // #5635: this write charges the repository's `repository_usage_ledger`
+    // row (migration 182's trigger), and every fill into the same Remote
+    // charges the same row. Committed synchronously, each fill held that row
+    // lock through its own WAL flush, so concurrent fills queued one flush at
+    // a time: 64 concurrent cold fills took 200 ms per upsert on average and
+    // over 1 s at p99. The `sync` CTE turns off the commit's wait for the
+    // flush for this statement's own (implicit) transaction only
+    // (`set_config(..., true)`), so the lock is released as soon as the
+    // commit is recorded and the queue drains at memory speed; still one
+    // round trip. The ledger charge commits or is lost together with the
+    // row. The cost: a database crash, or a failover to a standby, can lose
+    // the rows of up to about 3 x `wal_writer_delay` of fills. A lost row
+    // comes back only if its file is read again (the sidecar backfill);
+    // until then its bytes are missing from quota, eviction and the periodic
+    // re-scan. `PROXY_CACHE_CATALOG_SYNC_COMMIT` selects the behaviour.
+    let released = sqlx::query_scalar::<_, bool>(UPSERT_FILL_SQL)
+        .bind(repository_id)
+        .bind(path)
+        .bind(storage_key)
+        .bind(metadata_key)
+        .bind(size_bytes)
+        .bind(checksum_sha256)
+        .bind(content_type)
+        .bind(upstream_url)
+        .bind(quarantine_until)
+        .bind(keep_release)
+        .bind(!catalog_sync_commit())
+        .fetch_one(db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+    Ok(released)
+}
+
+/// The default of `PROXY_CACHE_CATALOG_SYNC_COMMIT` when it is unset or not
+/// a recognised boolean (#5635). Flipping the default is this one line.
+pub const CATALOG_SYNC_COMMIT_DEFAULT: bool = false;
+
+/// Whether [`upsert_fill`] commits synchronously
+/// (`PROXY_CACHE_CATALOG_SYNC_COMMIT`, default [`CATALOG_SYNC_COMMIT_DEFAULT`];
+/// #5635). Read once.
+pub fn catalog_sync_commit() -> bool {
+    static SYNC: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        parse_catalog_sync_commit(
+            std::env::var("PROXY_CACHE_CATALOG_SYNC_COMMIT")
+                .ok()
+                .as_deref(),
+        )
+    });
+    *SYNC
+}
+
+fn parse_catalog_sync_commit(value: Option<&str>) -> bool {
+    match value.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+        Some("true" | "1" | "yes" | "on") => true,
+        Some("false" | "0" | "no" | "off") => false,
+        _ => CATALOG_SYNC_COMMIT_DEFAULT,
+    }
 }
 
 /// Record a held fill's catalog row BEFORE its `409` is answered (#5223).
@@ -1064,6 +1112,107 @@ mod tests {
         .await
         .expect("insert repo");
         id
+    }
+
+    /// #5635: the default lives in one constant; explicit values win.
+    #[test]
+    fn catalog_sync_commit_parse_5635() {
+        assert_eq!(parse_catalog_sync_commit(None), CATALOG_SYNC_COMMIT_DEFAULT);
+        assert_eq!(
+            parse_catalog_sync_commit(Some("bogus")),
+            CATALOG_SYNC_COMMIT_DEFAULT
+        );
+        assert!(parse_catalog_sync_commit(Some(" TRUE ")));
+        assert!(!parse_catalog_sync_commit(Some("off")));
+    }
+
+    /// #5635: `upsert_fill`'s asynchronous commit is a real commit: another
+    /// connection sees the row and the ledger charge as soon as it returns,
+    /// and the setting, local to the statement's own transaction, does not
+    /// leak onto the pooled connection.
+    #[tokio::test]
+    async fn catalog_fill_async_commit_is_visible_and_scoped_5635() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let repo = insert_repo(&pool).await;
+        let pool1 = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect_with(pool.connect_options().as_ref().clone())
+            .await
+            .expect("single-connection pool");
+        let before: String = sqlx::query_scalar("SHOW synchronous_commit")
+            .fetch_one(&pool1)
+            .await
+            .unwrap();
+        // Inside the statement's transaction the setting really is off: run
+        // the exact statement in an explicit transaction and read it back, so
+        // a set_config that never ran (or a no-op) fails here.
+        let mut tx = pool1.begin().await.unwrap();
+        let _: bool = sqlx::query_scalar(UPSERT_FILL_SQL)
+            .bind(repo)
+            .bind("a/in-tx.whl")
+            .bind("k")
+            .bind("m")
+            .bind(1i64)
+            .bind(None::<&str>)
+            .bind(None::<&str>)
+            .bind(None::<&str>)
+            .bind(None::<chrono::DateTime<chrono::Utc>>)
+            .bind(false)
+            .bind(true)
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        let inside: String = sqlx::query_scalar("SELECT current_setting('synchronous_commit')")
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        assert_eq!(inside, "off", "the upsert turns synchronous_commit off");
+        tx.rollback().await.unwrap();
+        let reset: String = sqlx::query_scalar("SELECT current_setting('synchronous_commit')")
+            .fetch_one(&pool1)
+            .await
+            .unwrap();
+        assert_eq!(reset, before, "and only for its own transaction");
+        upsert_fill(
+            &pool1, repo, "a/b.whl", "k", "m", 1234, None, None, None, None, false,
+        )
+        .await
+        .expect("upsert_fill");
+        let after: String = sqlx::query_scalar("SHOW synchronous_commit")
+            .fetch_one(&pool1)
+            .await
+            .unwrap();
+        assert_eq!(
+            after, before,
+            "the setting ends with the upsert's transaction"
+        );
+        let (rows, ledger): (i64, i64) = sqlx::query_as(
+            "SELECT (SELECT COUNT(*) FROM proxy_cache_artifacts WHERE repository_id = $1), \
+                    COALESCE((SELECT proxy_bytes FROM repository_usage_ledger \
+                              WHERE repository_id = $1), 0)::BIGINT",
+        )
+        .bind(repo)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!((rows, ledger), (1, 1234));
+        // The conflict arm takes the same path and charges only the delta.
+        upsert_fill(
+            &pool1, repo, "a/b.whl", "k", "m", 1000, None, None, None, None, false,
+        )
+        .await
+        .expect("upsert_fill refresh");
+        let ledger: i64 = sqlx::query_scalar(
+            "SELECT proxy_bytes FROM repository_usage_ledger WHERE repository_id = $1",
+        )
+        .bind(repo)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(ledger, 1000);
+        cleanup_repo(&pool, repo).await;
     }
 
     /// Remove the repo (and, via `ON DELETE CASCADE`, its catalog +
