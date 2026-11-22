@@ -31,12 +31,11 @@ use std::time::Duration;
 
 use axum::http::{HeaderName, HeaderValue, StatusCode};
 use axum::response::Response;
-use chrono::{DateTime, Utc};
 
 use crate::api::download_response::try_presigned_redirect;
 use crate::api::handlers::proxy_helpers::try_proxy_cache_redirect;
 use crate::api::AppState;
-use crate::services::proxy_service::{CacheMetadata, ProxyService};
+use crate::services::proxy_service::{FreshCacheEntry, ProxyService};
 
 const DOCKER_CONTENT_DIGEST: HeaderName = HeaderName::from_static("docker-content-digest");
 
@@ -101,9 +100,12 @@ pub(crate) async fn try_stored_blob_redirect(
 ///   the object store would serve the coded bytes without the coding header,
 ///   and the client's digest check would fail (#3149). The streaming path
 ///   re-declares the coding.
-pub(crate) fn cached_blob_redirect_allowed(meta: &CacheMetadata, now: DateTime<Utc>) -> bool {
-    let held = meta.quarantine_until.is_some_and(|until| now < until);
-    !held && meta.content_encoding.is_none()
+///
+/// Both are read from the freshness probe's own copy of the sidecar (#6361):
+/// a second read could come back without the hold (a stale memoised copy, or
+/// an entry another replica re-filled) and let a held blob be signed.
+pub(crate) fn cached_blob_redirect_allowed(entry: &FreshCacheEntry) -> bool {
+    entry.quarantine_gate().is_ok() && entry.content_encoding().is_none()
 }
 
 /// Redirect a remote repository's blob when the proxy cache already holds a
@@ -126,17 +128,17 @@ pub(crate) async fn try_proxy_cached_blob_redirect(
     let storage = proxy.cache_storage_backend();
     // Check redirect support before the freshness probe: the probe reads the
     // cache sidecar, which is wasted work on a backend that cannot sign.
-    if !storage.supports_redirect() || !proxy.is_cache_fresh(repo_key, cache_path).await {
+    if !storage.supports_redirect() {
         return None;
     }
+    // #6361: one sidecar read; the hold, the coding and the size all come
+    // from the copy the freshness probe vouched for.
+    let entry = proxy.fresh_cache_redirect(repo_key, cache_path).await?;
     // #4506: no redirect for a Remote whose origin policy refuses its content.
     if proxy.cache_origin_policy_gate(repo_key).await.is_err() {
         return None;
     }
-    let meta_key =
-        ProxyService::cache_metadata_key(proxy.cache_scope(), repo_key, cache_path).ok()?;
-    let meta = proxy.load_cache_metadata_pub(&meta_key).await?;
-    if !cached_blob_redirect_allowed(&meta, Utc::now()) {
+    if !cached_blob_redirect_allowed(&entry) {
         return None;
     }
     let cache_key =
@@ -148,7 +150,7 @@ pub(crate) async fn try_proxy_cached_blob_redirect(
         true,
         expiry,
         true,
-        meta.size_bytes,
+        entry.size_bytes(),
     )
     .await?;
     Some(into_oci_blob_redirect(resp, digest))
@@ -159,6 +161,7 @@ pub(crate) async fn try_proxy_cached_blob_redirect(
 mod tests {
     use super::*;
     use crate::api::handlers::test_db_helpers as tdh;
+    use crate::services::proxy_service::CacheMetadata;
     use axum::http::header::{CACHE_CONTROL, LOCATION};
 
     const DIGEST: &str = "sha256:b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
@@ -217,26 +220,54 @@ mod tests {
         assert!(resp.headers().get(DOCKER_CONTENT_DIGEST).is_none());
     }
 
+    fn allowed(meta: CacheMetadata) -> bool {
+        cached_blob_redirect_allowed(&FreshCacheEntry::from_metadata(meta))
+    }
+
     #[test]
     fn cached_blob_redirect_allowed_for_plain_unheld_entry() {
-        assert!(cached_blob_redirect_allowed(&sidecar(), Utc::now()));
+        assert!(allowed(sidecar()));
     }
 
     #[test]
     fn cached_blob_redirect_refused_for_coded_entry() {
         let mut meta = sidecar();
         meta.content_encoding = Some("gzip".to_string());
-        assert!(!cached_blob_redirect_allowed(&meta, Utc::now()));
+        assert!(!allowed(meta));
     }
 
     #[test]
     fn cached_blob_redirect_follows_the_hold_window() {
-        let now = Utc::now();
+        let now = chrono::Utc::now();
         let mut meta = sidecar();
         meta.quarantine_until = Some(now + chrono::Duration::hours(1));
-        assert!(!cached_blob_redirect_allowed(&meta, now), "active hold");
+        assert!(!allowed(meta.clone()), "active hold");
         meta.quarantine_until = Some(now - chrono::Duration::seconds(1));
-        assert!(cached_blob_redirect_allowed(&meta, now), "elapsed hold");
+        assert!(allowed(meta), "elapsed hold");
+    }
+
+    /// #6361: the hold is taken from the freshness probe's read. A held blob
+    /// whose sidecar is gone after that read (evicted, or a stale memoised
+    /// copy elsewhere) is not signed, and the decision costs one sidecar read.
+    #[tokio::test]
+    async fn proxy_cached_blob_keeps_the_hold_after_eviction_6361() {
+        let (state, backend, content_key, meta_key) = proxy_state(true);
+        backend.seed_fresh_entry(&content_key, &meta_key);
+        let mut meta = sidecar();
+        meta.quarantine_until = Some(chrono::Utc::now() + chrono::Duration::days(7));
+        backend.objects.lock().unwrap().insert(
+            meta_key.clone(),
+            bytes::Bytes::from(serde_json::to_vec(&meta).unwrap()),
+        );
+        backend
+            .evict_after_read
+            .lock()
+            .unwrap()
+            .insert(meta_key.clone());
+        assert!(try_proxy_cached_blob_redirect(&state, REPO, PATH, DIGEST)
+            .await
+            .is_none());
+        assert_eq!(backend.read_count(&meta_key), 1, "one sidecar read");
     }
 
     async fn seeded_cloud(

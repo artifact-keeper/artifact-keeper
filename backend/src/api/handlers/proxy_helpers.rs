@@ -7744,11 +7744,11 @@ pub async fn local_fetch_or_redirect(
                 // paths (`proxy_fetch_or_redirect`, `try_member_cache_redirect`)
                 // apply. Those additionally read the `__cache_meta__.json`
                 // sidecar for TTL, revalidate the pinned ETag, and apply
-                // `cache_quarantine_gate` for the #2075 Package Age Policy hold.
-                // None of that happens here, so a present-but-stale or
-                // still-held entry can still be signed. That gap is
+                // the #2075 Package Age Policy hold (from the probe's own read
+                // since #6361). None of that happens here, so a present-but-stale
+                // or still-held entry can still be signed. That gap is
                 // pre-existing (this argument was hardcoded `true`); closing it
-                // needs the repo_key/path pair and is tracked separately. This
+                // needs the repo_key/path pair and is tracked in #6416. This
                 // change only removes the dead-redirect case.
                 //
                 // On a miss the streaming fallback below takes over. Note it

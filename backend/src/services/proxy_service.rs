@@ -2032,6 +2032,18 @@ impl FreshCacheEntry {
     pub fn quarantine_gate(&self) -> Result<()> {
         check_quarantine_until(self.metadata.quarantine_until)
     }
+
+    /// The `Content-Encoding` the cached bytes were stored with (`None` for
+    /// identity). A fast path that cannot replay the coding declines to
+    /// redirect a coded entry (#3149).
+    pub fn content_encoding(&self) -> Option<&str> {
+        self.metadata.content_encoding.as_deref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_metadata(metadata: CacheMetadata) -> Self {
+        Self { metadata }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
