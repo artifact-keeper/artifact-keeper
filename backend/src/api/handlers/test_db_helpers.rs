@@ -621,6 +621,32 @@ pub(crate) async fn device_expiry_serial_lock() -> DeviceExpirySerialGuard {
     }
 }
 
+/// Advisory-lock key for [`sync_claim_recovery_serial_lock`] (#5671).
+const SYNC_CLAIM_RECOVERY_TEST_LOCK_KEY: i64 = 0x5343_5671; // "SC" + issue #5671
+
+/// Cross-process serialization guard for the tests that run the sync-task
+/// claim recovery sweep, or need an unclaimed `in_progress` row of theirs to
+/// survive one (#5671).
+///
+/// `recover_expired_sync_task_claims` resets every lapsed `in_progress` row in
+/// the database, not just the caller's. Run concurrently, one test's sweep
+/// resets a row another test has just seeded before that test's own sweep
+/// runs, or holds the row's lock while the other test claims it, so the
+/// claim's `SKIP LOCKED` passes over it. The `db-serial` nextest group keeps
+/// them apart in CI; this lock also does under a single-process
+/// `cargo test`. Tests take it for their whole body.
+pub struct SyncClaimRecoverySerialGuard {
+    _conn: Option<sqlx::PgConnection>,
+}
+
+/// Acquire the sync claim-recovery test lock, blocking until it is free.
+/// Inert when no database is configured, like [`try_pool`].
+pub(crate) async fn sync_claim_recovery_serial_lock() -> SyncClaimRecoverySerialGuard {
+    SyncClaimRecoverySerialGuard {
+        _conn: serial_lock_session(SYNC_CLAIM_RECOVERY_TEST_LOCK_KEY).await,
+    }
+}
+
 /// Refresh the materialized storage stats for a test, absorbing transient
 /// cross-suite interference.
 ///
