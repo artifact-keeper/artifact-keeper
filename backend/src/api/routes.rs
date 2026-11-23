@@ -1603,6 +1603,16 @@ fn api_v1_routes(
                 auth_middleware,
             )),
         )
+        // Warm a conda Remote's proxy cache from a stored environment
+        // (#4184): POST/GET /conda/{repo}/warm, GET/DELETE
+        // /conda/{repo}/warm/{id}. Repository write (or admin) on {repo}.
+        .nest(
+            "/conda",
+            handlers::conda_warm::router().layer(middleware::from_fn_with_state(
+                auth_service.clone(),
+                auth_middleware,
+            )),
+        )
         // Stored-environment reverse index (#4054):
         // GET /environments/lookup?purl=... answers "which stored
         // environments contain this component" across every repository the
