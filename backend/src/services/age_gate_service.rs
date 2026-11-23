@@ -322,7 +322,7 @@ pub(crate) struct ReviewPolicyView {
     /// basis, threshold, and upstream on every decision.
     pub is_automatic: bool,
     pub identity: ReviewIdentityMatch,
-    /// `expires_at` is set and already in the past (migration 404). Resolved
+    /// `expires_at` is set and already in the past (migration 420). Resolved
     /// by the caller against one `now` so this stays a pure view and the whole
     /// decision remains testable without a clock.
     ///
@@ -332,7 +332,7 @@ pub(crate) struct ReviewPolicyView {
     pub expired: bool,
 }
 
-/// The queue's gate values (migration 404). `age` is the default so a row
+/// The queue's gate values (migration 420). `age` is the default so a row
 /// written before the column existed, or read through a `SELECT` that omits
 /// it, still behaves as the age gate it was.
 pub const GATE_AGE: &str = "age";
@@ -436,7 +436,7 @@ pub(crate) enum AgeGateCheckAction {
 /// * below the threshold, only a *manual* approval whose identity matches the
 ///   current policy (or a pre-identity legacy manual approval) still allows;
 /// * a manual approval under a different identity, an EXPIRED manual approval
-///   (migration 404), or any automatic approval that no longer holds (raised
+///   (migration 420), or any automatic approval that no longer holds (raised
 ///   threshold, switched mode, repointed upstream, legacy row), is voided back
 ///   to pending and blocks;
 /// * anything else blocks and records/bumps the pending review.
@@ -696,7 +696,7 @@ pub struct AgeGateReview {
     #[sqlx(default)]
     pub instance_locked: bool,
     /// Which withhold gate filed this row: `age` | `scan` | `curation`
-    /// (migration 404).
+    /// (migration 420).
     #[sqlx(default)]
     pub gate: Option<String>,
     /// A human's stated reason for wanting this package. `None` means nobody
@@ -1533,7 +1533,7 @@ impl AgeGateService {
     ///
     /// `gates` filters which withhold gates to include; `None` means ALL of
     /// them, which is what the unified reviewer queue wants. The age-gate admin
-    /// endpoint passes `["age"]` so its contract is unchanged by migration 404
+    /// endpoint passes `["age"]` so its contract is unchanged by migration 420
     /// making the table multi-gate.
     ///
     /// `justified_only` selects the reviewer's DEFAULT view: rows a human
@@ -2035,7 +2035,7 @@ impl AgeGateService {
         package_name: &str,
         exclude_version: &str,
     ) -> Result<Option<LastKnownGood>> {
-        // The join is scoped to `gate = 'age'` (migration 404): the table now
+        // The join is scoped to `gate = 'age'` (migration 420): the table now
         // holds a row per (gate, coordinate), so an unscoped join would let a
         // `scan` or `curation` row decide age eligibility, a pending scan
         // exception would hide an age-approved version from LKG, and an
@@ -4224,7 +4224,7 @@ mod tests {
             "a manual approval under a different identity is voided"
         );
         // An EXPIRED manual approval is voided the same way a stale one is
-        // (migration 404): the exception lapsed, so the package goes back on
+        // (migration 420): the exception lapsed, so the package goes back on
         // the queue rather than continuing to be served.
         assert_eq!(
             decide_age_gate_check(Some(&expired_view("approved", false, Matches)), false),
