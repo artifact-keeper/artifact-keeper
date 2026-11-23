@@ -998,18 +998,13 @@ pub fn spawn_all(
         });
     }
 
-    // Webhook delivery retry processor (every 30 seconds)
+    // Webhook delivery worker (#5195): claims when a delivery is enqueued or a
+    // lane finishes, and polls every few seconds for retries that came due.
     {
         let db = db.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(15)).await;
-            let mut ticker = interval(Duration::from_secs(30));
-            loop {
-                ticker.tick().await;
-                if let Err(e) = crate::api::handlers::webhooks::process_webhook_retries(&db).await {
-                    tracing::warn!("Webhook retry processing failed: {}", e);
-                }
-            }
+            crate::api::handlers::webhooks::run_webhook_delivery_worker(db).await;
         });
     }
 
