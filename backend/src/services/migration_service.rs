@@ -430,8 +430,9 @@ impl MigrationService {
             // Helm OCI is Full for the same reason Docker is: the source
             // stores charts as OCI manifests and blobs, and the importer
             // registers them in the OCI index exactly as a native push does
-            // (`is_oci_package_type` covers `helm_oci`), so `helm pull
-            // oci://...` resolves imported tags (#5264).
+            // (`is_oci_package_type` covers `helm_oci`), see
+            // `test_helm_oci_import_registers_manifest_and_blobs_artifactory_layout`
+            // in the migration worker (#5264).
             "helm_oci" => FormatCompatibility::Full,
             "conan" | "conda" => FormatCompatibility::Partial,
             _ => FormatCompatibility::Unsupported,
