@@ -368,6 +368,43 @@ pub fn record_proxy_scan_regrade_backlog_oldest(location: &'static str, secs: f6
     gauge!("ak_proxy_scan_regrade_backlog_oldest_seconds", "where" => location).set(secs);
 }
 
+/// One step of a proxy cache fill that runs detached from its request
+/// (#5220, #5509, #5617). `kind` is `buffered` (a buffered fill, detached
+/// from the start) or `stream_drain` (the rest of a streamed body whose client
+/// stopped reading). `outcome`:
+///
+/// * `started`: the fill took a `PROXY_UPSTREAM_MAX_DETACHED_FILLS` permit
+///   and runs on its own task;
+/// * `finished`: it ended within its deadline (cached, or failed upstream);
+/// * `abandoned`: it hit the fetch deadline plus the commit allowance and
+///   was dropped unfinished;
+/// * `refused`: no permit was free, so a buffered fill runs in its request
+///   (and ends if the client goes away) and a drain is not started at all.
+///
+/// A steady `refused` rate means the cap is too low for the traffic.
+pub fn record_proxy_detached_fill(kind: &'static str, outcome: &'static str) {
+    counter!("ak_proxy_detached_fills_total", "kind" => kind, "outcome" => outcome).increment(1);
+}
+
+/// Detached proxy cache fills running now, by `kind` (see
+/// [`record_proxy_detached_fill`]). `+1` when one starts, `-1` when it ends.
+pub fn record_proxy_detached_fills_in_flight(kind: &'static str, delta: f64) {
+    gauge!("ak_proxy_detached_fills_in_flight", "kind" => kind).increment(delta);
+}
+
+/// The `PROXY_UPSTREAM_MAX_DETACHED_FILLS` this process runs with (#5617), so
+/// a dashboard can compare `ak_proxy_detached_fills_in_flight` with it.
+pub fn record_proxy_detached_fills_limit(limit: usize) {
+    gauge!("ak_proxy_detached_fills_limit").set(limit as f64);
+}
+
+/// A request that waited on another request's buffered fill, whose upstream
+/// fetch then hit `PROXY_UPSTREAM_FETCH_DEADLINE_SECS`, took that verdict
+/// (the stale copy, or the error) instead of fetching again (#5617).
+pub fn record_proxy_fill_follower_inherited() {
+    counter!("ak_proxy_fill_followers_inherited_total").increment(1);
+}
+
 /// A queued `fail_closed` proxy scan dropped because no request wanted it any
 /// more (#5231).
 pub fn record_proxy_scan_abandoned() {

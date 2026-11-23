@@ -27,6 +27,7 @@ use crate::api::middleware::request_span::record_cache_outcome;
 use crate::error::{AppError, Result};
 use crate::models::repository::{Repository, RepositoryFormat, RepositoryType};
 use crate::services::cache_classifier;
+use crate::services::log_throttle::LogEvery;
 use crate::services::metrics_service::{
     record_proxy_cache_lookup, record_proxy_stale_if_error_response, ProxyCachePublishFailure,
 };
@@ -34,7 +35,8 @@ use crate::services::proxy_cache_cap::ProxyCacheCap;
 use crate::services::proxy_cache_scope::ProxyCacheScope;
 use crate::services::proxy_catalog;
 use crate::services::proxy_hydration::{
-    Coordinator, DetachedFillLimits, HydrationCoordinator, StreamHandle, StreamHeaders,
+    Coordinator, DetachedFillInFlight, DetachedFillLimits, HydrationCoordinator, StreamHandle,
+    StreamHeaders, DETACHED_FILL_LOG_INTERVAL,
 };
 use crate::services::proxy_scan_service::{
     decide_cache_scan_gate, CacheScanGate, StoredProxyVerdict,
@@ -86,13 +88,71 @@ const HYDRATION_WAIT_TIMEOUT_MESSAGE: &str = "Timed out waiting for proxy cache 
 /// Message prefix of a detached fill abandoned at its deadline.
 const DETACHED_FILL_DEADLINE_MESSAGE: &str = "Proxy cache fill abandoned";
 
-/// Whether `err` came from waiting on a detached fill (a follower timeout, or
-/// the fill abandoned at its deadline) rather than from the fill itself, which
-/// has already applied stale-if-error to its own upstream failures.
+/// Message prefix of a follower that took the verdict of the fill it waited
+/// on, whose upstream fetch hit its deadline (#5617).
+const LEADER_FETCH_DEADLINE_MESSAGE: &str =
+    "The proxy cache fill this request waited on hit its upstream fetch deadline";
+
+/// Whether `err` came from waiting on a detached fill (a follower timeout, the
+/// fill abandoned at its deadline, or a follower taking a leader's fetch
+/// deadline) rather than from the fill itself, which has already applied
+/// stale-if-error to its own upstream failures.
 fn is_detached_fill_wait_error(err: &AppError) -> bool {
     matches!(err, AppError::BadGateway(m)
         if m.starts_with(HYDRATION_WAIT_TIMEOUT_MESSAGE)
-            || m.starts_with(DETACHED_FILL_DEADLINE_MESSAGE))
+            || m.starts_with(DETACHED_FILL_DEADLINE_MESSAGE)
+            || m.starts_with(LEADER_FETCH_DEADLINE_MESSAGE))
+}
+
+/// When a buffered fill's upstream fetch last hit
+/// `PROXY_UPSTREAM_FETCH_DEADLINE_SECS`, by cache key (#5617).
+///
+/// A request that was waiting on that fill when it hit the deadline takes the
+/// same verdict (the stale copy through stale-if-error, or the error) instead
+/// of becoming the next leader and waiting out a second deadline: the
+/// upstream that just failed to answer in time is the one it would ask. A
+/// request that arrives after the deadline fetches as before, so nothing is
+/// pinned. Only the followers in this process see the entry; a follower on
+/// another replica (`PROXY_SINGLEFLIGHT_ADVISORY_LOCKS_ENABLED`) still fetches
+/// once itself.
+///
+/// An entry only matters to a request that started waiting before it was
+/// written, and no request waits longer than the hydration wait timeout, so
+/// older entries are dropped.
+fn fetch_deadline_hits() -> &'static std::sync::Mutex<HashMap<String, std::time::Instant>> {
+    static HITS: std::sync::OnceLock<std::sync::Mutex<HashMap<String, std::time::Instant>>> =
+        std::sync::OnceLock::new();
+    HITS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// Most cache keys [`fetch_deadline_hits`] holds at once.
+const FETCH_DEADLINE_HITS_MAX: usize = 4096;
+
+/// Record that the fill of `cache_key` hit its upstream fetch deadline now.
+fn note_fetch_deadline_hit(cache_key: &str) {
+    let now = std::time::Instant::now();
+    let mut hits = fetch_deadline_hits()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if hits.len() >= FETCH_DEADLINE_HITS_MAX {
+        let keep = crate::services::proxy_hydration::DEFAULT_PROXY_HYDRATION_WAIT_TIMEOUT;
+        hits.retain(|_, at| now.saturating_duration_since(*at) <= keep);
+        if hits.len() >= FETCH_DEADLINE_HITS_MAX {
+            // Forgetting only costs a follower its own fetch, as before #5617.
+            hits.clear();
+        }
+    }
+    hits.insert(cache_key.to_owned(), now);
+}
+
+/// Whether the fill of `cache_key` hit its upstream fetch deadline after
+/// `since` (when the asking request started to wait).
+fn fetch_deadline_hit_since(cache_key: &str, since: std::time::Instant) -> bool {
+    fetch_deadline_hits()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(cache_key)
+        .is_some_and(|at| *at >= since)
 }
 
 /// Apply the proxy's upstream connection settings (#5220) to `builder`: the
@@ -591,6 +651,10 @@ struct FinishFillOnDrop {
     limits: FinishFillLimits,
 }
 
+/// `kind` label of `ak_proxy_detached_fills_total` for a [`FinishFillOnDrop`]
+/// drain (#5617).
+const DETACHED_KIND_STREAM_DRAIN: &str = "stream_drain";
+
 /// How many [`FinishFillOnDrop`] drains may run at once (shared with the
 /// #5220 detached buffered fills) and for how long each may run.
 #[derive(Clone)]
@@ -674,22 +738,53 @@ impl Drop for FinishFillOnDrop {
             return;
         };
         let Ok(permit) = Arc::clone(&self.limits.permits).try_acquire_owned() else {
-            tracing::debug!(
-                "no detached-fill permit free; a streaming fill its client stopped \
-                 reading is dropped unfinished (#5509)"
+            // #5617: counted, and at WARN at most once a minute, so the cap
+            // biting is visible at the default log level.
+            crate::services::metrics_service::record_proxy_detached_fill(
+                DETACHED_KIND_STREAM_DRAIN,
+                "refused",
             );
+            static REFUSED_LOG: LogEvery = LogEvery::new(DETACHED_FILL_LOG_INTERVAL);
+            if let Some(held_back) = REFUSED_LOG.check() {
+                tracing::warn!(
+                    held_back,
+                    "no detached-fill permit free (PROXY_UPSTREAM_MAX_DETACHED_FILLS); a \
+                     streaming fill its client stopped reading is dropped unfinished and \
+                     not cached (#5509). `held_back` more since the last such line; see \
+                     ak_proxy_detached_fills_total{{kind=\"stream_drain\",outcome=\"refused\"}}"
+                );
+            } else {
+                tracing::debug!(
+                    "no detached-fill permit free; a streaming fill its client stopped \
+                     reading is dropped unfinished (#5509)"
+                );
+            }
             return;
         };
+        let in_flight = DetachedFillInFlight::start(DETACHED_KIND_STREAM_DRAIN);
         let deadline = self.limits.deadline;
         let cache_published = self.cache_published.clone();
         let drain = async move {
             let drained = tokio::time::timeout(deadline, Self::drain(body, cache_published)).await;
+            in_flight.end(drained.is_err());
             if drained.is_err() {
-                tracing::debug!(
-                    deadline_secs = deadline.as_secs(),
-                    "a streaming fill its client stopped reading did not finish within the \
-                     detached-fill deadline; abandoned unfinished (#5509)"
-                );
+                static ABANDONED_LOG: LogEvery = LogEvery::new(DETACHED_FILL_LOG_INTERVAL);
+                if let Some(held_back) = ABANDONED_LOG.check() {
+                    tracing::warn!(
+                        deadline_secs = deadline.as_secs(),
+                        held_back,
+                        "a streaming fill its client stopped reading did not finish within the \
+                         detached-fill deadline (PROXY_UPSTREAM_FETCH_DEADLINE_SECS + 60 s, \
+                         counted from the client going away); abandoned unfinished and not \
+                         cached (#5509). `held_back` more since the last such line"
+                    );
+                } else {
+                    tracing::debug!(
+                        deadline_secs = deadline.as_secs(),
+                        "a streaming fill its client stopped reading did not finish within the \
+                         detached-fill deadline; abandoned unfinished (#5509)"
+                    );
+                }
             }
         };
         let correlation = crate::api::middleware::tracing::current_correlation_id();
@@ -6635,6 +6730,9 @@ impl ProxyService {
                 .with_circuits(Arc::clone(&self.upstream_client.circuits)),
         );
         self.detached_fill_permits = Arc::new(Semaphore::new(timeouts.max_detached_fills));
+        crate::services::metrics_service::record_proxy_detached_fills_limit(
+            timeouts.max_detached_fills,
+        );
         self.upstream_timeouts = timeouts;
         self
     }
@@ -7754,6 +7852,12 @@ impl ProxyService {
         // leader's fill would queue them behind one scan after another and
         // run them into the hydration deadline.
         let waited_on_held_fill = std::sync::atomic::AtomicBool::new(false);
+        // #5617: a request waiting on a detached fill whose upstream fetch
+        // hits its deadline takes that verdict rather than fetching again.
+        // The in-request fills below (a caller check or a deferred commit)
+        // have no stale-if-error step for it, so they keep re-electing.
+        let waiting_since = std::time::Instant::now();
+        let inherit_fetch_deadline = check.is_none() && deferred.is_none();
         let check_cache = || async {
             // #4514: a fill another request holds back for the scan gate
             // (or a streaming publish in its tail) is waited for, not
@@ -7817,6 +7921,12 @@ impl ProxyService {
                         fetch_path
                     )));
                 }
+            }
+            if inherit_fetch_deadline && fetch_deadline_hit_since(&cache_key, waiting_since) {
+                crate::services::metrics_service::record_proxy_fill_follower_inherited();
+                return Err(AppError::BadGateway(format!(
+                    "{LEADER_FETCH_DEADLINE_MESSAGE}: {cache_key}"
+                )));
             }
             Ok(cached)
         };
@@ -7947,6 +8057,8 @@ impl ProxyService {
                     "Upstream fetch of {} exceeded its deadline",
                     redact_url_for_diagnostics(full_url)
                 );
+                // #5617: the requests waiting on this fill take its verdict.
+                note_fetch_deadline_hit(cache_key);
                 Err(AppError::BadGateway(format!(
                     "Upstream fetch exceeded the {}-second deadline",
                     deadline.as_secs()
@@ -27291,6 +27403,82 @@ mod tests {
             other => panic!("expected the deadline error, got {other:?}"),
         }
         assert!(elapsed < Duration::from_secs(4), "{elapsed:?}");
+    }
+
+    /// #5617: a request that waits on a buffered fill whose upstream fetch
+    /// then hits the fetch deadline takes that verdict. Before, it became the
+    /// next leader, asked the same upstream again and answered after a second
+    /// deadline (about twice the deadline in all). A request that arrives
+    /// after the deadline still fetches.
+    #[tokio::test]
+    async fn test_follower_takes_the_leaders_fetch_deadline_5617() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/stalled-5617"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(b"late".as_ref())
+                    .set_delay(Duration::from_secs(4)),
+            )
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("follower-deadline-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = Arc::new(
+            Arc::unwrap_or_clone(tdh::build_proxy_service_with_fs(
+                pool,
+                tmp.to_str().unwrap(),
+            ))
+            .with_upstream_settings(crate::config::ProxyUpstreamSettings {
+                connect_secs: 5,
+                read_secs: 60,
+                fetch_deadline_secs: 1,
+                ..Default::default()
+            }),
+        );
+        let repo = wiremock_remote_repo("follower-deadline", &server.uri(), tmp.to_str().unwrap());
+
+        let leader = {
+            let (proxy, repo) = (Arc::clone(&proxy), repo.clone());
+            tokio::spawn(async move { proxy.fetch_artifact(&repo, "stalled-5617").await })
+        };
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let started = std::time::Instant::now();
+        let follower = proxy.fetch_artifact(&repo, "stalled-5617").await;
+        let follower_secs = started.elapsed();
+        let leader = leader.await.expect("leader task");
+        let hits_after_both = server.received_requests().await.unwrap_or_default().len();
+
+        // Arrives after the deadline: fetches again, as before.
+        let _late = proxy.fetch_artifact(&repo, "stalled-5617").await;
+        let hits_after_late = server.received_requests().await.unwrap_or_default().len();
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert!(leader.is_err(), "the leader hit the deadline: {leader:?}");
+        match follower {
+            Err(AppError::BadGateway(message)) => assert!(
+                message.starts_with(LEADER_FETCH_DEADLINE_MESSAGE),
+                "the follower names the inherited deadline: {message}"
+            ),
+            other => panic!("expected the inherited deadline, got {other:?}"),
+        }
+        assert_eq!(
+            hits_after_both, 1,
+            "the follower did not ask the upstream again"
+        );
+        assert!(
+            follower_secs < Duration::from_millis(1500),
+            "the follower answered with the leader, not after a second deadline: {follower_secs:?}"
+        );
+        assert_eq!(hits_after_late, 2, "a later request fetches again");
     }
 
     // -- get_cache_ttl_for_repo: DB lookup with default fallback -------------
