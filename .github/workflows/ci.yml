@@ -1071,7 +1071,7 @@ jobs:
         run: ./scripts/ci/check-toolchain-pin.sh --active
 
       # #5273 drives npm through a pending scan and its eventual verdict.
-      - uses: actions/setup-node@v7.1.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         if: matrix.shard == 'handlers-1'
         with:
           node-version: '22'
@@ -1080,10 +1080,16 @@ jobs:
         if: matrix.shard == 'handlers-1'
         run: npm install --global npm@10.9.9
 
+      # Exact versions (#6178): an unversioned `tool:` installs whatever
+      # was released last, so a new upstream release could change every leg
+      # at once with no commit here. These are the versions the floating
+      # entries resolved to on main on 2026-11-23. Bump them together with
+      # the other install-action steps; check-action-pins.sh refuses an
+      # unversioned entry.
       - name: Install cargo-llvm-cov, cargo-nextest and sqlx-cli
         uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
         with:
-          tool: cargo-llvm-cov,cargo-nextest,sqlx-cli
+          tool: cargo-llvm-cov@0.9.1,cargo-nextest@0.9.152,sqlx-cli@0.9.1
 
       # The self-hosted runner image ships protoc; ubuntu-24.04 does not,
       # and build scripts in the dependency tree need it. services-1 also
@@ -1414,7 +1420,7 @@ jobs:
       - name: Install cargo-nextest and sqlx-cli
         uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
         with:
-          tool: cargo-nextest,sqlx-cli
+          tool: cargo-nextest@0.9.152,sqlx-cli@0.9.1
 
       # The self-hosted image shipped protoc; ubuntu-24.04 does not, and
       # build scripts in the dependency tree need it.
@@ -1922,7 +1928,7 @@ jobs:
       - name: Install cargo-nextest
         uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
         with:
-          tool: cargo-nextest
+          tool: cargo-nextest@0.9.152
 
       # Bounded (#6272): scripts/ci/apt-install-bounded.sh caps each download
       # attempt at 3 minutes and retries on azure.archive.ubuntu.com, so a
@@ -2521,6 +2527,15 @@ jobs:
 
       - name: Check the toolchain-pin gate catches what it must
         run: bash scripts/ci/test-check-toolchain-pin.sh
+
+      # Every `uses:` is a full commit sha and every install-action tool has
+      # an exact version (#6178), so no action or tool can change under this
+      # repo without a commit. Pure file inspection, no network, ~1s.
+      - name: Check every action and installed tool is pinned
+        run: bash scripts/ci/check-action-pins.sh
+
+      - name: Check the action-pin gate catches what it must
+        run: bash scripts/ci/test-check-action-pins.sh
 
       # The daily curl advisory watch (scheduled-curl-advisory-watch.yml,
       # #6003) is the only control over the curl / libcurl the backend and
@@ -3134,7 +3149,7 @@ jobs:
       - name: Setup Node.js for jscpd
         if: ${{ !cancelled() && steps.mb.outcome == 'success' }}
         continue-on-error: true
-        uses: actions/setup-node@v7.1.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '20'
 

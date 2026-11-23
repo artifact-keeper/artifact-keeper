@@ -37,6 +37,8 @@ test-shard-services-2 = []
 test-shard-router = []
 
 [dependencies]
+# Commit, version and Debian Release Date floor (#6181)
+ak-build-info = { path = "crates/ak-build-info" }
 openssl = { workspace = true, optional = true }
 # Async runtime
 tokio.workspace = true

@@ -538,7 +538,7 @@ pub async fn health_check(State(state): State<SharedState>) -> impl IntoResponse
         size: state.db.size(),
     };
 
-    let git_sha = env!("GIT_SHA");
+    let git_sha = crate::build_info::GIT_SHA;
     let is_prerelease = env!("CARGO_PKG_VERSION").contains('-');
     let (commit, dirty) = if git_sha != "unknown" {
         (Some(git_sha.to_string()), Some(is_prerelease))

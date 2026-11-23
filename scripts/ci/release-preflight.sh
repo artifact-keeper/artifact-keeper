@@ -1009,13 +1009,80 @@ else
       note "     shape), or its lead reference is wrong."
     fi
 
+    # -- a PR and its full revert, both in range, cancel out (#6363) --------
+    # Neither one ships: the tree at HEAD is as if both never merged, so
+    # neither can carry an entry, and every cut that held such a pair used to
+    # need a hand-written citation PR (#6251 for 1.12.2). A pair cancels only
+    # when the revert is the EXACT inverse of the reverted PR's diff, checked
+    # with `git patch-id`, so a partial back-out (#6235 shape) still needs its
+    # own entry. Candidates are the commit `git revert` names ("This reverts
+    # commit <sha>.") and, for a `Revert "..."` subject or a body that says
+    # revert / back out, every in-range PR number the commit cites.
+    #   cancelled: `<pr> <partner pr>` per line, both directions. A PR is in at
+    #   most one pair.
+    cancelled=""
+    patch_id() { # <from> <to>: the stable patch-id of `git diff <from> <to>`
+      git diff "$1" "$2" 2>/dev/null | git patch-id --stable 2>/dev/null | cut -d' ' -f1
+    }
+    while IFS= read -r rline; do
+      [[ -z "$rline" ]] && continue
+      rsha="${rline%% *}"
+      rsubj="${rline#* }"
+      [[ "$rsubj" =~ \(#([0-9]+)\)$ ]] || continue
+      rpr="${BASH_REMATCH[1]}"
+      rbody="$(git log -1 --format=%b "$rsha" 2>/dev/null || true)"
+      targets=""
+      while IFS= read -r tsha; do
+        [[ -z "$tsha" ]] && continue
+        tline="$(printf '%s\n' "$range_log" | grep -m1 "^${tsha}" || true)"
+        [[ -n "$tline" ]] && targets+="${tline%% *}"$'\n'
+      done < <(printf '%s\n' "$rbody" | grep -oE 'This reverts commit [0-9a-f]{7,40}' | awk '{print $4}')
+      # loud: the commit says it is a revert or back-out, so a near miss is
+      # worth reporting. A body that merely mentions a revert is checked, but
+      # a mismatch there is silent.
+      loud=0
+      if [[ -n "$targets" ]] || printf '%s\n' "$rsubj" | grep -qiE '^revert "|revert|back(ed|s|ing)?[ -]?out'; then
+        loud=1
+      fi
+      if [[ "$loud" -eq 1 ]] || printf '%s\n' "$rbody" | grep -qiE 'revert|back(ed|s|ing)?[ -]?out'; then
+        while IFS= read -r tpr; do
+          [[ -z "$tpr" || "$tpr" == "$rpr" ]] && continue
+          tline="$(printf '%s\n' "$range_log" | grep -m1 -E "\\(#${tpr}\\)\$" || true)"
+          [[ -n "$tline" ]] && targets+="${tline%% *}"$'\n'
+        done < <(printf '%s\n%s\n' "${rsubj% (#*}" "$rbody" | grep -oE '#[0-9]{2,6}' | tr -d '#' | sort -u)
+      fi
+      while IFS= read -r tsha; do
+        [[ -z "$tsha" || "$tsha" == "$rsha" ]] && continue
+        tsubj="$(printf '%s\n' "$range_log" | grep -m1 "^${tsha} " | cut -d' ' -f2-)"
+        [[ "$tsubj" =~ \(#([0-9]+)\)$ ]] || continue
+        tpr="${BASH_REMATCH[1]}"
+        fwd="$(patch_id "${tsha}^" "$tsha")"
+        inv="$(patch_id "$rsha" "${rsha}^")"
+        if [[ -n "$fwd" && "$fwd" == "$inv" ]]; then
+          # A PR pairs at most once. The log is newest first, so a reapply
+          # (a revert of the revert) pairs with the revert, and the original
+          # PR, whose change ships again, still needs its entry.
+          if printf '%s' "$cancelled" | grep -qE "^(${tpr}|${rpr}) "; then
+            continue
+          fi
+          cancelled+="${tpr} ${rpr}"$'\n'"${rpr} ${tpr}"$'\n'
+        elif [[ "$loud" -eq 1 ]]; then
+          note "  ! #${rpr} backs out #${tpr} only in part (its diff is not the exact inverse),"
+          note "    so both still need an entry."
+        fi
+      done < <(printf '%s' "$targets" | sort -u)
+    done <<< "$range_log"
+
     # -- backward: commits in the range that the section does not mention ----
     undocumented=0
     exempted=0
+    backed_out=0
     while IFS= read -r p; do
       [[ -z "$p" ]] && continue
-      subj="$(printf '%s\n' "$subjects" | grep -m1 -F "(#${p})" || true)"
-      sha="$(printf '%s\n' "$range_log" | grep -m1 -F "(#${p})" | cut -d' ' -f1 || true)"
+      # Anchored at the end: a revert's subject also holds the reverted PR's
+      # `(#N)` (`Revert "x (#107)" (#108)`), and must not be taken for #107.
+      subj="$(printf '%s\n' "$subjects" | grep -m1 -E "\\(#${p}\\)\$" || true)"
+      sha="$(printf '%s\n' "$range_log" | grep -m1 -E "\\(#${p}\\)\$" | cut -d' ' -f1 || true)"
       # Deliberately narrow, and identical to the release-branch gate's path C
       # (#3829): a release prep, a changelog-only commit, a dependency bump or
       # a CI/workflow-only commit -- each confined to its own path set -- are
@@ -1029,6 +1096,22 @@ else
       # it. Writing one produces another such commit, and so on. The exemption
       # is safe for the same reason `chore(release):` is: the commit's content
       # IS the bookkeeping, so there is nothing it could omit.
+      partner="$(printf '%s' "$cancelled" | awk -v p="$p" '$1 == p { print $2; exit }')"
+      if [[ -n "$partner" ]]; then
+        backed_out=$((backed_out + 1))
+        note "  ~ #$p cancels out with #${partner} (a full revert, both in range; neither ships): $(printf '%s' "$subj" | cut -c1-60)"
+        # Not a failure: an entry for a change that does not ship is worth a
+        # look, but a hand-written note about the back-out is legitimate.
+        for candidate in "$p" $(printf '%s\n' "$closes_map" | grep -m1 "^${p}:" | cut -d: -f2 | tr ',' ' '); do
+          [[ -z "$candidate" ]] && continue
+          if printf '%s\n' "$primary_refs" | grep -qx "$candidate"; then
+            note "    ! warning: a pending entry still leads with #${candidate}, but #$p was backed out"
+            note "      in this range; drop the entry unless it describes the back-out."
+            break
+          fi
+        done
+        continue
+      fi
       exempt_detail=""
       if [[ -n "$sha" ]]; then
         # The verdict comes back in globals, never through a command
@@ -1074,7 +1157,7 @@ else
     fi
 
     if [[ -z "$unresolved" && "$undocumented" -eq 0 ]]; then
-      ok "pending sections reconcile with ${prev_tag}..HEAD ($(printf '%s\n' "$primary_refs" | grep -c . || true) distinct entry references, $(printf '%s\n' "$range_prs" | grep -c . || true) merged PRs, $exempted exempt)"
+      ok "pending sections reconcile with ${prev_tag}..HEAD ($(printf '%s\n' "$primary_refs" | grep -c . || true) distinct entry references, $(printf '%s\n' "$range_prs" | grep -c . || true) merged PRs, $exempted exempt, $backed_out backed out)"
     fi
   fi
 fi

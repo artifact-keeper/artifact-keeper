@@ -1087,8 +1087,10 @@ async fn release_publish_timestamp(
 }
 
 /// Monotonic floor for the `Release` `Date:` field: the moment this binary was
-/// built (`RELEASE_DATE_FLOOR_EPOCH`, baked by `build.rs`; honors
-/// `SOURCE_DATE_EPOCH` so reproducible builds stay reproducible).
+/// built (`ak_build_info::RELEASE_DATE_FLOOR_EPOCH`, baked by that crate's
+/// build script; honors `SOURCE_DATE_EPOCH` so reproducible builds stay
+/// reproducible, and is a fixed 2026-01-01 in dev and test builds so they do
+/// not depend on the clock).
 ///
 /// Why a floor exists: [`release_publish_timestamp`] replaced a `Utc::now()`
 /// stamp with a state-derived one, so at deploy every pre-existing repo steps
@@ -1115,12 +1117,9 @@ async fn release_publish_timestamp(
 /// render different bytes on different replicas and the detached-signature
 /// invariant this file exists to hold would break again.
 fn release_date_floor() -> chrono::DateTime<chrono::Utc> {
-    // Compile-time constant; build.rs validates it parses, but degrade to
-    // "no floor" (epoch 0) rather than panic inside a request handler.
-    env!("RELEASE_DATE_FLOOR_EPOCH")
-        .parse::<i64>()
-        .ok()
-        .and_then(|secs| chrono::DateTime::from_timestamp(secs, 0))
+    // Compile-time constant; degrade to "no floor" (epoch 0) rather than
+    // panic inside a request handler should it ever be out of range.
+    chrono::DateTime::from_timestamp(ak_build_info::RELEASE_DATE_FLOOR_EPOCH, 0)
         .unwrap_or(chrono::DateTime::<chrono::Utc>::UNIX_EPOCH)
 }
 

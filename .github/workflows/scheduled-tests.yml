@@ -334,7 +334,7 @@ jobs:
       # Same Node major and jscpd major as the per-PR gate in ci.yml, so the
       # two measure with the same detector.
       - name: Setup Node.js for jscpd
-        uses: actions/setup-node@v7.1.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '20'
 

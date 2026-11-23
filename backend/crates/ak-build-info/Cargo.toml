@@ -1,0 +1,13 @@
+[package]
+name = "ak-build-info"
+description = "Build metadata (commit, version, Debian Release Date floor) baked into artifact-keeper-backend"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# No dependencies, on purpose: this crate's build script is the only one in
+# the workspace that reads the build environment (GIT_SHA, SOURCE_DATE_EPOCH),
+# so a change to either reruns a script that compiles in well under a second
+# instead of the backend's proto codegen (#6181).
+[dependencies]
