@@ -96,6 +96,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "ak-build-info"
+version = "1.12.4"
+
+[[package]]
 name = "alloc-no-stdlib"
 version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -243,6 +247,7 @@ name = "artifact-keeper-backend"
 version = "1.12.4"
 dependencies = [
  "aes-gcm",
+ "ak-build-info",
  "anyhow",
  "async-stream",
  "async-trait",

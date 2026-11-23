@@ -3,7 +3,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Declaring any rerun-if-changed at all turns off cargo's default of
     // rerunning on every change in the package. That default must stay off:
-    // a rerun reads the clock below and recompiles the whole crate (#6181).
+    // a rerun regenerates the protos and recompiles the whole crate (#6181).
     // So the schemas name themselves, or an edited .proto regenerates nothing
     // and the build fails against the previous generation -- or, worse, keeps
     // compiling against it.
@@ -54,50 +54,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &["proto"],
         )?;
 
-    // The commit the binary reports (`/health` `commit`, the startup log's
-    // `git=`), taken ONLY from the `GIT_SHA` environment variable. Every
-    // build that ships sets it: docker-publish.yml passes it as a build arg
-    // to docker/Dockerfile.backend, and release.yml's `build-binaries` sets
-    // it from the checked-out commit. Without it the value is the literal
-    // `"unknown"`, which build_info.rs and health.rs already treat as valid.
-    //
-    // This used to fall back to `git rev-parse HEAD` and watch HEAD, the
-    // branch ref and `packed-refs` (#5826) so the value stayed current. That
-    // made every commit, checkout or rebase rerun this script with a new
-    // `GIT_SHA`, and a changed `rustc-env` value recompiles the whole backend
-    // crate -- lib, every test harness and both binaries -- for a change that
-    // touched no source (#6181). A dev build now embeds the same value on
-    // every commit and stays Fresh. To embed the real commit in a local
-    // build, pass it: `GIT_SHA=$(git rev-parse HEAD) cargo build ...`.
-    let git_sha = std::env::var("GIT_SHA")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "unknown".to_string());
-    println!("cargo:rustc-env=GIT_SHA={git_sha}");
-    println!("cargo:rerun-if-env-changed=GIT_SHA");
-
-    // Compile-time floor for the Debian `Release` `Date:` field, in seconds
-    // since the Unix epoch (see `release_date_floor` in
-    // src/api/handlers/debian.rs for why it must exist and why it must be a
-    // build-time constant rather than a process-start or per-request value).
-    // `SOURCE_DATE_EPOCH` wins when set — the reproducible-builds convention —
-    // otherwise the build machine's clock when this script runs. Validated
-    // here so the baked string is always a parseable integer. Nothing above
-    // watches git any more, so in a dev checkout this script, and with it the
-    // clock reading, reruns only when a .proto or one of the variables it
-    // reads changes, not on every commit (#6181). A shipped build compiles
-    // from scratch and reads the clock at build time, as before.
-    let release_date_floor = std::env::var("SOURCE_DATE_EPOCH")
-        .ok()
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .unwrap_or_else(|| {
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0)
-        });
-    println!("cargo:rustc-env=RELEASE_DATE_FLOOR_EPOCH={release_date_floor}");
-    println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
+    // The commit, version and Debian `Release` `Date:` floor are not baked
+    // here: crates/ak-build-info's build script owns them, so this script
+    // reads no build environment and reruns only for a .proto (#6181).
 
     emit_test_shard_cfg();
 

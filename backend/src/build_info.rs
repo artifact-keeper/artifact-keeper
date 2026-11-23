@@ -1,42 +1,19 @@
-//! Build/version metadata baked in at compile time.
+//! Build/version metadata baked in at compile time, re-exported from the
+//! `ak-build-info` crate (backend/crates/ak-build-info).
 //!
-//! `GIT_SHA` is provided by `build.rs` from the `GIT_SHA` build environment
-//! variable, which every shipped build sets (the Docker Publish build arg,
-//! release.yml's binaries), and is the literal `"unknown"` otherwise: a local
-//! or CI test build, which no longer reads git so a commit does not recompile
-//! the crate (#6181). Consumers must therefore treat `"unknown"` as a valid,
-//! non-fatal value.
+//! `GIT_SHA` comes from the `GIT_SHA` build environment variable, which every
+//! shipped build sets (the Docker Publish build arg, release.yml's binaries),
+//! and is the literal `"unknown"` otherwise: a local or CI test build, which
+//! does not read git, so a commit does not recompile the crate (#6181).
+//! Consumers must therefore treat `"unknown"` as a valid, non-fatal value.
 
-/// Semantic version of the running build, from `CARGO_PKG_VERSION`.
-pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-
-/// Full git commit SHA of the build, or `"unknown"` when the build did not
-/// set `GIT_SHA`. Baked by `build.rs`.
-pub const GIT_SHA: &str = env!("GIT_SHA");
-
-/// Length of the short SHA form, matching the `sha-<commit>` tag emitted by the
-/// Docker Publish workflow so a log line can be matched to an exact image.
-const SHORT_SHA_LEN: usize = 7;
-
-/// Truncate a git SHA to its short form, leaving the `"unknown"` sentinel (and
-/// any value already shorter than the short length) untouched.
-fn shorten(sha: &str) -> &str {
-    if sha == "unknown" || sha.len() < SHORT_SHA_LEN {
-        sha
-    } else {
-        &sha[..SHORT_SHA_LEN]
-    }
-}
-
-/// Short (7-char) git SHA of the build, or `"unknown"` when unavailable.
-pub fn short_sha() -> &'static str {
-    shorten(GIT_SHA)
-}
+pub use ak_build_info::{short_sha, GIT_SHA, VERSION};
 
 #[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ak_build_info::shorten;
 
     #[test]
     fn shortens_a_full_sha() {
