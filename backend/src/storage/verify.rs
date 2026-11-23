@@ -179,6 +179,9 @@ pub fn verify_sha256_stream_with_hook(
                                 expected_len = ?expected_len,
                                 "stored object is longer than its record; aborting response"
                             );
+                            crate::services::metrics_service::record_stored_object_integrity_failure(
+                                "streaming",
+                            );
                             if let Some(hook) = st.on_mismatch.take() {
                                 hook();
                             }
@@ -215,6 +218,9 @@ pub fn verify_sha256_stream_with_hook(
                                     expected_len = ?expected_len,
                                     actual_len,
                                     "stored object failed integrity verification on serve; aborting response"
+                                );
+                                crate::services::metrics_service::record_stored_object_integrity_failure(
+                                    "streaming",
                                 );
                                 st.pending = None;
                                 if let Some(hook) = st.on_mismatch.take() {
@@ -432,6 +438,7 @@ fn log_mismatch(label: &str, expected: &[u8; 32], expected_len: u64, verdict: &I
             actual_len,
             "stored object failed integrity verification on serve; answering 502"
         );
+        crate::services::metrics_service::record_stored_object_integrity_failure("before_headers");
     }
 }
 
