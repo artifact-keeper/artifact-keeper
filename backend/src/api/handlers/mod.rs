@@ -626,6 +626,7 @@ pub mod composer;
 pub mod composer_upstream_search;
 pub mod conan;
 pub mod conda;
+pub mod conda_warm;
 pub mod cran;
 pub mod curation;
 pub mod debian;

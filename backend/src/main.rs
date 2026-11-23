@@ -1287,6 +1287,13 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         }
     }
 
+    // #4184: resume the conda warm jobs a previous process left running.
+    // Detached deliberately: lifecycle is governed by the shutdown token.
+    let _conda_warm_resume = artifact_keeper_backend::api::handlers::conda_warm::spawn_resume(
+        state.clone(),
+        runtime_shutdown_token.clone(),
+    );
+
     // #2249: proactive packument invalidation from npm's replication feed.
     // Opt-in (NPM_UPSTREAM_FEED_ENABLED); one replica consumes cluster-wide
     // via an advisory lock. Detached deliberately: lifecycle is governed by
