@@ -43,7 +43,9 @@ now, how old it is, and whether it is older than a limit you set (#5177).
 ```
 
 `state` is `ok`, `stale` (older than the limit) or `unknown` (the engine is
-configured but no source reported a build time). Age is measured against the
+configured but no source reported a build time). `max_age_seconds` is `null`
+while no limit is set; the example above runs with
+`SCAN_VULN_DB_MAX_AGE_HOURS=168`. Age is measured against the
 current time, not the last scan, so an air-gapped install whose database never
 updates becomes `stale` on schedule even when nothing new is scanned.
 
@@ -70,17 +72,23 @@ lookups) have no local database and are not listed.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `SCAN_VULN_DB_MAX_AGE_HOURS` | `168` (7 days) | Age past which a database is `stale`. `0` turns the check off; ages are still reported. |
+| `SCAN_VULN_DB_MAX_AGE_HOURS` | unset (off) | Age past which a database is `stale`, for example `168` for 7 days. Unset, `0` or not a whole number: the check is off, no engine is ever `stale` and nothing is logged; ages are still reported. |
 | `TRIVY_ADAPTER_VULNDB_TOKEN` | unset | Bearer token for the adapter's DB route (its `SCANNER_ADAPTER_TOKEN`). |
 
 ## Metrics and logs
 
 | Metric | Labels | Meaning |
 | --- | --- | --- |
-| `ak_scanner_vuln_db_age_seconds` | `engine` | Age of the installed database. |
+| `ak_scanner_vuln_db_age_seconds` | `engine` | Age of the installed database. `NaN` while the engine is `unknown`, never a frozen earlier value. |
 | `ak_scanner_vuln_db_stale` | `engine` | `1` while the database is older than the limit, else `0`. |
+| `ak_scanner_vuln_db_state` | `engine`, `state` | `1` for the engine's current state (`ok`, `stale`, `unknown`), `0` for the others. |
 | `ak_scanner_vuln_db_max_age_seconds` | | The limit in seconds, `0` when off. |
 | `ak_scanner_vuln_db_stale_warnings_total` | `engine` | Stale warnings logged. |
+
+An engine that stops reporting (the adapter lost its token, no scans in 48
+hours) turns `unknown`, which an age alert does not see: alert on
+`ak_scanner_vuln_db_state{state="unknown"} == 1` as well as on
+`ak_scanner_vuln_db_stale == 1`.
 
 While an engine is stale the backend logs a warning naming the engine, its
 database and its age: at once when it becomes stale, then at most once an

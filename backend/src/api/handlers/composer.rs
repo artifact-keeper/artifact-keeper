@@ -2017,21 +2017,28 @@ async fn search_hosted(
 }
 
 /// Merge source pages in priority order (#6332): the first source naming a
-/// package keeps it, the totals add up (an upper bound when sources share
-/// names), and there is a next page while any source has one. Every source is
-/// asked for the same page, so each of its hits shows up on some page.
+/// package keeps it, and there is a next page while any source has one. Every
+/// source is asked for the same page, so each of its hits shows up on some
+/// page. `total` counts hits that can be returned: each source's total, less
+/// the hits of this page another source already named. It stays an upper
+/// bound across pages (a name two sources share on a page not fetched is
+/// counted twice), never a count of hits this answer dropped.
 fn merge_search_pages(pages: Vec<SearchPage>) -> SearchPage {
     let mut seen = std::collections::HashSet::new();
     let mut merged = SearchPage::default();
     for page in pages {
-        merged.total = merged.total.saturating_add(page.total);
+        let offered = page.results.len() as i64;
+        let mut kept = 0i64;
         merged.has_next |= page.has_next;
         for hit in page.results {
             let name = hit["name"].as_str().unwrap_or_default().to_string();
             if seen.insert(name) {
                 merged.results.push(hit);
+                kept += 1;
             }
         }
+        let total = page.total.saturating_sub(offered - kept).max(kept);
+        merged.total = merged.total.saturating_add(total);
     }
     merged
 }
@@ -2118,12 +2125,14 @@ async fn search_upstreams(
                     targets.push(repo);
                 }
                 let hits = up::curated(&state.db, &targets, &page).await;
+                // Curated-out hits are not returned, so they are not counted.
+                let dropped = (page.hits.len() - hits.len()) as i64;
                 pages.push(SearchPage {
                     results: hits
                         .iter()
                         .map(|h| search_hit(url_repo_key, &h.name, &h.description))
                         .collect(),
-                    total: page.total,
+                    total: page.total.saturating_sub(dropped).max(hits.len() as i64),
                     has_next: page.has_next,
                 });
             }
@@ -2160,10 +2169,14 @@ async fn search(
     pages.extend(upstream_pages);
     let page = merge_search_pages(pages);
 
-    // #5495: a Virtual whose search found nothing while a forwarded member
-    // was down cannot say "no such package"; the client retries instead. A
+    // #5495: a Virtual whose search returns nothing while a forwarded member
+    // was down cannot say "no such package"; the client retries instead. The
+    // test is on what is returned, so hits curation removed do not hide it. A
     // Remote asked directly, or a Virtual with hits, fails soft.
-    if repo.repo_type == RepositoryType::Virtual && !unavailable.is_empty() && page.total == 0 {
+    if repo.repo_type == RepositoryType::Virtual
+        && !unavailable.is_empty()
+        && page.results.is_empty()
+    {
         return Err(super::composer_upstream_search::nothing_found_while_unavailable());
     }
 
@@ -5184,7 +5197,8 @@ mod metadata_db_tests {
                     "description": "up monolog/monolog",
                     "url": format!("/composer/{}/p2/monolog/monolog.json", fx.repo_key),
                 }],
-                "total": 2,
+                // The unusable `../evil` is not returned, so not counted.
+                "total": 1,
             })
         );
         assert_eq!(again_status, axum::http::StatusCode::OK);
@@ -5325,8 +5339,9 @@ mod metadata_db_tests {
             json,
             serde_json::json!({
                 "results": [hit("aktest/lib", "hosted"), hit("aktest/remote", "up aktest/remote")],
-                // Totals add up: 1 hosted + 3 upstream (an upper bound).
-                "total": 4,
+                // 1 hosted + 3 upstream, less the curated-out hit and the
+                // name the hosted member already returned: what is returned.
+                "total": 2,
             })
         );
         on.verify().await;
@@ -5391,6 +5406,109 @@ mod metadata_db_tests {
         assert_eq!(found["total"], 1);
         assert_eq!(found["results"][0]["name"], "aktest/lib");
         assert_eq!(none_status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// No hosted hit, one forwarding Remote whose every hit curation drops,
+    /// one forwarding Remote down: nothing is returned while a member was
+    /// unavailable, so the Virtual answers the #5495 503, not an empty 200.
+    #[tokio::test]
+    async fn virtual_search_with_everything_curated_out_and_a_member_down_is_503_6332() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(vf) = tdh::Fixture::setup("virtual", "composer").await else {
+            return;
+        };
+        let curated = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/search.json"))
+            .respond_with(upstream_answer(&["evil/one", "evil/two"]))
+            .mount(&curated)
+            .await;
+        let down = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/search.json"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&down)
+            .await;
+        let (r_cur, _k1, d1) = tdh::create_repo(&vf.pool, "remote", "composer").await;
+        let (r_down, _k2, d2) = tdh::create_repo(&vf.pool, "remote", "composer").await;
+        for (id, url, curation) in [(r_cur, curated.uri(), true), (r_down, down.uri(), false)] {
+            sqlx::query(
+                "UPDATE repositories SET upstream_url = $1, curation_enabled = $2, \
+                 curation_default_action = 'allow' WHERE id = $3",
+            )
+            .bind(url)
+            .bind(curation)
+            .bind(id)
+            .execute(&vf.pool)
+            .await
+            .expect("remote member");
+            opt_in_upstream_search(&vf.pool, id).await;
+        }
+        sqlx::query(
+            "INSERT INTO curation_rules (staging_repo_id, package_pattern, version_constraint, \
+             architecture, action, priority, reason, created_by) \
+             VALUES ($1, 'evil/*', '*', '*', 'block', 100, '#6332 test block', $2)",
+        )
+        .bind(r_cur)
+        .bind(vf.user_id)
+        .execute(&vf.pool)
+        .await
+        .expect("block rule");
+        add_member(&vf.pool, vf.repo_id, r_cur, 0).await;
+        add_member(&vf.pool, vf.repo_id, r_down, 5).await;
+        for m in [r_cur, r_down] {
+            tdh::grant_repo_access(&vf.pool, m, vf.user_id).await;
+        }
+        let cache = tempfile::tempdir().expect("proxy cache dir");
+        let state = tdh::build_state_with_proxy(
+            vf.pool.clone(),
+            cache.path().to_str().unwrap(),
+            tdh::build_proxy_service_with_fs(vf.pool.clone(), cache.path().to_str().unwrap()),
+        );
+        let auth = tdh::make_auth(vf.user_id, &vf.username);
+        let (status, _) = tdh::send(
+            tdh::router_with_auth(super::router(), state, auth),
+            tdh::get(format!("/{}/search.json?q=evil", vf.repo_key)),
+        )
+        .await;
+        let _ = sqlx::query("DELETE FROM curation_rules WHERE staging_repo_id = $1")
+            .bind(r_cur)
+            .execute(&vf.pool)
+            .await;
+        for (id, dir) in [(r_cur, d1), (r_down, d2)] {
+            tdh::cleanup(&vf.pool, id, Uuid::new_v4()).await;
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        vf.teardown().await;
+        assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn merged_total_counts_only_returned_hits_6332() {
+        let hit = |n: &str| serde_json::json!({"name": n});
+        let merged = merge_search_pages(vec![
+            SearchPage {
+                results: vec![hit("a/a")],
+                total: 1,
+                has_next: false,
+            },
+            SearchPage {
+                results: vec![hit("a/a"), hit("b/b")],
+                total: 2,
+                has_next: false,
+            },
+        ]);
+        assert_eq!(merged.results.len(), 2);
+        assert_eq!(merged.total, 2);
+        // A later page another source has stays counted (upper bound).
+        let paged = merge_search_pages(vec![SearchPage {
+            results: vec![hit("c/c")],
+            total: 30,
+            has_next: true,
+        }]);
+        assert_eq!((paged.total, paged.has_next), (30, true));
     }
 
     // -- Virtual repo: priority order — first member with the package wins -

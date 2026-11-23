@@ -53,14 +53,9 @@ use sqlx::PgPool;
 use utoipa::ToSchema;
 
 /// Env var: the age, in hours, past which a vulnerability database is
-/// reported stale. `0` turns the staleness check off (ages are still
-/// reported). Unset or unparsable: [`DEFAULT_MAX_AGE_HOURS`].
+/// reported stale. Unset, empty, `0` or unparsable: the staleness check is
+/// off (ages are still reported), which is the behaviour before #5177.
 pub const VULN_DB_MAX_AGE_HOURS_ENV: &str = "SCAN_VULN_DB_MAX_AGE_HOURS";
-
-/// Default staleness limit: seven days. Both engines publish a database at
-/// least daily, so a week means updates have stopped (an air-gapped install
-/// nobody re-imported into, a broken mirror), not a slow day.
-pub const DEFAULT_MAX_AGE_HOURS: u64 = 168;
 
 /// Env var naming the bearer token sent to the adapter's DB route; also read
 /// as `<NAME>_FILE`. Must match the adapter's `SCANNER_ADAPTER_TOKEN`. When
@@ -88,6 +83,9 @@ pub const AGE_METRIC: &str = "ak_scanner_vuln_db_age_seconds";
 pub const STALE_METRIC: &str = "ak_scanner_vuln_db_stale";
 /// The configured limit in seconds, 0 when the check is off.
 pub const MAX_AGE_METRIC: &str = "ak_scanner_vuln_db_max_age_seconds";
+/// One-hot state per engine: 1 for the current `state` label
+/// (`ok`, `stale`, `unknown`), 0 for the others.
+pub const STATE_METRIC: &str = "ak_scanner_vuln_db_state";
 /// Stale warnings logged, per engine.
 pub const STALE_WARNINGS_METRIC: &str = "ak_scanner_vuln_db_stale_warnings_total";
 
@@ -153,21 +151,20 @@ pub struct VulnDbStatusReport {
     pub engines: Vec<VulnDbEngineStatus>,
 }
 
-/// The staleness limit from `raw` (the env value). `None` disables it.
+/// The staleness limit from `raw` (the env value). `None` disables it:
+/// deployments that set no limit keep their behaviour (no stale state, no
+/// warning).
 pub fn parse_max_age(raw: Option<&str>) -> Option<Duration> {
-    let hours = match raw.map(str::trim).filter(|s| !s.is_empty()) {
-        None => DEFAULT_MAX_AGE_HOURS,
-        Some(v) => match v.parse::<u64>() {
-            Ok(h) => h,
-            Err(_) => {
-                tracing::warn!(
-                    "{VULN_DB_MAX_AGE_HOURS_ENV}={v:?} is not a whole number of hours; using {DEFAULT_MAX_AGE_HOURS}"
-                );
-                DEFAULT_MAX_AGE_HOURS
-            }
-        },
-    };
-    (hours > 0).then(|| Duration::from_secs(hours.saturating_mul(3600)))
+    let v = raw.map(str::trim).filter(|s| !s.is_empty())?;
+    match v.parse::<u64>() {
+        Ok(hours) => (hours > 0).then(|| Duration::from_secs(hours.saturating_mul(3600))),
+        Err(_) => {
+            tracing::warn!(
+                "{VULN_DB_MAX_AGE_HOURS_ENV}={v:?} is not a whole number of hours; the staleness check is off"
+            );
+            None
+        }
+    }
 }
 
 /// The configured limit, read once.
@@ -501,15 +498,25 @@ pub fn publish(report: &VulnDbStatusReport) {
     metrics::gauge!(MAX_AGE_METRIC).set(report.max_age_seconds.unwrap_or(0) as f64);
     for e in &report.engines {
         let engine = e.engine.clone();
-        if let Some(age) = e.age_seconds {
-            metrics::gauge!(AGE_METRIC, "engine" => engine.clone()).set(age as f64);
-        }
+        // An engine no source answered for has no age: the gauge is set to
+        // NaN rather than left at its last value, so an age alert cannot
+        // keep reading a frozen number; `ak_scanner_vuln_db_state` says why.
+        metrics::gauge!(AGE_METRIC, "engine" => engine.clone())
+            .set(e.age_seconds.map_or(f64::NAN, |a| a as f64));
         let stale = e.state == VulnDbState::Stale;
         metrics::gauge!(STALE_METRIC, "engine" => engine.clone()).set(if stale {
             1.0
         } else {
             0.0
         });
+        for (label, st) in [
+            ("ok", VulnDbState::Ok),
+            ("stale", VulnDbState::Stale),
+            ("unknown", VulnDbState::Unknown),
+        ] {
+            metrics::gauge!(STATE_METRIC, "engine" => engine.clone(), "state" => label)
+                .set(if e.state == st { 1.0 } else { 0.0 });
+        }
         if stale && should_warn(&engine) {
             metrics::counter!(STALE_WARNINGS_METRIC, "engine" => engine.clone()).increment(1);
             tracing::warn!(
@@ -559,6 +566,10 @@ pub fn describe_metrics() {
         MAX_AGE_METRIC,
         metrics::Unit::Seconds,
         "SCAN_VULN_DB_MAX_AGE_HOURS in seconds, 0 when the staleness check is off"
+    );
+    metrics::describe_gauge!(
+        STATE_METRIC,
+        "1 for each engine's current vulnerability-database state (ok, stale, unknown), 0 for the others"
     );
     metrics::describe_counter!(
         STALE_WARNINGS_METRIC,
@@ -615,15 +626,24 @@ mod tests {
     }
 
     #[test]
-    fn max_age_defaults_to_a_week_and_zero_turns_it_off() {
-        let week = Some(Duration::from_secs(168 * 3600));
-        assert_eq!(parse_max_age(None), week);
-        assert_eq!(parse_max_age(Some("")), week);
-        assert_eq!(parse_max_age(Some("soon")), week);
-        assert_eq!(parse_max_age(Some("0")), None);
+    fn max_age_is_off_unless_set() {
+        for off in [
+            None,
+            Some(""),
+            Some(" "),
+            Some("soon"),
+            Some("0"),
+            Some("-5"),
+        ] {
+            assert_eq!(parse_max_age(off), None, "{off:?}");
+        }
         assert_eq!(
             parse_max_age(Some(" 24 ")),
             Some(Duration::from_secs(86_400))
+        );
+        assert_eq!(
+            parse_max_age(Some("168")),
+            Some(Duration::from_secs(168 * 3600))
         );
     }
 
@@ -645,7 +665,7 @@ mod tests {
             &[obs("grype", "2026-11-01T12:00:00Z", VulnDbSource::Scanner)],
             &["grype"],
             now,
-            parse_max_age(None),
+            parse_max_age(Some("168")),
         );
         let g = &report.engines[0];
         assert_eq!(g.engine, "grype");
@@ -664,7 +684,7 @@ mod tests {
             "2026-11-23T06:00:00Z",
             VulnDbSource::ScanHistory,
         )];
-        let report = summarize(&o, &[], now, parse_max_age(None));
+        let report = summarize(&o, &[], now, parse_max_age(Some("168")));
         assert_eq!(report.engines[0].state, VulnDbState::Ok);
         assert_eq!(report.engines[0].age_seconds, Some(6 * 3600));
         // Off: even a year-old DB is only reported.
@@ -697,7 +717,7 @@ mod tests {
             ],
             &["trivy"],
             now,
-            parse_max_age(None),
+            parse_max_age(Some("168")),
         );
         assert_eq!(report.engines.len(), 1);
         let t = &report.engines[0];
@@ -722,7 +742,12 @@ mod tests {
 
     #[test]
     fn a_configured_engine_with_no_data_is_unknown_not_fresh() {
-        let report = summarize(&[], &["trivy", "grype"], Utc::now(), parse_max_age(None));
+        let report = summarize(
+            &[],
+            &["trivy", "grype"],
+            Utc::now(),
+            parse_max_age(Some("168")),
+        );
         assert_eq!(report.engines.len(), 2);
         assert!(report
             .engines

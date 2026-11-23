@@ -183,9 +183,8 @@ pub(crate) struct UpstreamPage {
 /// package names are dropped.
 pub(crate) fn parse(body: &[u8], req: &SearchRequest<'_>) -> Option<UpstreamPage> {
     let doc: serde_json::Value = serde_json::from_slice(body).ok()?;
-    let hits: Vec<UpstreamHit> = doc
-        .get("results")?
-        .as_array()?
+    let results = doc.get("results")?.as_array()?;
+    let hits: Vec<UpstreamHit> = results
         .iter()
         .filter_map(|hit| {
             let name = hit.get("name")?.as_str()?;
@@ -204,11 +203,21 @@ pub(crate) fn parse(body: &[u8], req: &SearchRequest<'_>) -> Option<UpstreamPage
         })
         .take(usize::try_from(req.per_page).unwrap_or(0))
         .collect();
-    let total = doc
+    let unusable = results
+        .iter()
+        .filter(|h| {
+            !h.get("name")
+                .and_then(|n| n.as_str())
+                .is_some_and(is_plain_package_name)
+        })
+        .count() as i64;
+    // `total` counts what can be returned: the names dropped here are not.
+    let total = (doc
         .get("total")
         .and_then(|t| t.as_i64())
-        .unwrap_or(hits.len() as i64)
-        .max(0);
+        .unwrap_or(results.len() as i64)
+        - unusable)
+        .max(hits.len() as i64);
     let has_next = doc
         .get("next")
         .and_then(|n| n.as_str())
@@ -295,27 +304,36 @@ async fn fetch(
     req: &SearchRequest<'_>,
 ) -> Outcome {
     let path = upstream_path(req);
+    // One deadline for the whole read: the budget-permit wait and the
+    // upstream fetch share it, so a full budget cannot double the bound.
     let timeout = search_timeout();
+    let deadline = tokio::time::Instant::now() + timeout;
     let outcome =
         match proxy_helpers::reserve_metadata_budget_bounded(MAX_BODY_BYTES, Some(timeout), None)
             .await
         {
             Err(_) => Outcome::Unavailable,
             Ok(_permit) => {
-                let read = crate::services::upstream_circuit::within_own_deadline(
-                    timeout,
-                    proxy_helpers::proxy_fetch_uncached_capped(
-                        proxy,
-                        remote.id,
-                        &remote.key,
-                        upstream_url,
-                        &path,
-                        MAX_BODY_BYTES,
-                    ),
-                )
-                .await;
+                let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+                let read = if left.is_zero() {
+                    None
+                } else {
+                    crate::services::upstream_circuit::within_own_deadline(
+                        left,
+                        proxy_helpers::proxy_fetch_uncached_capped(
+                            proxy,
+                            remote.id,
+                            &remote.key,
+                            upstream_url,
+                            &path,
+                            MAX_BODY_BYTES,
+                        ),
+                    )
+                    .await
+                    .ok()
+                };
                 match read {
-                    Err(_) => {
+                    None => {
                         tracing::warn!(
                             repo = %remote.key,
                             timeout_secs = timeout.as_secs_f64(),
@@ -323,11 +341,11 @@ async fn fetch(
                         );
                         Outcome::Unavailable
                     }
-                    Ok(Err(resp)) if proxy_helpers::is_member_unavailable_response(&resp) => {
+                    Some(Err(resp)) if proxy_helpers::is_member_unavailable_response(&resp) => {
                         Outcome::Unavailable
                     }
-                    Ok(Err(_)) => Outcome::Miss,
-                    Ok(Ok(body)) => {
+                    Some(Err(_)) => Outcome::Miss,
+                    Some(Ok(body)) => {
                         parse(&body, req).map_or(Outcome::Miss, |p| Outcome::Page(Arc::new(p)))
                     }
                 }
@@ -399,28 +417,54 @@ pub(crate) async fn forwarding_remotes(db: &PgPool, candidates: Vec<RepoInfo>) -
 
 /// The hits of `page` that every one of `targets` lets through curation.
 /// `targets` are the Remote that answered and, for a Virtual search, the
-/// Virtual. An evaluation error drops the hit, as the proxy path refuses.
+/// Virtual. One rule-set read per target with curation on, whatever the page
+/// size (#6332); a `block` drops the hit, and a failed read drops the whole
+/// page, as the proxy path refuses when it cannot evaluate. Flags serve, as
+/// on a download; a search hit is not a download, so they are not logged.
 pub(crate) async fn curated(
     db: &PgPool,
     targets: &[&RepoInfo],
     page: &UpstreamPage,
 ) -> Vec<UpstreamHit> {
-    if !targets.iter().any(|t| t.curation_enabled) {
-        return page.hits.clone();
-    }
-    let mut kept = Vec::with_capacity(page.hits.len());
-    'hits: for hit in &page.hits {
-        for target in targets {
-            if proxy_helpers::evaluate_curation(db, *target, &hit.name, None)
-                .await
-                .is_err()
-            {
-                continue 'hits;
+    let names: Vec<&str> = page.hits.iter().map(|h| h.name.as_str()).collect();
+    let mut keep = vec![true; names.len()];
+    let svc = crate::services::curation_service::CurationService::new(db.clone());
+    for target in targets {
+        if !target.curation_enabled || !matches!(target.repo_type.as_str(), "remote" | "virtual") {
+            continue;
+        }
+        match svc
+            .evaluate_pep503_packages(
+                target.id,
+                &target.curation_default_action,
+                Some(&target.format),
+                &names,
+            )
+            .await
+        {
+            Ok(evals) => {
+                for (k, e) in keep.iter_mut().zip(evals) {
+                    if e.action == "block" {
+                        *k = false;
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    repo = %target.key,
+                    error = %e,
+                    "curation evaluation failed; dropping the upstream search hits"
+                );
+                return Vec::new();
             }
         }
-        kept.push(hit.clone());
     }
-    kept
+    page.hits
+        .iter()
+        .zip(keep)
+        .filter(|(_, k)| *k)
+        .map(|(h, _)| h.clone())
+        .collect()
 }
 
 /// The 503 a Virtual answers when it found nothing while a forwarded member
@@ -494,7 +538,8 @@ mod tests {
         );
         assert_eq!(page.hits[0].description, "Logs");
         assert_eq!(page.hits[1].description, "");
-        assert_eq!(page.total, 40);
+        // 40 upstream, minus the two names this page showed unusable.
+        assert_eq!(page.total, 38);
         assert!(page.has_next);
 
         let last = parse(br#"{"results":[{"name":"a/b"}],"total":1}"#, &req(15, 1)).unwrap();
