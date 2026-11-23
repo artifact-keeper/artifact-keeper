@@ -2317,8 +2317,142 @@ async fn claim_due_webhook_deliveries_for_webhooks(
     .await
 }
 
-/// The claim query. `only_webhooks` is `None` on every production path; the
-/// same statement, ranking and locking serve the test-only restricted form.
+/// Lanes per claim kept for endpoints that are not failing (#5195): a claim
+/// gives at most `max_webhooks - WEBHOOK_HEALTHY_LANE_RESERVE` lanes to
+/// webhooks with consecutive failures, so dead endpoints leaving backoff
+/// together cannot take every lane from healthy ones.
+const WEBHOOK_HEALTHY_LANE_RESERVE: i64 = 2;
+
+/// Advisory-lock class for the per-webhook claim lock (the issue number).
+const WEBHOOK_CLAIM_LOCK_CLASS: i32 = 5195;
+
+/// Statement 1 of the claim: pick the webhooks to give lanes to and take a
+/// transaction-scoped advisory lock on each one, skipping any webhook another
+/// claimer holds. `heads` reads each webhook's oldest due rows from an
+/// index-only, ordered scan of migration 417's index that stops after
+/// `per_webhook` rows (reading any other column makes the planner sort the
+/// whole backlog); `eligible` looks them up by primary key to drop webhooks
+/// whose lane is visibly in flight. The lock is taken on the picked rows only:
+/// `picked` is materialized and limited, so the volatile lock call cannot run
+/// on rows that are filtered out.
+const WEBHOOK_CLAIM_LANES_SQL: &str = r#"
+WITH hooks AS (
+    SELECT w.id, w.delivery_failures > 0 AS failing
+    FROM webhooks w
+    WHERE (w.delivery_backoff_until IS NULL OR w.delivery_backoff_until <= NOW())
+      AND ($3::uuid[] IS NULL OR w.id = ANY($3))
+),
+heads AS (
+    SELECT h.id AS webhook_id, h.failing, r.id, r.next_retry_at
+    FROM hooks h
+    CROSS JOIN LATERAL (
+        SELECT d.id, d.next_retry_at
+        FROM webhook_deliveries d
+        WHERE d.webhook_id = h.id
+          AND d.success = false
+          AND d.attempts < d.max_attempts
+          AND d.next_retry_at IS NOT NULL
+          AND d.next_retry_at <= NOW()
+        ORDER BY d.next_retry_at ASC, d.id ASC
+        LIMIT $2
+    ) r
+),
+eligible AS (
+    SELECT heads.webhook_id,
+           bool_or(heads.failing) AS failing,
+           MIN(heads.next_retry_at) AS oldest
+    FROM heads
+    JOIN webhook_deliveries d ON d.id = heads.id
+    GROUP BY heads.webhook_id
+    HAVING NOT bool_or(d.claim_expires_at IS NOT NULL AND d.claim_expires_at > NOW())
+),
+picked AS MATERIALIZED (
+    SELECT webhook_id
+    FROM (
+        SELECT webhook_id, failing, oldest,
+               ROW_NUMBER() OVER (PARTITION BY failing ORDER BY oldest, webhook_id) AS nth
+        FROM eligible
+    ) e
+    WHERE NOT failing OR nth <= $4
+    ORDER BY oldest ASC, webhook_id ASC
+    LIMIT $1
+)
+SELECT webhook_id
+FROM picked
+WHERE pg_try_advisory_xact_lock($5, hashtext(webhook_id::text))
+"#;
+
+/// Statement 2 of the claim, run after statement 1 in the same transaction,
+/// so under a snapshot taken after the webhook locks were acquired: a claimer
+/// that held one of these locks before has committed, and its claims are
+/// visible here. `lanes` re-checks backoff and in-flight state for the locked
+/// webhooks, which makes the one-lane-per-endpoint rule race-free across
+/// replicas. `candidate` locks each picked row by primary key and re-checks
+/// the due and unclaimed predicates on the locked version; driving the lock
+/// from the id list keeps the planner off 067's next_retry_at index, which
+/// would walk every due row in the table.
+const WEBHOOK_CLAIM_ROWS_SQL: &str = r#"
+WITH heads AS (
+    SELECT w.id AS webhook_id, r.id, r.next_retry_at
+    FROM webhooks w
+    CROSS JOIN LATERAL (
+        SELECT d.id, d.next_retry_at
+        FROM webhook_deliveries d
+        WHERE d.webhook_id = w.id
+          AND d.success = false
+          AND d.attempts < d.max_attempts
+          AND d.next_retry_at IS NOT NULL
+          AND d.next_retry_at <= NOW()
+        ORDER BY d.next_retry_at ASC, d.id ASC
+        LIMIT $1
+    ) r
+    WHERE w.id = ANY($2::uuid[])
+      AND (w.delivery_backoff_until IS NULL OR w.delivery_backoff_until <= NOW())
+),
+lanes AS (
+    SELECT heads.webhook_id
+    FROM heads
+    JOIN webhook_deliveries d ON d.id = heads.id
+    GROUP BY heads.webhook_id
+    HAVING NOT bool_or(d.claim_expires_at IS NOT NULL AND d.claim_expires_at > NOW())
+),
+candidate AS (
+    SELECT l.id
+    FROM (SELECT heads.id FROM heads JOIN lanes USING (webhook_id)) p
+    CROSS JOIN LATERAL (
+        SELECT d.id
+        FROM webhook_deliveries d
+        WHERE d.id = p.id
+          AND d.success = false
+          AND d.next_retry_at IS NOT NULL
+          AND d.next_retry_at <= NOW()
+          AND d.attempts < d.max_attempts
+          AND (d.claim_expires_at IS NULL OR d.claim_expires_at <= NOW())
+        FOR UPDATE SKIP LOCKED
+    ) l
+),
+claimed AS (
+    UPDATE webhook_deliveries d
+    SET claimed_by = $3,
+        claim_token = gen_random_uuid(),
+        claim_expires_at = NOW() + make_interval(secs => $4)
+    FROM candidate
+    WHERE d.id = candidate.id
+    RETURNING d.id, d.webhook_id, d.event, d.payload, d.attempts, d.max_attempts,
+              d.claim_token, d.claimed_by, d.claim_expires_at, d.next_retry_at
+)
+SELECT id, webhook_id, event, payload, attempts, max_attempts,
+       claim_token, claimed_by, claim_expires_at
+FROM claimed
+ORDER BY next_retry_at ASC, id ASC
+"#;
+
+/// The claim, as two statements in one transaction (see
+/// [`WEBHOOK_CLAIM_LANES_SQL`] and [`WEBHOOK_CLAIM_ROWS_SQL`]); the advisory
+/// locks are released at commit, by which time the claims are visible to
+/// every other claimer. `only_webhooks` is `None` on every production path;
+/// the same statements, ranking and locking serve the test-only restricted
+/// form.
 async fn claim_due_webhook_deliveries_of(
     db: &sqlx::PgPool,
     max_webhooks: i64,
@@ -2329,89 +2463,30 @@ async fn claim_due_webhook_deliveries_of(
 ) -> std::result::Result<Vec<Claimed<RetryDeliveryRow>>, String> {
     use sqlx::Row;
 
-    // Plan shape matters here (scripts/perf/webhook-claim-cost.sh):
-    // - `heads` reads each eligible webhook's oldest due rows from an
-    //   index-only, ordered scan of migration 417's index that stops after
-    //   `per_webhook` rows; it reads no other column, or the planner would
-    //   sort the webhook's whole backlog instead;
-    // - `lanes` looks those rows up by primary key to skip a webhook whose
-    //   lane is in flight (any of its oldest due rows holds a live claim);
-    // - `candidate` locks each picked row by primary key and re-checks the
-    //   due and unclaimed predicates on the locked version, so a row claimed
-    //   or finished concurrently is skipped rather than replaced. Driving
-    //   the lock from the id list keeps the planner off 067's next_retry_at
-    //   index, which would walk every due row in the table.
-    let raw_rows = sqlx::query(
-        r#"
-        WITH hooks AS (
-            SELECT w.id
-            FROM webhooks w
-            WHERE (w.delivery_backoff_until IS NULL OR w.delivery_backoff_until <= NOW())
-              AND ($5::uuid[] IS NULL OR w.id = ANY($5))
-        ),
-        heads AS (
-            SELECT h.id AS webhook_id, r.id, r.next_retry_at
-            FROM hooks h
-            CROSS JOIN LATERAL (
-                SELECT d.id, d.next_retry_at
-                FROM webhook_deliveries d
-                WHERE d.webhook_id = h.id
-                  AND d.success = false
-                  AND d.attempts < d.max_attempts
-                  AND d.next_retry_at IS NOT NULL
-                  AND d.next_retry_at <= NOW()
-                ORDER BY d.next_retry_at ASC, d.id ASC
-                LIMIT $2
-            ) r
-        ),
-        lanes AS (
-            SELECT heads.webhook_id
-            FROM heads
-            JOIN webhook_deliveries d ON d.id = heads.id
-            GROUP BY heads.webhook_id
-            HAVING NOT bool_or(d.claim_expires_at IS NOT NULL AND d.claim_expires_at > NOW())
-            ORDER BY MIN(heads.next_retry_at) ASC, heads.webhook_id ASC
-            LIMIT $1
-        ),
-        candidate AS (
-            SELECT l.id
-            FROM (SELECT heads.id FROM heads JOIN lanes USING (webhook_id)) p
-            CROSS JOIN LATERAL (
-                SELECT d.id
-                FROM webhook_deliveries d
-                WHERE d.id = p.id
-                  AND d.success = false
-                  AND d.next_retry_at IS NOT NULL
-                  AND d.next_retry_at <= NOW()
-                  AND d.attempts < d.max_attempts
-                  AND (d.claim_expires_at IS NULL OR d.claim_expires_at <= NOW())
-                FOR UPDATE SKIP LOCKED
-            ) l
-        ),
-        claimed AS (
-            UPDATE webhook_deliveries d
-            SET claimed_by = $3,
-                claim_token = gen_random_uuid(),
-                claim_expires_at = NOW() + make_interval(secs => $4)
-            FROM candidate
-            WHERE d.id = candidate.id
-            RETURNING d.id, d.webhook_id, d.event, d.payload, d.attempts, d.max_attempts,
-                      d.claim_token, d.claimed_by, d.claim_expires_at, d.next_retry_at
-        )
-        SELECT id, webhook_id, event, payload, attempts, max_attempts,
-               claim_token, claimed_by, claim_expires_at
-        FROM claimed
-        ORDER BY next_retry_at ASC, id ASC
-        "#,
-    )
-    .bind(max_webhooks)
-    .bind(per_webhook)
-    .bind(claimed_by)
-    .bind(claim_ttl_secs)
-    .bind(only_webhooks)
-    .fetch_all(db)
-    .await
-    .map_err(|e| format!("Failed to claim retry queue: {}", e))?;
+    let err = |e: sqlx::Error| format!("Failed to claim retry queue: {}", e);
+    let mut tx = db.begin().await.map_err(err)?;
+    let locked: Vec<Uuid> = sqlx::query_scalar(WEBHOOK_CLAIM_LANES_SQL)
+        .bind(max_webhooks)
+        .bind(per_webhook)
+        .bind(only_webhooks)
+        .bind(failing_lane_cap(max_webhooks))
+        .bind(WEBHOOK_CLAIM_LOCK_CLASS)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(err)?;
+    if locked.is_empty() {
+        tx.commit().await.map_err(err)?;
+        return Ok(Vec::new());
+    }
+    let raw_rows = sqlx::query(WEBHOOK_CLAIM_ROWS_SQL)
+        .bind(per_webhook)
+        .bind(&locked)
+        .bind(claimed_by)
+        .bind(claim_ttl_secs)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(err)?;
+    tx.commit().await.map_err(err)?;
 
     Ok(raw_rows
         .into_iter()
@@ -2431,6 +2506,11 @@ async fn claim_due_webhook_deliveries_of(
             )
         })
         .collect())
+}
+
+/// How many of `max_webhooks` lanes one claim may give to failing webhooks.
+fn failing_lane_cap(max_webhooks: i64) -> i64 {
+    (max_webhooks - WEBHOOK_HEALTHY_LANE_RESERVE).max(0)
 }
 
 /// Re-extend the caller's claim on one delivery immediately before the send.
@@ -2503,10 +2583,12 @@ const WEBHOOK_DELIVERY_POLL_SECS_DEFAULT: u64 = 5;
 const WEBHOOK_BACKLOG_GAUGE_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Ceiling on one endpoint's backoff (#5195), in seconds;
-/// `WEBHOOK_ENDPOINT_BACKOFF_MAX_SECS` overrides it and `0` turns endpoint
-/// backoff off. The schedule follows the per-delivery retry schedule (30 s,
-/// 60 s, 120 s, ...) but stops here, so a receiver that comes back is sent its
-/// queued deliveries within five minutes even after a long outage.
+/// `WEBHOOK_ENDPOINT_BACKOFF_MAX_SECS` overrides it. The schedule follows the
+/// per-delivery retry schedule (30 s, 60 s, 120 s, ...) but stops here, so a
+/// receiver that comes back is sent its queued deliveries within five minutes
+/// even after a long outage. Every step is at least the poll interval, so a
+/// failed endpoint is never re-claimed straight away: `0` leaves exactly that
+/// floor, one attempt per poll as before #5195.
 const WEBHOOK_ENDPOINT_BACKOFF_MAX_SECS_DEFAULT: i64 = 300;
 
 /// A non-negative whole-seconds setting from the environment, or `default`
@@ -2530,7 +2612,8 @@ fn webhook_delivery_poll() -> std::time::Duration {
     std::time::Duration::from_secs(secs.max(1) as u64)
 }
 
-/// The endpoint backoff ceiling in seconds; 0 means no endpoint backoff.
+/// The endpoint backoff ceiling in seconds; 0 leaves only the poll-interval
+/// floor.
 fn webhook_endpoint_backoff_max_secs() -> i64 {
     static MAX: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
     *MAX.get_or_init(|| {
@@ -2642,10 +2725,16 @@ async fn dispatch_due_webhook_lanes(
         tokio::spawn(async move {
             // Wakes the worker when the lane ends, even if it panicked, so the
             // freed slot (and the endpoint's next rows) are claimed at once.
-            let _done = LaneDone { _permit: permit };
+            let mut done = LaneDone {
+                _permit: permit,
+                wake: true,
+            };
             let refs: Vec<&Claimed<RetryDeliveryRow>> = lane.iter().collect();
             if let Err(e) = deliver_webhook_lane(&db, &client, refs).await {
+                // A database error: leave the retry to the next poll rather
+                // than spinning the worker against a struggling database.
                 tracing::warn!("Webhook delivery lane failed: {}", e);
+                done.wake = false;
             }
         });
         started += 1;
@@ -2653,14 +2742,18 @@ async fn dispatch_due_webhook_lanes(
     Ok(started)
 }
 
-/// Held by a running lane: frees its slot and wakes the worker on drop.
+/// Held by a running lane: frees its slot on drop and, unless the lane hit a
+/// database error, wakes the worker.
 struct LaneDone {
     _permit: tokio::sync::OwnedSemaphorePermit,
+    wake: bool,
 }
 
 impl Drop for LaneDone {
     fn drop(&mut self) {
-        wake_webhook_delivery_worker();
+        if self.wake {
+            wake_webhook_delivery_worker();
+        }
     }
 }
 
@@ -2671,8 +2764,22 @@ enum DeliveryStep {
     Skipped,
     /// Sent and accepted by the receiver.
     Delivered,
-    /// Sent and failed (transport error, timeout, or non-2xx status).
-    Failed,
+    /// Sent and failed. `endpoint` says whether the failure is the
+    /// endpoint's (see [`is_endpoint_level_failure`]) rather than this
+    /// delivery's.
+    Failed { endpoint: bool },
+}
+
+/// Whether a failed send says the endpoint is unavailable, as opposed to the
+/// receiver rejecting this one delivery (#5195). No response (connection
+/// error, timeout), 5xx, 3xx and most 4xx (401, 403, 404, 408, 410, 425,
+/// 429, ...) are the endpoint's: its URL, credentials or capacity are wrong
+/// for every delivery, so the endpoint backs off. 400, 409, 413, 415 and 422
+/// reject the payload: the receiver is up, so only that delivery is
+/// rescheduled on its own retry schedule and the lane carries on with the
+/// endpoint's other deliveries.
+fn is_endpoint_level_failure(status: Option<i32>) -> bool {
+    !matches!(status, Some(400 | 409 | 413 | 415 | 422))
 }
 
 /// Send each claimed delivery and record the outcome, waiting for all of them.
@@ -2742,12 +2849,16 @@ fn group_by_webhook<T>(rows: impl Iterator<Item = T>, key: impl Fn(&T) -> Uuid) 
     lanes
 }
 
-/// Send one webhook's claimed deliveries in order. After a failed send the
-/// endpoint goes into backoff (#5195): its remaining deliveries are released
-/// unattempted (attempts and `next_retry_at` unchanged) and the claim skips
-/// the webhook until the backoff ends, so a receiver that is down is sent one
-/// delivery per backoff step rather than one per worker pass. A lane that
-/// delivered clears the endpoint's backoff.
+/// Send one webhook's claimed deliveries in order. After an endpoint-level
+/// failure the endpoint goes into backoff (#5195): its remaining deliveries
+/// are released unattempted (attempts and `next_retry_at` unchanged) and the
+/// claim skips the webhook until the backoff ends, so a receiver that is down
+/// is sent one delivery per backoff step rather than one per worker pass. A
+/// failure that is the delivery's own (a payload rejection) reschedules only
+/// that delivery. A lane in which the endpoint answered (delivered, or
+/// rejected a payload) clears the backoff, and if such a lane then hits an
+/// endpoint-level failure the count restarts at 1, so an endpoint that
+/// mostly works never climbs the schedule.
 async fn deliver_webhook_lane(
     db: &sqlx::PgPool,
     client: &reqwest::Client,
@@ -2756,7 +2867,7 @@ async fn deliver_webhook_lane(
     let Some(webhook_id) = lane.first().map(|d| d.webhook_id) else {
         return Ok(());
     };
-    let mut delivered = false;
+    let mut answered = false;
     for (i, delivery) in lane.iter().enumerate() {
         let step = match deliver_one_claimed_webhook(db, client, delivery).await {
             Ok(step) => step,
@@ -2766,17 +2877,17 @@ async fn deliver_webhook_lane(
             }
         };
         match step {
-            DeliveryStep::Delivered => delivered = true,
+            DeliveryStep::Delivered | DeliveryStep::Failed { endpoint: false } => answered = true,
             DeliveryStep::Skipped => {}
-            DeliveryStep::Failed => {
+            DeliveryStep::Failed { endpoint: true } => {
                 let rest = &lane[i + 1..];
                 release_unattempted_claims(db, rest).await;
-                back_off_webhook_endpoint(db, webhook_id, rest.len()).await;
+                back_off_webhook_endpoint(db, webhook_id, rest.len(), answered).await;
                 return Ok(());
             }
         }
     }
-    if delivered {
+    if answered {
         clear_webhook_endpoint_backoff(db, webhook_id).await;
     }
     Ok(())
@@ -2789,18 +2900,17 @@ fn webhook_endpoint_backoff_base_secs(failures: i32, max_secs: i64) -> i64 {
 }
 
 /// The jittered backoff for each consecutive-failure count from 1 until the
-/// cap, indexed by the SQL in [`back_off_webhook_endpoint`]. A cap of 0 gives
-/// `[0]`: failures are still counted, but the endpoint is never skipped.
-fn webhook_endpoint_backoff_schedule(max_secs: i64) -> Vec<f64> {
+/// cap, indexed by the SQL in [`back_off_webhook_endpoint`]. Every step is at
+/// least `floor_secs` (the poll interval), jitter included, so a failed
+/// endpoint is never re-claimed by the wake of its own finished lane; a cap of
+/// 0 gives `[floor_secs]`. `seed` decorrelates endpoints (the webhook id).
+fn webhook_endpoint_backoff_schedule(max_secs: i64, floor_secs: i64, seed: u64) -> Vec<f64> {
+    let floor = floor_secs.max(1);
     let mut steps = Vec::new();
     for failures in 1..=12 {
         let base = webhook_endpoint_backoff_base_secs(failures, max_secs);
-        let step = if base == 0 {
-            0
-        } else {
-            apply_jitter(base, deterministic_jitter_seed(failures))
-        };
-        steps.push(step as f64);
+        let jittered = apply_jitter(base.max(1), deterministic_jitter_seed(failures) ^ seed);
+        steps.push(jittered.max(floor) as f64);
         if base >= max_secs {
             break;
         }
@@ -2808,14 +2918,24 @@ fn webhook_endpoint_backoff_schedule(max_secs: i64) -> Vec<f64> {
     steps
 }
 
-/// Record a failed send to an endpoint and start (or lengthen) its backoff.
-async fn back_off_webhook_endpoint(db: &sqlx::PgPool, webhook_id: Uuid, deferred: usize) {
+/// Record an endpoint-level failed send and start (or lengthen) its backoff.
+/// `restart` (the endpoint answered earlier in the same lane) sets the count
+/// to 1 instead of adding to it.
+async fn back_off_webhook_endpoint(
+    db: &sqlx::PgPool,
+    webhook_id: Uuid,
+    deferred: usize,
+    restart: bool,
+) {
     let result: std::result::Result<Option<(i32, f64)>, sqlx::Error> = sqlx::query_as(
         r#"
         UPDATE webhooks
-        SET delivery_failures = delivery_failures + 1,
+        SET delivery_failures = CASE WHEN $3 THEN 1 ELSE delivery_failures + 1 END,
             delivery_backoff_until = NOW() + make_interval(
-                secs => ($2::float8[])[LEAST(delivery_failures + 1, cardinality($2::float8[]))]
+                secs => ($2::float8[])[LEAST(
+                    CASE WHEN $3 THEN 1 ELSE delivery_failures + 1 END,
+                    cardinality($2::float8[])
+                )]
             )
         WHERE id = $1
         RETURNING delivery_failures,
@@ -2825,7 +2945,10 @@ async fn back_off_webhook_endpoint(db: &sqlx::PgPool, webhook_id: Uuid, deferred
     .bind(webhook_id)
     .bind(webhook_endpoint_backoff_schedule(
         webhook_endpoint_backoff_max_secs(),
+        webhook_delivery_poll().as_secs() as i64,
+        webhook_id.as_u128() as u64,
     ))
+    .bind(restart)
     .fetch_optional(db)
     .await;
     match result {
@@ -3169,7 +3292,9 @@ async fn deliver_one_claimed_webhook(
     Ok(if success {
         DeliveryStep::Delivered
     } else {
-        DeliveryStep::Failed
+        DeliveryStep::Failed {
+            endpoint: is_endpoint_level_failure(response_status),
+        }
     })
 }
 
@@ -7937,9 +8062,9 @@ mod tests {
                 return;
             };
             let webhook = insert_url_webhook(&pool, "http://198.51.100.7/x").await;
-            back_off_webhook_endpoint(&pool, webhook, 0).await;
+            back_off_webhook_endpoint(&pool, webhook, 0, false).await;
             let first = endpoint_backoff_state(&pool, webhook).await;
-            back_off_webhook_endpoint(&pool, webhook, 0).await;
+            back_off_webhook_endpoint(&pool, webhook, 0, false).await;
             let second = endpoint_backoff_state(&pool, webhook).await;
 
             let (server, _ssrf_guard) = tdh::non_loopback_mock_server().await;
@@ -8044,14 +8169,21 @@ mod tests {
             assert_eq!(webhook_endpoint_backoff_base_secs(3, max), 120);
             assert_eq!(webhook_endpoint_backoff_base_secs(4, max), 300);
             assert_eq!(webhook_endpoint_backoff_base_secs(12, max), 300);
-            assert_eq!(webhook_endpoint_backoff_schedule(0), vec![0.0]);
-            let long = webhook_endpoint_backoff_schedule(1_000_000);
+            assert_eq!(webhook_endpoint_backoff_schedule(0, 5, 7), vec![5.0]);
+            assert_eq!(webhook_endpoint_backoff_schedule(0, 30, 7), vec![30.0]);
+            assert!(
+                webhook_endpoint_backoff_schedule(max, 400, 7)
+                    .iter()
+                    .all(|s| *s == 400.0),
+                "no step is shorter than the poll interval"
+            );
+            let long = webhook_endpoint_backoff_schedule(1_000_000, 5, 7);
             assert_eq!(
                 long.len(),
                 12,
                 "the schedule ends at the retry table's last step"
             );
-            let steps = webhook_endpoint_backoff_schedule(max);
+            let steps = webhook_endpoint_backoff_schedule(max, 5, 7);
             assert_eq!(steps.len(), 4);
             for (step, base) in steps.iter().zip([30.0, 60.0, 120.0, 300.0]) {
                 assert!(
@@ -8099,6 +8231,205 @@ mod tests {
             )
             .await
             .is_ok());
+        }
+
+        // -------------------------------------------------------------------
+        // Review fixes (#5195): failure classes, restart, per-endpoint lock
+        // -------------------------------------------------------------------
+
+        #[test]
+        fn payload_rejections_are_the_deliverys_failure_not_the_endpoints() {
+            for status in [400, 409, 413, 415, 422] {
+                assert!(!is_endpoint_level_failure(Some(status)), "{status}");
+            }
+            for status in [None, Some(301), Some(401), Some(403), Some(404), Some(408)] {
+                assert!(is_endpoint_level_failure(status), "{status:?}");
+            }
+            for status in [Some(410), Some(429), Some(500), Some(502), Some(503)] {
+                assert!(is_endpoint_level_failure(status), "{status:?}");
+            }
+        }
+
+        #[test]
+        fn a_claim_keeps_lanes_for_healthy_endpoints() {
+            assert_eq!(failing_lane_cap(8), 6);
+            assert_eq!(failing_lane_cap(3), 1);
+            assert_eq!(failing_lane_cap(2), 0);
+            assert_eq!(failing_lane_cap(1), 0);
+        }
+
+        /// An endpoint that rejects one payload (422) is not backed off: the
+        /// rejected delivery is rescheduled and the lane goes on to the
+        /// endpoint's other deliveries.
+        #[tokio::test]
+        async fn payload_rejection_reschedules_only_that_delivery() {
+            use wiremock::matchers::{method, path};
+            use wiremock::{Mock, ResponseTemplate};
+
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let (server, _ssrf_guard) = tdh::non_loopback_mock_server().await;
+            Mock::given(method("POST"))
+                .and(path("/reject"))
+                .respond_with(ResponseTemplate::new(422))
+                .mount(&server)
+                .await;
+            let webhook = insert_url_webhook(&pool, &format!("{}/reject", server.uri())).await;
+            let rows = insert_due_deliveries(&pool, webhook, 3, 600).await;
+            let claimed = claim_fixture_deliveries(&pool, &rows, "reject-test").await;
+            deliver_claimed_webhook_batch(&pool, &claimed)
+                .await
+                .expect("deliver");
+
+            let received = server.received_requests().await.expect("recording on");
+            let state = endpoint_backoff_state(&pool, webhook).await;
+            let rescheduled: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM webhook_deliveries \
+                 WHERE webhook_id = $1 AND attempts = 2 AND next_retry_at > NOW()",
+            )
+            .bind(webhook)
+            .fetch_one(&pool)
+            .await
+            .expect("count rescheduled");
+            cleanup_claim_test(&pool, webhook).await;
+
+            assert_eq!(received.len(), 3, "every delivery in the lane is sent");
+            assert_eq!(
+                rescheduled, 3,
+                "each rejected delivery follows its own retry"
+            );
+            assert_eq!(state, (0, None), "the endpoint is not backed off");
+        }
+
+        /// A lane that delivered and then hit an endpoint-level failure
+        /// restarts the endpoint's count at 1 instead of climbing from an
+        /// earlier streak, so a mostly-working endpoint stays at the first
+        /// backoff step.
+        #[tokio::test]
+        async fn a_failure_after_a_delivery_in_the_lane_restarts_the_count() {
+            use wiremock::matchers::{method, path};
+            use wiremock::{Mock, ResponseTemplate};
+
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let (server, _ssrf_guard) = tdh::non_loopback_mock_server().await;
+            Mock::given(method("POST"))
+                .and(path("/flaky"))
+                .respond_with(ResponseTemplate::new(200))
+                .up_to_n_times(1)
+                .with_priority(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/flaky"))
+                .respond_with(ResponseTemplate::new(503))
+                .with_priority(2)
+                .mount(&server)
+                .await;
+            let webhook = insert_url_webhook(&pool, &format!("{}/flaky", server.uri())).await;
+            sqlx::query("UPDATE webhooks SET delivery_failures = 3 WHERE id = $1")
+                .bind(webhook)
+                .execute(&pool)
+                .await
+                .expect("seed a failure streak");
+            let rows = insert_due_deliveries(&pool, webhook, 3, 600).await;
+            let claimed = claim_fixture_deliveries(&pool, &rows, "restart-test").await;
+            deliver_claimed_webhook_batch(&pool, &claimed)
+                .await
+                .expect("deliver");
+            let (failures, backoff) = endpoint_backoff_state(&pool, webhook).await;
+            cleanup_claim_test(&pool, webhook).await;
+
+            assert_eq!(failures, 1, "the streak restarts after a delivery");
+            let secs = backoff.expect("backed off");
+            assert!((20.0..=40.0).contains(&secs), "first step, ~30 s: {secs}");
+        }
+
+        /// While another claimer holds a webhook's claim lock (its claim
+        /// transaction is open), this claim takes none of that webhook's rows.
+        #[tokio::test]
+        async fn claim_skips_a_webhook_another_claimer_is_locking() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let webhook = insert_url_webhook(&pool, "http://198.51.100.7/locked").await;
+            insert_due_deliveries(&pool, webhook, 3, 600).await;
+            let mut other = pool.begin().await.expect("begin");
+            sqlx::query("SELECT pg_advisory_xact_lock($1, hashtext($2::text))")
+                .bind(WEBHOOK_CLAIM_LOCK_CLASS)
+                .bind(webhook.to_string())
+                .execute(&mut *other)
+                .await
+                .expect("take the claim lock");
+            let during =
+                claim_due_webhook_deliveries_for_webhooks(&pool, &[webhook], 50, "lock-b", 60.0)
+                    .await
+                    .expect("claim ok")
+                    .len();
+            other.rollback().await.expect("release");
+            let after =
+                claim_due_webhook_deliveries_for_webhooks(&pool, &[webhook], 50, "lock-b", 60.0)
+                    .await
+                    .expect("claim ok")
+                    .len();
+            cleanup_claim_test(&pool, webhook).await;
+
+            assert_eq!(during, 0, "a webhook locked by another claimer is skipped");
+            assert_eq!(after, 3, "once the lock is released its rows are claimable");
+        }
+
+        /// Many claimers racing for one webhook: exactly one of them gets a
+        /// lane, every time, while new deliveries keep arriving.
+        #[tokio::test]
+        async fn racing_claimers_give_one_endpoint_one_lane() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let webhook = insert_url_webhook(&pool, "http://198.51.100.7/race").await;
+            insert_due_deliveries(&pool, webhook, 5, 600).await;
+            for round in 0..15 {
+                let mut tasks = Vec::new();
+                for c in 0..8 {
+                    let pool = pool.clone();
+                    tasks.push(tokio::spawn(async move {
+                        let by = format!("racer-{c}");
+                        claim_due_webhook_deliveries_for_webhooks(&pool, &[webhook], 50, &by, 60.0)
+                            .await
+                            .expect("claim ok")
+                    }));
+                }
+                // A delivery enqueued mid-race must not open a second lane.
+                insert_due_delivery(&pool, webhook).await;
+                let mut winners = std::collections::HashSet::new();
+                let mut all = Vec::new();
+                for t in tasks {
+                    for d in t.await.expect("join") {
+                        winners.insert(d.claimed_by().to_string());
+                        all.push(d);
+                    }
+                }
+                // A claimer that starts after the winner committed sees its
+                // claims and gets nothing; one that raced it is locked out.
+                let late =
+                    claim_due_webhook_deliveries_for_webhooks(&pool, &[webhook], 50, "late", 60.0)
+                        .await
+                        .expect("claim ok");
+                let late_count = late.len();
+                for d in all.iter().chain(late.iter()) {
+                    release_test_claim(&pool, d).await;
+                }
+                assert!(
+                    winners.len() <= 1,
+                    "round {round}: {winners:?} all got lanes"
+                );
+                assert_eq!(
+                    late_count, 0,
+                    "round {round}: a lane was open, nothing more"
+                );
+            }
+            cleanup_claim_test(&pool, webhook).await;
         }
     }
 }
