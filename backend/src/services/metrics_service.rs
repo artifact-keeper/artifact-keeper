@@ -85,6 +85,23 @@ pub fn init_metrics() -> PrometheusHandle {
     handle
 }
 
+/// Publish `ak_build_info{version, git} 1` (#5656): the running build, for
+/// dashboards that join it onto other series and for spotting a mixed-version
+/// rollout. Called at startup, after the recorder is installed. It carries
+/// `# HELP` text, like every family that is described.
+pub fn publish_build_info() {
+    metrics::describe_gauge!(
+        "ak_build_info",
+        "Always 1. The labels name the running build: version and git commit."
+    );
+    gauge!(
+        "ak_build_info",
+        "version" => crate::build_info::VERSION,
+        "git" => crate::build_info::short_sha()
+    )
+    .set(1.0);
+}
+
 /// The recorder [`init_metrics`] installs: the Prometheus recorder alone, or a
 /// fan-out of it and `otel`.
 pub(crate) fn build_global_recorder(
@@ -726,6 +743,33 @@ pub fn record_scan_inventory_success(scan_type: &str) {
         "scan_type" => scan_type.to_string()
     )
     .increment(1);
+}
+
+/// `ak_health_monitor_up{service}`: 1 when the health monitor's last check of
+/// `service` was healthy, else 0 (#5651). One series per checked dependency
+/// (database, storage, scanner-adapter, ...), so an alert can fire on a
+/// component going down without polling the health log.
+pub fn record_health_monitor_status(service: &str, healthy: bool) {
+    metrics::describe_gauge!(
+        "ak_health_monitor_up",
+        "1 when the health monitor's last check of the service was healthy, else 0."
+    );
+    gauge!("ak_health_monitor_up", "service" => service.to_string()).set(if healthy {
+        1.0
+    } else {
+        0.0
+    });
+}
+
+/// `ak_health_monitor_postgres_restarts_total`: Postgres restarts the health
+/// monitor detected (#5651). A restart is usually over before the next check,
+/// so the up gauge alone would not show it.
+pub fn record_health_monitor_postgres_restart() {
+    metrics::describe_counter!(
+        "ak_health_monitor_postgres_restarts_total",
+        "Postgres restarts detected by the health monitor (pg_postmaster_start_time after the last check)."
+    );
+    counter!("ak_health_monitor_postgres_restarts_total").increment(1);
 }
 
 /// Record a webhook delivery event.
@@ -1425,6 +1469,24 @@ mod tests {
     fn test_record_scan_inventory_failure_does_not_panic() {
         record_scan_inventory_failure("trivy");
         record_scan_inventory_failure("openscap");
+    }
+
+    #[test]
+    fn build_info_is_exported_with_help_text_5656() {
+        let recorder = prometheus_builder().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, publish_build_info);
+        let text = handle.render();
+        assert!(text.contains("# HELP ak_build_info "), "{text}");
+        let line = text
+            .lines()
+            .find(|l| l.starts_with("ak_build_info{"))
+            .unwrap_or_else(|| panic!("no ak_build_info sample: {text}"));
+        assert!(
+            line.contains(&format!("version=\"{}\"", crate::build_info::VERSION)),
+            "{line}"
+        );
+        assert!(line.ends_with(" 1"), "{line}");
     }
 
     #[test]

@@ -46,8 +46,11 @@ pub fn router() -> Router<SharedState> {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ArtifactHealthResponse {
     pub artifact_id: Uuid,
-    pub health_score: i32,
-    pub health_grade: String,
+    /// `null` when the artifact is unrated: no security, license, quality
+    /// or metadata score exists for it (a generic file that has not been
+    /// scanned, #5656).
+    pub health_score: Option<i32>,
+    pub health_grade: Option<String>,
     pub security_score: Option<i32>,
     pub license_score: Option<i32>,
     pub quality_score: Option<i32>,
@@ -305,8 +308,9 @@ pub struct GateEvaluationResponse {
     pub passed: bool,
     pub action: String,
     pub gate_name: String,
-    pub health_score: i32,
-    pub health_grade: String,
+    /// `null` when the artifact is unrated (#5656).
+    pub health_score: Option<i32>,
+    pub health_grade: Option<String>,
     pub violations: Vec<GateViolationResponse>,
     #[schema(value_type = Object)]
     pub component_scores: serde_json::Value,
@@ -1505,8 +1509,8 @@ mod tests {
         let now = chrono::Utc::now();
         let resp = ArtifactHealthResponse {
             artifact_id: Uuid::new_v4(),
-            health_score: 85,
-            health_grade: "A".to_string(),
+            health_score: Some(85),
+            health_grade: Some("A".to_string()),
             security_score: Some(90),
             license_score: Some(100),
             quality_score: Some(75),
@@ -1518,8 +1522,8 @@ mod tests {
             last_checked_at: Some(now),
             checks: vec![],
         };
-        assert_eq!(resp.health_score, 85);
-        assert_eq!(resp.health_grade, "A");
+        assert_eq!(resp.health_score, Some(85));
+        assert_eq!(resp.health_grade.as_deref(), Some("A"));
         assert_eq!(resp.security_score, Some(90));
         assert_eq!(resp.critical_issues, 0);
     }
@@ -2036,6 +2040,10 @@ mod tests {
     /// filesystem fallback. Before the fix, trigger paths built
     /// `QualityCheckService` without wiring `StorageRegistry`, so cloud-backed
     /// artifacts failed to stage and no quality-check rows were written.
+    ///
+    /// A Helm chart: since #5656 the Helm lint is the only check that reads
+    /// the artifact's bytes, so it is the one that must stage them through
+    /// the configured backend.
     #[tokio::test]
     async fn test_trigger_checks_uses_repo_storage_backend_3736() {
         use crate::api::handlers::proxy_helpers::RepoInfo;
@@ -2045,7 +2053,7 @@ mod tests {
             return;
         };
         let (user_id, username) = tdh::create_user(&pool).await;
-        let (repo_id, repo_key, storage_dir) = tdh::create_repo(&pool, "local", "rpm").await;
+        let (repo_id, repo_key, storage_dir) = tdh::create_repo(&pool, "local", "helm").await;
 
         let (state, mem) = tdh::build_state_with_cloud(pool.clone(), "s3");
         sqlx::query("UPDATE repositories SET storage_backend = 's3' WHERE id = $1")
@@ -2063,8 +2071,8 @@ mod tests {
             &state,
             &pool,
             &repo_info,
-            "rpm/demo/1.0/demo-1.0.rpm",
-            "demo/1.0/demo-1.0.rpm",
+            "helm/demo-1.0.tgz",
+            "demo-1.0.tgz",
             "demo",
             "1.0",
             "application/octet-stream",
@@ -2094,7 +2102,10 @@ mod tests {
         let mut check_count = 0i64;
         for _ in 0..100 {
             check_count = sqlx::query_scalar::<_, i64>(
-                "SELECT COUNT(*)::int8 FROM quality_check_results WHERE artifact_id = $1",
+                // The Helm lint row: it is written after the content read
+                // (the metadata row lands first, before any read).
+                "SELECT COUNT(*)::int8 FROM quality_check_results \
+                 WHERE artifact_id = $1 AND check_type = 'helm_lint'",
             )
             .bind(artifact_id)
             .fetch_one(&pool)

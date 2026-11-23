@@ -440,8 +440,9 @@ pub fn gate_block_message(eval: &QualityGateEvaluation) -> String {
     format!(
         "Promotion blocked by quality gate '{}' (health score: {}, grade: {}, violations: {})",
         eval.gate_name,
-        eval.health_score,
-        eval.health_grade,
+        eval.health_score
+            .map_or_else(|| "unrated".to_string(), |s| s.to_string()),
+        eval.health_grade.as_deref().unwrap_or("unrated"),
         eval.violations.len(),
     )
 }
@@ -3442,8 +3443,8 @@ mod tests {
             passed,
             action: action.to_string(),
             gate_name: "test-gate".to_string(),
-            health_score: 42,
-            health_grade: "D".to_string(),
+            health_score: Some(42),
+            health_grade: Some("D".to_string()),
             violations,
             component_scores: ComponentScores {
                 security: Some(50),

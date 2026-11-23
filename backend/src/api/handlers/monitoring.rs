@@ -152,7 +152,9 @@ pub async fn run_health_check(
         ));
     }
     let monitor = HealthMonitorService::new(state.db.clone(), MonitorConfig::default());
-    let results = monitor.check_all_services(&state.config).await?;
+    let results = monitor
+        .check_all_services(&state.config, Some(&state.storage))
+        .await?;
     Ok(Json(results))
 }
 

@@ -337,7 +337,7 @@ pub(crate) async fn run_storage_gc_tick_follow_on(
 pub fn spawn_all(
     db: PgPool,
     config: Config,
-    _primary_storage: Arc<dyn crate::storage::StorageBackend>,
+    primary_storage: Arc<dyn crate::storage::StorageBackend>,
     storage_registry: Arc<crate::storage::StorageRegistry>,
     smtp_service: Option<Arc<SmtpService>>,
     event_bus: Arc<EventBus>,
@@ -516,6 +516,7 @@ pub fn spawn_all(
     {
         let db = db.clone();
         let config_clone = config.clone();
+        let storage = primary_storage.clone();
         tokio::spawn(async move {
             tokio::time::sleep(jittered_startup_delay(15)).await;
             let monitor = HealthMonitorService::new(db.clone(), MonitorConfig::default());
@@ -534,7 +535,10 @@ pub fn spawn_all(
                     tracing::debug!("Another replica owns the health monitor lease; skipping");
                     continue;
                 };
-                match monitor.check_all_services(&config_clone).await {
+                match monitor
+                    .check_all_services(&config_clone, Some(&storage))
+                    .await
+                {
                     Ok(results) => {
                         for entry in &results {
                             if entry.status != "healthy" {
@@ -1403,6 +1407,10 @@ pub fn spawn_all(
     }
 
     // Password expiry notifications (configurable interval, default: hourly)
+    //
+    // Named in the one "Background schedulers started" line below; it used
+    // to log its own copy of that line as well (#5656).
+    let password_expiry: &str;
     if config.password_expiry_days > 0 {
         if let Some(smtp) = smtp_service {
             let db = db.clone();
@@ -1435,18 +1443,12 @@ pub fn spawn_all(
                     }
                 }
             });
-            tracing::info!(
-                "Background schedulers started: metrics, health monitor, lifecycle, stuck-scan janitor, backup schedules, sync policies, webhook retries, curation sync, upload cleanup, password expiry notifications"
-            );
+            password_expiry = ", password expiry notifications";
         } else {
-            tracing::info!(
-                "Background schedulers started: metrics, health monitor, lifecycle, stuck-scan janitor, backup schedules, sync policies, webhook retries, curation sync, upload cleanup (password expiry notifications skipped: SMTP not configured)"
-            );
+            password_expiry = " (password expiry notifications skipped: SMTP not configured)";
         }
     } else {
-        tracing::info!(
-            "Background schedulers started: metrics, health monitor, lifecycle, stuck-scan janitor, backup schedules, sync policies, webhook retries, curation sync, upload cleanup"
-        );
+        password_expiry = "";
     }
     // Download-ticket cleanup (every 10 minutes).
     //
@@ -1572,7 +1574,7 @@ pub fn spawn_all(
     }
 
     tracing::info!(
-        "Background schedulers started: metrics, health monitor, lifecycle, stuck-scan janitor, backup schedules, sync policies, webhook retries, curation sync, upload cleanup, download ticket cleanup, age-gate auto-approval, environment advisory re-evaluation, audit retention"
+        "Background schedulers started: metrics, health monitor, lifecycle, stuck-scan janitor, backup schedules, sync policies, webhook retries, curation sync, upload cleanup, download ticket cleanup, age-gate auto-approval, environment advisory re-evaluation, audit retention{password_expiry}"
     );
 }
 

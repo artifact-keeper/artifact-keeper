@@ -52,8 +52,9 @@ pub struct QualityCheckIssue {
 pub struct ArtifactHealthScore {
     pub id: Uuid,
     pub artifact_id: Uuid,
-    pub health_score: i32,
-    pub health_grade: String,
+    /// `None`: unrated, no component has a score (#5656).
+    pub health_score: Option<i32>,
+    pub health_grade: Option<String>,
     pub security_score: Option<i32>,
     pub license_score: Option<i32>,
     pub quality_score: Option<i32>,
@@ -137,8 +138,9 @@ pub struct QualityGateEvaluation {
     pub passed: bool,
     pub action: String,
     pub gate_name: String,
-    pub health_score: i32,
-    pub health_grade: String,
+    /// `None`: the artifact is unrated (#5656).
+    pub health_score: Option<i32>,
+    pub health_grade: Option<String>,
     pub violations: Vec<QualityGateViolation>,
     pub component_scores: ComponentScores,
 }
