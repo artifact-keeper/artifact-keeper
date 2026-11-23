@@ -143,3 +143,24 @@ damaged objects.
 
 `DOWNLOAD_VERIFY_CHECKSUMS=false` (default `true`) turns verification off on
 every route above. Integrity is then the client's responsibility.
+
+### Skipping it where the client checks the digest
+
+Verification hashes every byte served, once. On a core without SHA
+instructions that is the main cost of a large pull: measured on a 2013 Xeon
+(E5-2680 v2), a warm 1 GiB OCI blob pull took about 8 CPU-seconds and ran at
+about 140 MB/s with verification, and 1.2 CPU-seconds at about 1.2 GB/s
+without it (`scripts/perf/serve-verify-large-objects.sh`,
+`cargo bench --bench serve_verify`). Cores with SHA extensions (most x86
+server CPUs since 2019, and Arm v8.2+) hash several times faster.
+
+`DOWNLOAD_VERIFY_SKIP_CLIENT_VERIFIED=oci` (default unset) turns verification
+off on OCI blob pulls only. A blob is fetched by its `sha256:` digest, and
+`docker`, containerd, Podman and every OCI distribution client refuse a body
+that does not hash to it, so a corrupt blob cannot be accepted silently. What
+you give up on that route: the server no longer aborts the transfer, counts the
+failure in `ak_stored_object_integrity_failures_total`, or repairs a Remote's
+blob from upstream when a pull finds it corrupt; the client sees a digest
+error instead. The storage scrub still finds and repairs the object. Every
+other route keeps verifying. `oci` is the only accepted value today; other
+names are logged at startup and ignored.

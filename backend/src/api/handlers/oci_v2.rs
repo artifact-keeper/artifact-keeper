@@ -7362,7 +7362,9 @@ async fn handle_head_blob(
 /// STORED_OBJECT_INTEGRITY` with no body, a larger one is cut short before
 /// its last chunk, so a client never receives a complete-looking corrupt
 /// layer. A range pull is served unverified (only the whole object can be
-/// checked). `DOWNLOAD_VERIFY_CHECKSUMS=false` turns the check off.
+/// checked). `DOWNLOAD_VERIFY_CHECKSUMS=false` turns the check off, and so
+/// does `DOWNLOAD_VERIFY_SKIP_CLIENT_VERIFIED=oci` for this route only (#6468):
+/// every OCI client checks a blob against the digest it pulled.
 ///
 /// The `502` carries [`crate::storage::verify::IntegrityFailure`];
 /// `on_stream_mismatch` runs when a larger blob is the one found corrupt, after
@@ -7382,7 +7384,7 @@ async fn serve_stored_blob(
         ),
         (CONTENT_TYPE, "application/octet-stream".to_string()),
     ];
-    let verify = crate::storage::verify::serve_verification_enabled()
+    let verify = crate::storage::verify::serve_verification_enabled_for("oci")
         .then(|| crate::storage::verify::advertised_sha256(&base_headers))
         .flatten()
         .map(
