@@ -2349,7 +2349,14 @@ fn metadata_gate_unavailable(what: &str, error: &dyn std::fmt::Display) -> Respo
 /// copy the METADATA served is the one inside the cached distribution that
 /// was gated ([`metadata_from_cached_distribution`]), not the upstream's
 /// sidecar: the bytes the gate decided on are the bytes the metadata
-/// describes, and the upstream is not contacted for either.
+/// describes, and the upstream is not contacted for either. It is served only
+/// when the Remote's cached index (the one the client resolved the file from)
+/// advertises exactly its hash ([`cached_index_core_metadata_sha256`]); an
+/// index that advertises another METADATA (the upstream reused the file name)
+/// or none is a `503` with `Retry-After`. A client would reject METADATA
+/// whose hash is not the advertised one, and nothing vouches for it. Once the
+/// distribution's own request has refetched and gated the new bytes, the
+/// copy is fresh again and the upstream's sidecar is served.
 #[allow(clippy::too_many_arguments)]
 async fn metadata_gate_for_cached_file(
     state: &SharedState,
@@ -2444,9 +2451,149 @@ async fn metadata_gate_for_cached_file(
         Some(body) => body,
         None => read_cached_distribution(proxy, repo_key, &cache_path, filename, &cached).await?,
     };
-    metadata_from_cached_distribution(filename, body)
+    let metadata = metadata_from_cached_distribution(filename, body).await?;
+    // Served only where the index the client resolved from advertises exactly
+    // these bytes: anything else the client rejects on its PEP 658 hash check
+    // (an upstream that reused the file name advertises the new METADATA's
+    // hash), or it describes a file nobody vouched for.
+    let advertised = cached_index_core_metadata_sha256(
+        state,
+        proxy,
+        repo_id,
+        repo_key,
+        upstream_url,
+        project,
+        filename,
+    )
+    .await;
+    let served = proxy_helpers::sha256_hex(&metadata);
+    match advertised.as_slice() {
+        [] => Err(metadata_gate_unavailable(
+            "the index's core-metadata hash for the cached distribution",
+            &"no cached index advertises one",
+        )),
+        hashes if hashes.iter().all(|h| *h == served) => Ok(Some(metadata)),
+        _ => Err(metadata_gate_unavailable(
+            "the index's core-metadata hash for the cached distribution",
+            &"the cached index advertises another METADATA than the cached distribution's",
+        )),
+    }
+}
+
+/// The PEP 658/714 core-metadata SHA-256s the Remote's cached simple index
+/// advertises for `filename` (#6444): from each of its cached forms (PEP 691
+/// JSON, HTML) that names the file with a hash, read past expiry, never from
+/// the upstream. Empty when no cached form does, or none can be read.
+async fn cached_index_core_metadata_sha256(
+    state: &SharedState,
+    proxy: &crate::services::proxy_service::ProxyService,
+    repo_id: uuid::Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    project: &NormalizedProjectName,
+    filename: &str,
+) -> Vec<String> {
+    let index_path = fetch_pypi_upstream_index_path(&state.db, repo_id).await;
+    let normalized = PypiHandler::normalize_name(project.as_str());
+    let (_, upstream_index_path) =
+        pypi_upstream_url_and_path(upstream_url, &format!("{}/", normalized), &index_path);
+    let mut hashes = Vec::new();
+    for json in [true, false] {
+        let (cache_path, _, _) = pypi_index_cache_entry(&upstream_index_path, json);
+        let Ok(Some(sidecar)) = proxy.get_cache_metadata_strict(repo_key, &cache_path).await else {
+            continue;
+        };
+        // Buffered and parsed: reserved against the shared buffered-metadata
+        // budget (#2684), sized to the entry (#5973).
+        let _budget = proxy_helpers::proxy_metadata_budget()
+            .reserve(usize::try_from(sidecar.size_bytes).unwrap_or(usize::MAX))
+            .await;
+        let Ok(Some(body)) = proxy
+            .get_cached_artifact_by_path_ignoring_expiry(repo_key, &cache_path)
+            .await
+        else {
+            continue;
+        };
+        // Cached decoded since #5983; a coded entry is not parsed.
+        if body
+            .content_encoding
+            .as_deref()
+            .is_some_and(|c| !c.eq_ignore_ascii_case("identity"))
+        {
+            continue;
+        }
+        let content = body.content;
+        let wanted = filename.to_string();
+        if let Ok(Some(hash)) = tokio::task::spawn_blocking(move || {
+            core_metadata_sha256_in_simple_index(&content, &wanted)
+        })
         .await
-        .map(Some)
+        {
+            hashes.push(hash);
+        }
+    }
+    hashes
+}
+
+/// The core-metadata SHA-256 a simple index (PEP 691 JSON or HTML) advertises
+/// for `filename`: `core-metadata` / `data-dist-info-metadata` (PEP 714 / 658)
+/// as `{"sha256": ...}` or `sha256=...`. `None` when the file is not listed,
+/// or listed without a hash (a bare `true`).
+fn core_metadata_sha256_in_simple_index(body: &[u8], filename: &str) -> Option<String> {
+    if sniff_simple_index(body) == SniffedSimpleIndex::Json {
+        #[derive(serde::Deserialize)]
+        struct File<'a> {
+            #[serde(borrow)]
+            filename: std::borrow::Cow<'a, str>,
+            #[serde(rename = "core-metadata", default)]
+            core_metadata: Option<serde_json::Value>,
+            #[serde(rename = "data-dist-info-metadata", default)]
+            dist_info_metadata: Option<serde_json::Value>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Page<'a> {
+            #[serde(borrow, default)]
+            files: Vec<File<'a>>,
+        }
+        let page: Page<'_> = serde_json::from_slice(body).ok()?;
+        let file = page.files.iter().find(|f| f.filename == filename)?;
+        return [&file.core_metadata, &file.dist_info_metadata]
+            .into_iter()
+            .flatten()
+            .find_map(|v| {
+                v.get("sha256")?
+                    .as_str()
+                    .and_then(proxy_helpers::normalize_expected_sha256)
+            });
+    }
+    let html = String::from_utf8_lossy(body);
+    for tag in SIMPLE_ANCHOR_START_RE.find_iter(&html) {
+        let Some(target) = simple_anchor_target(tag.as_str()) else {
+            continue;
+        };
+        if !href_basename_names_file(&target.filename, filename) {
+            continue;
+        }
+        for attr in SIMPLE_DATA_ATTR_RE.captures_iter(tag.as_str()) {
+            let name = attr[1].to_ascii_lowercase();
+            if name != "data-core-metadata" && name != "data-dist-info-metadata" {
+                continue;
+            }
+            let value = attr
+                .get(2)
+                .or_else(|| attr.get(3))
+                .or_else(|| attr.get(4))
+                .map(|m| decode_html_entities_minimal(m.as_str()));
+            if let Some(hash) = value
+                .as_deref()
+                .and_then(|v| v.strip_prefix("sha256="))
+                .and_then(proxy_helpers::normalize_expected_sha256)
+            {
+                return Some(hash);
+            }
+        }
+    }
+    None
 }
 
 /// The cached body of a distribution the metadata gate decides on (#6444),
@@ -23769,8 +23916,10 @@ mod tests {
     ///   nothing scanned;
     /// * a stored blocking verdict for the cached copy: `403`;
     /// * a stored clean verdict, stale: the METADATA served is the one inside
-    ///   the cached wheel the gate decided on, not the upstream's sidecar; fresh:
-    ///   the sidecar is served as before (`None`);
+    ///   the cached wheel the gate decided on, not the upstream's sidecar, when
+    ///   the cached index advertises its hash; `503` when no cached index
+    ///   does, or it advertises another (a reused file name); fresh: the
+    ///   sidecar is served as before (`None`);
     /// * a cached body that does not match its sidecar's digest: `503`.
     ///
     /// That each status equals the wheel's is checked end to end (tier
@@ -23816,14 +23965,66 @@ mod tests {
                 b"Metadata-Version: 2.1\nName: dupwheel\nVersion: 1.0\nRequires-Dist: other\n",
             ),
         ]));
-        let cases: [(&str, bool, Option<&str>, Option<Bytes>); 6] = [
+        let cases: [(&str, bool, Option<&str>, Option<Bytes>); 8] = [
             ("stalewheel", true, None, None),
             ("tornwheel", true, None, Some(Bytes::from_static(b"torn"))),
             ("dupwheel", true, None, Some(dup_wheel)),
             ("vulnstale", true, Some("vulnerable"), None),
             ("cleanstale", true, Some("clean"), None),
             ("cleanfresh", false, Some("clean"), None),
+            ("cleannoindex", true, Some("clean"), None),
+            ("cleanreused", true, Some("clean"), None),
         ];
+        // The Remote's cached client-facing index for a project, advertising
+        // `core` as the wheel's core-metadata hash.
+        let seed_index = |project: &str, core: &str| {
+            let file = format!("{project}-1.0-py3-none-any.whl");
+            let html = format!(
+                "<html><body><a href=\"{uri}/files/{file}#sha256={z}\" \
+                 data-core-metadata=\"sha256={core}\">{file}</a></body></html>",
+                z = "0".repeat(64)
+            );
+            let html = Bytes::from(html);
+            let scope = crate::services::proxy_cache_scope::ProxyCacheScope::unscoped();
+            let path = format!("simple/{project}/");
+            let content_key = crate::services::proxy_service::ProxyService::cache_storage_key(
+                &scope,
+                &remote.key,
+                &path,
+            )
+            .expect("index key");
+            let meta_key = crate::services::proxy_service::ProxyService::cache_metadata_key(
+                &scope,
+                &remote.key,
+                &path,
+            )
+            .expect("index sidecar key");
+            let now = chrono::Utc::now();
+            let meta = crate::services::proxy_service::CacheMetadata {
+                cached_at: now,
+                upstream_etag: None,
+                storage_etag: None,
+                last_modified: None,
+                negative_cached_until: None,
+                quarantine_until: None,
+                expires_at: now + chrono::Duration::hours(1),
+                content_type: Some("text/html".to_string()),
+                content_encoding: None,
+                upstream_commit_sha: None,
+                size_bytes: html.len() as i64,
+                checksum_sha256: proxy_helpers::sha256_hex(&html),
+            };
+            let mut objects = backend.objects.lock().unwrap();
+            objects.insert(content_key, html);
+            objects.insert(meta_key, Bytes::from(serde_json::to_vec(&meta).unwrap()));
+        };
+        let own_metadata = |project: &str| {
+            proxy_helpers::sha256_hex(&Bytes::from(format!(
+                "Metadata-Version: 2.1\nName: {project}\nVersion: 1.0\nSummary: from-row\n"
+            )))
+        };
+        seed_index("cleanstale", &own_metadata("cleanstale"));
+        seed_index("cleanreused", &"ab".repeat(32));
         let mut digests = Vec::new();
         for (project, aged, verdict, body) in &cases {
             let file = format!("{project}-1.0-py3-none-any.whl");
@@ -23929,6 +24130,8 @@ mod tests {
         let vuln = metadata("vulnstale").await;
         let clean_stale = metadata("cleanstale").await;
         let clean_fresh = metadata("cleanfresh").await;
+        let no_index = metadata("cleannoindex").await;
+        let reused = metadata("cleanreused").await;
         let fetched_for_metadata = upstream.received_requests().await.unwrap_or_default().len();
 
         for d in &digests {
@@ -23980,6 +24183,53 @@ mod tests {
             StatusCode::SERVICE_UNAVAILABLE,
             "a cached body that is not the sidecar's is never decided on: {torn:?}"
         );
+        assert_eq!(
+            no_index.0,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no cached index vouches for the extracted METADATA: {no_index:?}"
+        );
+        assert_eq!(
+            reused.0,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the cached index advertises other METADATA (a reused file name): {reused:?}"
+        );
+    }
+
+    /// #6444: the core-metadata hash a cached simple index advertises for a
+    /// file, in either form; none for a bare flag or an unlisted file.
+    #[test]
+    fn test_core_metadata_sha256_in_simple_index_6444() {
+        let a = "a".repeat(64);
+        let b = "b".repeat(64);
+        let html = format!(
+            "<a href=\"https://h/p/demo-1.0-py3-none-any.whl#sha256={b}\" \
+             data-dist-info-metadata=\"sha256={a}\" data-core-metadata=\"sha256={a}\">x</a>\
+             <a href=\"https://h/p/demo-2.0-py3-none-any.whl\" data-core-metadata>y</a>"
+        );
+        let got =
+            |body: &str, f: &str| super::core_metadata_sha256_in_simple_index(body.as_bytes(), f);
+        assert_eq!(got(&html, "demo-1.0-py3-none-any.whl"), Some(a.clone()));
+        assert_eq!(
+            got(&html, "demo-2.0-py3-none-any.whl"),
+            None,
+            "a bare flag has no hash"
+        );
+        assert_eq!(got(&html, "demo-3.0-py3-none-any.whl"), None);
+        let json = serde_json::json!({
+            "meta": {"api-version": "1.1"}, "name": "demo",
+            "files": [
+                {"filename": "demo-1.0-py3-none-any.whl", "url": "https://h/x", "hashes": {"sha256": b},
+                 "core-metadata": {"sha256": a}},
+                {"filename": "demo-2.0-py3-none-any.whl", "url": "https://h/y", "hashes": {},
+                 "core-metadata": true},
+                {"filename": "demo-3.0-py3-none-any.whl", "url": "https://h/z", "hashes": {},
+                 "data-dist-info-metadata": {"sha256": b}}
+            ]
+        })
+        .to_string();
+        assert_eq!(got(&json, "demo-1.0-py3-none-any.whl"), Some(a));
+        assert_eq!(got(&json, "demo-2.0-py3-none-any.whl"), None);
+        assert_eq!(got(&json, "demo-3.0-py3-none-any.whl"), Some(b));
     }
 
     /// #3783: a twine upload stores the wheel's own classifiers — and the
