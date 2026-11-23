@@ -51,6 +51,11 @@ Both are one query, bounded to 1 second and run alongside the dependency
 probes below, so with the database down `/readyz` answers `503` in about a
 second, inside a 5 second probe timeout (#5651).
 
+From a stop signal on, `/readyz` answers `503` at once with `failing:
+["shutting_down"]`, without probing anything, while `/livez` and `/health`
+keep their usual answers (#5921). See
+[graceful-shutdown.md](graceful-shutdown.md).
+
 Initial setup (the default admin password not yet changed) is reported as
 `checks.setup_complete` but never makes `/readyz` fail, so an operator can
 finish setup through `kubectl exec` without the pod being restarted (#889).

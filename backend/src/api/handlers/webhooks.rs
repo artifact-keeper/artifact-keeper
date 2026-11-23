@@ -2651,7 +2651,11 @@ pub async fn run_webhook_delivery_worker(db: sqlx::PgPool) {
     let mut backlog_gauge = WebhookBacklogGauge::default();
     let mut next_gauge = tokio::time::Instant::now();
     loop {
-        if let Err(e) = dispatch_due_webhook_lanes(&db, &client, &lanes, None).await {
+        // #5921: a draining process claims no new deliveries; the lanes it
+        // already started finish, and another replica takes the rest.
+        if crate::services::shutdown_drain::is_draining() {
+            tracing::debug!("draining for shutdown; not claiming webhook deliveries");
+        } else if let Err(e) = dispatch_due_webhook_lanes(&db, &client, &lanes, None).await {
             tracing::warn!("Webhook delivery claim failed: {}", e);
         }
         if tokio::time::Instant::now() >= next_gauge {

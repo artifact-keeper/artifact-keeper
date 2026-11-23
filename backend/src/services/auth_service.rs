@@ -3802,6 +3802,12 @@ impl AuthService {
         if should_update {
             let token_id = stored_token.id;
             let db = self.db.clone();
+            // Deliberately not `db_read_retry::spawn_write`: the read retry
+            // does not see this spawned write, and a replayed GET may run it
+            // twice, which is harmless (it only sets last_used_at to now).
+            // Counting it as a write would stop a GET authenticated with an
+            // API token from being replayed whenever the debounce lets the
+            // update through.
             tokio::spawn(async move {
                 let _ = sqlx::query("UPDATE api_tokens SET last_used_at = NOW() WHERE id = $1")
                     .bind(token_id)

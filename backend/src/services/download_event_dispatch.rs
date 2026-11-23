@@ -174,6 +174,9 @@ pub fn flush_lost_total() -> u64 {
 /// availability contract — the download response can never be coupled to the
 /// event store through this call.
 pub fn try_enqueue(event: DownloadEvent) -> EnqueueOutcome {
+    // #5941: a request that queued a download counter is never replayed after
+    // a lost database connection (it would count twice).
+    crate::api::middleware::db_read_retry::note_write();
     try_enqueue_with(
         DOWNLOAD_EVENT_DISPATCH.get().and_then(|cell| cell.as_ref()),
         event,

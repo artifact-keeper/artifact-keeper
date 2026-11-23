@@ -347,7 +347,17 @@ impl AppError {
     /// (#4750). This is an infrastructure failure, so a credential check that
     /// hits it must answer a retryable 503, never a 401. A data error caused
     /// by the request's own bytes is not included.
+    ///
+    /// Every path that turns a database error into a response consults this
+    /// (the generic envelope, `db_status` for format envelopes, the auth
+    /// middleware), so it is also where a lost connection is noted for the
+    /// read-retry middleware (#5941): see
+    /// [`crate::api::middleware::db_read_retry`]. Outside a request the note
+    /// is a no-op.
     pub(crate) fn is_db_unavailable(&self) -> bool {
+        if self.is_transient_connection_error() {
+            crate::api::middleware::db_read_retry::note_transient_connection_error();
+        }
         match self {
             Self::Sqlx(
                 sqlx::Error::PoolTimedOut
@@ -358,6 +368,35 @@ impl AppError {
             ) => true,
             Self::Sqlx(e) => is_db_unavailable_message(&e.to_string()),
             Self::Database(msg) => is_db_unavailable_message(msg),
+            _ => false,
+        }
+    }
+
+    /// True when the connection a statement ran on was lost or could not be
+    /// opened, so the statement cannot have taken effect and running it again
+    /// on a fresh connection may succeed (#5941): a socket error, a SQLSTATE
+    /// in class 08 (connection exception), 57P01/57P02/57P03 (the server
+    /// terminated the session or is starting, shutting down or in recovery),
+    /// or 25006 (the session landed on a server that became a read-only
+    /// standby after a failover).
+    ///
+    /// Narrower than [`Self::is_db_unavailable`] on purpose: a pool-acquire
+    /// timeout, `too many clients`, and a statement or lock timeout on a live
+    /// connection are capacity or query problems that an immediate retry
+    /// only makes worse, and a closed pool means this process is stopping.
+    pub(crate) fn is_transient_connection_error(&self) -> bool {
+        use crate::api::middleware::db_read_retry::{
+            is_transient_connection_message, is_transient_sqlstate,
+        };
+        match self {
+            Self::Sqlx(sqlx::Error::Io(_)) => true,
+            Self::Sqlx(e) => {
+                e.as_database_error()
+                    .and_then(|d| d.code())
+                    .is_some_and(|code| is_transient_sqlstate(&code))
+                    || is_transient_connection_message(&e.to_string())
+            }
+            Self::Database(msg) => is_transient_connection_message(msg),
             _ => false,
         }
     }

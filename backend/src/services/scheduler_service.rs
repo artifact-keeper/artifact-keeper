@@ -1961,6 +1961,14 @@ async fn execute_due_backup_schedules(
         };
 
     for due_schedule in &due_schedules {
+        // #5921: a draining process starts no new backup run; another
+        // replica claims the due run.
+        if crate::services::shutdown_drain::is_draining() {
+            tracing::info!(
+                "draining for shutdown; leaving due scheduled backups to another replica"
+            );
+            break;
+        }
         let claimed = match claim_backup_schedule_run(
             db,
             due_schedule.id,
