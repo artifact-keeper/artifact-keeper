@@ -221,6 +221,7 @@ async fn admission_refusal(
     state: &SharedState,
     target: &WriteTarget,
     declared: Option<u64>,
+    stores_bytes: bool,
 ) -> Option<QuotaRefusal> {
     let max = state.config.max_upload_size_bytes;
     if target.size_limited && max > 0 {
@@ -230,6 +231,14 @@ async fn admission_refusal(
     }
     if !target.storage {
         return None;
+    }
+    // The disk threshold (#5191) reads a cached reading: no query, so it
+    // runs before the database budget and is never skipped by it. An OCI
+    // cross-repository blob mount writes no bytes and is not refused.
+    if stores_bytes {
+        if let Some(refusal) = super::disk::refusal(declared) {
+            return Some(refusal);
+        }
     }
     let budget = std::time::Duration::from_millis(state.config.quotas.precheck_budget_ms);
     match tokio::time::timeout(budget, quota_refusal(&state.db, target, declared)).await {
@@ -243,6 +252,14 @@ async fn admission_refusal(
             None
         }
     }
+}
+
+/// An OCI cross-repository blob mount (`POST /v2/.../blobs/uploads/?mount=`):
+/// it links a blob the instance already stores and writes no bytes.
+pub(crate) fn is_oci_blob_mount(path: &str, query: Option<&str>) -> bool {
+    path.starts_with("/v2/")
+        && path.trim_end_matches('/').ends_with("/blobs/uploads")
+        && query.is_some_and(|q| q.split('&').any(|kv| kv.starts_with("mount=")))
 }
 
 /// The `/v2` name a blob or manifest write targets: the path between `/v2/`
@@ -330,7 +347,8 @@ pub async fn upload_admission(
         return next.run(req).await;
     };
     let declared = declared_length(req.headers());
-    let Some(refusal) = admission_refusal(&state, &target, declared).await else {
+    let stores_bytes = !is_oci_blob_mount(&path, req.uri().query());
+    let Some(refusal) = admission_refusal(&state, &target, declared, stores_bytes).await else {
         return next.run(req).await;
     };
     // A write that names no repository (the chunked upload API) runs behind
@@ -663,6 +681,26 @@ mod tests {
         for (method, path, expected) in cases {
             assert_eq!(&write_target(method, path), expected, "{method} {path}");
         }
+    }
+
+    #[test]
+    fn oci_blob_mounts_are_told_apart_from_uploads_5191() {
+        let p = "/v2/docker/app/blobs/uploads/";
+        assert!(is_oci_blob_mount(p, Some("mount=sha256:aa&from=other/app")));
+        assert!(is_oci_blob_mount(
+            "/v2/docker/app/blobs/uploads",
+            Some("from=x&mount=sha256:aa")
+        ));
+        assert!(!is_oci_blob_mount(p, None));
+        assert!(!is_oci_blob_mount(p, Some("digest=sha256:aa")));
+        assert!(!is_oci_blob_mount(
+            "/v2/docker/app/blobs/uploads/0b1c",
+            Some("mount=sha256:aa")
+        ));
+        assert!(!is_oci_blob_mount(
+            "/maven/m/blobs/uploads",
+            Some("mount=x")
+        ));
     }
 
     #[test]
@@ -1018,8 +1056,8 @@ mod tests {
         let gib = 1u64 << 30;
         let (state, _dir) = quota_state(pool, used + 4 * gib, None);
         let write = target(true, true, Some("libs")).unwrap();
-        let refusal = admission_refusal(&state, &write, Some(16 * gib)).await;
-        let admitted = admission_refusal(&state, &write, Some(1024)).await;
+        let refusal = admission_refusal(&state, &write, Some(16 * gib), true).await;
+        let admitted = admission_refusal(&state, &write, Some(1024), true).await;
         super::storage::install(&QuotaSettings::default());
         let refusal = refusal.expect("over the storage quota");
         assert_eq!(refusal.into_response().status(), StatusCode::FORBIDDEN);

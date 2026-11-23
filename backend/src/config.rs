@@ -700,6 +700,14 @@ impl ProxyUpstreamSettings {
 /// * `QUOTA_PRECHECK_BUDGET_MS` (default 500): how long the check before an
 ///   upload body is read may wait on the database before it admits the
 ///   request unchecked (#6316).
+/// * `STORAGE_DISK_WARN_PERCENT` (default 95) and
+///   `STORAGE_DISK_BLOCK_PERCENT` (default 0, off): thresholds on how full
+///   the filesystem under `STORAGE_PATH` (and `AK_UPLOAD_STAGING_DIR`) is
+///   (#5191). At the warning threshold the backend logs and sets
+///   `ak_storage_disk_state`; at the block threshold writes are refused with
+///   `403 DISK_THRESHOLD_EXCEEDED` while reads keep working. Measured every
+///   `STORAGE_DISK_CHECK_INTERVAL_SECS` (default 5); see
+///   [`crate::services::quota::disk`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct QuotaSettings {
     /// `STORAGE_QUOTA_BYTES`; `0` = off.
@@ -716,6 +724,12 @@ pub struct QuotaSettings {
     pub help_url: Option<String>,
     /// `QUOTA_PRECHECK_BUDGET_MS`. Default 500.
     pub precheck_budget_ms: u64,
+    /// `STORAGE_DISK_WARN_PERCENT`, 0..=100; `0` = off. Default 95.
+    pub disk_warn_percent: u8,
+    /// `STORAGE_DISK_BLOCK_PERCENT`, 0..=100; `0` = off. Default 0.
+    pub disk_block_percent: u8,
+    /// `STORAGE_DISK_CHECK_INTERVAL_SECS`, at least 1. Default 5.
+    pub disk_check_interval_secs: u64,
 }
 
 impl Default for QuotaSettings {
@@ -728,6 +742,9 @@ impl Default for QuotaSettings {
             transfer_grace_percent: 0,
             help_url: None,
             precheck_budget_ms: 500,
+            disk_warn_percent: 95,
+            disk_block_percent: 0,
+            disk_check_interval_secs: 5,
         }
     }
 }
@@ -752,6 +769,14 @@ impl QuotaSettings {
             .min(1000),
             help_url: Self::parse_help_url(env::var("QUOTA_HELP_URL").ok().as_deref()),
             precheck_budget_ms: env_parse("QUOTA_PRECHECK_BUDGET_MS", d.precheck_budget_ms),
+            disk_warn_percent: env_parse("STORAGE_DISK_WARN_PERCENT", d.disk_warn_percent).min(100),
+            disk_block_percent: env_parse("STORAGE_DISK_BLOCK_PERCENT", d.disk_block_percent)
+                .min(100),
+            disk_check_interval_secs: env_parse(
+                "STORAGE_DISK_CHECK_INTERVAL_SECS",
+                d.disk_check_interval_secs,
+            )
+            .max(1),
         }
     }
 

@@ -636,6 +636,17 @@ fn blocking_reader(stream: BoxStream<'static, Result<Bytes>>) -> impl Read {
 }
 
 /// The first location takes the archive stream, the others copy from a location already written
+/// The disk-threshold refusal of a backup whose archive lands on the storage
+/// volume: a filesystem archive handle, which writes under `STORAGE_PATH`
+/// (#5191). An archive in an object store (`BACKUP_S3_BUCKET`, or S3/GCS/Azure
+/// storage) is not refused.
+fn archive_disk_refusal(archive: &StorageService) -> Option<crate::services::quota::QuotaRefusal> {
+    if archive.backend_kind() != "filesystem" {
+        return None;
+    }
+    crate::services::quota::disk::refusal(None)
+}
+
 async fn restore_to(
     backend: Arc<dyn crate::storage::StorageBackend>,
     key: &str,
@@ -2052,6 +2063,13 @@ impl BackupService {
 
     async fn do_backup(&self, backup_id: Uuid, cancel: &CancellationToken) -> Result<Backup> {
         let backup = self.get_by_id(backup_id).await?;
+        // The disk usage threshold (#5191): an archive written to the storage
+        // volume itself (no BACKUP_S3_BUCKET, filesystem storage) is refused
+        // while the volume is at its block threshold, before anything is
+        // exported. An archive in a separate bucket is not.
+        if let Some(refusal) = archive_disk_refusal(&self.archive_storage) {
+            return Err(AppError::QuotaRefused(Box::new(refusal)));
+        }
 
         // Export database tables as JSON
         let mut table_names = vec![
@@ -3134,7 +3152,16 @@ impl BackupService {
             }
             None => std::collections::HashMap::new(),
         };
-        // Pass two streams each artifact from the archive to its locations
+        // Pass two streams each artifact from the archive to its locations.
+        // A restore is exempt from the disk usage threshold (#5191): an
+        // operator restoring from a backup needs it to complete. It is logged.
+        if !artifact_digests.is_empty() && crate::services::quota::disk::refusal(None).is_some() {
+            tracing::warn!(
+                artifacts = artifact_digests.len(),
+                "restoring artifacts while the storage volume is at its disk block threshold; \
+                 restores are exempt, but the volume may fill"
+            );
+        }
         if !artifact_digests.is_empty() {
             let compressed = self.archive_storage.get_stream(storage_path).await?;
             let digests = artifact_digests.to_vec();
@@ -3662,6 +3689,32 @@ mod scope_tests;
 
 #[cfg(test)]
 mod test_archives;
+
+#[cfg(ak_test_shard = "services-1")]
+#[cfg(test)]
+mod disk_threshold_tests {
+    use super::*;
+
+    #[test]
+    fn a_filesystem_archive_is_refused_at_the_disk_block_threshold_5191() {
+        let dir = tempfile::tempdir().unwrap();
+        let fs = StorageService::new(Arc::new(
+            crate::services::storage_service::FilesystemBackend::new(dir.path().to_path_buf()),
+        ))
+        .with_kind("filesystem");
+        let bucket = StorageService::new(Arc::new(
+            crate::services::storage_service::FilesystemBackend::new(dir.path().to_path_buf()),
+        ))
+        .with_kind("s3");
+        crate::services::quota::disk::block_for_tests(true);
+        let refusal = archive_disk_refusal(&fs).expect("a filesystem archive is refused");
+        assert_eq!(refusal.code(), "DISK_THRESHOLD_EXCEEDED");
+        // An archive in a separate bucket does not land on the volume.
+        assert!(archive_disk_refusal(&bucket).is_none());
+        crate::services::quota::disk::block_for_tests(false);
+        assert!(archive_disk_refusal(&fs).is_none());
+    }
+}
 
 #[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]

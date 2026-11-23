@@ -151,9 +151,19 @@ pub fn observe(used: u64) {
     }
 }
 
-/// The instance-quota denial of a write that adds `additional_bytes`, or
-/// `None` when it fits (or adds nothing, or no quota is set).
+/// The instance-wide denial of a write that adds `additional_bytes`, or
+/// `None` when it fits (or adds nothing). The instance storage quota first,
+/// then the disk usage threshold (#5191) from its cached reading, so every
+/// caller (trusted peer replication included) gets both, and a
+/// `QuotaScope::Disk` denial means the write fits the quota.
 pub async fn instance_denial(db: &PgPool, additional_bytes: i64) -> Result<Option<QuotaDenial>> {
+    if let Some(denial) = instance_quota_denial(db, additional_bytes).await? {
+        return Ok(Some(denial));
+    }
+    Ok(super::disk::denial(additional_bytes))
+}
+
+async fn instance_quota_denial(db: &PgPool, additional_bytes: i64) -> Result<Option<QuotaDenial>> {
     let quota = settings().quota_bytes;
     if quota == 0 || additional_bytes <= 0 {
         return Ok(None);

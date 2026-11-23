@@ -15,6 +15,9 @@ unset value or `0` turns it off.
 | `MAX_UPLOAD_SIZE` | 10 GiB | Largest single upload (existing setting) |
 | `QUOTA_HELP_URL` | none | An `http(s)` link added to refusals and shown in the web UI |
 | `QUOTA_PRECHECK_BUDGET_MS` | `500` | How long the check before the body is read may wait on the database (`0` skips its lookups) |
+| `STORAGE_DISK_WARN_PERCENT` | `95` | Storage volume usage that logs a warning (0-100, `0` off); see [Disk usage thresholds](#disk-usage-thresholds) |
+| `STORAGE_DISK_BLOCK_PERCENT` | off | Storage volume usage at which writes are refused (0-100) |
+| `STORAGE_DISK_CHECK_INTERVAL_SECS` | `5` | How often the volume is measured |
 
 Every value is in bytes. The messages use binary units (1 GiB = 1024^3 bytes).
 
@@ -54,6 +57,96 @@ concurrent upload.
 
 Each time usage crosses the warning threshold or the quota, the backend logs
 it once (a `warn` line).
+
+## Disk usage thresholds
+
+The storage quota counts what the instance stores. It does not see the disk
+it stores it on: repository quotas can add up to more than the volume, proxy
+caches grow on their own, and deleted artifacts wait in the trash for
+`GC_TRASH_RETENTION_DAYS` before their space comes back. Two thresholds on
+the storage volume itself catch a filling disk before it is full (#5191):
+
+- **Warn** (`STORAGE_DISK_WARN_PERCENT`, default `95`): a `warn` log line
+  (`storage volume is 95.3% full (...): free disk or add storage`) when usage
+  crosses it, repeated at most every 10 minutes while it stays above, and
+  `ak_storage_disk_state` = 1. Nothing is refused.
+- **Block** (`STORAGE_DISK_BLOCK_PERCENT`, off by default): writes that
+  would store new bytes are refused with **`403 DISK_THRESHOLD_EXCEEDED`**. A
+  write whose declared `Content-Length` would take the volume to the
+  threshold is refused too. Writes resume by themselves once usage is one
+  percentage point below the threshold (so a volume hovering at the line does
+  not flap). Where it applies:
+  - **Format uploads, OCI pushes, the repository artifact API and the chunked
+    upload API** (every chunk): refused before the body is read, as for the
+    storage quota. An OCI cross-repository blob mount writes no bytes and is
+    not refused.
+  - **npm publishes**: checked once the package document is read, because the
+    same `PUT` also carries metadata-only changes (dist-tags, deprecations)
+    that are not refused.
+  - **Peer replication** (trusted sessions included), **OCI promotion** and
+    every other write through the shared publish admission: refused once the
+    size is known.
+  - **Artifactory/Nexus migration imports**: an item that would cross the
+    threshold is not written and fails with the refusal message; while the
+    volume stays blocked the job is **paused** (`error_summary` says why), and
+    `POST /api/v1/migrations/{id}/resume` continues it once space is freed.
+  - **Backups** whose archive is written to filesystem storage (no
+    `BACKUP_S3_BUCKET`) fail at the start with the refusal. An archive in a
+    separate bucket is not affected.
+  - **Restores are exempt**: an operator restoring from a backup needs it to
+    complete. A restore that runs while the volume is blocked logs a `warn`.
+
+While blocked, downloads, listing, search, deletes, lifecycle policies and
+storage garbage collection keep working, so you can free space without a
+restart. A remote (proxy) repository keeps serving what it fetches upstream,
+streamed to the client, but does not write it to the cache (Debian `dists`
+revalidation included). A replicating peer that is refused backs off and
+retries the delivery later; the task is not failed. (Under an active
+package age hold such a fetch answers `409`, as it does whenever a fill
+cannot be cached.)
+
+Usage is what `df` reports: bytes in use over bytes in use plus bytes
+available, so space reserved for root counts as used. The backend measures
+`STORAGE_PATH` when `STORAGE_BACKEND=filesystem`, and `AK_UPLOAD_STAGING_DIR`
+when it is set; the fuller one decides. The reading is taken on a background
+thread every `STORAGE_DISK_CHECK_INTERVAL_SECS`, and every second while the
+volume is at the warn threshold or blocked, and cached, so no request waits on
+the filesystem. Under pressure every chunk of a long upload session is
+checked against a reading at most a second old. Until the first reading, nothing is refused. A
+failed reading keeps the last state and logs a warning (at most every 10
+minutes).
+
+The thresholds do not apply to object storage (S3, Azure Blob, GCS): there is
+no volume to measure, and only the staging directory is watched when it is
+set. A repository configured with its own filesystem storage location on
+another volume is not measured either. Measuring needs Linux (`statvfs`);
+elsewhere the thresholds are off with a startup warning.
+
+Why `403` and not `507`: a 5xx is retried by npm, pip, Maven, cargo, NuGet,
+Docker and Helm clients, often with backoff or a chunked re-upload, and a
+retry storm against a nearly full disk adds partial writes and temp files at
+the worst moment. Why not `STORAGE_QUOTA_EXCEEDED`: raising a quota frees no
+disk, so its remedy would point the wrong way. A write that still finds the
+disk genuinely full (for example with the block threshold off) answers
+`507 STORAGE_FULL` as before.
+
+The refusal:
+
+```json
+{
+  "code": "DISK_THRESHOLD_EXCEEDED",
+  "message": "server storage nearly full: free disk or add storage (the storage volume is 98.4% full, 98.4 GiB of 100.0 GiB; writes are refused from 98%). Downloads are not affected.",
+  "limit_bytes": 105226698752,
+  "used_bytes": 105656795136,
+  "threshold_percent": 98,
+  "used_percent": 98.4
+}
+```
+
+`limit_bytes` is the usage the threshold stands for, `used_bytes` the bytes in
+use. Over HTTP/1.1 the reason phrase is `403 Disk Threshold Exceeded`; on
+`/v2` the code is `DENIED` with the message, and docker prints
+`denied: server storage nearly full: ...`.
 
 ## Repository and project quotas
 
@@ -156,6 +249,7 @@ uses ...").
 | Repository or project quota | 403 | `QUOTA_EXCEEDED` | `scope: "repository"` or `"project"`, `repository`, `project`, `limit_bytes`, `used_bytes`, `content_length` (when declared) |
 | Transfer | 429 + `Retry-After` | `TRANSFER_QUOTA_EXCEEDED` | `limit_bytes` (the monthly quota), `used_bytes`, `period_end`, `retry_after_seconds`, `help_url` |
 | Upload size | 413 | `PAYLOAD_TOO_LARGE` | `limit_bytes`, `content_length` (when declared) |
+| Disk usage threshold | 403 | `DISK_THRESHOLD_EXCEEDED` | `limit_bytes`, `used_bytes`, `threshold_percent`, `used_percent`, `content_length` (when declared) |
 
 `help_url` is present only when `QUOTA_HELP_URL` is set.
 
@@ -169,7 +263,7 @@ Some format clients only read their own error shape:
 
 Over HTTP/1.1 the status line also carries a short reason phrase
 (`403 Storage Quota Exceeded`, `403 Quota Exceeded`,
-`429 Transfer Quota Exceeded`), because Maven and twine print the reason
+`429 Transfer Quota Exceeded`, `403 Disk Threshold Exceeded`), because Maven and twine print the reason
 phrase rather than the body.
 
 ## Reading the figures
@@ -187,9 +281,15 @@ administrators.
                      "hard_limit_bytes": 67108864000, "state": "ok",
                      "period_start": "2026-11-01T00:00:00Z", "period_end": "2026-12-01T00:00:00Z"},
   "max_upload_bytes": 2147483648,
-  "quota_help_url": null
+  "quota_help_url": null,
+  "disk": {"enabled": true, "warn_percent": 95, "block_percent": 98, "volume": "storage",
+           "reading": {"total_bytes": 107374182400, "used_bytes": 96636764160, "free_bytes": 5368709120},
+           "used_percent": 94.74, "state": "ok"}
 }
 ```
+
+Disk `state` is `ok`, `warning` or `blocked`; `enabled` is `false` when both
+thresholds are off or there is no volume to measure.
 
 Storage `state` is `ok`, `warning` or `exceeded`. Transfer `state` is `ok`,
 `warning`, `over` or `refusing`.
@@ -202,11 +302,18 @@ Storage `state` is `ok`, `warning` or `exceeded`. Transfer `state` is `ok`,
 | `ak_storage_used_bytes` | gauge | Stored bytes (refreshed every 10 seconds while a storage quota is set) |
 | `ak_transfer_quota_bytes` | gauge | `TRANSFER_QUOTA_BYTES` (0 when off) |
 | `ak_transfer_used_bytes` | gauge | Download bytes of the current month, all replicas |
-| `ak_quota_refusals_total{kind}` | counter | Refusals by `kind`: `storage`, `repository`, `transfer`, `upload_size` |
+| `ak_quota_refusals_total{kind}` | counter | Refusals by `kind`: `storage`, `repository`, `transfer`, `upload_size`, `disk` |
+| `ak_storage_disk_state` | gauge | `0` ok, `1` at the warn threshold, `2` writes refused |
+| `ak_storage_disk_used_percent{volume}` | gauge | Usage of the `storage` or `staging` volume, as `df` reports it |
+| `ak_storage_disk_total_bytes{volume}` | gauge | The volume's size |
+| `ak_storage_disk_free_bytes{volume}` | gauge | Bytes still available to the backend |
+| `ak_storage_disk_threshold_percent{level}` | gauge | `STORAGE_DISK_WARN_PERCENT` (`level="warn"`) and `STORAGE_DISK_BLOCK_PERCENT` (`level="block"`) |
 | `ak_quota_precheck_skipped_total` | counter | Uploads admitted unchecked before the body was read because the pre-check ran out of `QUOTA_PRECHECK_BUDGET_MS` |
 
 A useful alert is
 `ak_storage_used_bytes / ak_storage_quota_bytes > 0.8 and ak_storage_quota_bytes > 0`.
+For the disk, alert on `ak_storage_disk_state > 0`, and page on
+`rate(ak_quota_refusals_total{kind="disk"}[5m]) > 0`.
 
 ## In front of the backend
 

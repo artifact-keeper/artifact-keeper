@@ -12,6 +12,7 @@
 //! | repository / project quota | 403 | `QUOTA_EXCEEDED` | `DENIED` |
 //! | monthly transfer quota | 429 + `Retry-After` | `TRANSFER_QUOTA_EXCEEDED` | `TOOMANYREQUESTS` |
 //! | upload size | 413 | `PAYLOAD_TOO_LARGE` | `SIZE_INVALID` |
+//! | disk usage threshold | 403 | `DISK_THRESHOLD_EXCEEDED` | `DENIED` |
 //!
 //! Why 403 for storage rather than 413 or 507: 413 means "this payload is too
 //! large", which is false for a small package pushed into a full registry
@@ -20,6 +21,11 @@
 //! refusal a client does not retry, and docker prints it as
 //! `denied: <message>`. The `code` tells a quota refusal apart from a
 //! permission refusal.
+//!
+//! The disk threshold (#5191) is a separate refusal from the storage quota
+//! because its remedy differs: raising a quota frees no physical disk, so the
+//! quota's "raise the quota" would point the operator the wrong way. It has
+//! its own code, reason phrase, message and metric label.
 //!
 //! Over HTTP/1.1 the response also carries a short reason phrase
 //! (`403 Storage Quota Exceeded`), because Maven and twine print the reason
@@ -46,6 +52,8 @@ pub enum RefusalKind {
     Transfer,
     /// `MAX_UPLOAD_SIZE`.
     UploadSize,
+    /// The storage volume is at `STORAGE_DISK_BLOCK_PERCENT` (#5191).
+    Disk,
 }
 
 impl RefusalKind {
@@ -56,6 +64,7 @@ impl RefusalKind {
             Self::Repository => "repository",
             Self::Transfer => "transfer",
             Self::UploadSize => "upload_size",
+            Self::Disk => "disk",
         }
     }
 }
@@ -77,6 +86,10 @@ pub struct QuotaRefusal {
     pub period_end: Option<DateTime<Utc>>,
     pub retry_after_seconds: Option<u64>,
     pub help_url: Option<String>,
+    /// The disk refusal's `STORAGE_DISK_BLOCK_PERCENT`.
+    pub threshold_percent: Option<u8>,
+    /// The disk refusal's measured volume usage, in percent.
+    pub used_percent: Option<f64>,
 }
 
 fn non_negative(value: i64) -> u64 {
@@ -104,6 +117,41 @@ impl QuotaRefusal {
             period_end: None,
             retry_after_seconds: None,
             help_url: None,
+            threshold_percent: None,
+            used_percent: None,
+        }
+    }
+
+    /// The leading phrase of the disk-threshold refusal's message.
+    pub const DISK_MESSAGE: &'static str = "server storage nearly full: free disk or add storage";
+
+    /// The disk usage threshold refuses a write (#5191): the storage volume
+    /// has `total_bytes` of capacity, `used_bytes` of it in use, and writes
+    /// are refused at `threshold_percent`. `limit_bytes` is the usage the
+    /// threshold stands for.
+    pub fn disk_threshold(
+        total_bytes: u64,
+        used_bytes: u64,
+        threshold_percent: u8,
+        content_length: Option<u64>,
+    ) -> Self {
+        let limit_bytes =
+            u64::try_from(u128::from(total_bytes) * u128::from(threshold_percent) / 100)
+                .unwrap_or(u64::MAX);
+        let used_percent = super::percent(used_bytes, total_bytes).unwrap_or(100.0);
+        let message = format!(
+            "{} (the storage volume is {used_percent:.1}% full, {} of {}; writes are refused \
+             from {threshold_percent}%). Downloads are not affected.",
+            Self::DISK_MESSAGE,
+            format_bytes(used_bytes),
+            format_bytes(total_bytes),
+        );
+        Self {
+            used_bytes: Some(used_bytes),
+            content_length,
+            threshold_percent: Some(threshold_percent),
+            used_percent: Some(used_percent),
+            ..Self::base(RefusalKind::Disk, message, limit_bytes)
         }
     }
 
@@ -216,6 +264,12 @@ impl QuotaRefusal {
                     ..Self::base(RefusalKind::Repository, message, limit)
                 }
             }
+            QuotaScope::Disk => Self::disk_threshold(
+                non_negative(denial.limit_bytes),
+                used,
+                denial.threshold_percent.unwrap_or(100),
+                None,
+            ),
         }
     }
 
@@ -265,7 +319,9 @@ impl QuotaRefusal {
 
     pub fn status(&self) -> StatusCode {
         match self.kind {
-            RefusalKind::Storage | RefusalKind::Repository => StatusCode::FORBIDDEN,
+            RefusalKind::Storage | RefusalKind::Repository | RefusalKind::Disk => {
+                StatusCode::FORBIDDEN
+            }
             RefusalKind::Transfer => StatusCode::TOO_MANY_REQUESTS,
             RefusalKind::UploadSize => StatusCode::PAYLOAD_TOO_LARGE,
         }
@@ -278,13 +334,14 @@ impl QuotaRefusal {
             RefusalKind::Repository => "QUOTA_EXCEEDED",
             RefusalKind::Transfer => "TRANSFER_QUOTA_EXCEEDED",
             RefusalKind::UploadSize => "PAYLOAD_TOO_LARGE",
+            RefusalKind::Disk => "DISK_THRESHOLD_EXCEEDED",
         }
     }
 
     /// The OCI distribution-spec error code.
     pub fn oci_code(&self) -> &'static str {
         match self.kind {
-            RefusalKind::Storage | RefusalKind::Repository => "DENIED",
+            RefusalKind::Storage | RefusalKind::Repository | RefusalKind::Disk => "DENIED",
             RefusalKind::Transfer => "TOOMANYREQUESTS",
             RefusalKind::UploadSize => "SIZE_INVALID",
         }
@@ -297,6 +354,7 @@ impl QuotaRefusal {
             RefusalKind::Repository => b"Quota Exceeded",
             RefusalKind::Transfer => b"Transfer Quota Exceeded",
             RefusalKind::UploadSize => b"Payload Too Large",
+            RefusalKind::Disk => b"Disk Threshold Exceeded",
         }
     }
 
@@ -331,6 +389,12 @@ impl QuotaRefusal {
         }
         if let Some(url) = &self.help_url {
             map.insert("help_url".into(), url.clone().into());
+        }
+        if let Some(threshold) = self.threshold_percent {
+            map.insert("threshold_percent".into(), threshold.into());
+        }
+        if let Some(used) = self.used_percent {
+            map.insert("used_percent".into(), used.into());
         }
         map
     }
@@ -584,6 +648,51 @@ mod tests {
                 .additional_bytes,
             None
         );
+    }
+
+    #[tokio::test]
+    async fn disk_threshold_refusal_is_its_own_403_5191() {
+        let refusal = QuotaRefusal::disk_threshold(100 * GIB, 99 * GIB, 98, Some(5));
+        assert_eq!(refusal.kind.label(), "disk");
+        assert_eq!(refusal.oci_code(), "DENIED");
+        let response = refusal.clone().into_response();
+        assert_eq!(
+            response
+                .extensions()
+                .get::<hyper::ext::ReasonPhrase>()
+                .map(|r| r.as_bytes().to_vec()),
+            Some(b"Disk Threshold Exceeded".to_vec())
+        );
+        assert!(response.headers().get(header::CONNECTION).is_none());
+        let (status, body) = json_of(response).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "code": "DISK_THRESHOLD_EXCEEDED",
+                "message": "server storage nearly full: free disk or add storage (the storage \
+                            volume is 99.0% full, 99.0 GiB of 100.0 GiB; writes are refused \
+                            from 98%). Downloads are not affected.",
+                "limit_bytes": 98 * GIB,
+                "used_bytes": 99 * GIB,
+                "content_length": 5,
+                "threshold_percent": 98,
+                "used_percent": 99.0,
+            })
+        );
+        // Not the quota's remedy.
+        assert!(!refusal.message.contains("quota"));
+        let oci = refusal.oci_body();
+        assert_eq!(oci["errors"][0]["detail"]["threshold_percent"], 98);
+        assert_eq!(refusal.npm_body()["error"], refusal.message.as_str());
+        // The service-layer denial renders the same refusal.
+        let mut denial = QuotaDenial::new(QuotaScope::Disk, 100, 99);
+        denial.threshold_percent = Some(98);
+        let r = denial.refusal();
+        assert_eq!(r.code(), "DISK_THRESHOLD_EXCEEDED");
+        assert_eq!(r.limit_bytes, 98);
+        assert!(r.message.starts_with(QuotaRefusal::DISK_MESSAGE));
+        assert_eq!(denial.exceeded_message(), r.message);
     }
 
     #[tokio::test]

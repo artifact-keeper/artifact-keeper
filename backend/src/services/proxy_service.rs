@@ -10171,8 +10171,15 @@ impl ProxyService {
         // *siblings* (Packages, etc.), not the Release itself.
         let now = Utc::now();
 
-        // Write to cache
-        if let Err(e) = self
+        // Write to cache, unless the storage volume is at its disk block
+        // threshold (#5191): then the fetched Release is served uncached, like
+        // every other fill.
+        if crate::services::quota::disk::cache_fills_blocked() {
+            tracing::debug!(
+                cache_key = %cache_key,
+                "storage volume at its disk threshold; serving dists uncached"
+            );
+        } else if let Err(e) = self
             .cache_artifact(
                 &cache_key,
                 &metadata_key,
@@ -11068,6 +11075,15 @@ impl ProxyService {
             tracing::debug!(
                 repository = %repo.key,
                 "instance storage quota reached; serving without caching"
+            );
+            return false;
+        }
+        // At the disk block threshold (#5191) likewise: the response is
+        // still streamed to the client, never written to the volume.
+        if crate::services::quota::disk::cache_fills_blocked() {
+            tracing::debug!(
+                repository = %repo.key,
+                "storage volume at its disk threshold; serving without caching"
             );
             return false;
         }

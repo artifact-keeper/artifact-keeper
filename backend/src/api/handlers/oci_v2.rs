@@ -4866,6 +4866,10 @@ async fn cache_manifest_reference_locally(
     if crate::services::quota::storage::at_quota(&state.db).await {
         return Err("instance storage quota reached; not caching".to_string());
     }
+    // Likewise at the disk block threshold (#5191).
+    if crate::services::quota::disk::cache_fills_blocked() {
+        return Err("storage volume at its disk threshold; not caching".to_string());
+    }
     let digest = compute_sha256(content);
     let storage = state
         .storage_for_repo(&repo.location)
@@ -13427,6 +13431,14 @@ fn mount_quota_refusal(
 ) -> Result<(), Option<Response>> {
     match decision {
         Ok(None) => Ok(()),
+        // A mount writes no bytes, so the disk threshold (#5191) does not
+        // refuse it. The disk check runs after every quota, so a disk denial
+        // means the mount fits them all.
+        Ok(Some(denial))
+            if denial.scope == crate::services::repository_service::QuotaScope::Disk =>
+        {
+            Ok(())
+        }
         Ok(Some(denial)) => Err(oci_quota_refusal(Ok(Some(denial)))),
         Err(e) => {
             tracing::warn!("blob mount quota check failed; falling back to an upload: {e}");
