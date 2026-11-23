@@ -543,10 +543,156 @@ pub fn is_compound_spdx_expression(input: &str) -> bool {
     parser.or_expr(0) && parser.pos == tokens.len()
 }
 
+/// A scanner license-list element that is already a *conjunctive* SPDX
+/// expression, kept as written instead of being wrapped as one opaque
+/// `LicenseRef-` by [`sanitize_license_term`] (#6379).
+///
+/// It qualifies when it is compound ([`is_compound_spdx_expression`]: it
+/// combines licenses with `AND` or attaches an exception with `WITH`), has
+/// no `OR` anywhere, and is at most [`LICENSE_TERM_INPUT_CAP`] characters.
+/// Whitespace runs collapse to one space.
+///
+/// Every license of a conjunction applies, so keeping it cannot let a
+/// policy pass the package on one arm: a policy that approves MIT alone
+/// still fails `MIT AND PSF-2.0`. An `OR` offers a choice between arms, so
+/// an element with one stays wrapped as before (#1152), and so does prose,
+/// a lone identifier (which [`sanitize_license_term`] canonicalises) and an
+/// oversized field.
+///
+/// Each license operand is rewritten as [`sanitize_license_term`] would a
+/// lone term, so the result is a valid SPDX expression of listed ids: a
+/// known identifier takes its canonical case (`mit` becomes `MIT`, with a
+/// trailing `+` kept), and an identifier outside [`SPDX_IDENTIFIERS`]
+/// becomes `LicenseRef-<sanitised>` on its own, leaving the rest of the
+/// expression readable. `LicenseRef-` / `DocumentRef-` operands and the
+/// exception after `WITH` are kept as written.
+///
+/// The result joins with other terms under ` AND ` without parentheses:
+/// `AND` is associative and `WITH` binds tighter than it.
+pub fn conjunctive_spdx_expression(term: &str) -> Option<String> {
+    let trimmed = term.trim();
+    if trimmed.chars().count() > LICENSE_TERM_INPUT_CAP {
+        return None;
+    }
+    let tokens = tokenize_spdx_expression(trimmed)?;
+    if tokens.iter().any(|t| matches!(t, SpdxToken::Or)) || !is_compound_spdx_expression(trimmed) {
+        return None;
+    }
+    let mut out = String::with_capacity(trimmed.len());
+    let mut after_open = true;
+    let mut after_with = false;
+    for token in &tokens {
+        let piece = match token {
+            SpdxToken::Open => {
+                if !after_open {
+                    out.push(' ');
+                }
+                out.push('(');
+                after_open = true;
+                continue;
+            }
+            SpdxToken::Close => {
+                out.push(')');
+                continue;
+            }
+            SpdxToken::And => "AND".to_string(),
+            SpdxToken::With => "WITH".to_string(),
+            SpdxToken::Or => return None,
+            SpdxToken::Term(t) if after_with => (*t).to_string(),
+            SpdxToken::Term(t) => canonical_operand(t),
+        };
+        if !after_open {
+            out.push(' ');
+        }
+        out.push_str(&piece);
+        after_open = false;
+        after_with = matches!(token, SpdxToken::With);
+    }
+    Some(out)
+}
+
+/// One license operand of an expression in canonical form (#6379): a
+/// listed id (with an optional `+`) in its canonical case, a `LicenseRef-`
+/// or `DocumentRef-` reference as written, anything else wrapped as
+/// [`sanitize_license_term`] wraps an unknown term.
+fn canonical_operand(term: &str) -> String {
+    if term.starts_with("LicenseRef-") || term.starts_with("DocumentRef-") {
+        return term.to_string();
+    }
+    let (base, plus) = match term.strip_suffix('+') {
+        Some(base) => (base, "+"),
+        None => (term, ""),
+    };
+    if let Some(canonical) = SPDX_CANONICAL.get(&base.to_lowercase()) {
+        return format!("{canonical}{plus}");
+    }
+    sanitize_license_term(term).unwrap_or_else(|| "LicenseRef-NOASSERTION".to_string())
+}
+
 #[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #6379: only a compound expression without `OR`, within the input
+    /// cap, is kept; whitespace is normalised.
+    #[test]
+    fn conjunctive_spdx_expression_keeps_only_conjunctions_6379() {
+        for (input, want) in [
+            ("MIT AND PSF-2.0", Some("MIT AND LicenseRef-PSF-2.0")),
+            (" MIT\tAND  PSF-2.0 ", Some("MIT AND LicenseRef-PSF-2.0")),
+            ("(MIT AND ISC) AND Zlib", Some("(MIT AND ISC) AND Zlib")),
+            ("GPL-2.0+ AND MIT", Some("GPL-2.0+ AND MIT")),
+            ("( MIT AND ISC )AND Zlib", Some("(MIT AND ISC) AND Zlib")),
+            // Known ids take their canonical case.
+            ("mit AND isc", Some("MIT AND ISC")),
+            // PSF-2.0 is not on the list: wrapped alone, as a lone PSF-2.0 is.
+            ("mit AND psf-2.0", Some("MIT AND LicenseRef-psf-2.0")),
+            ("gpl-2.0+ AND apache-2.0", Some("GPL-2.0+ AND Apache-2.0")),
+            (
+                "apache-2.0 WITH LLVM-exception",
+                Some("Apache-2.0 WITH LLVM-exception"),
+            ),
+            // An unlisted id is wrapped on its own; the rest stays readable.
+            ("MIT AND Foo-1.0", Some("MIT AND LicenseRef-Foo-1.0")),
+            (
+                "(Acme-EULA AND isc) AND MIT",
+                Some("(LicenseRef-Acme-EULA AND ISC) AND MIT"),
+            ),
+            ("Bar+ AND MIT", Some("LicenseRef-Bar AND MIT")),
+            (
+                "DocumentRef-x:LicenseRef-y AND MIT",
+                Some("DocumentRef-x:LicenseRef-y AND MIT"),
+            ),
+            (
+                "Apache-2.0 WITH LLVM-exception",
+                Some("Apache-2.0 WITH LLVM-exception"),
+            ),
+            ("LicenseRef-Foo AND MIT", Some("LicenseRef-Foo AND MIT")),
+            ("MIT OR Apache-2.0", None),
+            ("(MIT AND ISC) OR Zlib", None),
+            ("MIT AND (ISC OR Zlib)", None),
+            ("MIT", None),
+            ("(MIT)", None),
+            ("GPL v2 and MIT", None),
+            ("MIT/Apache-2.0 AND ISC", None),
+            ("MIT AND", None),
+            ("MIT and ISC", None),
+            ("", None),
+        ] {
+            assert_eq!(
+                conjunctive_spdx_expression(input).as_deref(),
+                want,
+                "{input:?}"
+            );
+        }
+        let at_cap = format!("MIT{}", " AND MIT".repeat((LICENSE_TERM_INPUT_CAP - 3) / 8));
+        assert!(at_cap.len() <= LICENSE_TERM_INPUT_CAP);
+        assert!(conjunctive_spdx_expression(&at_cap).is_some());
+        let over = format!("{at_cap} AND ISC AND Zlib");
+        assert!(over.len() > LICENSE_TERM_INPUT_CAP);
+        assert_eq!(conjunctive_spdx_expression(&over), None);
+    }
 
     #[test]
     fn known_identifiers_validate() {
