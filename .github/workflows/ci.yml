@@ -147,6 +147,9 @@ jobs:
       pull-requests: read
       # The push-time tree check reads the merged PR's check runs.
       checks: read
+      # The unit-build step lists the in-flight runs' jobs to see whether
+      # the ak-beefy-runners slot is free.
+      actions: read
     outputs:
       code: ${{ steps.filter.outputs.code }}
       backend: ${{ steps.filter.outputs.backend }}
@@ -159,6 +162,7 @@ jobs:
       scanner_adapter: ${{ steps.filter.outputs.scanner_adapter }}
       workflow_contracts: ${{ steps.filter.outputs.workflow_contracts }}
       workflow_scan_gate: ${{ steps.filter.outputs.workflow_scan_gate }}
+      unit_build: ${{ steps.unit_build.outputs.where }}
     steps:
       # Push only, and only the tree-check script: on a push the checkout is
       # the protected branch's own commit. Pull requests are classified from
@@ -425,6 +429,93 @@ jobs:
           echo "scanner-adapter Go inputs changed: $scanner_adapter"
           echo "workflow files changed (contract tests): $workflow_contracts"
           echo "docker-publish.yml changed (workflow_scan_gate_tests): $workflow_scan_gate"
+
+      # Where the unit-test binaries are built, for `test-backend-unit-build`
+      # and the unit-test legs (#6158). `beefy`: ONE job on ak-beefy-runners
+      # (a rocky pod with a 32Gi runner container) compiles every shard's
+      # tests into a nextest archive, and the five hosted legs only run
+      # their share of it. `hosted`: every leg compiles its own shard, as
+      # before. The single build peaks at ~26 GiB, which no 16 GB hosted
+      # runner holds, and a shard build at 13-18 GiB, which is why the legs
+      # need their swapfile.
+      #
+      # `beefy` only for code this repository's own members wrote: a manual
+      # dispatch, or a pull request from a branch of this repository that
+      # Dependabot did not open. A self-hosted runner must
+      # never execute a fork's code (its build scripts and tests run with
+      # whatever the pod can reach), and a Dependabot PR is unreviewed
+      # upstream code. A merge-group run stays hosted, so the queue never
+      # waits on rocky. A push stays hosted too: every push to main, master
+      # or release/** also starts Docker Publish, whose amd64 leg wants the
+      # same slot within seconds, before the jobs API lists it (a job
+      # waiting on `needs` is not listed yet), so the slot check below
+      # cannot see the race. The hosted legs' push runs are also what keeps
+      # the shared dependency cache fresh.
+      #
+      # And only while the pool has a free slot. ak-beefy-runners has
+      # BEEFY_SLOTS runners (maxRunners in artifact-keeper-arc-runners'
+      # argocd/arc-beefy-runners-values.yaml; keep the two equal), and
+      # Docker Publish's amd64 backend leg holds one for 50-70 min per
+      # push. A run that finds every slot taken (a queued or running job on
+      # that label in a CI or Docker Publish run) builds hosted instead of
+      # queueing behind it: hosted is slower to build but never waits. Two
+      # runs that look at the same moment can both see a free slot; the
+      # second then waits for one build (~15 min), not for a release
+      # image. Any API error means `hosted`.
+      #
+      # A queued build is not bounded by its timeout-minutes (GitHub waits up
+      # to 24 h for a self-hosted runner), and the legs wait with it. The
+      # check below cannot see other repositories' jobs on the same
+      # org-level scale set (artifact-keeper-iac's helm-ci). If rocky or its
+      # ARC listener is down, set the repository variable
+      # AK_UNIT_BUILD_ONCE=off (turns `beefy` off without a PR), cancel the
+      # stuck run and re-run it.
+      - name: Decide where the unit-test binaries are built
+        id: unit_build
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          SWITCH: ${{ vars.AK_UNIT_BUILD_ONCE }}
+          BEEFY_SLOTS: "1"
+        run: |
+          decide() { # <where> <why>
+            echo "where=$1" >> "$GITHUB_OUTPUT"
+            echo "unit-test build: $1 ($2)"
+            exit 0
+          }
+          case "$EVENT_NAME" in
+            workflow_dispatch) ;;
+            push) decide hosted "push: Docker Publish takes the ak-beefy-runners slot for this commit" ;;
+            pull_request)
+              [ -n "$HEAD_REPO" ] && [ "$HEAD_REPO" = "$GITHUB_REPOSITORY" ] \
+                || decide hosted "pull request from ${HEAD_REPO:-a deleted fork}: no self-hosted runner"
+              [ "$PR_AUTHOR" != "dependabot[bot]" ] \
+                || decide hosted "Dependabot pull request: no self-hosted runner"
+              ;;
+            *) decide hosted "$EVENT_NAME run: GitHub-hosted only" ;;
+          esac
+          [ "$SWITCH" != off ] || decide hosted "repository variable AK_UNIT_BUILD_ONCE=off"
+          busy=0
+          for wf in docker-publish.yml ci.yml; do
+            for st in in_progress queued; do
+              runs=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/${wf}/runs?status=${st}&per_page=50" \
+                --jq '.workflow_runs[].id') || decide hosted "could not list ${st} ${wf} runs"
+              for id in $runs; do
+                [ "$id" = "$GITHUB_RUN_ID" ] && continue
+                n=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${id}/jobs?filter=latest&per_page=100" \
+                  --jq '[.jobs[] | select(.status != "completed") | select(.labels | index("ak-beefy-runners"))] | length') \
+                  || decide hosted "could not list the jobs of run ${id}"
+                if [ "$n" -gt 0 ]; then
+                  echo "run ${id} (${wf}) holds or waits for ${n} ak-beefy-runners slot(s)"
+                  busy=$((busy + n))
+                  [ "$busy" -lt "$BEEFY_SLOTS" ] || decide hosted "all ${BEEFY_SLOTS} ak-beefy-runners slot(s) taken"
+                fi
+              done
+            done
+          done
+          decide beefy "trusted ${EVENT_NAME}, ${busy} of ${BEEFY_SLOTS} ak-beefy-runners slot(s) taken"
 
   # ════════════════════════════════════════════════════════════════════════════
   # RELEASE-BUMP GATE
@@ -977,6 +1068,298 @@ jobs:
           CARGO_INCREMENTAL: "0"
         run: cargo check --locked --workspace --target x86_64-pc-windows-gnu --features vendored-openssl
 
+  # BUILD-ONCE: EVERY SHARD'S UNIT TESTS IN ONE BUILD, ON ROCKY (#6158).
+  #
+  # The five legs below used to compile the same workspace five times, each
+  # at 13-18 GiB of rustc on a 16 GB hosted runner (76% of CI's minutes). One
+  # build of all ~22.7k tests peaks at ~26 GiB (#6133), which only a 32 GB
+  # runner holds, so it runs here, on ak-beefy-runners: a rocky pod whose
+  # runner container has a 32Gi limit (artifact-keeper-arc-runners
+  # argocd/arc-beefy-runners-values.yaml). It compiles with no
+  # `test-shard-*` feature (build.rs then turns every shard gate on), under
+  # `cargo llvm-cov` like the legs, and `cargo nextest archive`s the lib and
+  # bin test binaries. Each leg downloads that archive and runs its share.
+  #
+  # WHEN: only when the `changes` job says `unit_build == 'beefy'`: trusted
+  # code (a dispatch, or a pull request from a branch of this repository
+  # that Dependabot did not open) and a free slot in the pool. Everything
+  # else (pushes, fork and Dependabot pull requests, merge groups, a busy
+  # pool, AK_UNIT_BUILD_ONCE=off) skips this job, and the legs build
+  # their own shard on the hosted runner exactly as before. So does a
+  # FAILED build here (continue-on-error: the run stays green): the legs
+  # then build for themselves, and only a bad partition (below) turns the
+  # run red, through test-backend-unit.
+  #
+  # WHERE ON DISK: /home/runner/work/<repo>/<repo>, the hosted runners'
+  # workspace path, not this pod's /home/runner/_work. The pool mounts a
+  # volume there. The test binaries carry that path in
+  # env!("CARGO_MANIFEST_DIR") (~30 tests read fixtures through it) and in
+  # their coverage mappings, and `cargo llvm-cov report` excludes test
+  # files and the target dir by workspace path, so a leg reads the
+  # binaries exactly as if it had built them. It is also what lets this job
+  # share the legs' dependency cache: rust-cache keys its entries by
+  # absolute target path, and by the CARGO*/RUST* variables, which are set
+  # to the hosted runner's values below.
+  #
+  # The cache is written only outside pull requests and merge groups (in
+  # practice by a dispatch; pushes build hosted and the router leg saves);
+  # a pull request restores main's entry and writes nothing, and fork code never reaches
+  # this job, so nothing untrusted can seed what it or a later push
+  # restores. The archive goes to the run's own artifacts (one day).
+  test-backend-unit-build:
+    name: 🧪 Build Unit Tests
+    runs-on: ak-beefy-runners
+    # Measured on the PR (#6158): see the PR description. The ceiling is
+    # for a cold dependency cache on rocky's 8 CPUs.
+    timeout-minutes: 50
+    # A failure here (a pod without the limit or volume, an OOM, a lost
+    # runner) only means the legs build for themselves, so it must not turn
+    # the run red; the legs read `archive`, not this job's result. A bad
+    # partition still fails the run, through test-backend-unit.
+    continue-on-error: true
+    needs: [changes, release-bump]
+    if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' && needs.release-bump.outputs.bump_only != 'true' && needs.changes.outputs.unit_build == 'beefy' }}
+    outputs:
+      # ok | bad | error | empty (never ran): read by test-backend-unit,
+      # which fails only on `bad`.
+      partition: ${{ steps.partition.outputs.verdict }}
+      # ok | bad | empty: compiler warnings in the all-shards build.
+      warnings: ${{ steps.warnings.outputs.verdict }}
+      # `ready` once the archive is uploaded: the legs' FROM_ARCHIVE.
+      archive: ${{ steps.ready.outputs.archive }}
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      # The legs' value, because rust-cache hashes it into the cache key.
+      # The build itself runs at BUILD_JOBS (the pod's 8 CPUs) through
+      # `--build-jobs`, which does not enter the key.
+      CARGO_BUILD_JOBS: "4"
+      CARGO_INCREMENTAL: "0"
+      CARGO_NET_RETRY: "10"
+      SQLX_OFFLINE: true
+      # What the ubuntu-24.04 image sets; the pod sets neither. Empty
+      # RUST_TEST_THREADS (the pod sets 8) is left out of the cache key.
+      CARGO_HOME: /home/runner/.cargo
+      RUSTUP_HOME: /home/runner/.rustup
+      RUST_TEST_THREADS: ""
+      BUILD_ROOT: /home/runner/work/artifact-keeper/artifact-keeper
+      BUILD_JOBS: "8"
+    defaults:
+      run:
+        working-directory: /home/runner/work/artifact-keeper/artifact-keeper
+    steps:
+      # The pool's dind sidecar keeps its image store on the NODE
+      # (hostPath /home/runner-dind), and Docker Publish's amd64 backend
+      # leg builds release images through it. Pull-request code compiled
+      # here (every build.rs, proc macro and test) must not reach that
+      # daemon, or it could seed a layer or tag a later release build
+      # reuses (#6176). Each ARC pod runs one job, so this job removes the
+      # socket from its own pod, and the Docker Hub pull credentials with
+      # it, before any of that code exists on disk, and refuses to go on
+      # if the daemon still answers. The legs then build for themselves.
+      - name: Cut this pod off from the shared docker daemon
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -uo pipefail
+          for sock in /var/run/docker.sock /run/docker.sock; do
+            [ -e "$sock" ] && { rm -f "$sock" 2>/dev/null || sudo rm -f "$sock"; }
+          done
+          rm -rf "$HOME/.docker" 2>/dev/null || sudo rm -rf "$HOME/.docker"
+          unset DOCKER_HOST
+          echo "DOCKER_HOST=unix:///nonexistent/docker.sock" >> "$GITHUB_ENV"
+          if [ -e /var/run/docker.sock ] || [ -e /run/docker.sock ] || [ -e "$HOME/.docker/config.json" ]; then
+            echo "::error title=Could not isolate the build pod::the docker socket or credentials are still present, so pull-request code will not be built on ak-beefy-runners. The unit-test legs build for themselves."
+            exit 1
+          fi
+          if command -v docker >/dev/null && DOCKER_HOST=unix:///var/run/docker.sock timeout 10 docker info >/dev/null 2>&1; then
+            echo "::error title=Could not isolate the build pod::the shared docker daemon still answers. The unit-test legs build for themselves."
+            exit 1
+          fi
+          echo "docker socket and registry credentials removed from this pod"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Fails in seconds, not after a 10-minute build, on a pod without the
+      # volume or the memory this job needs (an arc-runners values change
+      # that has not been applied, or was rolled back). The legs then build
+      # for themselves.
+      - name: Check the pod and move the checkout to the hosted path
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          if [ -r /sys/fs/cgroup/memory.max ]; then
+            limit=$(cat /sys/fs/cgroup/memory.max)
+          else
+            limit=$(cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null || echo 0)
+          fi
+          echo "runner container memory limit: ${limit}"
+          if [ "$limit" != max ] && [ "$limit" -lt $((30 * 1024 * 1024 * 1024)) ]; then
+            echo "::error title=ak-beefy-runners is too small::the runner container's memory limit is ${limit} bytes; the build-once job needs at least 30 GiB (artifact-keeper-arc-runners argocd/arc-beefy-runners-values.yaml). The unit-test legs build for themselves instead."
+            exit 1
+          fi
+          if ! mountpoint -q /home/runner/work; then
+            echo "::error title=ak-beefy-runners has no /home/runner/work volume::the build must run at the hosted runners' workspace path, on a volume (rocky's root disk is small). See artifact-keeper-arc-runners argocd/arc-beefy-runners-values.yaml. The unit-test legs build for themselves instead."
+            exit 1
+          fi
+          mkdir -p "$BUILD_ROOT"
+          cp -a "$GITHUB_WORKSPACE/." "$BUILD_ROOT/"
+          git -C "$BUILD_ROOT" log -1 --format='building %H'
+          df -h "$BUILD_ROOT" | tail -1
+
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master 2026-11-15; the toolchain input picks the compiler
+        with:
+          toolchain: 1.98.0
+          components: llvm-tools-preview
+
+      - name: Assert the pinned Rust toolchain is in force
+        run: ./scripts/ci/check-toolchain-pin.sh --active
+
+      # The pod is the generic runner image: no compiler, no protoc, none of
+      # the -dev packages the hosted image ships and the build scripts in
+      # the dependency tree (openssl-sys, libgit2-sys, prost) need. And no
+      # zstd: without it @actions/cache falls back to gzip, which is part of
+      # the cache version, so the legs' (zstd) entry would never restore.
+      # Bounded like every protoc install (#6272).
+      - name: Install the build dependencies
+        timeout-minutes: 12
+        run: |
+          bash scripts/ci/apt-install-bounded.sh \
+            build-essential pkg-config libssl-dev zlib1g-dev cmake protobuf-compiler zstd
+
+      - name: Install cargo-llvm-cov and cargo-nextest
+        uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
+        with:
+          tool: cargo-llvm-cov@0.9.1,cargo-nextest@0.9.152
+
+      # The legs' cache entry (same prefix, shared key, path and key
+      # variables): the instrumented dependency graph is the same for every
+      # shard. Saved from push runs only; see the job comment.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          prefix-key: v1-rust
+          shared-key: unit-shard-instrumented
+          workspaces: /home/runner/work/artifact-keeper/artifact-keeper -> target
+          save-if: ${{ github.event_name != 'pull_request' && github.event_name != 'merge_group' }}
+
+      - name: Fetch dependencies
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            if cargo fetch; then
+              exit 0
+            fi
+            echo "cargo fetch failed (attempt ${attempt}/3) — retrying" >&2
+            sleep $(( attempt * 10 ))
+          done
+          echo "ERROR: cargo fetch failed after 3 attempts" >&2
+          exit 1
+
+      # The lib-test and bin-test targets one at a time, as in the legs:
+      # the ~26 GiB lib-test rustc and the ~10 GiB non-test library the
+      # bins need would overlap otherwise (#3494). run-measured-build.sh
+      # writes each pass's peak RSS to the job summary. `nextest archive`
+      # then packs what the two passes built; it compiles nothing.
+      - name: Build and archive the instrumented test binaries
+        id: build
+        run: |
+          set -euo pipefail
+          source <(cargo llvm-cov show-env --sh)
+          cargo llvm-cov clean --workspace
+          ./scripts/ci/run-measured-build.sh "lib (every shard)" \
+            cargo nextest run --workspace --lib --no-run --build-jobs "$BUILD_JOBS"
+          ./scripts/ci/run-measured-build.sh bins \
+            cargo nextest run --workspace --bins --no-run --build-jobs "$BUILD_JOBS"
+          cargo nextest archive --workspace --lib --bins --build-jobs "$BUILD_JOBS" \
+            --archive-file "$RUNNER_TEMP/unit-tests.tar.zst"
+          ls -l "$RUNNER_TEMP/unit-tests.tar.zst"
+
+      # The legs' #6329 check, once for every shard: this build has no
+      # `test-shard-*` feature, so the full dead_code lint is on and any
+      # warning is a real one. A rebuild is a no-op that replays cargo's
+      # cached diagnostics. The archive is still uploaded and used, and the
+      # run fails through test-backend-unit's `warnings` read, since no leg
+      # builds (and checks) its own shard then.
+      - name: Refuse compiler warnings in the all-shards test build
+        id: warnings
+        env:
+          CARGO_TERM_COLOR: never
+        run: |
+          source <(cargo llvm-cov show-env --sh)
+          out="$(cargo nextest run --workspace --lib --bins --no-run --build-jobs "$BUILD_JOBS" 2>&1)"
+          if grep -qE '^warning: `artifact-keeper[^`]*` \(.*\) generated [0-9]+ warnings?' <<<"$out"; then
+            printf '%s\n' "$out" | grep -vE '^ *(Compiling|Finished|Executable|Blocking|Downloaded|Fresh) '
+            echo "verdict=bad" >> "$GITHUB_OUTPUT"
+            echo "::error title=Compiler warnings in the unit-test build::the all-shards test build has rustc warnings (above)."
+          else
+            echo "verdict=ok" >> "$GITHUB_OUTPUT"
+            echo "no compiler warnings in the all-shards test build"
+          fi
+
+      # Each leg selects its tests with `test-shards.py archive-filter`.
+      # The filters partition the archive by construction (the BIN_SHARD
+      # leg takes whatever no other leg claims); this proves it with
+      # nextest's own filter engine, on the binaries the legs will run:
+      # every test selected by exactly one leg. A violation is a bug in the
+      # script, and fails the run (through test-backend-unit) even though
+      # the legs then build and run for themselves.
+      - name: Check that the legs partition the archive
+        id: partition
+        run: |
+          set -uo pipefail
+          source <(cargo llvm-cov show-env --sh)
+          mkdir -p "$RUNNER_TEMP/listing"
+          for shard in $(python3 scripts/ci/test-shards.py shards); do
+            if ! filter="$(python3 scripts/ci/test-shards.py archive-filter "$shard")" \
+                || ! cargo nextest list --workspace --lib --bins -E "$filter" --message-format json \
+                  >"$RUNNER_TEMP/listing/${shard}.json"; then
+              # Not a verdict on the partition: the legs build for themselves.
+              echo "verdict=error" >> "$GITHUB_OUTPUT"
+              echo "::error title=Could not list the archive::listing shard ${shard} failed; the unit-test legs build for themselves."
+              exit 1
+            fi
+          done
+          if python3 scripts/ci/test-shards.py partition-check "$RUNNER_TEMP/listing"; then
+            echo "verdict=ok" >> "$GITHUB_OUTPUT"
+          else
+            echo "verdict=bad" >> "$GITHUB_OUTPUT"
+            echo "::error title=The unit-test legs do not partition the archive::some test would run in no leg or in two (list above). The legs build their own shards instead, but test-backend-unit fails until scripts/ci/test-shards.py archive-filter is fixed."
+            exit 1
+          fi
+
+      - name: Upload the test archive
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: unit-test-archive
+          path: ${{ runner.temp }}/unit-tests.tar.zst
+          if-no-files-found: error
+          # Already zstd; a re-run of this job replaces it.
+          compression-level: 0
+          # Long enough for "Re-run failed jobs" on a leg days later: the
+          # build job's result is kept, so the leg looks for this archive.
+          retention-days: 5
+          overwrite: true
+
+      - name: Mark the archive ready
+        id: ready
+        run: echo "archive=ready" >> "$GITHUB_OUTPUT"
+
+      # The pod's memory high-water mark and disk, on every run (report
+      # only). rocky runs cgroup v1, the hosted runners v2; both are read.
+      - name: Memory and disk report
+        if: always()
+        working-directory: ${{ github.workspace }}
+        run: |
+          for f in /sys/fs/cgroup/memory.peak /sys/fs/cgroup/memory/memory.max_usage_in_bytes; do
+            if [ -r "$f" ]; then
+              printf '%s: %s GiB\n' "$f" "$(awk -v b="$(cat "$f")" 'BEGIN{printf "%.2f", b/1073741824}')"
+            fi
+          done
+          free -g
+          df -h "$GITHUB_WORKSPACE" /home/runner/work / 2>/dev/null | cat
+          du -sh "$BUILD_ROOT/target" 2>/dev/null || true
+
   # UNIT TESTS + COVERAGE, SHARDED ACROSS GITHUB-HOSTED RUNNERS.
   #
   # The instrumented lib-test target used to be ONE rustc invocation holding
@@ -998,6 +1381,16 @@ jobs:
   # of one unsharded run, and then applies the same floor and new-code gates
   # as before.
   #
+  # When `test-backend-unit-build` above succeeded, a leg compiles nothing:
+  # it downloads that job's archive of EVERY shard's tests and runs its own
+  # share, chosen by `test-shards.py archive-filter` (the shard's test
+  # modules; the BIN_SHARD leg also takes the bin targets and anything no
+  # other leg claims). The coverage per leg, and the sum in coverage-gates,
+  # come out the same: every production line is instrumented in the one
+  # build, and each test module still runs in exactly one leg. Otherwise
+  # (the build was skipped or failed) the leg builds its shard as below.
+  # `FROM_ARCHIVE` picks the steps.
+  #
   # The integration suites (backend/tests/) are not part of this: they link
   # the library WITHOUT `cfg(test)`, so sharding does nothing for them. They
   # run in `test-backend-integration`. The required context
@@ -1011,7 +1404,9 @@ jobs:
     # (20-core aarch64 host; a 4-vCPU hosted runner is slower), ~2-4 min of
     # tests, plus the instrumented dependency graph when the cache misses.
     timeout-minutes: 60
-    needs: [changes, release-bump]
+    # The build job's `archive` output picks the leg's mode (FROM_ARCHIVE);
+    # skipped or failed, the leg builds for itself. `!cancelled()` runs it either way.
+    needs: [changes, release-bump, test-backend-unit-build]
     # Skip on docs-only PRs and version-bump-only release PRs -- see check-rust.
     if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' && needs.release-bump.outputs.bump_only != 'true' }}
     strategy:
@@ -1038,6 +1433,9 @@ jobs:
       # (main.rs and bin/**; their test modules are gated to it, #6133).
       # test-shards.py `check` fails if this is not the shard they carry.
       BIN_SHARD: router
+      # true: run this shard's tests from test-backend-unit-build's archive.
+      FROM_ARCHIVE: ${{ needs.test-backend-unit-build.outputs.archive == 'ready' }}
+      ARCHIVE: ${{ github.workspace }}/../unit-test-archive/unit-tests.tar.zst
     services:
       # DB-backed lib tests need it; one fresh database per leg also means
       # the `db-serial` groups in .config/nextest.toml only have to
@@ -1086,22 +1484,27 @@ jobs:
           tool: cargo-llvm-cov,cargo-nextest,sqlx-cli
 
       # The self-hosted runner image ships protoc; ubuntu-24.04 does not,
-      # and build scripts in the dependency tree need it. services-1 also
-      # gets squashfs-tools so the incus scanner's real mksquashfs/unsquashfs
+      # and build scripts in the dependency tree need it (not when the leg
+      # runs from the archive: it builds nothing). services-1 also gets
+      # squashfs-tools so the incus scanner's real mksquashfs/unsquashfs
       # tests run as the non-root runner user instead of skipping (#4470).
       # Bounded (#6272): scripts/ci/apt-install-bounded.sh caps each download
       # attempt at 3 minutes and retries on azure.archive.ubuntu.com, so a
       # crawling mirror cannot hold the job to its ceiling.
       - name: Install protoc
+        if: env.FROM_ARCHIVE != 'true' || matrix.shard == 'services-1'
         timeout-minutes: 12
-        run: bash scripts/ci/apt-install-bounded.sh protobuf-compiler ${{ matrix.shard == 'services-1' && 'squashfs-tools' || '' }}
+        run: bash scripts/ci/apt-install-bounded.sh ${{ env.FROM_ARCHIVE != 'true' && 'protobuf-compiler' || '' }} ${{ matrix.shard == 'services-1' && 'squashfs-tools' || '' }}
 
       # The instrumented dependency graph (~750 crates, 3.3 GB) is identical
       # in every leg, so all legs share one cache entry. Saved from `main`
       # only (see the note on check-rust's rust-cache step; a merge group's
       # ref is as unrestorable as a PR's) and from one leg only, so five legs
-      # do not race to write the same key.
+      # do not race to write the same key. test-backend-unit-build reads
+      # and writes the same entry; a leg running from its archive compiles
+      # nothing and touches no cache.
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        if: env.FROM_ARCHIVE != 'true'
         with:
           prefix-key: v1-rust
           shared-key: unit-shard-instrumented
@@ -1112,6 +1515,7 @@ jobs:
       # `main` before any test ran (run 31176621357). This retries resolution
       # and download ONLY; no test step is ever retried.
       - name: Fetch dependencies
+        if: env.FROM_ARCHIVE != 'true'
         run: |
           set -euo pipefail
           for attempt in 1 2 3; do
@@ -1151,8 +1555,9 @@ jobs:
       # crawls past the 30-minute limit), always inside this compile step.
       # The disk has ~80 GB free, so a 12 GiB swapfile on it gives the
       # kernel somewhere to put cold pages instead. Best effort: a failure
-      # here is a ::warning::, never a red job.
+      # here is a ::warning::, never a red job. Not needed from the archive.
       - name: Add swap
+        if: env.FROM_ARCHIVE != 'true'
         run: |
           if sudo fallocate -l 12G /ak-ci-swapfile \
              && sudo chmod 600 /ak-ci-swapfile \
@@ -1199,6 +1604,7 @@ jobs:
       # log, instead of running into the 60-minute job ceiling.
       - name: Build instrumented test binaries
         id: build
+        if: env.FROM_ARCHIVE != 'true'
         timeout-minutes: 30
         run: |
           source <(cargo llvm-cov show-env --sh)
@@ -1240,6 +1646,15 @@ jobs:
           fi
           echo "no compiler warnings in the ${{ matrix.shard }} test build"
 
+      # The archive the build job uploaded: every shard's lib-test and
+      # bin-test binaries, built at this workspace's path.
+      - name: Download the unit-test archive
+        if: env.FROM_ARCHIVE == 'true'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: unit-test-archive
+          path: ${{ github.workspace }}/../unit-test-archive
+
       # See the pool job's history (#3494, #3699, #3479) for the flags:
       # `--bins` on the leg that owns the bin-target tests, `--no-fail-fast`
       # so a red run reports every failure, and the LLVM %Nm merge pool so
@@ -1252,7 +1667,10 @@ jobs:
       # `-E`: a test module with no shard gate is compiled in every leg;
       # `test-shards.py filter` skips its tests in all but the one leg its
       # file maps to, so each still runs exactly once (`all()` when every
-      # module is gated, the normal case).
+      # module is gated, the normal case). From the archive, which holds
+      # every shard's tests, `archive-filter` selects this shard's;
+      # `--extract-to` puts the binaries where `cargo llvm-cov report`
+      # looks for them.
       #
       # `--profile ci` (.config/nextest.toml): no retries, and a JUnit report
       # at target/nextest/ci/junit.xml for the two steps below (#6172).
@@ -1269,6 +1687,21 @@ jobs:
         run: |
           source <(cargo llvm-cov show-env --sh)
           export LLVM_PROFILE_FILE="${LLVM_PROFILE_FILE%/*}/%32m.profraw"
+          if [ "$FROM_ARCHIVE" = true ]; then
+            filter="$(python3 scripts/ci/test-shards.py archive-filter "${{ matrix.shard }}")"
+            echo "nextest filter for this leg (from the archive, ${#filter} bytes): ${filter:0:400}..."
+            mkdir -p "$CARGO_LLVM_COV_TARGET_DIR"
+            rc=0
+            cargo nextest run --archive-file "$ARCHIVE" --extract-to "$CARGO_LLVM_COV_TARGET_DIR" \
+              -E "$filter" --test-threads 8 --no-fail-fast --profile ci || rc=$?
+            # The JUnit lands under the extracted target dir; the summary and
+            # upload steps read it where a built leg writes it.
+            junit="$(find "$CARGO_LLVM_COV_TARGET_DIR" -path '*/nextest/ci/junit.xml' -print -quit 2>/dev/null || true)"
+            if [ -n "$junit" ]; then
+              mkdir -p target/nextest/ci && cp "$junit" target/nextest/ci/junit.xml
+            fi
+            exit "$rc"
+          fi
           filter="$(python3 scripts/ci/test-shards.py filter "${{ matrix.shard }}")"
           echo "nextest filter for this leg: ${filter}"
           if [ "${{ matrix.shard }}" = "$BIN_SHARD" ]; then
@@ -1305,8 +1738,10 @@ jobs:
         run: |
           source <(cargo llvm-cov show-env --sh)
           mkdir -p coverage
-          cargo llvm-cov report --lcov --output-path coverage/lcov.info
-          cargo llvm-cov report --summary-only > coverage/summary.txt
+          from=()
+          if [ "$FROM_ARCHIVE" = true ]; then from=(--nextest-archive-file "$ARCHIVE"); fi
+          cargo llvm-cov report "${from[@]}" --lcov --output-path coverage/lcov.info
+          cargo llvm-cov report "${from[@]}" --summary-only > coverage/summary.txt
           tail -3 coverage/summary.txt
 
       - name: Upload coverage artifact
@@ -2016,17 +2451,33 @@ jobs:
     name: 🧪 Backend Unit Tests
     runs-on: ubuntu-24.04
     timeout-minutes: 5
-    needs: [changes, release-bump, test-backend-unit-shard, test-backend-integration]
+    needs: [changes, release-bump, test-backend-unit-build, test-backend-unit-shard, test-backend-integration]
     if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' && needs.release-bump.outputs.bump_only != 'true' }}
     steps:
+      # The build-once job's own result is not required: skipped (hosted
+      # build) or failed, the legs built and ran their shards themselves.
+      # Only its partition check counts, because a leg falling back to its
+      # own build would otherwise hide a broken archive-filter.
       - name: Require every unit-test shard and the integration suites
         env:
+          RESULT_BUILD: ${{ needs.test-backend-unit-build.result }}
+          PARTITION: ${{ needs.test-backend-unit-build.outputs.partition }}
+          WARNINGS: ${{ needs.test-backend-unit-build.outputs.warnings }}
           RESULT_SHARDS: ${{ needs.test-backend-unit-shard.result }}
           RESULT_INTEGRATION: ${{ needs.test-backend-integration.result }}
           INTEGRATION_WANTED: ${{ github.event_name == 'merge_group' || needs.changes.outputs.tests != 'false' || needs.changes.outputs.ci_full == 'true' }}
         run: |
+          echo "unit-test build-once job: ${RESULT_BUILD:-missing} (partition check: ${PARTITION:-not run})"
           echo "unit-test shards: ${RESULT_SHARDS:-missing}"
           echo "integration suites: ${RESULT_INTEGRATION:-missing} (wanted: ${INTEGRATION_WANTED:-missing})"
+          if [ "$WARNINGS" = bad ]; then
+            echo "::error title=Compiler warnings in the unit-test build::see '🧪 Build Unit Tests'. The legs ran from its archive, so no leg built (and checked) its own shard."
+            exit 1
+          fi
+          if [ "$PARTITION" = bad ]; then
+            echo "::error title=The unit-test legs do not partition the archive::see '🧪 Build Unit Tests': scripts/ci/test-shards.py archive-filter would run some test in no leg or in two."
+            exit 1
+          fi
           integration_ok=false
           if [ "$RESULT_INTEGRATION" = "success" ]; then
             integration_ok=true
