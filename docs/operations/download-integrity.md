@@ -31,6 +31,10 @@ as a clean response under its original digest (#3919, #4323).
   virtual repository, which serves the member's bytes. A corrupt member is the
   final `502` there too, not a `404` (#4989).
 
+- Every proxy-cache hit of a Remote, on its own route and through a virtual
+  repository, checked against the SHA-256 the cache entry's sidecar records
+  (#4323). See [Proxy-cache hits](#proxy-cache-hits) for what a mismatch does.
+
 Protobuf commit bundles are never
 checked, because their recorded digest is a commit digest, not the digest of
 the stored bundle.
@@ -55,6 +59,28 @@ the stored bundle.
   answers from the artifact row, reads no body and is not checked. Helm and
   the other `serve_local_artifact` formats read the object for a `HEAD` too,
   so they check it.
+
+## Proxy-cache hits
+
+A Remote's cached object is verified while it streams, for every size, with
+one chunk held back and nothing read ahead (#4323):
+
+- A mismatch is known only at the end, after the `200` went out, so the
+  transfer is aborted before its last bytes and the client sees a short read,
+  never a complete body. Package clients retry a short read.
+- The entry is evicted (body and sidecar), so the retry is a cache miss and
+  fetches the object again from upstream through the Remote's usual gates
+  (origin policy, Package Age Policy, scan, the expected digest where the
+  format knows one). The eviction leaves an entry alone if a refill already
+  replaced it.
+- A `HEAD` reads no body and is not checked.
+- An entry whose sidecar records no SHA-256 (an empty body, or a sidecar from
+  before digests were recorded) is served unchecked, as before.
+- A presigned redirect hands out the object without the bytes passing through
+  the backend, so it is not checked here: the client's own integrity check
+  (Cargo's `cksum`, npm's `integrity`, an OCI digest) applies.
+
+`ak_proxy_cache_integrity_evictions_total{repository}` counts the evictions.
 
 ## Repair on a Remote OCI repository
 
@@ -103,7 +129,13 @@ small object to check it; on the generic and artifact routes they read
 nothing.
 
 Each failure logs `stored object failed integrity verification on serve`
-at error level with the object, the expected and actual digest and length.
+at error level with the object, the expected and actual digest and length,
+and increments `ak_stored_object_integrity_failures_total`: `phase` is
+`before_headers` (an object of at most 4 MiB answered `502`, or a Remote OCI
+blob repaired from upstream) or `streaming` (aborted mid-transfer: a larger
+object, a small one the budget had no room for, and every proxy-cache hit).
+The buffered proxy-cache read, which treats a mismatch as a cache miss, is not
+counted there; it shows as `ak_proxy_cache_lookups_total{result="miss_checksum_mismatch"}`. Any increase means damaged storage.
 Run the storage scrub (`POST /api/v1/admin/storage-scrub`) to find other
 damaged objects.
 

@@ -152,6 +152,45 @@ async fn invalidate_proxy_metadata_lru(metadata_key: &str) {
     proxy_metadata_lru().await.invalidate(metadata_key).await;
 }
 
+/// Evict a proxy-cache entry whose body failed verification on a hit
+/// (#4323), if its sidecar still records `failed_digest`: a sidecar naming
+/// another digest belongs to a refill that landed after the failed read, and
+/// is left alone, and not counted. Body before sidecar, as every eviction
+/// orders them; an eviction is counted in
+/// `ak_proxy_cache_integrity_evictions_total` once it is decided; delete
+/// errors are logged and otherwise ignored, as `CacheStore::invalidate`
+/// ignores them, because a sidecar over a missing body already reads as a
+/// miss (#3147).
+async fn evict_corrupt_cache_entry(
+    storage: Arc<StorageService>,
+    repo_key: String,
+    content_key: String,
+    sidecar_key: String,
+    failed_digest: String,
+) {
+    let current = match storage.get(&sidecar_key).await {
+        Ok(bytes) => serde_json::from_slice::<CacheMetadata>(&bytes).ok(),
+        Err(_) => None,
+    };
+    if current.is_some_and(|m| m.checksum_sha256 != failed_digest) {
+        return;
+    }
+    crate::services::metrics_service::record_proxy_cache_integrity_eviction(&repo_key);
+    tracing::warn!(
+        cache_key = %content_key,
+        expected_sha256 = %failed_digest,
+        "proxy cache object failed verification on serve; evicting the entry so the next \
+         read refetches it upstream (#4323)"
+    );
+    if let Err(e) = storage.delete(&content_key).await {
+        tracing::debug!(cache_key = %content_key, error = %e, "evicting corrupt cache body");
+    }
+    if let Err(e) = storage.delete(&sidecar_key).await {
+        tracing::debug!(cache_key = %sidecar_key, error = %e, "evicting corrupt cache sidecar");
+    }
+    invalidate_proxy_metadata_lru(&sidecar_key).await;
+}
+
 /// Upper bound on how long a cache read will wait for an in-flight streaming
 /// publish tail (#3335). The tail — staging `copy`, staging delete, ETag pin,
 /// sidecar write — is normally a few milliseconds on filesystem backends and
@@ -8613,12 +8652,10 @@ impl ProxyService {
         let metadata_key = Self::cache_metadata_key(&self.cache_scope, &repo.key, cache_path)?;
 
         // Cache hit fast path: load metadata sidecar, stream content
-        // straight from storage. The slow-path SHA verification done by
-        // the buffered `fetch_artifact_with_cache_path` is intentionally
-        // skipped here — we cannot recompute SHA without buffering, and
-        // the storage backend's own integrity guarantees apply just as
-        // they do for presigned redirects (#1018 R-tradeoff already
-        // accepted upstream).
+        // straight from storage. The body is hashed while it streams and
+        // checked against the sidecar's SHA-256 (#4323, see
+        // `verify_cached_body`); a mismatch aborts the transfer and evicts
+        // the entry, where the buffered read answers it as a miss.
         if let Some(result) = self
             .try_streaming_cache_hit(
                 repo,
@@ -9076,7 +9113,8 @@ impl ProxyService {
         };
         match stream {
             Ok(body) => Ok(Some(StreamingFetchResult {
-                body,
+                // #4323: hashed while it streams, against the sidecar's digest.
+                body: self.verify_cached_body(cache_key, metadata_key, metadata, body),
                 content_type: metadata.content_type.clone(),
                 content_length: Some(metadata.size_bytes as u64),
                 // Proxy-cache stream: not our artifact row (#1278), unrecorded.
@@ -9098,6 +9136,62 @@ impl ProxyService {
             }
             Err(e) => Err(e),
         }
+    }
+
+    /// Verify a proxy-cache hit's body against the SHA-256 and size its
+    /// sidecar records, while it streams (#4323).
+    ///
+    /// The hit paths used to stream a cached body unchecked, while the
+    /// buffered read treated a digest mismatch as a miss. Now the body is
+    /// wrapped in [`verify::verify_sha256_stream_with_hook`]: memory stays at
+    /// one chunk, nothing is read ahead (a `HEAD`, whose body is never
+    /// polled, costs nothing), and a body that does not match is never
+    /// delivered complete, because its last chunk is withheld and the
+    /// transfer aborted. The mismatch also evicts the entry (body, sidecar,
+    /// in-process sidecar LRU), so the next read is a miss and refetches the
+    /// object upstream under every gate: a corrupt cached object heals on the
+    /// client's retry instead of failing every pull until its TTL runs out.
+    /// The eviction only removes the entry when its sidecar still records the
+    /// digest that failed, so a refill that landed meanwhile is kept.
+    ///
+    /// Unverified, exactly as before: `DOWNLOAD_VERIFY_CHECKSUMS=false`, and a
+    /// sidecar recording no SHA-256 (an empty-body entry, or one written
+    /// before digests were recorded).
+    fn verify_cached_body(
+        &self,
+        cache_key: &str,
+        metadata_key: &str,
+        metadata: &CacheMetadata,
+        body: futures::stream::BoxStream<'static, Result<Bytes>>,
+    ) -> futures::stream::BoxStream<'static, Result<Bytes>> {
+        use crate::storage::verify;
+        let Some(expected) = verify::parse_sha256_hex(&metadata.checksum_sha256)
+            .filter(|_| verify::serve_verification_enabled())
+        else {
+            return body;
+        };
+        let repo_key = Self::cache_entry_of_content_key(&self.cache_scope, cache_key)
+            .map_or("unknown", |(repo_key, _)| repo_key)
+            .to_string();
+        let storage = Arc::clone(&self.storage);
+        let failed_digest = metadata.checksum_sha256.clone();
+        let (content_key, sidecar_key) = (cache_key.to_string(), metadata_key.to_string());
+        let on_mismatch: verify::MismatchHook = Box::new(move || {
+            tokio::spawn(evict_corrupt_cache_entry(
+                storage,
+                repo_key,
+                content_key,
+                sidecar_key,
+                failed_digest,
+            ));
+        });
+        verify::verify_sha256_stream_with_hook(
+            body,
+            expected,
+            Some(metadata.size_bytes.max(0) as u64),
+            format!("proxy cache {cache_key}"),
+            Some(on_mismatch),
+        )
     }
 
     /// The streaming leader body: open upstream ONCE, tee to client + cache,
@@ -17304,6 +17398,7 @@ mod tests {
         let proxy = build_proxy_service_with_storage(backend.clone());
         let mut metadata = stale_positive_sidecar(18);
         metadata.expires_at = Utc::now() + chrono::Duration::hours(1);
+        metadata.checksum_sha256 = sha256_hex_of(b"real-tarball-bytes");
 
         let opened = proxy
             .open_cached_stream(content_key, &sidecar_key_of(content_key), &metadata)
@@ -17317,6 +17412,143 @@ mod tests {
             b"real-tarball-bytes".to_vec()
         );
         assert!(backend.exists(content_key).await.unwrap());
+    }
+
+    fn sha256_hex_of(bytes: &[u8]) -> String {
+        use sha2::Digest;
+        hex::encode(sha2::Sha256::digest(bytes))
+    }
+
+    /// Drain `body`, returning the bytes delivered before it ended and
+    /// whether it ended in an error.
+    async fn drain_until_error(body: BoxStream<'static, Result<Bytes>>) -> (Vec<u8>, bool) {
+        let mut body = body;
+        let mut out = Vec::new();
+        while let Some(chunk) = body.next().await {
+            match chunk {
+                Ok(chunk) => out.extend_from_slice(&chunk),
+                Err(_) => return (out, true),
+            }
+        }
+        (out, false)
+    }
+
+    /// Wait (bounded) for the spawned eviction of a corrupt entry.
+    async fn wait_until_absent(backend: &CacheObjectBackend, key: &str) -> bool {
+        for _ in 0..100 {
+            if !backend.exists(key).await.unwrap() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        false
+    }
+
+    /// #4323: a cache hit is verified against the sidecar's SHA-256 while it
+    /// streams. A body of the right size whose bytes changed in storage is
+    /// never delivered complete (the transfer ends in an error before its last
+    /// chunk), and the entry is evicted so the next read refetches upstream.
+    #[tokio::test]
+    async fn test_streaming_hit_with_corrupt_bytes_aborts_and_evicts_the_entry_4323() {
+        let backend = CacheObjectBackend::new();
+        let content_key = "proxy-cache/npm-remote/4323-corrupt/__content__";
+        let metadata_key = sidecar_key_of(content_key);
+        let good = b"real-tarball-bytes";
+        backend.put_object(content_key, b"real-tarball-BYTES").await;
+        let mut metadata = stale_positive_sidecar(good.len() as i64);
+        metadata.expires_at = Utc::now() + chrono::Duration::hours(1);
+        metadata.checksum_sha256 = sha256_hex_of(good);
+        backend.put_sidecar(&metadata_key, &metadata).await;
+        let proxy = build_proxy_service_with_storage(backend.clone());
+
+        let opened = proxy
+            .open_cached_stream(content_key, &metadata_key, &metadata)
+            .await
+            .expect("opens")
+            .expect("the size matches, so the entry opens as a hit");
+        let (delivered, errored) = drain_until_error(opened.body).await;
+
+        assert!(errored, "a corrupt cached body must end in an error");
+        assert!(
+            delivered.len() < good.len(),
+            "a corrupt cached body must never be delivered complete ({} bytes went out)",
+            delivered.len()
+        );
+        assert!(
+            wait_until_absent(&backend, content_key).await,
+            "the corrupt body is evicted"
+        );
+        assert!(
+            !backend.exists(&metadata_key).await.unwrap(),
+            "and its sidecar, so the next read is a miss that refetches upstream"
+        );
+    }
+
+    /// #4323 positive control: an intact cached body is served whole and its
+    /// entry kept; a sidecar recording no digest is served unverified as
+    /// before.
+    #[tokio::test]
+    async fn test_streaming_hit_with_intact_bytes_is_served_whole_4323() {
+        let good = b"real-tarball-bytes";
+        for (slug, digest) in [
+            ("4323-intact", sha256_hex_of(good)),
+            ("4323-no-digest", String::new()),
+        ] {
+            let backend = CacheObjectBackend::new();
+            let content_key = format!("proxy-cache/npm-remote/{slug}/__content__");
+            let metadata_key = sidecar_key_of(&content_key);
+            backend.put_object(&content_key, good).await;
+            let mut metadata = stale_positive_sidecar(good.len() as i64);
+            metadata.expires_at = Utc::now() + chrono::Duration::hours(1);
+            metadata.checksum_sha256 = digest;
+            backend.put_sidecar(&metadata_key, &metadata).await;
+            let proxy = build_proxy_service_with_storage(backend.clone());
+
+            let opened = proxy
+                .open_cached_stream(&content_key, &metadata_key, &metadata)
+                .await
+                .expect("opens")
+                .expect("hit");
+            assert_eq!(drain_body(opened.body).await, good.to_vec(), "{slug}");
+            assert!(backend.exists(&content_key).await.unwrap(), "{slug}");
+            assert!(backend.exists(&metadata_key).await.unwrap(), "{slug}");
+        }
+    }
+
+    /// #4323: the eviction removes the entry only while its sidecar still
+    /// records the digest that failed; a refill that landed meanwhile is kept.
+    #[tokio::test]
+    async fn test_corrupt_entry_eviction_keeps_a_refill_4323() {
+        let backend = CacheObjectBackend::new();
+        let content_key = "proxy-cache/npm-remote/4323-refilled/__content__";
+        let metadata_key = sidecar_key_of(content_key);
+        backend.put_object(content_key, b"fresh-refill").await;
+        let mut refilled = stale_positive_sidecar(12);
+        refilled.checksum_sha256 = sha256_hex_of(b"fresh-refill");
+        backend.put_sidecar(&metadata_key, &refilled).await;
+        let storage = Arc::new(StorageService::new(backend.clone()));
+
+        evict_corrupt_cache_entry(
+            storage.clone(),
+            "npm-remote".to_string(),
+            content_key.to_string(),
+            metadata_key.clone(),
+            sha256_hex_of(b"the bytes that failed"),
+        )
+        .await;
+        assert!(backend.exists(content_key).await.unwrap());
+        assert!(backend.exists(&metadata_key).await.unwrap());
+
+        evict_corrupt_cache_entry(
+            storage,
+            "npm-remote".to_string(),
+            content_key.to_string(),
+            metadata_key.clone(),
+            refilled.checksum_sha256.clone(),
+        )
+        .await;
+        assert!(!backend.exists(content_key).await.unwrap());
+        assert!(!backend.exists(&metadata_key).await.unwrap());
     }
 
     /// #4758 on the stale-if-error reader, which takes `Content-Length` off the
@@ -17750,9 +17982,10 @@ mod tests {
         let content_key = "proxy-cache/npm-remote/4640-stream/__content__";
         let metadata_key = sidecar_key_of(content_key);
         backend.put_object(content_key, b"KEPT-BYTES").await;
-        backend
-            .put_sidecar(&metadata_key, &stale_positive_sidecar(10))
-            .await;
+        let mut sidecar = stale_positive_sidecar(10);
+        // A hit is verified against the recorded digest (#4323).
+        sidecar.checksum_sha256 = sha256_hex_of(b"KEPT-BYTES");
+        backend.put_sidecar(&metadata_key, &sidecar).await;
         let proxy = build_proxy_service_with_storage(backend.clone());
 
         let handle = proxy
@@ -18614,6 +18847,7 @@ mod tests {
         let mut metadata = stale_positive_sidecar(18);
         metadata.expires_at = Utc::now() + chrono::Duration::hours(1);
         metadata.storage_etag = Some("\"ac0a54faa6e8c861ec913465610119f4\"".to_string());
+        metadata.checksum_sha256 = sha256_hex_of(b"real-tarball-bytes");
 
         let opened = proxy
             .open_cached_stream(content_key, &sidecar_key_of(content_key), &metadata)
@@ -24099,6 +24333,8 @@ mod tests {
         // checks an unpinned entry's size against it (#4758).
         let mut sidecar: CacheMetadata = serde_json::from_slice(&fresh_metadata_bytes()).unwrap();
         sidecar.size_bytes = wheel_body.len() as i64;
+        // ...and records its digest: a hit is verified against it (#4323).
+        sidecar.checksum_sha256 = StorageService::calculate_hash(&wheel_body);
         let mut entries = std::collections::HashMap::new();
         entries.insert(
             keys.metadata.clone(),

@@ -515,6 +515,32 @@ pub fn record_serve_verify_buffer_fallback() {
     counter!("ak_serve_verify_buffer_fallback_total").increment(1);
 }
 
+/// A stored object whose bytes did not match their recorded SHA-256, found by
+/// the serve-time verifier (`storage::verify`, #4323). `phase` is
+/// `before_headers` (an object of at most 4 MiB, checked before anything is
+/// sent: refused with the `502 STORED_OBJECT_INTEGRITY`, or for a Remote OCI
+/// blob repaired from upstream, #5169) or `streaming` (the transfer was
+/// aborted before its last chunk: a larger object, one the verification
+/// budget had no room for, and every proxy-cache hit). The buffered
+/// proxy-cache read is not counted here: its mismatch is a cache miss,
+/// `ak_proxy_cache_lookups_total{result="miss_checksum_mismatch"}`. Any
+/// increase means corrupted storage: the admin storage scrub finds the
+/// affected rows.
+pub fn record_stored_object_integrity_failure(phase: &'static str) {
+    counter!("ak_stored_object_integrity_failures_total", "phase" => phase).increment(1);
+}
+
+/// A Remote's proxy-cache entry evicted because its stored bytes did not
+/// match the digest its sidecar records (#4323); the next read refetches it
+/// upstream. `repository` is the Remote's key.
+pub fn record_proxy_cache_integrity_eviction(repository: &str) {
+    counter!(
+        "ak_proxy_cache_integrity_evictions_total",
+        "repository" => repository.to_string()
+    )
+    .increment(1);
+}
+
 /// Outcome of a CEP-27 publish attestation decision (#4711). `outcome` is one
 /// of [`CONDA_ATTESTATION_OUTCOMES`]; `repository` is the repository key.
 ///
