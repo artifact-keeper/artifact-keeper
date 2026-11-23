@@ -2661,6 +2661,7 @@ mod tests {
     fn test_format_compatibility_all_full() {
         let full_formats = [
             "maven", "npm", "docker", "pypi", "helm", "nuget", "cargo", "go", "generic",
+            "helm_oci", "helmoci",
         ];
         for fmt in &full_formats {
             assert_eq!(
@@ -4337,7 +4338,7 @@ mod tests {
         // Natively-indexed and unsupported formats say nothing.
         for quiet in [
             "maven", "npm", "docker", "pypi", "generic", "cargo", "rpm", "yum", "debian", "apt",
-            "wat",
+            "helm_oci", "helmoci", "wat",
         ] {
             assert!(
                 MigrationService::index_limitation(quiet).is_none(),
