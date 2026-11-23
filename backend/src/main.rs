@@ -1351,6 +1351,13 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         runtime_shutdown_token.clone(),
     );
 
+    // #5177: keep each scanner's vulnerability-database age (API + gauges)
+    // current and warn when it passes SCAN_VULN_DB_MAX_AGE_HOURS.
+    artifact_keeper_backend::services::vuln_db_status::spawn_refresher(
+        state.clone(),
+        runtime_shutdown_token.clone(),
+    );
+
     // Keep a handle for the gRPC server before the sync worker consumes db_pool
     let grpc_db_pool = db_pool.clone();
     let migration_db_pool = db_pool.clone();
