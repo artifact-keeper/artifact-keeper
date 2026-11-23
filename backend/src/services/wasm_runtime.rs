@@ -62,6 +62,23 @@ impl From<wasmtime::Error> for WasmError {
     }
 }
 
+impl WasmError {
+    /// Classify an error from calling into a guest export.
+    ///
+    /// A guest trap is the error's root cause, under the wasm backtrace that
+    /// `Display` prints, so the trap code is read with `downcast_ref` rather
+    /// than from the message: fuel exhaustion is [`WasmError::FuelExhausted`]
+    /// and any other trap is a call failure that names its trap code (for
+    /// example the `unreachable` a guest's failed allocation aborts with).
+    pub fn from_call(e: wasmtime::Error) -> Self {
+        match e.downcast_ref::<wasmtime::Trap>() {
+            Some(wasmtime::Trap::OutOfFuel) => WasmError::FuelExhausted,
+            Some(trap) => WasmError::CallFailed(format!("guest trapped ({trap}): {e}")),
+            None => WasmError::CallFailed(e.to_string()),
+        }
+    }
+}
+
 /// Result type for WASM operations.
 pub type WasmResult<T> = std::result::Result<T, WasmError>;
 
@@ -115,7 +132,7 @@ impl ResourceLimiter for PluginContext {
         current: usize,
         desired: usize,
         maximum: Option<usize>,
-    ) -> anyhow::Result<bool> {
+    ) -> wasmtime::Result<bool> {
         self.limits.memory_growing(current, desired, maximum)
     }
 
@@ -124,7 +141,7 @@ impl ResourceLimiter for PluginContext {
         current: usize,
         desired: usize,
         maximum: Option<usize>,
-    ) -> anyhow::Result<bool> {
+    ) -> wasmtime::Result<bool> {
         self.limits.table_growing(current, desired, maximum)
     }
 }
@@ -170,8 +187,9 @@ impl WasmRuntime {
     pub fn new() -> WasmResult<Self> {
         let mut config = Config::new();
 
-        // Enable async support for Tokio integration
-        config.async_support(true);
+        // No `async_support(true)`: wasmtime 48 deprecates it as a no-op.
+        // A Store runs async whenever the `*_async` APIs are called, which
+        // is all the plugin host uses.
 
         // Enable fuel-based execution metering
         config.consume_fuel(true);
@@ -187,6 +205,19 @@ impl WasmRuntime {
 
         // Disable features we don't need for security
         config.wasm_threads(false);
+
+        // Wasmtime 48 turns these proposals on by default; 36 had them off.
+        // Plugins have only ever been validated without them, so keep them
+        // off: the guest surface stays what it was on 36 (#6276). Disabling
+        // GC also keeps the GC-heap code that RUSTSEC-2026-0573 was in out
+        // of reach entirely. `concurrency_support(false)` skips the
+        // component-model-async machinery in every Store, which the
+        // plugin host never uses.
+        config.wasm_gc(false);
+        config.wasm_function_references(false);
+        config.wasm_exceptions(false);
+        config.wasm_component_model_async(false);
+        config.concurrency_support(false);
 
         Ok(Self { config })
     }
@@ -744,7 +775,7 @@ mod tests {
     #[test]
     fn test_wasm_runtime_with_config() {
         let mut config = Config::new();
-        config.async_support(true);
+        config.consume_fuel(true);
         let runtime = WasmRuntime::with_config(config);
         let _ = &runtime.config;
     }
@@ -1150,5 +1181,130 @@ mod tests {
             .table_growing(0_usize, 16_usize, Some(10_000_usize))
             .expect("table growth should be allowed under the default limit");
         assert!(ok);
+    }
+
+    // -----------------------------------------------------------------------
+    // Sandbox contract (#6276): what a plugin can and cannot do must not
+    // loosen when wasmtime is upgraded.
+    // -----------------------------------------------------------------------
+
+    /// Proposals wasmtime 48 enables by default (GC, function references,
+    /// exceptions) and threads stay rejected, as they were on 36.
+    #[test]
+    fn test_sandbox_rejects_proposals_disabled_for_plugins() {
+        let runtime = WasmRuntime::new().unwrap();
+        let cases: [(&str, &str); 4] = [
+            ("gc", "(component (core module (type (struct))))"),
+            ("exceptions", "(component (core module (tag)))"),
+            (
+                "function-references",
+                "(component (core module (func (param (ref func)))))",
+            ),
+            ("threads", "(component (core module (memory 1 1 shared)))"),
+        ];
+        for (proposal, wat) in cases {
+            let result = runtime.validate(wat.as_bytes());
+            assert!(
+                matches!(result, Err(WasmError::ValidationFailed(_))),
+                "{proposal}: a plugin using it must be rejected, got {result:?}"
+            );
+        }
+        // The proposals plugins may use are still accepted.
+        runtime
+            .validate(b"(component (core module (func (result v128) (v128.const i64x2 0 0))))")
+            .expect("simd stays enabled");
+    }
+
+    /// A Store from `create_store` with a guest function on its engine.
+    fn sandbox_instance(
+        limits: &PluginResourceLimits,
+        wat: &str,
+    ) -> (Store<PluginContext>, wasmtime::Instance) {
+        let runtime = WasmRuntime::new().unwrap();
+        let compiled = runtime.compile(b"(component)").unwrap();
+        let mut store = runtime
+            .create_store(&compiled, "sb", "sb-fmt", limits)
+            .unwrap();
+        let module = wasmtime::Module::new(compiled.engine(), wat).unwrap();
+        let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+        (store, instance)
+    }
+
+    /// Fuel metering still stops a guest that never yields.
+    #[test]
+    fn test_sandbox_fuel_stops_an_infinite_loop() {
+        let limits = PluginResourceLimits {
+            memory_mb: 16,
+            timeout_secs: 0,
+            fuel: 1_000_000,
+        };
+        let (mut store, instance) =
+            sandbox_instance(&limits, "(module (func (export \"spin\") (loop br 0)))");
+        let spin = instance
+            .get_typed_func::<(), ()>(&mut store, "spin")
+            .unwrap();
+        let err = spin.call(&mut store, ()).expect_err("must run out of fuel");
+        assert_eq!(
+            err.downcast_ref::<wasmtime::Trap>(),
+            Some(&wasmtime::Trap::OutOfFuel),
+            "{err:?}"
+        );
+        assert_eq!(store.get_fuel().unwrap(), 0);
+        // The plugin registry's call path reports it as fuel exhaustion.
+        assert!(matches!(
+            WasmError::from_call(err),
+            WasmError::FuelExhausted
+        ));
+    }
+
+    /// Any other guest trap is a call failure that names its trap code.
+    #[test]
+    fn test_from_call_names_the_trap_code() {
+        let limits = PluginResourceLimits {
+            memory_mb: 16,
+            timeout_secs: 0,
+            fuel: 1_000_000,
+        };
+        let (mut store, instance) =
+            sandbox_instance(&limits, "(module (func (export \"boom\") unreachable))");
+        let boom = instance
+            .get_typed_func::<(), ()>(&mut store, "boom")
+            .unwrap();
+        let err = boom.call(&mut store, ()).expect_err("must trap");
+        match WasmError::from_call(err) {
+            WasmError::CallFailed(msg) => assert!(
+                msg.starts_with(
+                    "guest trapped (wasm trap: wasm `unreachable` instruction executed)"
+                ),
+                "{msg}"
+            ),
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(matches!(
+            WasmError::from_call(wasmtime::Error::msg("not a trap")),
+            WasmError::CallFailed(m) if m == "not a trap"
+        ));
+    }
+
+    /// The per-plugin memory cap still refuses `memory.grow` past it.
+    #[test]
+    fn test_sandbox_memory_cap_refuses_growth_past_limit() {
+        let limits = PluginResourceLimits {
+            memory_mb: 2,
+            timeout_secs: 0,
+            fuel: 1_000_000,
+        };
+        let (mut store, instance) = sandbox_instance(
+            &limits,
+            "(module (memory 1) (func (export \"grow\") (param i32) (result i32) \
+             (memory.grow (local.get 0))))",
+        );
+        let grow = instance
+            .get_typed_func::<i32, i32>(&mut store, "grow")
+            .unwrap();
+        // 1 page (64 KiB) + 31 pages = 2 MiB: allowed, returns the old size.
+        assert_eq!(grow.call(&mut store, 31).unwrap(), 1);
+        // One more page is over the 2 MiB cap: refused with -1.
+        assert_eq!(grow.call(&mut store, 1).unwrap(), -1);
     }
 }
