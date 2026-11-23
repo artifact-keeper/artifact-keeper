@@ -89,25 +89,7 @@ ignore = [
     # the lock no longer contains it (#5555).
     "RUSTSEC-2026-0459",
 
-    # wasmtime batch of 2026-11-16. 0566, 0569 and 0571 are fixed by the bump to
-    # 36.0.21 (#6273). The two below have no fix on the 36.x line (patched only
-    # in >= 48.0.9 / 49.0.6 / 50.0.2), and neither is reachable here. The
-    # upstream GHSAs scope them to versions after ours: 0573 affects >= 47.0.0,
-    # 0567 affects >= 39.0.0. The RustSec entries carry no `unaffected` range,
-    # so cargo-audit flags 36.0.21 anyway. Our engine config is also outside
-    # both triggers (only one Config, WasmRuntime::new in wasm_runtime.rs):
-    # - RUSTSEC-2026-0573 (GHSA-wvgq-g5hf-6gm6): guest abort through a GC heap
-    #   whose reservation isn't a multiple of the page size. It needs the Wasm
-    #   GC proposal (off by default before 47.0.0, and we never call wasm_gc)
-    #   plus gc_heap_may_move(false) or memory_may_move(false) with a
-    #   non-page-multiple gc_heap_reservation or memory_reservation. We set
-    #   none of these.
-    # - RUSTSEC-2026-0567 (GHSA-2674-w29h-wqvj): guest abort through
-    #   memory.atomic.wait/notify when the crate is built WITHOUT its `threads`
-    #   cargo feature but the threads proposal is turned on through
-    #   Config::wasm_features. We keep wasmtime's default features, so
-    #   `threads` is compiled in, and we call wasm_threads(false).
-    # Remove both when wasmtime moves to a patched major (>= 48.0.9).
-    "RUSTSEC-2026-0573",
-    "RUSTSEC-2026-0567",
+    # wasmtime batch of 2026-11-16: 0566, 0569 and 0571 were fixed by the bump
+    # to 36.0.21 (#6273), and 0567 and 0573 by the move to the 48 LTS line
+    # (>= 48.0.9, #6276). No wasmtime ignores needed.
 ]
