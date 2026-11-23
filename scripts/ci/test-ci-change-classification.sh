@@ -267,6 +267,8 @@ expect "jscpd source prep (.py, coverage uses it)" "true false false true"   pul
 expect "CI-only file plus backend code"            "true true false true"    pull_request scripts/ci/test-foo.sh backend/src/main.rs
 expect "Cargo.lock"                                "true true true true"     pull_request Cargo.lock
 expect "nested Cargo.toml"                         "true true true true"     pull_request backend/Cargo.toml
+expect "cargo-audit ignore list"                   "true false true true"    pull_request .cargo/audit.toml
+expect "osv-scanner ignore list"                   "true false true true"    pull_request osv-scanner.toml
 expect "anything unrecognised is a Rust input"     "true false false true"   pull_request docker/Dockerfile.backend
 expect "a script in scripts/ but outside ci/"      "true false false true"   pull_request scripts/e2e-setup.sh
 FAKE_GH_FAIL=1 expect "file listing fails -> full CI" "true true true true"  pull_request whatever

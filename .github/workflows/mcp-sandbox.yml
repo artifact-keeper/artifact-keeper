@@ -100,7 +100,7 @@ jobs:
           save-if: ${{ github.event_name != 'pull_request' && github.event_name != 'merge_group' }}
 
       - name: Build ak-mcp-introspector
-        run: cargo build --bin ak-mcp-introspector
+        run: cargo build --locked --bin ak-mcp-introspector
 
       - name: Publish the guest image to a stand-in OCI registry
         id: guest

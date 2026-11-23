@@ -200,7 +200,7 @@ jobs:
           toolchain: 1.98.0
 
       - name: Install cargo-audit
-        run: cargo install cargo-audit --locked || true
+        run: cargo install cargo-audit --locked --version 0.23.0 || true
 
       - name: Run Rust security audit
         run: cargo audit --json > rust-audit.json || true
@@ -278,7 +278,7 @@ jobs:
           SQLX_OFFLINE: true
           CARGO_TERM_COLOR: always
           CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER: x86_64-w64-mingw32-gcc
-        run: cargo build --release --target x86_64-pc-windows-gnu --features vendored-openssl
+        run: cargo build --locked --release --target x86_64-pc-windows-gnu --features vendored-openssl
 
       - name: Package binary
         run: |
