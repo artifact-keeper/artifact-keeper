@@ -383,10 +383,19 @@ pub fn create_router(state: SharedState) -> Router {
     // instead of queueing on the pool with the whole burst. Outside every
     // middleware that reads the database (setup, guest access, visibility,
     // auth), so a shed request has done no work; probes are never gated.
+    // Fairness (#6344): a share of the slots is kept for requests presenting
+    // a credential, and a client at its share yields to a waiting one.
     if let Some(gate) = crate::api::middleware::db_admission::DbAdmission::new(
         state.db.clone(),
         state.config.database_request_wait_ms(),
         state.config.database_request_slots(),
+        crate::api::middleware::db_admission::Fairness {
+            credentialed_reserve_percent: state
+                .config
+                .database_request_credentialed_reserve_percent,
+            client_share_percent: state.config.database_request_client_share_percent,
+            trusted_proxies: state.config.rate_limit_trusted_proxy_cidrs.clone(),
+        },
     ) {
         router = router.layer(middleware::from_fn_with_state(
             gate,

@@ -139,6 +139,42 @@ database or storage work:
   request runs without a slot. Slow uploads or upstream fetches holding
   slots never shed anything on their own.
 
+**Fairness between clients (#6344).** Without it, whoever arrives first gets
+every slot, so one anonymous flood (a single IP, or a misbehaving CI job)
+could hold them all and get everyone else shed. Two rules apply, only while
+the pool is busy:
+
+- **Reserved share for credentialed requests.**
+  `DATABASE_REQUEST_CREDENTIALED_RESERVE_PERCENT` (default 25) of the slots
+  can only be taken by a request that presents a credential: an
+  `Authorization` header, `X-API-Key`, `X-NuGet-ApiKey`, the `ak_access_token`
+  session cookie, or a `/t/<token>/` path. Anonymous requests share the rest,
+  so an anonymous flood is shed before it reaches the reserve. The gate can't
+  verify a credential without a database round trip, so this is a hint. A
+  request with a forged header takes a reserved slot and is answered `401` by
+  authentication. While other clients wait, one address can hold at most its
+  per-client share of the slots that way. A flood of forged headers from
+  many addresses can still fill the reserve; credentialed clients then
+  compete with it first come, first served, as everyone did without the
+  reserve. Web-UI logins and other anonymous calls draw from the anonymous
+  share.
+- **Per-client share under contention.** Requests are keyed by the
+  best-effort client IP, the rate limiter's key (`X-Forwarded-For` believed
+  only from `RATE_LIMIT_TRUSTED_PROXY_CIDRS`; an IPv6 client by its /64), in
+  a fixed table, so memory is
+  bounded however many addresses a flood uses. A client that already holds or
+  waits for `DATABASE_REQUEST_CLIENT_SHARE_PERCENT` (default 25, one slot per
+  pool connection with the default slots) of the slots is shed at once while
+  another client is waiting, so the slots it releases go to the others. A
+  client alone on a busy pool is never limited by its share. Clients behind
+  one NAT or proxy that isn't trusted count as one client.
+
+Fairness sheds are the same `503 POOL_EXHAUSTED` + `Retry-After`, counted in
+`ak_db_requests_shed_total` and, by `class` (`anonymous`, `credentialed`) and
+`reason` (`backlog`, `client_share`), in `ak_db_admission_sheds_total`. Set
+either variable to `0` to turn its rule off; with both at `0` the gate
+hands out slots first come, first served.
+
 A shed request has done no work, so it is never let through. Authentication,
 authorization and scanning run unchanged for every admitted request, and a
 credential check that can't reach the database still answers `503`, never
@@ -155,6 +191,8 @@ instead of the `503`.
 
 - No gate: `DATABASE_REQUEST_ACQUIRE_WAIT_MS=0` or
   `DATABASE_REQUEST_CONCURRENCY=0`.
+- No fairness: `DATABASE_REQUEST_CREDENTIALED_RESERVE_PERCENT=0` and
+  `DATABASE_REQUEST_CLIENT_SHARE_PERCENT=0`.
 - Probes on the request pool: `DATABASE_PROBE_CONNECTIONS=0`.
 
 ### How package clients retry a 503
