@@ -151,6 +151,7 @@ pub mod scanner_service;
 pub mod search_indexer;
 pub mod search_service;
 pub mod service_account_service;
+pub mod shutdown_drain;
 pub mod signing_service;
 pub mod smtp_service;
 pub mod source_registry;

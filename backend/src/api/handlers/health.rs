@@ -609,6 +609,15 @@ pub async fn health_check(State(state): State<SharedState>) -> impl IntoResponse
     )
 )]
 pub async fn readiness_check(State(state): State<SharedState>) -> impl IntoResponse {
+    // #5921: a replica draining for shutdown is not ready, whatever its
+    // dependencies say; answer at once without probing them.
+    if crate::services::shutdown_drain::is_draining() {
+        let setup_required = state
+            .setup_required
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let (status_code, response) = draining_response(setup_required);
+        return (status_code, Json(response));
+    }
     // The database probe and the dependency probes run concurrently, each
     // under its own deadline, so a dead database answers within
     // READYZ_DATABASE_TIMEOUT instead of after two sequential pool acquires
@@ -765,6 +774,59 @@ fn build_readyz_response(
     };
 
     (status_code, response)
+}
+
+/// Name of the `failing` entry a replica draining for shutdown reports.
+const SHUTTING_DOWN: &str = "shutting_down";
+
+/// Status of a check or dependency `/readyz` skipped because the process is
+/// draining for shutdown.
+const STATUS_NOT_CHECKED: &str = "not_checked";
+
+/// The `/readyz` answer while the process drains for shutdown (#5921): a
+/// stop was requested, so load balancers and the kubelet should take this
+/// replica out of rotation while it keeps serving what still reaches it.
+/// Nothing is probed: `failing` is exactly `["shutting_down"]` and every
+/// check and dependency reads `not_checked`. `/livez` and `/health` are not
+/// affected, so nothing restarts the process meanwhile.
+fn draining_response(setup_required: bool) -> (StatusCode, ReadyzResponse) {
+    let not_checked = || CheckStatus {
+        status: STATUS_NOT_CHECKED.to_string(),
+        message: None,
+    };
+    let dependency = || DependencyStatus {
+        status: STATUS_NOT_CHECKED.to_string(),
+        required: false,
+        message: None,
+    };
+    let setup_complete = CheckStatus {
+        status: if setup_required {
+            SETUP_INCOMPLETE
+        } else {
+            SETUP_COMPLETE
+        }
+        .to_string(),
+        message: None,
+    };
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        ReadyzResponse {
+            status: "not_ready".to_string(),
+            checks: ReadyzChecks {
+                database: not_checked(),
+                migrations: not_checked(),
+                setup_complete,
+            },
+            dependencies: ReadyzDependencies {
+                opensearch: dependency(),
+                storage: dependency(),
+                scanner: dependency(),
+                ldap: dependency(),
+            },
+            failing: vec![SHUTTING_DOWN.to_string()],
+            degraded: Vec::new(),
+        },
+    )
 }
 
 /// Compute whether the service should be reported as ready.
@@ -1824,6 +1886,30 @@ mod tests {
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("\"not_ready\""));
         assert!(json.contains("No successful migrations found"));
+    }
+
+    /// #5921: a replica draining for shutdown answers 503 naming only the
+    /// reason, with nothing probed, and keeps reporting the setup state.
+    #[test]
+    fn draining_fails_readiness_and_names_only_the_reason() {
+        for setup_required in [false, true] {
+            let (code, response) = draining_response(setup_required);
+            assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(response.status, "not_ready");
+            assert_eq!(response.failing, vec![SHUTTING_DOWN.to_string()]);
+            assert!(response.degraded.is_empty());
+            assert_eq!(response.checks.database.status, STATUS_NOT_CHECKED);
+            assert_eq!(response.checks.migrations.status, STATUS_NOT_CHECKED);
+            assert_eq!(response.dependencies.storage.status, STATUS_NOT_CHECKED);
+            assert_eq!(
+                response.checks.setup_complete.status,
+                if setup_required {
+                    SETUP_INCOMPLETE
+                } else {
+                    SETUP_COMPLETE
+                }
+            );
+        }
     }
 
     /// Regression for #889: when only `setup_required` is true, the readiness

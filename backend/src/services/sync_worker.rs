@@ -1228,6 +1228,12 @@ async fn process_pending_tasks(
             continue;
         }
 
+        // #5921: a draining process claims no new transfers.
+        if crate::services::shutdown_drain::is_draining() {
+            tracing::debug!("draining for shutdown; not claiming sync tasks");
+            break;
+        }
+
         // ── Claim pending tasks (RowClaimedQueue) ───────────────────────
         // Claiming (not just selecting) is what stops a second replica from
         // executing the same task in this window; the in-statement live-claim
