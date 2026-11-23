@@ -49,6 +49,9 @@ fn lifecycle_service(state: &SharedState) -> LifecycleService {
     LifecycleService::new(state.db.clone())
         .with_proxy_service(state.proxy_service.clone())
         .with_npm_packument_cache(state.npm_packument_cache.clone())
+        .with_derived_state(
+            crate::services::lifecycle_service::SweepDerivedState::from_state(state),
+        )
 }
 
 pub fn router() -> Router<SharedState> {

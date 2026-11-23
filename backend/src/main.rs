@@ -1383,6 +1383,7 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         advisory_client.clone(),
         state.proxy_service.clone(),
         state.npm_packument_cache.clone(),
+        artifact_keeper_backend::services::lifecycle_service::SweepDerivedState::from_state(&state),
     );
 
     // Drains the durable scan queue (migration 362) when SCAN_QUEUE_ENABLED and

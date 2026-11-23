@@ -72,8 +72,40 @@ async fn index_cache_set(cache: &IndexCache, key: String, bytes: Bytes) {
     c.insert(key, (bytes, Instant::now()));
 }
 
+#[cfg(test)]
 async fn index_cache_invalidate(cache: &IndexCache, key: &str) {
     cache.write().await.remove(key);
+}
+
+/// Drop the cached sparse-index entries of `crates` (lowercased names) in
+/// the repository keyed `repo_key` and in every virtual repository that
+/// includes it, recursively (#3840). Run whenever a crate's version set
+/// changes: on publish, and on every delete path, the REST delete and the
+/// lifecycle sweep (#6469), which otherwise left the index listing a removed
+/// version for up to [`INDEX_CACHE_TTL_SECS`]. The ancestors are looked up
+/// once for all crates, and the cache lock is taken once.
+pub(crate) async fn invalidate_crate_index_caches(
+    db: &sqlx::PgPool,
+    cache: &IndexCache,
+    repo_id: uuid::Uuid,
+    repo_key: &str,
+    crates: &[String],
+) {
+    if crates.is_empty() {
+        return;
+    }
+    let virtual_keys: Vec<String> =
+        crate::services::repository_service::RepositoryService::new(db.clone())
+            .virtual_ancestor_keys(repo_id)
+            .await;
+    let mut c = cache.write().await;
+    for name in crates {
+        let name = name.to_lowercase();
+        c.remove(&format!("{repo_key}:{name}"));
+        for vkey in &virtual_keys {
+            c.remove(&format!("{vkey}:{name}"));
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1979,20 +2011,16 @@ async fn publish(
     )
     .await?;
 
-    // Invalidate the index cache for this crate so the next fetch sees the new version.
-    index_cache_invalidate(&state.index_cache, &format!("{}:{}", repo_key, name_lower)).await;
-
-    // Also invalidate every virtual repo that includes this hosted repo —
-    // recursively, so a virtual nesting the crate's direct parent converges
-    // too instead of serving a stale index entry (#3840).
-    let virtual_keys: Vec<String> =
-        crate::services::repository_service::RepositoryService::new(state.db.clone())
-            .virtual_ancestor_keys(repo.id)
-            .await;
-
-    for vkey in &virtual_keys {
-        index_cache_invalidate(&state.index_cache, &format!("{}:{}", vkey, name_lower)).await;
-    }
+    // Invalidate the index cache for this crate so the next fetch sees the new
+    // version, here and in every virtual repo that includes this one (#3840).
+    invalidate_crate_index_caches(
+        &state.db,
+        &state.index_cache,
+        repo.id,
+        &repo_key,
+        std::slice::from_ref(&name_lower),
+    )
+    .await;
 
     info!(
         "Cargo publish: {} {} ({} bytes) to repo {}",

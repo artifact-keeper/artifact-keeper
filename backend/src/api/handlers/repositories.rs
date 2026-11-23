@@ -14743,6 +14743,20 @@ pub async fn delete_artifact(
         .await;
     }
 
+    // Deleting a crate version changes its sparse-index file, which is cached
+    // for up to 300 s; drop it here and in every Virtual serving this
+    // repository, as publish does (#6469).
+    if repo.format == RepositoryFormat::Cargo {
+        crate::api::handlers::cargo::invalidate_crate_index_caches(
+            &state.db,
+            &state.index_cache,
+            repo.id,
+            &repo.key,
+            std::slice::from_ref(&artifact.name),
+        )
+        .await;
+    }
+
     // Deleting an npm artifact changes the packument, so drop the computed
     // packument cache for its package — including in every virtual repo that
     // serves this one; otherwise a warm virtual-repo GET keeps listing the
