@@ -2515,6 +2515,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    0,
                 )
                 .await
                 .expect("complete"));
@@ -2570,6 +2571,7 @@ mod tests {
                 None,
                 None,
                 None,
+                0,
             ),
         )
         .await
@@ -2608,6 +2610,7 @@ mod tests {
                 None,
                 None,
                 None,
+                0,
             )
         };
         let lapse = |id: Uuid| {

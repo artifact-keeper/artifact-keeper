@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT id, artifact_id, repository_id, scan_type, status,\n                   findings_count, critical_count, high_count, medium_count, low_count, info_count,\n                   scanner_version, error_message, started_at, completed_at, created_at,\n                   is_reused, source_scan_id, scan_completeness, scan_completeness_reason,\n                      vuln_db_version, vuln_db_published_at\n            FROM scan_results\n            WHERE id = $1\n            FOR SHARE\n            ",
+  "query": "\n            SELECT id, artifact_id, repository_id, scan_type, status,\n                   findings_count, critical_count, high_count, medium_count, low_count, info_count,\n                   scanner_version, error_message, started_at, completed_at, created_at,\n                   is_reused, source_scan_id, scan_completeness, scan_completeness_reason,\n                      vuln_db_version, vuln_db_published_at, advisory_excluded\n            FROM scan_results\n            WHERE ($1::uuid IS NULL OR repository_id = $1)\n              AND ($2::uuid IS NULL OR artifact_id = $2)\n              AND ($3::text IS NULL OR status = $3)\n              AND ($4::text IS NULL OR scan_type = $4)\n            ORDER BY created_at DESC\n            LIMIT $5 OFFSET $6\n            ",
   "describe": {
     "columns": [
       {
@@ -127,7 +127,7 @@
       {
         "ordinal": 11,
         "name": "scanner_version",
-        "type_info": "Varchar",
+        "type_info": "Text",
         "origin": {
           "Table": {
             "table": "scan_results",
@@ -226,7 +226,7 @@
       {
         "ordinal": 20,
         "name": "vuln_db_version",
-        "type_info": "Varchar",
+        "type_info": "Text",
         "origin": {
           "Table": {
             "table": "scan_results",
@@ -244,11 +244,27 @@
             "name": "vuln_db_published_at"
           }
         }
+      },
+      {
+        "ordinal": 22,
+        "name": "advisory_excluded",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "scan_results",
+            "name": "advisory_excluded"
+          }
+        }
       }
     ],
     "parameters": {
       "Left": [
-        "Uuid"
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Text",
+        "Int8",
+        "Int8"
       ]
     },
     "nullable": [
@@ -273,8 +289,9 @@
       false,
       true,
       true,
-      true
+      true,
+      false
     ]
   },
-  "hash": "4b793a5dde2021506f09c385047b8551da5cc6764e230bf5a64b4007c1122ffd"
+  "hash": "1bc54f2f15de94519ab2ced641407ed50fd7a5ac9a4d10db91f9ca1072b6bb86"
 }

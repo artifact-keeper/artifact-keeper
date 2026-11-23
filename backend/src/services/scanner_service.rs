@@ -5151,6 +5151,9 @@ pub struct ScanOutput {
     /// different DB vintages, can never stamp one scan with another's DB.
     /// `None` falls back to [`Scanner::vuln_db`] in the orchestrator.
     pub vuln_db: Option<VulnDbProvenance>,
+    /// Dependencies `ADVISORY_EXCLUDE_PATTERNS` kept out of external advisory
+    /// lookups (#6335). The orchestrator persists this on the scan row.
+    pub advisory_excluded: i32,
 }
 
 impl ScanOutput {
@@ -5164,6 +5167,7 @@ impl ScanOutput {
             scan_completeness: ScanCompleteness::Complete,
             cataloged: None,
             vuln_db: None,
+            advisory_excluded: 0,
         }
     }
 
@@ -5184,6 +5188,7 @@ impl ScanOutput {
             scan_completeness: ScanCompleteness::Complete,
             cataloged: None,
             vuln_db: None,
+            advisory_excluded: 0,
         }
     }
 
@@ -5206,6 +5211,7 @@ impl ScanOutput {
             scan_completeness: classify_trivy_completeness(report, stderr, known_targets),
             cataloged: None,
             vuln_db: None,
+            advisory_excluded: 0,
         }
     }
 
@@ -9477,6 +9483,7 @@ impl DependencyScanner {
             scan_completeness: completeness_for_feeds(feeds_degraded),
             cataloged: None,
             vuln_db: None,
+            advisory_excluded: advisory_excluded as i32,
         })
     }
 }
@@ -10712,6 +10719,7 @@ impl ScannerService {
                     scan_completeness,
                     cataloged,
                     vuln_db: output_vuln_db,
+                    advisory_excluded,
                 }) => {
                     // #4036 fail-closed: a catalog-reporting scanner that RAN
                     // successfully over a package-archive artifact whose format
@@ -11079,6 +11087,9 @@ impl ScannerService {
                             pin_identity.as_deref(),
                             written_reason.as_deref(),
                             vuln_db.as_ref(),
+                            // #6335: the dependency scanner's deliberately
+                            // skipped lookups belong on the stored verdict.
+                            advisory_excluded,
                         )
                         .await
                     {
@@ -18550,6 +18561,7 @@ mod tests {
                 cataloged("curl", "8.14.1-r4"),
             ]),
             vuln_db: None,
+            advisory_excluded: 0,
         };
         let pin = ExpectedComponent::os_package(
             ComponentEcosystem::Alpine,
@@ -29109,6 +29121,7 @@ tonic-build = "0.12"
                 scan_completeness: ScanCompleteness::Complete,
                 cataloged: self.cataloged.clone(),
                 vuln_db: None,
+                advisory_excluded: 0,
             })
         }
     }
@@ -29306,6 +29319,7 @@ tonic-build = "0.12"
                 scan_completeness: ScanCompleteness::Complete,
                 cataloged: Some(self.cataloged.clone()),
                 vuln_db: None,
+                advisory_excluded: 0,
             })
         }
     }
@@ -30433,6 +30447,7 @@ tonic-build = "0.12"
                 },
                 cataloged: None,
                 vuln_db: None,
+                advisory_excluded: 0,
             })
         }
     }
@@ -33753,6 +33768,7 @@ tonic-build = "0.12"
                         scan_completeness: ScanCompleteness::Complete,
                         cataloged: None,
                         vuln_db: None,
+                        advisory_excluded: 0,
                     }),
                     FakeOutcome::CompleteWithCatalog {
                         findings,
@@ -33764,6 +33780,7 @@ tonic-build = "0.12"
                         scan_completeness: ScanCompleteness::Complete,
                         cataloged: cataloged.clone(),
                         vuln_db: None,
+                        advisory_excluded: 0,
                     }),
                     // Displays as "Internal error: <reason>" so the reason is
                     // preserved in scan_results.error_message via fail_scan.
@@ -37626,6 +37643,43 @@ tonic-build = "0.12"
                 .scan(&artifact, None, &Bytes::from_static(content))
                 .await
                 .expect("scan")
+        }
+
+        async fn scan_requirements_excluding(content: &'static [u8], raw: &str) -> ScanOutput {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/querybatch"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": []
+                })))
+                .mount(&server)
+                .await;
+            let mut client = Arc::try_unwrap(advisory_client_for(
+                &format!("{}/v1/querybatch", server.uri()),
+                None,
+            ))
+            .unwrap_or_else(|_| unreachable!("a fresh Arc has one owner"));
+            client.exclusions = AdvisoryExclusions::parse(raw);
+            let scanner = DependencyScanner::new(Arc::new(client));
+            let artifact = make_artifact("requirements.txt", "/app/requirements.txt", None);
+            scanner
+                .scan(&artifact, None, &Bytes::from_static(content))
+                .await
+                .expect("scan")
+        }
+
+        #[tokio::test]
+        async fn test_excluded_dependency_count_is_carried_on_scan_output() {
+            let out = scan_requirements_excluding(
+                b"acme-internal==1.0\nrequests==2.31.0\n",
+                "pkg:pypi/acme-*",
+            )
+            .await;
+
+            assert_eq!(
+                out.advisory_excluded, 1,
+                "the skipped lookup must reach the scan result, not just the log"
+            );
         }
 
         /// The same CVE in two DIFFERENT packages is two findings. Once

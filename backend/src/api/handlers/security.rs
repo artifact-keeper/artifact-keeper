@@ -456,6 +456,11 @@ pub struct ScanResponse {
     /// When that database was built / last updated (#3014); for a live-API
     /// scanner, the query time. `null` means unknown, never fresh.
     pub vuln_db_published_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// How many dependencies `ADVISORY_EXCLUDE_PATTERNS` kept out of external
+    /// advisory lookups for this scan (#6335). Zero for scanners that do not
+    /// consult those feeds. A deliberate exclusion is not a coverage gap.
+    #[schema(example = 3)]
+    pub advisory_excluded: i32,
     /// #2471: number of `not_applicable` scanner rows folded into this row.
     /// `Some(n)` marks a synthetic *summary* row that collapses `n` redundant
     /// "this scanner does not apply" results (e.g. the image-family scanners
@@ -531,6 +536,7 @@ impl ScanResponse {
             scan_completeness_reason: s.scan_completeness_reason,
             vuln_db_version: s.vuln_db_version,
             vuln_db_published_at: s.vuln_db_published_at,
+            advisory_excluded: s.advisory_excluded,
             collapsed_not_applicable_count: None,
             collapsed_scan_types: None,
         }
@@ -9678,6 +9684,7 @@ mod tests {
             scan_completeness_reason: None,
             vuln_db_version: None,
             vuln_db_published_at: None,
+            advisory_excluded: 0,
         }
     }
 
@@ -9713,13 +9720,16 @@ mod tests {
         let scan = ScanResult {
             vuln_db_version: Some("trivy-db-v2".to_string()),
             vuln_db_published_at: Some(built),
+            advisory_excluded: 3,
             ..make_scan_result()
         };
         let resp = scan_result_to_response(scan, None, None);
         assert_eq!(resp.vuln_db_version.as_deref(), Some("trivy-db-v2"));
         assert_eq!(resp.vuln_db_published_at, Some(built));
+        assert_eq!(resp.advisory_excluded, 3);
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["vuln_db_version"], "trivy-db-v2");
+        assert_eq!(json["advisory_excluded"], 3);
     }
 
     /// #3013: the persisted class reaches the findings API.
@@ -9777,6 +9787,7 @@ mod tests {
             scan_completeness_reason: None,
             vuln_db_version: None,
             vuln_db_published_at: None,
+            advisory_excluded: 0,
         };
         let resp = scan_result_to_response(scan, None, None);
         assert_eq!(resp.artifact_name, None);
@@ -9815,6 +9826,7 @@ mod tests {
             scan_completeness_reason: None,
             vuln_db_version: None,
             vuln_db_published_at: None,
+            advisory_excluded: 0,
         };
         let resp = scan_result_to_response(scan, Some("lib".to_string()), None);
         assert_eq!(resp.findings_count, 100);
@@ -9851,6 +9863,7 @@ mod tests {
             scan_completeness_reason: None,
             vuln_db_version: None,
             vuln_db_published_at: None,
+            advisory_excluded: 0,
         };
         let resp = scan_result_to_response(scan, Some("artifact".into()), None);
         assert!(resp.is_reused);
@@ -9893,6 +9906,7 @@ mod tests {
             scan_completeness_reason: None,
             vuln_db_version: None,
             vuln_db_published_at: None,
+            advisory_excluded: 0,
         };
         let resp = scan_result_to_response(scan, None, None);
         assert_eq!(
@@ -11015,6 +11029,7 @@ mod tests {
             None,
             None,
             None,
+            0,
         )
         .await
         .expect("complete");

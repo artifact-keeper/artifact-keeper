@@ -1143,6 +1143,7 @@ impl GrypeScanner {
             // Registry mode does not feed the #3003 identity gate; unchanged.
             cataloged: None,
             vuln_db: None,
+            advisory_excluded: 0,
         })
     }
 
@@ -1192,6 +1193,7 @@ impl GrypeScanner {
                     scan_completeness: completeness_for(truncated),
                     cataloged,
                     vuln_db: None,
+                    advisory_excluded: 0,
                 })
             }
             Err(e) => Err(fail_scan(
@@ -2097,6 +2099,7 @@ impl GrypeScanner {
             scan_completeness: completeness_for(truncated),
             cataloged,
             vuln_db: None,
+            advisory_excluded: 0,
         };
         // #5236: what grype reported for an Alpine subpackage pin's synthetic
         // origin record belongs to the subpackage.

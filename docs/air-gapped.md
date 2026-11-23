@@ -488,7 +488,9 @@ not graded partial for it, and it stays in the inventory and SBOM. Conda
 packages match on their conda name (`pkg:conda/...`), before any PyPI alias is
 looked up. A pattern without `pkg:`, with a version (`@1.*`) or with purl
 qualifiers (`?type=jar`) matches nothing and is reported as a warning at
-startup. Unset, every dependency is looked up.
+startup. Unset, every dependency is looked up. The number of dependencies
+skipped this way is stored on the scan result as `advisory_excluded` and
+returned by the scan API (1.14.0, #6335); it is not a coverage gap.
 
 The setting covers the advisory lookups only. Other paths can still send an
 internal name off the instance:

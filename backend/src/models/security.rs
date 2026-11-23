@@ -600,6 +600,12 @@ pub struct ScanResult {
     /// live-API scanner (#3014). `None` means unknown, never fresh.
     #[serde(default)]
     pub vuln_db_published_at: Option<DateTime<Utc>>,
+    /// Number of dependencies `ADVISORY_EXCLUDE_PATTERNS` kept out of external
+    /// advisory lookups for this scan (#6335). Zero for scanners that do not
+    /// consult those feeds and for rows written before migration 418.
+    #[serde(default)]
+    #[sqlx(default)]
+    pub advisory_excluded: i32,
 }
 
 /// An individual vulnerability finding within a scan.

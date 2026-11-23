@@ -3103,6 +3103,7 @@ mod listing_refusals_4288_tests {
                 None,
                 None,
                 None,
+                0,
             )
             .await
             .expect("complete scan");

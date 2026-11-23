@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT id, artifact_id, repository_id, scan_type, status,\n                   findings_count, critical_count, high_count, medium_count, low_count, info_count,\n                   scanner_version, error_message, started_at, completed_at, created_at,\n                   is_reused, source_scan_id, scan_completeness, scan_completeness_reason,\n                      vuln_db_version, vuln_db_published_at\n            FROM scan_results\n            WHERE id = $1\n            ",
+  "query": "\n            SELECT id, artifact_id, repository_id, scan_type, status,\n                   findings_count, critical_count, high_count, medium_count, low_count, info_count,\n                   scanner_version, error_message, started_at, completed_at, created_at,\n                   is_reused, source_scan_id, scan_completeness, scan_completeness_reason,\n                      vuln_db_version, vuln_db_published_at, advisory_excluded\n            FROM scan_results\n            WHERE id = $1\n            FOR SHARE\n            ",
   "describe": {
     "columns": [
       {
@@ -127,7 +127,7 @@
       {
         "ordinal": 11,
         "name": "scanner_version",
-        "type_info": "Varchar",
+        "type_info": "Text",
         "origin": {
           "Table": {
             "table": "scan_results",
@@ -226,7 +226,7 @@
       {
         "ordinal": 20,
         "name": "vuln_db_version",
-        "type_info": "Varchar",
+        "type_info": "Text",
         "origin": {
           "Table": {
             "table": "scan_results",
@@ -242,6 +242,17 @@
           "Table": {
             "table": "scan_results",
             "name": "vuln_db_published_at"
+          }
+        }
+      },
+      {
+        "ordinal": 22,
+        "name": "advisory_excluded",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "scan_results",
+            "name": "advisory_excluded"
           }
         }
       }
@@ -273,8 +284,9 @@
       false,
       true,
       true,
-      true
+      true,
+      false
     ]
   },
-  "hash": "8486a3e43d09639f372561d95ec0a4e6b6d3f4048794941ed8ba167251244a92"
+  "hash": "f3bbaa60296ff335458577a1c2e1c0d2ecbd848a2ef546e3256e3f0983a8e9d9"
 }

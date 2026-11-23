@@ -160,6 +160,7 @@ async fn create_scans_with_findings(
             None,
             None,
             None,
+            0,
         )
         .await
         .expect("complete scan");

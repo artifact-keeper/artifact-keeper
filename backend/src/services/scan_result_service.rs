@@ -1031,7 +1031,7 @@ macro_rules! scan_result_columns {
          findings_count, critical_count, high_count, medium_count, low_count, info_count, \
          scanner_version, error_message, started_at, completed_at, created_at, \
          is_reused, source_scan_id, scan_completeness, scan_completeness_reason, \
-         vuln_db_version, vuln_db_published_at"
+         vuln_db_version, vuln_db_published_at, advisory_excluded"
     };
 }
 
@@ -1439,7 +1439,7 @@ impl ScanResultService {
                       findings_count, critical_count, high_count, medium_count, low_count, info_count,
                       scanner_version, error_message, started_at, completed_at, created_at,
                       is_reused, source_scan_id, scan_completeness, scan_completeness_reason,
-                      vuln_db_version, vuln_db_published_at
+                      vuln_db_version, vuln_db_published_at, advisory_excluded
             "#,
         )
         .bind(artifact_id)
@@ -1503,7 +1503,7 @@ impl ScanResultService {
                       findings_count, critical_count, high_count, medium_count, low_count, info_count,
                       scanner_version, error_message, started_at, completed_at, created_at,
                       is_reused, source_scan_id, scan_completeness, scan_completeness_reason,
-                      vuln_db_version, vuln_db_published_at
+                      vuln_db_version, vuln_db_published_at, advisory_excluded
             "#,
             artifact_id,
             repository_id,
@@ -1697,7 +1697,7 @@ impl ScanResultService {
                    findings_count, critical_count, high_count, medium_count, low_count, info_count,
                    scanner_version, error_message, started_at, completed_at, created_at,
                    is_reused, source_scan_id, scan_completeness, scan_completeness_reason,
-                      vuln_db_version, vuln_db_published_at
+                      vuln_db_version, vuln_db_published_at, advisory_excluded
             FROM scan_results
             WHERE artifact_id = $1
               AND checksum_sha256 = $2::bpchar
@@ -1945,7 +1945,7 @@ impl ScanResultService {
                    findings_count, critical_count, high_count, medium_count, low_count, info_count,
                    scanner_version, error_message, started_at, completed_at, created_at,
                    is_reused, source_scan_id, scan_completeness, scan_completeness_reason,
-                      vuln_db_version, vuln_db_published_at
+                      vuln_db_version, vuln_db_published_at, advisory_excluded
             FROM scan_results
             WHERE id = $1
             FOR SHARE
@@ -1977,16 +1977,16 @@ impl ScanResultService {
                 findings_count, critical_count, high_count, medium_count, low_count, info_count,
                 scanner_version, checksum_sha256, source_scan_id, is_reused, pin_identity,
                 scan_completeness, scan_completeness_reason, inventory_status,
-                vuln_db_version, vuln_db_published_at
+                vuln_db_version, vuln_db_published_at, advisory_excluded
             )
             VALUES ($1, $2, $3, 'completed', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, true, $15,
                     $16, $17, (SELECT inventory_status FROM scan_results WHERE id = $14),
-                    $18, $19)
+                    $18, $19, $20)
             RETURNING id, artifact_id, repository_id, scan_type, status,
                       findings_count, critical_count, high_count, medium_count, low_count, info_count,
                       scanner_version, error_message, started_at, completed_at, created_at,
                       is_reused, source_scan_id, scan_completeness, scan_completeness_reason,
-                      vuln_db_version, vuln_db_published_at
+                      vuln_db_version, vuln_db_published_at, advisory_excluded
             "#,
             artifact_id,
             repository_id,
@@ -2012,6 +2012,8 @@ impl ScanResultService {
             // ORIGINAL scan ran against; record that vintage, not NULL.
             source.vuln_db_version,
             source.vuln_db_published_at,
+            // #6335: and the original scan's skipped-lookup count.
+            source.advisory_excluded,
         )
         .fetch_one(&mut **tx)
         .await
@@ -2125,7 +2127,7 @@ impl ScanResultService {
                    findings_count, critical_count, high_count, medium_count, low_count, info_count,
                    scanner_version, error_message, started_at, completed_at, created_at,
                    is_reused, source_scan_id, scan_completeness, scan_completeness_reason,
-                      vuln_db_version, vuln_db_published_at
+                      vuln_db_version, vuln_db_published_at, advisory_excluded
             FROM scan_results
             WHERE id = $1
             FOR SHARE
@@ -2166,13 +2168,14 @@ impl ScanResultService {
                 scan_completeness_reason = $12,
                 inventory_status = (SELECT inventory_status FROM scan_results WHERE id = $8),
                 vuln_db_version = $13,
-                vuln_db_published_at = $14
+                vuln_db_published_at = $14,
+                advisory_excluded = $15
             WHERE id = $1 AND status = 'running'
             RETURNING id, artifact_id, repository_id, scan_type, status,
                       findings_count, critical_count, high_count, medium_count, low_count, info_count,
                       scanner_version, error_message, started_at, completed_at, created_at,
                       is_reused, source_scan_id, scan_completeness, scan_completeness_reason,
-                      vuln_db_version, vuln_db_published_at
+                      vuln_db_version, vuln_db_published_at, advisory_excluded
             "#,
             target_scan_id,
             findings,
@@ -2194,6 +2197,8 @@ impl ScanResultService {
             // #3014: and the source's vulnerability-database vintage.
             source.vuln_db_version,
             source.vuln_db_published_at,
+            // #6335: the copied verdict keeps the skipped-lookup count.
+            source.advisory_excluded,
         )
         .fetch_optional(&mut *tx)
         .await
@@ -2264,6 +2269,9 @@ impl ScanResultService {
     /// against; `None` (no database, or not reported) is stored as NULL in
     /// both `vuln_db_version` and `vuln_db_published_at`.
     ///
+    /// `advisory_excluded` (#6335) is how many dependencies the scanner kept
+    /// out of external advisory lookups; scanners without those lookups pass 0.
+    ///
     /// Returns whether the row was settled: `false` when a queued job's claim
     /// was recovered for a rerun (see `scan_queue::claim_still_held`), and the
     /// caller must not act on these totals (#6423).
@@ -2283,6 +2291,7 @@ impl ScanResultService {
         pin_identity: Option<&str>,
         scan_completeness_reason: Option<&str>,
         vuln_db: Option<&VulnDbProvenance>,
+        advisory_excluded: i32,
     ) -> Result<bool> {
         // #6232: a queued job settles its rows only while it holds its claim.
         let mut tx = self
@@ -2305,7 +2314,8 @@ impl ScanResultService {
                 pin_identity = $11,
                 scan_completeness_reason = $12,
                 vuln_db_version = $13,
-                vuln_db_published_at = $14
+                vuln_db_published_at = $14,
+                advisory_excluded = $15
             WHERE id = $1
             "#,
             scan_id,
@@ -2322,6 +2332,7 @@ impl ScanResultService {
             scan_completeness_reason,
             vuln_db.map(|p| p.version.as_str()),
             vuln_db.and_then(|p| p.published_at),
+            advisory_excluded,
         )
         .execute(&mut *tx)
         .await
@@ -2634,7 +2645,7 @@ impl ScanResultService {
                       findings_count, critical_count, high_count, medium_count, low_count, info_count,
                       scanner_version, error_message, started_at, completed_at, created_at,
                       is_reused, source_scan_id, scan_completeness, scan_completeness_reason,
-                      vuln_db_version, vuln_db_published_at
+                      vuln_db_version, vuln_db_published_at, advisory_excluded
             "#,
             artifact_id,
             repository_id,
@@ -2659,7 +2670,7 @@ impl ScanResultService {
                    findings_count, critical_count, high_count, medium_count, low_count, info_count,
                    scanner_version, error_message, started_at, completed_at, created_at,
                    is_reused, source_scan_id, scan_completeness, scan_completeness_reason,
-                      vuln_db_version, vuln_db_published_at
+                      vuln_db_version, vuln_db_published_at, advisory_excluded
             FROM scan_results
             WHERE id = $1
             "#,
@@ -2696,7 +2707,7 @@ impl ScanResultService {
                    findings_count, critical_count, high_count, medium_count, low_count, info_count,
                    scanner_version, error_message, started_at, completed_at, created_at,
                    is_reused, source_scan_id, scan_completeness, scan_completeness_reason,
-                      vuln_db_version, vuln_db_published_at
+                      vuln_db_version, vuln_db_published_at, advisory_excluded
             FROM scan_results
             WHERE ($1::uuid IS NULL OR repository_id = $1)
               AND ($2::uuid IS NULL OR artifact_id = $2)
@@ -2763,7 +2774,7 @@ impl ScanResultService {
                     findings_count, critical_count, high_count, medium_count, low_count, \
                     info_count, scanner_version, error_message, started_at, completed_at, \
                     created_at, is_reused, source_scan_id, scan_completeness, \
-                    scan_completeness_reason, vuln_db_version, vuln_db_published_at \
+                    scan_completeness_reason, vuln_db_version, vuln_db_published_at, advisory_excluded \
              FROM scan_results WHERE {FILTER} \
              ORDER BY created_at DESC LIMIT $7 OFFSET $8"
         );
@@ -4724,6 +4735,7 @@ mod tests {
             scan_completeness_reason: None,
             vuln_db_version: None,
             vuln_db_published_at: None,
+            advisory_excluded: 0,
         };
         assert_eq!(result.scan_type, "dependency");
         assert_eq!(result.status, "completed");
@@ -4759,6 +4771,7 @@ mod tests {
             scan_completeness_reason: None,
             vuln_db_version: None,
             vuln_db_published_at: None,
+            advisory_excluded: 0,
         };
         let json = serde_json::to_value(&result).unwrap();
         assert_eq!(json["scan_type"], "image");
@@ -4793,6 +4806,7 @@ mod tests {
             scan_completeness_reason: None,
             vuln_db_version: None,
             vuln_db_published_at: None,
+            advisory_excluded: 0,
         };
         assert_eq!(result.status, "failed");
         assert_eq!(result.error_message.as_deref(), Some("Scanner timed out"));
@@ -4824,6 +4838,7 @@ mod tests {
             scan_completeness_reason: None,
             vuln_db_version: None,
             vuln_db_published_at: None,
+            advisory_excluded: 0,
         };
         assert!(result.is_reused);
         assert_eq!(result.source_scan_id, Some(source_id));
@@ -5071,6 +5086,7 @@ mod tests {
             scan_completeness_reason: None,
             vuln_db_version: None,
             vuln_db_published_at: None,
+            advisory_excluded: 0,
         }
     }
 
@@ -5785,6 +5801,7 @@ mod tests {
                 None,
                 None,
                 None,
+                0,
             )
             .await
             .expect("complete scan");
@@ -6021,6 +6038,7 @@ mod tests {
                 None,
                 None,
                 None,
+                0,
             )
             .await
             .expect("complete source scan");
@@ -6129,11 +6147,12 @@ mod tests {
             }
         }
 
-        /// #3014 + #3013: the vulnerability-DB provenance written by
-        /// `complete_scan` and each finding's class survive the round trip,
-        /// the `finding_class` filter narrows the listing, and BOTH reuse
-        /// paths carry the source scan's DB vintage and finding classes onto
-        /// the reused row (a reused verdict is only as fresh as its source).
+        /// #3014 + #3013 + #6335: the vulnerability-DB provenance, each
+        /// finding's class and the advisory-exclusion count written by
+        /// `complete_scan` survive the round trip. The `finding_class` filter
+        /// narrows the listing, and BOTH reuse paths carry the source scan's
+        /// DB vintage, finding classes and skipped-lookup count onto the
+        /// reused row (a reused verdict is only as fresh as its source).
         #[tokio::test]
         async fn vuln_db_and_finding_class_round_trip_and_survive_reuse() {
             use crate::models::security::{FindingClass, VulnDbProvenance};
@@ -6179,6 +6198,7 @@ mod tests {
                 None,
                 None,
                 Some(&provenance),
+                7,
             )
             .await
             .expect("complete scan");
@@ -6186,6 +6206,7 @@ mod tests {
             let stored = svc.get_scan(scan.id).await.expect("get scan");
             assert_eq!(stored.vuln_db_version.as_deref(), Some("grype-db-v6.1.10"));
             assert_eq!(stored.vuln_db_published_at, Some(built));
+            assert_eq!(stored.advisory_excluded, 7);
 
             let malicious = FindingListFilter {
                 finding_class: Some("malicious"),
@@ -6230,6 +6251,10 @@ mod tests {
             for reused in [&copied, &converted] {
                 assert_eq!(reused.vuln_db_version.as_deref(), Some("grype-db-v6.1.10"));
                 assert_eq!(reused.vuln_db_published_at, Some(built));
+                assert_eq!(
+                    reused.advisory_excluded, 7,
+                    "the reused verdict must keep the skipped-lookup count"
+                );
                 let (rows, total) = svc
                     .list_findings(reused.id, &malicious, 0, 50)
                     .await
@@ -6268,6 +6293,7 @@ mod tests {
                 pin_identity,
                 None,
                 None,
+                0,
             )
             .await
             .expect("complete scan");
@@ -6765,6 +6791,7 @@ mod tests {
                 None,
                 None,
                 None,
+                0,
             )
             .await
             .expect("complete rescan");
@@ -6817,6 +6844,7 @@ mod tests {
                 (completeness != "complete").then_some("test reason"),
                 None,
                 None,
+                0,
             )
             .await
             .expect("complete scan");
@@ -8236,6 +8264,7 @@ mod tests {
                 None,
                 Some("grype cataloged no components; artifact contents were not recognized"),
                 None,
+                0,
             )
             .await
             .expect("complete scan as not_cataloged");
@@ -8291,6 +8320,7 @@ mod tests {
                 None,
                 None,
                 None,
+                0,
             )
             .await
             .expect("complete rescan");
@@ -8331,6 +8361,7 @@ mod tests {
                 None,
                 None,
                 None,
+                0,
             )
             .await
             .expect("complete scan as partial");
@@ -8831,6 +8862,7 @@ mod tests {
                 None,
                 None,
                 None,
+                0,
             )
             .await
             .expect("complete legacy");
@@ -8867,6 +8899,7 @@ mod tests {
                 None,
                 None,
                 None,
+                0,
             )
             .await
             .expect("complete modern");
@@ -8935,6 +8968,7 @@ mod tests {
                 None,
                 None,
                 None,
+                0,
             )
             .await
             .expect("complete old scan");
@@ -8960,6 +8994,7 @@ mod tests {
                 None,
                 None,
                 None,
+                0,
             )
             .await
             .expect("complete new scan");
