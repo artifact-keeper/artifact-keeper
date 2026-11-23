@@ -6958,6 +6958,13 @@ async fn download_package(
         return serve_sidecar(&state, auth.as_ref(), &repo, &subdir, &filename, request).await;
     }
 
+    // #6433: a proxy-cache row is served only after its cache sidecar is
+    // checked; one nothing vouches for is no row, so a Remote resolves the
+    // package through its proxy path below.
+    let artifact = proxy_helpers::vouched_row(&state, repo.id, artifact, |a| {
+        proxy_helpers::ServedRowRef::new(&a.storage_key, Some(a.size_bytes))
+    })
+    .await?;
     let not_found = || (StatusCode::NOT_FOUND, "Package not found").into_response();
     let artifact = match artifact {
         Some(a) => a,
@@ -9784,6 +9791,9 @@ async fn serve_sidecar(
         // #5810: in strict mode a Remote member that could not answer ends
         // the walk with the retryable 503, as it does for the package.
         let fallback = proxy_helpers::virtual_member_fallback(&state.db, repo.id).await;
+        // #6426: set when a Remote member could not answer (#5504), so an
+        // empty walk is the retryable 503 rather than a 404.
+        let mut unavailable = false;
         for (member, policy) in members.iter().zip(policies) {
             if member.repo_type == RepositoryType::Remote {
                 if !remote_admitted {
@@ -9813,11 +9823,11 @@ async fn serve_sidecar(
                 .await
                 {
                     Ok(response) => return Ok(response),
-                    Err(resp)
-                        if fallback.is_strict()
-                            && proxy_helpers::is_member_unavailable_response(&resp) =>
-                    {
-                        return Err(proxy_helpers::member_unavailable_response());
+                    Err(resp) if proxy_helpers::is_member_unavailable_response(&resp) => {
+                        if fallback.is_strict() {
+                            return Err(proxy_helpers::member_unavailable_response());
+                        }
+                        unavailable = true;
                     }
                     Err(_) => {}
                 }
@@ -9829,13 +9839,23 @@ async fn serve_sidecar(
                 return sidecar_response(&request, text, &sha);
             }
         }
-        return Err(not_found());
+        return Err(sidecar_walk_miss(unavailable));
     }
 
     let (text, sha) = load_hosted_sidecar(&state.db, repo.id, subdir, request.package())
         .await?
         .ok_or_else(not_found)?;
     sidecar_response(&request, text, &sha)
+}
+
+/// What a Virtual's sidecar walk that no member served answers (#6426): the
+/// retryable 503 when a Remote member could not answer, else the 404.
+fn sidecar_walk_miss(unavailable: bool) -> Response {
+    if unavailable {
+        proxy_helpers::member_unavailable_response()
+    } else {
+        (StatusCode::NOT_FOUND, "Attestation sidecar not found").into_response()
+    }
 }
 
 /// Core logic for retrieving a CEP-27 attestation.
@@ -18852,6 +18872,16 @@ mod tests {
     // -----------------------------------------------------------------------
     // CEP-50 sidecar helpers
     // -----------------------------------------------------------------------
+
+    /// #6426: a Virtual's sidecar walk that no member served answers the
+    /// retryable 503 when a Remote member could not answer, else the 404.
+    #[test]
+    fn sidecar_walk_miss_reports_an_unavailable_member_6426() {
+        let down = sidecar_walk_miss(true);
+        assert_eq!(down.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(down.headers().contains_key(axum::http::header::RETRY_AFTER));
+        assert_eq!(sidecar_walk_miss(false).status(), StatusCode::NOT_FOUND);
+    }
 
     #[test]
     fn sidecar_request_recognizes_both_cep50_forms() {

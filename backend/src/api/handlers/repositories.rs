@@ -13884,17 +13884,24 @@ pub async fn download_artifact(
     // #5457: an OCI manifest row (`v2/<name>/manifests/<ref>`) is gated with
     // every alias of its digest, as the native pull is, so a rejected image
     // is not downloadable here through a clean tag or digest alias.
+    //
+    // #6433: a proxy-cache row is served in no form (redirect, stream, range,
+    // HEAD) before its cache sidecar is checked: held is the 409, a refusal
+    // the 403, and a row nothing vouches for is not served from storage, so
+    // a Remote answers through its proxy path below as for a missing row.
+    let mut cache_row_declined = false;
     {
-        if let Some(artifact_id) = sqlx::query_scalar::<_, Uuid>(
-            "SELECT id \
-             FROM artifacts \
-             WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
-        )
-        .bind(repo.id)
-        .bind(&path)
-        .fetch_optional(&state.db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?
+        if let Some((artifact_id, storage_key, size_bytes)) =
+            sqlx::query_as::<_, (Uuid, String, i64)>(
+                "SELECT id, storage_key, size_bytes \
+                 FROM artifacts \
+                 WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
+            )
+            .bind(repo.id)
+            .bind(&path)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?
         {
             crate::services::oci_manifests::enforce_path_download_gate(
                 &state.db,
@@ -13902,6 +13909,16 @@ pub async fn download_artifact(
                 &path,
             )
             .await?;
+            let row = Some((storage_key, size_bytes));
+            cache_row_declined = match proxy_helpers::vouched_row(&state, repo.id, row, |(k, n)| {
+                proxy_helpers::ServedRowRef::new(k, Some(*n))
+            })
+            .await
+            {
+                Ok(vouched) => vouched.is_none(),
+                // The hold's 409, a refusal's 403.
+                Err(refusal) => return Ok(refusal),
+            };
             // #5076: a Remote that scans on proxy can hold rows of its own
             // (replication, a publish into the remote). This route cannot
             // grade them as their format route does, so, as for its Remote
@@ -13994,7 +14011,7 @@ pub async fn download_artifact(
     // GET-signed URL hands the client a URL it cannot use. Skip the redirect and
     // fall through to the streamed path below, which already builds the correct
     // headers with an empty body for a HEAD.
-    if presigned_enabled && !is_head {
+    if presigned_enabled && !is_head && !cache_row_declined {
         // Get artifact metadata first using query_as for runtime checking
         #[derive(sqlx::FromRow)]
         struct ArtifactRow {
@@ -14070,6 +14087,7 @@ pub async fn download_artifact(
     // to `max_upload_size_bytes`), so this used to buffer the whole object to
     // learn its length, on a HEAD too.
     if repo.repo_type != RepositoryType::Virtual
+        && !cache_row_declined
         && repo.format == RepositoryFormat::Docker
         && crate::services::oci_manifests::is_manifest_path(&path)
     {
@@ -14150,17 +14168,21 @@ pub async fn download_artifact(
         }
     }
 
-    let download_result = artifact_service
-        .download_stream(
-            repo.id,
-            &path,
-            auth.as_ref().map(|a| a.user_id),
-            client_ip_str.clone(),
-            user_agent.as_deref(),
-            // #2260 §5: a HEAD serves no body, so it must not count.
-            !is_head,
-        )
-        .await;
+    let download_result = if cache_row_declined {
+        Err(AppError::NotFound("Artifact not found".to_string()))
+    } else {
+        artifact_service
+            .download_stream(
+                repo.id,
+                &path,
+                auth.as_ref().map(|a| a.user_id),
+                client_ip_str.clone(),
+                user_agent.as_deref(),
+                // #2260 §5: a HEAD serves no body, so it must not count.
+                !is_head,
+            )
+            .await
+    };
 
     match download_result {
         Ok((artifact, body)) => {
@@ -18510,6 +18532,37 @@ mod tests {
 
         assert_eq!(whole.0, StatusCode::OK);
         assert_eq!(&whole.1[..], &data[..]);
+    }
+
+    /// #6433: the generic download route serves a Remote's proxy-cache row
+    /// in no form before its cache sidecar is checked. A held row answers the
+    /// hold's 409 to a GET and to a HEAD; a fresh one streams its bytes; a
+    /// stale one is not served from storage, and the Remote's proxy path
+    /// answers instead (here its upstream is unreachable). Before, all three
+    /// were streamed from the row.
+    #[tokio::test]
+    async fn generic_download_gates_proxy_cache_rows_6433() {
+        use tdh::{CacheRowRig, CacheRowSidecar as S};
+        let Some(rig) = CacheRowRig::setup("generic").await else {
+            return;
+        };
+        tdh::publish_repo(&rig.fx.pool, rig.fx.repo_id).await;
+        let fresh = rig.row("pkg/fresh.bin", "fresh", "1.0", S::Fresh).await;
+        let stale = rig.row("pkg/stale.bin", "stale", "1.0", S::Stale).await;
+        rig.row("pkg/held.bin", "held", "1.0", S::Held).await;
+        let key = rig.fx.repo_key.clone();
+        let app = || tdh::router_anon(download_router(), rig.state.clone());
+        let fresh_get = tdh::send(app(), tdh::get(format!("/{key}/download/pkg/fresh.bin"))).await;
+        let held_get = tdh::send(app(), tdh::get(format!("/{key}/download/pkg/held.bin"))).await;
+        let held_head = tdh::send(app(), tdh::head(format!("/{key}/download/pkg/held.bin"))).await;
+        let stale_get = tdh::send(app(), tdh::get(format!("/{key}/download/pkg/stale.bin"))).await;
+        rig.teardown().await;
+
+        assert_eq!(fresh_get, (StatusCode::OK, fresh), "a fresh row is served");
+        assert_eq!(held_get.0, StatusCode::CONFLICT, "a held row's GET");
+        assert_eq!(held_head.0, StatusCode::CONFLICT, "a held row's HEAD");
+        assert_ne!(stale_get.0, StatusCode::OK, "a stale row is not served");
+        assert_ne!(stale_get.1, stale, "a stale row's bytes are not served");
     }
 
     #[tokio::test]

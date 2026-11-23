@@ -1,0 +1,7 @@
+---
+section: Changed
+issues: [#6360]
+---
+- **A Nexus migration walks the `/assets` listing only for raw and Maven repositories, and its memory for that walk is now bounded** (#6360). After a repository's components, the Nexus client paged through `/service/rest/v1/assets` for the files that no component owns. Only raw and `maven2` repositories can hold such files, so for npm, Docker, PyPI, NuGet and every other format the walk fetched every asset again and kept none. The client now reads the repository's format from its first component, or from its first asset if it has no components, and skips the walk where it cannot list anything. A migration of such a repository makes at most half the listing requests it did.
+
+  Where the walk runs, the component paths it dedupes against were all held as strings for the whole walk. They are now held as 128-bit digests, only for rows inside the job's date window, and at most 1,000,000 of them (about 32 MB); the set is released when the walk ends. The digests are keyed per walk, so an upstream cannot craft colliding paths. Past the cap, a file of a later component may be listed a second time. The worker finds it already completed in the job and drops it without transferring or counting it, under every conflict policy; only a dry run can count such a file twice. A warning names the repository when the cap is reached. What a migration moves is otherwise unchanged.

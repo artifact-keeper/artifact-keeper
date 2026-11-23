@@ -595,7 +595,9 @@ async fn download_module(
     let filename = file_path.trim_start_matches('/');
 
     let artifact =
-        match proxy_helpers::find_local_by_filename_suffix(&state.db, repo.id, filename).await? {
+        match proxy_helpers::find_servable_local_by_filename_suffix(&state, repo.id, filename)
+            .await?
+        {
             Some(a) => a,
             None => {
                 let upstream_path = format!("v3/files/{}", filename);

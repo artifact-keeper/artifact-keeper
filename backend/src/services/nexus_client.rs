@@ -24,9 +24,62 @@ pub struct NexusAuth {
     pub password: String,
 }
 
-/// Listing pages [`NexusClient`]'s `count_artifacts` walks before reporting a
-/// lower bound (#3928): repositories of up to 2,000 assets are counted exactly.
-pub const NEXUS_COUNT_PAGE_BUDGET: usize = 2;
+/// `/components` pages [`NexusClient`]'s `count_artifacts` walks before it
+/// reports a lower bound (#3928, #6260): up to 2,000 components.
+pub const NEXUS_COUNT_COMPONENT_PAGES: usize = 200;
+
+/// `/assets` pages the count walks for a raw or Maven repository, on top of
+/// its component pages: up to 4,000 assets, counting component-owned files,
+/// files without a component and Maven metadata alike.
+///
+/// The count is exact when the repository has at most 2,000 components and,
+/// for raw and Maven repositories, at most 4,000 assets in its asset listing;
+/// otherwise it is not exact. That covers every repository main counted
+/// exactly (fewer than 2,000 listed assets in all). A count that is not exact
+/// is normally a lower bound; if the walk passes the dedupe cap
+/// ([`DEFAULT_LISTED_PATHS_CAP`]) it can instead be too high, because a
+/// component's file may then be counted again by the asset walk.
+pub const NEXUS_COUNT_ASSET_PAGES: usize = 400;
+
+/// Upstream `/components` and `/assets` pages one listing call may fetch
+/// before it returns what it has gathered (#6260).
+///
+/// Nexus has no server-side date filter, so a filtered listing keeps fetching
+/// until it has a page's worth of rows inside the window. With a narrow
+/// window over a large repository that was the whole repository in one call,
+/// during which the worker could not see a pause or cancel and the job showed
+/// no progress. Fifty pages of ten components is about five seconds of
+/// listing at the default 100 ms throttle.
+pub const DEFAULT_LIST_PAGE_BUDGET: usize = 50;
+
+/// Env override for [`DEFAULT_LIST_PAGE_BUDGET`]. `0` or a value that does
+/// not parse keeps the default: an unbounded call is what the budget removes.
+pub(crate) const MIGRATION_NEXUS_LIST_PAGE_BUDGET_ENV: &str = "MIGRATION_NEXUS_LIST_PAGE_BUDGET";
+
+fn list_page_budget_from(raw: Option<&str>) -> usize {
+    let Some(raw) = raw else {
+        return DEFAULT_LIST_PAGE_BUDGET;
+    };
+    match raw.trim().parse::<usize>() {
+        Ok(pages) if pages > 0 => pages,
+        _ => {
+            tracing::warn!(
+                env = MIGRATION_NEXUS_LIST_PAGE_BUDGET_ENV,
+                value = raw,
+                default = DEFAULT_LIST_PAGE_BUDGET,
+                "ignoring an invalid Nexus listing page budget; using the default"
+            );
+            DEFAULT_LIST_PAGE_BUDGET
+        }
+    }
+}
+
+/// Most component paths a raw or Maven repository walk records for its asset
+/// walk to dedupe against (#6360). Each is held as a 128-bit digest, about
+/// 20 bytes with the set's overhead, so the set stays under roughly 32 MB
+/// however large the repository is. See [`ListedPaths`] for what happens past
+/// the cap.
+pub const DEFAULT_LISTED_PATHS_CAP: usize = 1_000_000;
 
 /// Nexus client configuration
 #[derive(Debug, Clone)]
@@ -51,6 +104,12 @@ pub struct NexusClientConfig {
     /// Cancelled when the migration owning this client is cancelled. A retry
     /// backoff waits on it, so a cancel does not have to outlast a 30 s sleep.
     pub cancel_token: CancellationToken,
+    /// Most component paths one repository walk records for the asset walk to
+    /// dedupe against ([`DEFAULT_LISTED_PATHS_CAP`], #6360).
+    pub listed_paths_cap: usize,
+    /// Upstream listing pages one `list_artifacts` call may fetch
+    /// ([`DEFAULT_LIST_PAGE_BUDGET`]; `MIGRATION_NEXUS_LIST_PAGE_BUDGET`).
+    pub list_page_budget: usize,
 }
 
 impl Default for NexusClientConfig {
@@ -80,6 +139,12 @@ impl Default for NexusClientConfig {
             throttle_delay_ms: 100,
             retry_config: RetryConfig::default(),
             cancel_token: CancellationToken::new(),
+            listed_paths_cap: DEFAULT_LISTED_PATHS_CAP,
+            list_page_budget: list_page_budget_from(
+                std::env::var(MIGRATION_NEXUS_LIST_PAGE_BUDGET_ENV)
+                    .ok()
+                    .as_deref(),
+            ),
         }
     }
 }
@@ -112,9 +177,16 @@ struct ListCursor {
     pending: std::collections::VecDeque<AqlResult>,
     /// Which Nexus listing `token` belongs to.
     phase: ListPhase,
-    /// Paths already handed out, so the asset walk skips every asset a
-    /// component already listed.
-    listed_paths: std::collections::HashSet<String>,
+    /// Paths the component walk listed, so the asset walk skips every asset a
+    /// component already listed. Filled only for a repository whose format
+    /// can hold component-less content, and only with rows inside the window:
+    /// the asset walk reads the same `lastModified` and drops the rest
+    /// itself. Emptied when the walk ends (#6360).
+    listed_paths: ListedPaths,
+    /// Whether the asset walk can list anything for this repository, decided
+    /// from the first component's format (#6360). `None` until a component
+    /// is seen.
+    asset_walk_needed: Option<bool>,
     /// Both listings answered without a continuation token: the walk is over.
     exhausted: bool,
     /// The `modified` window this walk is filtered to. Offsets count only the
@@ -195,13 +267,97 @@ enum ListPhase {
 }
 
 impl ListCursor {
-    /// The listing in the current phase has no more pages.
+    /// The listing in the current phase has no more pages. A repository whose
+    /// components say its format has no component-less content skips the
+    /// asset walk (#6360): it would page through every asset again and keep
+    /// none of them.
     fn finish_phase(&mut self) {
         self.token = None;
         match self.phase {
-            ListPhase::Components => self.phase = ListPhase::Assets,
-            ListPhase::Assets => self.exhausted = true,
+            ListPhase::Components if self.asset_walk_needed != Some(false) => {
+                self.phase = ListPhase::Assets
+            }
+            ListPhase::Components | ListPhase::Assets => self.finish_walk(),
         }
+    }
+
+    /// Both listings are over. The dedupe set is not needed any more and the
+    /// cursor stays parked until the client is dropped, so release it.
+    fn finish_walk(&mut self) {
+        self.token = None;
+        self.exhausted = true;
+        self.listed_paths.release();
+    }
+}
+
+/// The component paths a repository walk has listed, for the asset walk to
+/// skip (#6360). Nexus's `/assets` lists component-owned assets too and does
+/// not say which component owns one, so the asset walk can only tell a
+/// component-less file from a component's file by its path.
+///
+/// Paths are held as 128-bit digests rather than strings, and at most `cap` of
+/// them. The digest is keyed with a random key per walk, so an upstream
+/// cannot craft paths that collide and make the walk drop a file; a chance
+/// collision is about 10^-27 at a million entries.
+///
+/// Past the cap no new path is recorded, so the asset walk can list an
+/// unrecorded component's file a second time. Such rows are flagged
+/// `possible_duplicate`: the worker finds the file already completed in this
+/// job and drops the row without counting it, under every conflict policy.
+/// A dry run writes no item rows, so past the cap it can count such a file
+/// twice. A warning names the repository when the cap is reached.
+#[derive(Default)]
+struct ListedPaths {
+    digests: std::collections::HashSet<u128>,
+    keys: (
+        std::collections::hash_map::RandomState,
+        std::collections::hash_map::RandomState,
+    ),
+    cap: usize,
+    overflowed: bool,
+}
+
+impl ListedPaths {
+    fn with_cap(cap: usize) -> Self {
+        Self {
+            cap,
+            ..Self::default()
+        }
+    }
+
+    fn digest(&self, path: &str) -> u128 {
+        use std::hash::BuildHasher;
+        (u128::from(self.keys.0.hash_one(path)) << 64) | u128::from(self.keys.1.hash_one(path))
+    }
+
+    /// Record `path`. `false` when it was recorded before; a path that could
+    /// not be recorded because the set is full counts as new.
+    fn insert(&mut self, repo: &str, path: &str) -> bool {
+        let digest = self.digest(path);
+        if self.digests.contains(&digest) {
+            return false;
+        }
+        if self.digests.len() < self.cap {
+            self.digests.insert(digest);
+        } else if !self.overflowed {
+            self.overflowed = true;
+            tracing::warn!(
+                repo = %repo,
+                cap = self.cap,
+                "Nexus asset-walk dedupe set is full; assets of later components may be \
+                 listed twice and are then dropped as already completed"
+            );
+        }
+        true
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.digests.len()
+    }
+
+    fn release(&mut self) {
+        self.digests = std::collections::HashSet::new();
     }
 }
 
@@ -706,6 +862,7 @@ impl NexusClient {
         };
 
         AqlResult {
+            possible_duplicate: false,
             repo: repo_name.to_string(),
             path: dir,
             name,
@@ -741,6 +898,14 @@ impl NexusClient {
         }
     }
 
+    /// Whether a repository of this Nexus format can hold assets the asset
+    /// walk lists ([`Self::is_component_less_content`]). A Nexus repository
+    /// has exactly one format, so one component or asset decides it for the
+    /// whole repository (#6360).
+    fn format_has_component_less_content(format: Option<&str>) -> bool {
+        matches!(format, Some("raw" | "maven2"))
+    }
+
     /// The repository-relative path a row was listed under, the key the asset
     /// walk dedupes on.
     fn listed_path(result: &AqlResult) -> String {
@@ -766,6 +931,13 @@ impl NexusClient {
     /// Any other offset still works: the cursor misses and the listing is
     /// walked from page 1, discarding what precedes `offset`, exactly as
     /// before.
+    ///
+    /// One call fetches at most `list_page_budget` upstream pages (#6260).
+    /// When the budget runs out before the page is full, the call returns
+    /// what it has, possibly nothing, with `incomplete` set, and the cursor
+    /// stays parked where it stopped so the next call carries on from there.
+    /// A seek to an `offset` the cursor is not at walks up to that offset
+    /// before the budget applies, so the next call finds the cursor there.
     ///
     /// `range.total` reports the assets this call walked to fill the page —
     /// the per-call figure the Artifactory client's `range.total` also carries.
@@ -801,6 +973,7 @@ impl NexusClient {
             None => (
                 ListCursor {
                     window,
+                    listed_paths: ListedPaths::with_cap(self.config.listed_paths_cap),
                     ..ListCursor::default()
                 },
                 usize::try_from(offset).unwrap_or(usize::MAX),
@@ -808,35 +981,59 @@ impl NexusClient {
         };
 
         let target = to_discard.saturating_add(want);
+        let budget = self.config.list_page_budget.max(1);
+        let mut pages_fetched = 0usize;
+        let mut incomplete = false;
         while cursor.pending.len() < target && !cursor.exhausted {
+            if pages_fetched >= budget && cursor.pending.len() >= to_discard {
+                incomplete = true;
+                break;
+            }
+            pages_fetched += 1;
             let endpoint = match cursor.phase {
                 ListPhase::Components => "components",
                 ListPhase::Assets => "assets",
             };
-            let path = match &cursor.token {
-                Some(t) => format!(
-                    "/service/rest/v1/{}?repository={}&continuationToken={}",
-                    endpoint, repo_name, t
-                ),
-                None => format!("/service/rest/v1/{}?repository={}", endpoint, repo_name),
-            };
+            let path = Self::listing_path(endpoint, repo_name, cursor.token.as_deref());
 
             let next_token = match cursor.phase {
                 ListPhase::Components => {
                     let page: NexusComponentsResponse = self.get(&path).await?;
-                    let results = Self::page_to_results(repo_name, &page);
-                    // Every component asset is recorded as listed, inside the
-                    // window or not, so the asset walk never re-lists it.
-                    cursor
-                        .listed_paths
-                        .extend(results.iter().map(Self::listed_path));
-                    cursor
-                        .pending
-                        .extend(results.into_iter().filter(|r| window.admits(r)));
+                    if cursor.asset_walk_needed.is_none() {
+                        cursor.asset_walk_needed = page.items.first().map(|c| {
+                            Self::format_has_component_less_content(Some(c.format.as_str()))
+                        });
+                    }
+                    let record_paths = cursor.asset_walk_needed == Some(true);
+                    for result in Self::page_to_results(repo_name, &page) {
+                        if !window.admits(&result) {
+                            // The asset walk reads the same `lastModified`
+                            // and leaves this row out on its own.
+                            continue;
+                        }
+                        if record_paths {
+                            cursor
+                                .listed_paths
+                                .insert(repo_name, &Self::listed_path(&result));
+                        }
+                        cursor.pending.push_back(result);
+                    }
                     page.continuation_token
                 }
                 ListPhase::Assets => match self.get::<NexusAssetsResponse>(&path).await {
                     Ok(page) => {
+                        // A repository without components gets here without
+                        // its format known. All of its assets share one
+                        // format, so the first one says whether the walk can
+                        // list anything at all (#6360).
+                        if let Some(first) = page.items.first() {
+                            if !Self::format_has_component_less_content(first.format.as_deref()) {
+                                cursor.asset_walk_needed = Some(false);
+                                // Ends the walk; the loop condition sees it.
+                                cursor.finish_walk();
+                                continue;
+                            }
+                        }
                         for asset in &page.items {
                             let Some(asset_path) = asset.path.as_deref() else {
                                 continue;
@@ -845,9 +1042,15 @@ impl NexusClient {
                                 continue;
                             }
                             let result = Self::asset_to_result(repo_name, asset_path, asset);
-                            if cursor.listed_paths.insert(Self::listed_path(&result))
-                                && window.admits(&result)
+                            // Window first, so the dedupe set holds only rows
+                            // that can be listed.
+                            if window.admits(&result)
+                                && cursor
+                                    .listed_paths
+                                    .insert(repo_name, &Self::listed_path(&result))
                             {
+                                let mut result = result;
+                                result.possible_duplicate = cursor.listed_paths.overflowed;
                                 cursor.pending.push_back(result);
                             }
                         }
@@ -903,7 +1106,17 @@ impl NexusClient {
         cursor.next_offset = offset.saturating_add(page_results.len() as i64);
         self.store_list_cursor(repo_name, cursor);
 
+        if incomplete {
+            tracing::debug!(
+                repo = %repo_name,
+                pages = pages_fetched,
+                returned = page_results.len(),
+                "Nexus listing call reached its page budget; returning a partial page"
+            );
+        }
+
         Ok(AqlResponse {
+            incomplete,
             results: page_results,
             range: AqlRange {
                 start_pos: offset,
@@ -911,6 +1124,120 @@ impl NexusClient {
                 total: walked,
             },
         })
+    }
+
+    /// Count a repository's listed assets for the assessment (#3928), walking
+    /// at most [`NEXUS_COUNT_COMPONENT_PAGES`] component pages and, for raw and
+    /// Maven repositories, [`NEXUS_COUNT_ASSET_PAGES`] asset pages.
+    ///
+    /// The two walks have separate budgets (#6260). Counting through the
+    /// budgeted listing shared one budget between them, so a raw repository
+    /// of 1,500 components (150 component pages, then 150 asset pages) came
+    /// out as a lower bound. The count applies the same rules as the listing:
+    /// every component asset, then the asset walk's component-less files,
+    /// deduplicated by path.
+    pub async fn count_artifacts(
+        &self,
+        repo_name: &str,
+    ) -> Result<crate::services::source_registry::ArtifactCount, ArtifactoryError> {
+        use crate::services::source_registry::ArtifactCount;
+
+        let mut counted: i64 = 0;
+        let mut paths = ListedPaths::with_cap(self.config.listed_paths_cap);
+        let mut asset_walk_needed: Option<bool> = None;
+
+        // Components.
+        let mut token: Option<String> = None;
+        let mut pages = 0usize;
+        loop {
+            if pages >= NEXUS_COUNT_COMPONENT_PAGES {
+                return Ok(ArtifactCount {
+                    counted,
+                    exact: false,
+                });
+            }
+            pages += 1;
+            let path = Self::listing_path("components", repo_name, token.as_deref());
+            let page: NexusComponentsResponse = self.get(&path).await?;
+            if asset_walk_needed.is_none() {
+                asset_walk_needed = page
+                    .items
+                    .first()
+                    .map(|c| Self::format_has_component_less_content(Some(c.format.as_str())));
+            }
+            for result in Self::page_to_results(repo_name, &page) {
+                counted += 1;
+                if asset_walk_needed == Some(true) {
+                    paths.insert(repo_name, &Self::listed_path(&result));
+                }
+            }
+            match page.continuation_token {
+                Some(next) if token.as_deref() != Some(next.as_str()) => token = Some(next),
+                _ => break,
+            }
+        }
+        if asset_walk_needed == Some(false) {
+            return Ok(ArtifactCount {
+                counted,
+                exact: true,
+            });
+        }
+
+        // Files no component owns.
+        let mut token: Option<String> = None;
+        let mut pages = 0usize;
+        loop {
+            if pages >= NEXUS_COUNT_ASSET_PAGES {
+                return Ok(ArtifactCount {
+                    counted,
+                    exact: false,
+                });
+            }
+            pages += 1;
+            let path = Self::listing_path("assets", repo_name, token.as_deref());
+            let page = match self.get::<NexusAssetsResponse>(&path).await {
+                Ok(page) => page,
+                Err(ArtifactoryError::NotFound(_)) => break,
+                Err(e) => return Err(e),
+            };
+            if let Some(first) = page.items.first() {
+                if !Self::format_has_component_less_content(first.format.as_deref()) {
+                    break;
+                }
+            }
+            for asset in &page.items {
+                let Some(asset_path) = asset.path.as_deref() else {
+                    continue;
+                };
+                if !Self::is_component_less_content(asset_path, asset) {
+                    continue;
+                }
+                let result = Self::asset_to_result(repo_name, asset_path, asset);
+                if paths.insert(repo_name, &Self::listed_path(&result)) {
+                    counted += 1;
+                }
+            }
+            match page.continuation_token {
+                Some(next) if token.as_deref() != Some(next.as_str()) => token = Some(next),
+                _ => break,
+            }
+        }
+        // Past the dedupe cap a component's file can be counted twice, so the
+        // figure is then not exact and may be too high.
+        Ok(ArtifactCount {
+            counted,
+            exact: !paths.overflowed,
+        })
+    }
+
+    fn listing_path(endpoint: &str, repo_name: &str, token: Option<&str>) -> String {
+        match token {
+            Some(t) => format!(
+                "/service/rest/v1/{}?repository={}&continuationToken={}",
+                endpoint, repo_name, t
+            ),
+            None => format!("/service/rest/v1/{}?repository={}", endpoint, repo_name),
+        }
     }
 
     /// Download an artifact by repository name and path.
@@ -1012,22 +1339,13 @@ impl crate::services::source_registry::SourceRegistry for NexusClient {
         self.list_artifacts(repo_key, offset, limit).await
     }
 
-    /// A smaller walk than the default (#3928): one Nexus listing page of
-    /// [`COUNT_PAGE_SIZE`](crate::services::source_registry::COUNT_PAGE_SIZE)
-    /// rows costs many `/components` requests, each behind the client's
-    /// throttle delay, so the full default budget would make an assessment of
-    /// a large Nexus repository take minutes.
+    /// Budgeted in upstream pages rather than listing calls (#3928, #6260):
+    /// see [`NexusClient::count_artifacts`].
     async fn count_artifacts(
         &self,
         repo_key: &str,
     ) -> Result<crate::services::source_registry::ArtifactCount, ArtifactoryError> {
-        crate::services::source_registry::count_by_listing(
-            self,
-            repo_key,
-            crate::services::source_registry::COUNT_PAGE_SIZE,
-            NEXUS_COUNT_PAGE_BUDGET,
-        )
-        .await
+        NexusClient::count_artifacts(self, repo_key).await
     }
 
     async fn list_artifacts_with_date_filter(
@@ -2106,13 +2424,21 @@ mod tests {
     /// One page of the fixture repository: `FIXTURE_PAGE_SIZE` components with
     /// one asset each, plus the continuation token that follows it.
     fn fixture_components_page(page_index: usize, next_token: Option<&str>) -> serde_json::Value {
+        fixture_components_page_of("npm", page_index, next_token)
+    }
+
+    fn fixture_components_page_of(
+        format: &str,
+        page_index: usize,
+        next_token: Option<&str>,
+    ) -> serde_json::Value {
         let items: Vec<serde_json::Value> = (0..FIXTURE_PAGE_SIZE)
             .map(|slot| {
                 let n = page_index * FIXTURE_PAGE_SIZE + slot;
                 serde_json::json!({
                     "id": format!("comp-{n}"),
                     "repository": "nexus-paged",
-                    "format": "npm",
+                    "format": format,
                     "name": format!("pkg-{n}"),
                     "version": "1.0.0",
                     "assets": [{
@@ -2133,12 +2459,17 @@ mod tests {
     /// chained by continuation token, so every page but the first is only
     /// reachable through the token of the one before it.
     async fn paged_components_server() -> (MockServer, NexusClient) {
+        paged_components_server_of("npm").await
+    }
+
+    /// [`paged_components_server`] with components of another Nexus format.
+    async fn paged_components_server_of(format: &str) -> (MockServer, NexusClient) {
         use wiremock::matchers::{query_param, query_param_is_missing};
 
         let server = MockServer::start().await;
         for page_index in 0..FIXTURE_PAGES {
             let next = (page_index + 1 < FIXTURE_PAGES).then(|| format!("t{}", page_index + 1));
-            let body = fixture_components_page(page_index, next.as_deref());
+            let body = fixture_components_page_of(format, page_index, next.as_deref());
             let response = ResponseTemplate::new(200).set_body_json(body);
             let route = Mock::given(method("GET")).and(path("/service/rest/v1/components"));
             if page_index == 0 {
@@ -2748,7 +3079,7 @@ mod tests {
     /// the component walk lists, the asset walk adds nothing.
     #[tokio::test]
     async fn test_list_artifacts_unchanged_when_every_asset_has_a_component() {
-        let (server, client) = paged_components_server().await;
+        let (server, client) = paged_components_server_of("raw").await;
         let all: Vec<serde_json::Value> = (0..FIXTURE_PAGES * FIXTURE_PAGE_SIZE)
             .map(|n| fixture_asset(&format!("pkg-{n}/1.0.0/pkg-{n}-1.0.0.tgz"), n))
             .collect();
@@ -2768,7 +3099,7 @@ mod tests {
     /// A Nexus without the assets API still migrates its components.
     #[tokio::test]
     async fn test_list_artifacts_tolerates_a_missing_assets_api() {
-        let (server, client) = paged_components_server().await;
+        let (server, client) = paged_components_server_of("raw").await;
 
         let rows = walk_all(&client, "nexus-paged", 100).await;
 
@@ -3041,6 +3372,494 @@ mod tests {
         assert_eq!(
             asset.last_modified.as_deref(),
             Some("2024-02-02T00:00:00.000+00:00")
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #6360: the asset walk runs only where it can list something, and its
+    // dedupe set holds only what it needs
+    // -----------------------------------------------------------------------
+
+    /// How many paths the parked cursor for `repo` holds for the asset walk.
+    fn listed_paths_held(client: &NexusClient, repo: &str) -> usize {
+        client
+            .list_cursors
+            .lock()
+            .expect("cursor lock")
+            .get(repo)
+            .map_or(0, |c| c.listed_paths.len())
+    }
+
+    /// An npm repository has no component-less content the migration keeps,
+    /// so the asset walk paged through every asset again and kept none of
+    /// them, and every component path was held in memory for it.
+    ///
+    /// Fails-before: two `/assets` requests, and two paths held after the
+    /// first page.
+    #[tokio::test]
+    async fn test_list_artifacts_skips_the_asset_walk_for_an_npm_repository_6360() {
+        let (server, client) = paged_components_server().await;
+        let npm_assets = |range: std::ops::Range<usize>| -> Vec<serde_json::Value> {
+            range
+                .map(|n| fixture_asset_of("npm", &format!("pkg-{n}/-/pkg-{n}-1.0.0.tgz"), n))
+                .collect()
+        };
+        mount_asset_pages(
+            &server,
+            "nexus-paged",
+            vec![npm_assets(0..5), npm_assets(5..10)],
+        )
+        .await;
+
+        let first = client
+            .list_artifacts("nexus-paged", 0, FIXTURE_PAGE_SIZE as i64)
+            .await
+            .expect("list the first page");
+        assert_eq!(first.results.len(), FIXTURE_PAGE_SIZE);
+        assert_eq!(
+            listed_paths_held(&client, "nexus-paged"),
+            0,
+            "an npm repository keeps no paths for an asset walk it will not run"
+        );
+
+        let rows = walk_all(&client, "nexus-paged", FIXTURE_PAGE_SIZE as i64).await;
+
+        assert_eq!(rows.len(), FIXTURE_PAGES * FIXTURE_PAGE_SIZE);
+        assert_eq!(
+            request_count(&server, "/service/rest/v1/assets").await,
+            0,
+            "the asset walk cannot list anything for npm and is not run"
+        );
+    }
+
+    /// A repository with no components does not say its format until the
+    /// asset walk starts. Its first asset does: a PyPI repository stops after
+    /// one asset page instead of paging through all of them.
+    ///
+    /// Fails-before: three `/assets` requests.
+    #[tokio::test]
+    async fn test_list_artifacts_asset_walk_stops_on_the_first_page_of_another_format_6360() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/service/rest/v1/components"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "items": [], "continuationToken": null })),
+            )
+            .mount(&server)
+            .await;
+        let pages = (0..3)
+            .map(|p| vec![fixture_asset_of("pypi", &format!("/simple/pkg-{p}/"), p)])
+            .collect();
+        mount_asset_pages(&server, "pypi-hosted", pages).await;
+        let client = nexus_client_for(&server);
+
+        let rows = walk_all(&client, "pypi-hosted", 10).await;
+
+        assert!(rows.is_empty());
+        assert_eq!(request_count(&server, "/service/rest/v1/assets").await, 1);
+    }
+
+    /// Where the asset walk does run, the dedupe set holds only the rows
+    /// inside the window (the asset walk drops the rest on the same
+    /// `lastModified`), and it is released when the walk ends.
+    ///
+    /// Fails-before: the out-of-window component paths are held too, and the
+    /// set outlives the walk.
+    #[tokio::test]
+    async fn test_list_artifacts_dedupe_set_holds_in_window_rows_and_is_released_6360() {
+        use crate::services::source_registry::SourceRegistry;
+
+        let server = dated_server().await;
+        let client = nexus_client_for(&server);
+        let after = Some("2024-01-01T00:00:00+00:00");
+
+        // Page one holds file-1 (out of the window) and file-2 (inside it).
+        let first = client
+            .list_artifacts_with_date_filter("dated", 0, 1, after, None)
+            .await
+            .expect("list the first page");
+        assert_eq!(first.results[0].name, "file-2.bin");
+        assert_eq!(
+            listed_paths_held(&client, "dated"),
+            1,
+            "only the in-window component path is held"
+        );
+
+        let names = walk_dated(&client, 2, after, None).await;
+        assert_eq!(
+            names,
+            vec!["file-2.bin", "file-5.bin", "file-6.bin", "new.bin"]
+        );
+        assert_eq!(
+            listed_paths_held(&client, "dated"),
+            0,
+            "the dedupe set is released once the walk is over"
+        );
+    }
+
+    /// The dedupe set is capped (#6360): an unfiltered walk of a large Maven
+    /// or raw repository used to hold every component path as a string for
+    /// the whole walk. Past the cap nothing more is recorded, and the asset
+    /// walk lists an unrecorded component's asset again (the worker's
+    /// duplicate check skips it) rather than losing any file.
+    #[tokio::test]
+    async fn test_list_artifacts_dedupe_set_is_capped_6360() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/service/rest/v1/components"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "items": [{
+                    "id": "comp-1",
+                    "repository": "maven-capped",
+                    "format": "maven2",
+                    "group": "com.example",
+                    "name": "lib",
+                    "version": "1.0",
+                    "assets": [
+                        fixture_asset_of("maven2", "com/example/lib/1.0/lib-1.0.jar", 1),
+                        fixture_asset_of("maven2", "com/example/lib/1.0/lib-1.0.pom", 2)
+                    ]
+                }],
+                "continuationToken": null
+            })))
+            .mount(&server)
+            .await;
+        mount_asset_pages(
+            &server,
+            "maven-capped",
+            vec![vec![
+                fixture_asset_of("maven2", "com/example/lib/1.0/lib-1.0.jar", 1),
+                fixture_asset_of("maven2", "com/example/lib/1.0/lib-1.0.pom", 2),
+                fixture_asset_of("maven2", "com/example/docs/install.txt", 3),
+            ]],
+        )
+        .await;
+        let client = NexusClient::new(NexusClientConfig {
+            base_url: server.uri(),
+            auth: NexusAuth {
+                username: "u".into(),
+                password: "p".into(),
+            },
+            throttle_delay_ms: 0,
+            listed_paths_cap: 1,
+            ..Default::default()
+        })
+        .expect("build nexus client");
+
+        let first = client
+            .list_artifacts("maven-capped", 0, 2)
+            .await
+            .expect("list the component page");
+        assert_eq!(first.results.len(), 2);
+        assert_eq!(
+            listed_paths_held(&client, "maven-capped"),
+            1,
+            "no more paths are held than the cap"
+        );
+
+        let rows = walk_all(&client, "maven-capped", 2).await;
+        let listed: Vec<String> = rows
+            .iter()
+            .map(|r| format!("{}/{}", r.path, r.name))
+            .collect();
+        assert_eq!(
+            listed,
+            vec![
+                "com/example/lib/1.0/lib-1.0.jar".to_string(),
+                "com/example/lib/1.0/lib-1.0.pom".to_string(),
+                "com/example/lib/1.0/lib-1.0.pom".to_string(),
+                "com/example/docs/install.txt".to_string(),
+            ],
+            "the recorded jar is not listed again, the unrecorded pom is (the \
+             documented fallback), and the component-less file is not lost"
+        );
+    }
+
+    #[test]
+    fn test_listed_paths_digest_tells_paths_apart_6360() {
+        let mut set = ListedPaths::with_cap(10);
+        assert!(set.insert("r", "a/b.jar"));
+        assert!(!set.insert("r", "a/b.jar"), "a recorded path is a repeat");
+        assert!(set.insert("r", "a/b.pom"));
+        assert!(set.insert("r", "a/b.ja"));
+        assert_eq!(set.len(), 3);
+        set.release();
+        assert_eq!(set.len(), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // #6260: one listing call fetches a bounded number of upstream pages
+    // -----------------------------------------------------------------------
+
+    fn budget_client_for(server: &MockServer, budget: usize) -> NexusClient {
+        NexusClient::new(NexusClientConfig {
+            base_url: server.uri(),
+            auth: NexusAuth {
+                username: "u".into(),
+                password: "p".into(),
+            },
+            timeout_secs: 30,
+            throttle_delay_ms: 0,
+            list_page_budget: budget,
+            ..Default::default()
+        })
+        .expect("build nexus client")
+    }
+
+    /// With a narrow window most upstream pages hold nothing to list, and one
+    /// call kept fetching until it had a full page or the repository ended.
+    /// A call now stops after its budget and says so; following `incomplete`
+    /// lists exactly what the unbudgeted walk lists, each page fetched once.
+    #[tokio::test]
+    async fn test_list_artifacts_call_stops_at_its_page_budget_6260() {
+        use crate::services::source_registry::SourceRegistry;
+
+        let server = dated_server().await;
+        let client = budget_client_for(&server, 2);
+        let after = Some("2024-01-01T00:00:00+00:00");
+
+        let first = client
+            .list_artifacts_with_date_filter("dated", 0, 10, after, None)
+            .await
+            .expect("list the first call");
+        assert!(first.incomplete, "the call ran out of budget, not listing");
+        assert_eq!(
+            first
+                .results
+                .iter()
+                .map(|r| r.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["file-2.bin"],
+        );
+        assert_eq!(upstream_request_count(&server).await, 2);
+
+        let second = client
+            .list_artifacts_with_date_filter("dated", 1, 10, after, None)
+            .await
+            .expect("continue the walk");
+        assert!(!second.incomplete, "the listing ended inside this call");
+        assert_eq!(
+            second
+                .results
+                .iter()
+                .map(|r| r.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["file-5.bin", "file-6.bin", "new.bin"],
+        );
+        assert_eq!(upstream_request_count(&server).await, 3);
+        assert_eq!(request_count(&server, "/service/rest/v1/assets").await, 1);
+    }
+
+    /// An empty budgeted page is still `incomplete`, and the cursor is parked
+    /// where it stopped so the next call does not re-walk from page 1.
+    #[tokio::test]
+    async fn test_list_artifacts_empty_budgeted_page_keeps_the_cursor_6260() {
+        use crate::services::source_registry::SourceRegistry;
+
+        let server = dated_server().await;
+        let client = budget_client_for(&server, 1);
+        // Nothing before 2022-06 except file-3 (page two).
+        let before = Some("2022-06-01T00:00:00+00:00");
+
+        let first = client
+            .list_artifacts_with_date_filter("dated", 0, 10, None, before)
+            .await
+            .expect("list page one");
+        assert!(first.incomplete);
+        // file-6 has no lastModified and is kept by every window.
+        assert!(first.results.is_empty());
+
+        let mut names = Vec::new();
+        let mut offset = 0i64;
+        loop {
+            let page = client
+                .list_artifacts_with_date_filter("dated", offset, 10, None, before)
+                .await
+                .expect("list a page");
+            let len = page.results.len();
+            names.extend(page.results.into_iter().map(|r| r.name));
+            offset += len as i64;
+            if !page.incomplete && len < 10 {
+                break;
+            }
+        }
+        assert_eq!(names, vec!["file-3.bin", "file-6.bin", "old.bin"]);
+        assert_eq!(
+            upstream_request_count(&server).await,
+            3,
+            "every component page fetched once across the budgeted calls"
+        );
+    }
+
+    /// Serves a listing endpoint from `items`, ten per page, chained by the
+    /// page index as continuation token.
+    struct PagedItems(Vec<serde_json::Value>);
+
+    impl wiremock::Respond for PagedItems {
+        fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+            let page: usize = request
+                .url
+                .query_pairs()
+                .find(|(k, _)| k == "continuationToken")
+                .and_then(|(_, v)| v.parse().ok())
+                .unwrap_or(0);
+            let chunk: Vec<_> = self.0.iter().skip(page * 10).take(10).cloned().collect();
+            let next = ((page + 1) * 10 < self.0.len()).then(|| (page + 1).to_string());
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({ "items": chunk, "continuationToken": next }))
+        }
+    }
+
+    /// A Nexus serving `components` and `assets` for `repo`, ten per page.
+    async fn counted_server(
+        repo: &str,
+        components: Vec<serde_json::Value>,
+        assets: Vec<serde_json::Value>,
+    ) -> MockServer {
+        use wiremock::matchers::query_param;
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/service/rest/v1/components"))
+            .and(query_param("repository", repo))
+            .respond_with(PagedItems(components))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/service/rest/v1/assets"))
+            .and(query_param("repository", repo))
+            .respond_with(PagedItems(assets))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    fn component_of(format: &str, n: usize, assets: Vec<serde_json::Value>) -> serde_json::Value {
+        serde_json::json!({
+            "id": format!("comp-{n}"),
+            "repository": "r",
+            "format": format,
+            "name": format!("c{n}"),
+            "version": "1",
+            "assets": assets
+        })
+    }
+
+    /// A raw repository of 1,500 single-asset components needs 150 component
+    /// pages and then 150 asset pages. Counting through the budgeted listing
+    /// shared one 200-page budget between them and reported a lower bound;
+    /// main counted it exactly. The two walks now have their own budgets.
+    #[tokio::test]
+    async fn test_count_artifacts_raw_1500_components_is_exact_6260() {
+        let assets: Vec<_> = (0..1500)
+            .map(|n| fixture_asset_of("raw", &format!("f/{n}.bin"), n))
+            .collect();
+        let components = assets
+            .iter()
+            .enumerate()
+            .map(|(n, a)| component_of("raw", n, vec![a.clone()]))
+            .collect();
+        let server = counted_server("raw-big", components, assets).await;
+        let client = budget_client_for(&server, 1);
+
+        let count = client.count_artifacts("raw-big").await.expect("count");
+
+        assert_eq!(count.counted, 1500);
+        assert!(count.exact, "1,500 components are within both budgets");
+        assert_eq!(upstream_request_count(&server).await, 150);
+        assert_eq!(request_count(&server, "/service/rest/v1/assets").await, 150);
+    }
+
+    /// 300 Maven components of six files each, plus two files without a
+    /// component and the regenerated metadata: 1,802 artifacts, exactly.
+    #[tokio::test]
+    async fn test_count_artifacts_maven_300_by_6_is_exact_6260() {
+        let mut all_assets = Vec::new();
+        let mut components = Vec::new();
+        for c in 0..300 {
+            let assets: Vec<_> = ["jar", "pom", "sources.jar", "javadoc.jar", "module", "asc"]
+                .iter()
+                .enumerate()
+                .map(|(i, ext)| {
+                    fixture_asset_of("maven2", &format!("com/ex/a{c}/1/a{c}-1.{ext}"), c * 6 + i)
+                })
+                .collect();
+            all_assets.extend(assets.iter().cloned());
+            components.push(component_of("maven2", c, assets));
+        }
+        all_assets.push(fixture_asset_of("maven2", "docs/install.txt", 9001));
+        all_assets.push(fixture_asset_of("maven2", "docs/notes.txt", 9002));
+        for ext in ["", ".md5", ".sha1", ".sha256", ".sha512"] {
+            all_assets.push(fixture_asset_of(
+                "maven2",
+                &format!("com/ex/a0/maven-metadata.xml{ext}"),
+                9100,
+            ));
+        }
+        let server = counted_server("maven-big", components, all_assets).await;
+        let client = budget_client_for(&server, 1);
+
+        let count = client.count_artifacts("maven-big").await.expect("count");
+
+        assert_eq!(count.counted, 1802);
+        assert!(count.exact);
+        assert_eq!(upstream_request_count(&server).await, 30);
+        assert_eq!(request_count(&server, "/service/rest/v1/assets").await, 181);
+    }
+
+    /// Past 2,000 components the count is a lower bound, and the walk stops
+    /// at its component-page budget.
+    #[tokio::test]
+    async fn test_count_artifacts_past_the_component_budget_is_a_lower_bound_6260() {
+        let components = (0..2010)
+            .map(|n| {
+                component_of(
+                    "npm",
+                    n,
+                    vec![fixture_asset_of("npm", &format!("p{n}.tgz"), n)],
+                )
+            })
+            .collect();
+        let server = counted_server("npm-big", components, vec![]).await;
+        let client = nexus_client_for(&server);
+
+        let count = client.count_artifacts("npm-big").await.expect("count");
+
+        assert_eq!(count.counted, 2000);
+        assert!(!count.exact);
+        assert_eq!(
+            upstream_request_count(&server).await,
+            NEXUS_COUNT_COMPONENT_PAGES
+        );
+        assert_eq!(request_count(&server, "/service/rest/v1/assets").await, 0);
+    }
+
+    /// The listing call budget does not shorten the count.
+    #[tokio::test]
+    async fn test_count_artifacts_ignores_the_listing_call_budget_6260() {
+        let (server, _) = paged_components_server().await;
+        let client = budget_client_for(&server, 1);
+
+        let count = client.count_artifacts("nexus-paged").await.expect("count");
+
+        assert_eq!(count.counted, (FIXTURE_PAGES * FIXTURE_PAGE_SIZE) as i64);
+        assert!(count.exact);
+        assert_eq!(upstream_request_count(&server).await, FIXTURE_PAGES);
+    }
+
+    #[test]
+    fn test_list_page_budget_env_parsing_6260() {
+        assert_eq!(list_page_budget_from(None), DEFAULT_LIST_PAGE_BUDGET);
+        assert_eq!(list_page_budget_from(Some("200")), 200);
+        assert_eq!(list_page_budget_from(Some(" 7 ")), 7);
+        assert_eq!(
+            list_page_budget_from(Some("0")),
+            DEFAULT_LIST_PAGE_BUDGET,
+            "an unbounded call is what the budget removes"
+        );
+        assert_eq!(
+            list_page_budget_from(Some("lots")),
+            DEFAULT_LIST_PAGE_BUDGET
         );
     }
 }

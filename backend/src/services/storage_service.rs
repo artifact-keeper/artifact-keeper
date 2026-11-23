@@ -27,6 +27,33 @@ pub struct PutStreamResult {
     pub bytes_written: u64,
 }
 
+/// One page of a bounded key listing ([`StorageBackend::list_page`], #6429).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct KeyPage {
+    /// The keys of this page, in the backend's listing order.
+    pub keys: Vec<String>,
+    /// The cursor of the next page, or `None` when this page is the last.
+    pub next: Option<String>,
+}
+
+impl KeyPage {
+    /// The page of `sorted` (byte order) that follows `cursor`: the first
+    /// `limit` keys greater than it. `next` is the last key returned when more
+    /// keys may follow.
+    pub fn from_sorted(sorted: Vec<String>, cursor: Option<&str>, limit: usize) -> Self {
+        let limit = limit.max(1);
+        let mut keys: Vec<String> = sorted
+            .into_iter()
+            .filter(|k| cursor.is_none_or(|c| k.as_str() > c))
+            .take(limit + 1)
+            .collect();
+        let more = keys.len() > limit;
+        keys.truncate(limit);
+        let next = if more { keys.last().cloned() } else { None };
+        Self { keys, next }
+    }
+}
+
 /// Storage backend trait
 #[async_trait]
 pub trait StorageBackend: Send + Sync {
@@ -77,6 +104,24 @@ pub trait StorageBackend: Send + Sync {
 
     /// List keys with optional prefix
     async fn list(&self, prefix: Option<&str>) -> Result<Vec<String>>;
+
+    /// One bounded page of the keys under `prefix`: at most `limit` keys
+    /// after `cursor`, and the cursor of the next page (#6429).
+    ///
+    /// `cursor` is opaque: pass `None` for the first page and then the
+    /// previous page's [`KeyPage::next`] unchanged. A page ends the listing
+    /// when its `next` is `None`. Keys come back in the backend's listing
+    /// order, which is stable between pages but not necessarily byte order.
+    ///
+    /// The default lists the whole prefix and slices it, so a caller paging
+    /// a large prefix through a backend without its own implementation pays
+    /// a full listing per page. The filesystem, S3, GCS and Azure backends
+    /// override it and read only about one page per call.
+    async fn list_page(&self, prefix: &str, cursor: Option<&str>, limit: usize) -> Result<KeyPage> {
+        let mut keys = self.list(Some(prefix)).await?;
+        keys.sort_unstable();
+        Ok(KeyPage::from_sorted(keys, cursor, limit))
+    }
 
     /// Copy content from one key to another
     async fn copy(&self, source: &str, dest: &str) -> Result<()>;
@@ -164,6 +209,59 @@ impl FilesystemBackend {
     }
 }
 
+/// The page walk behind [`FilesystemBackend::list_page`]: the files under
+/// `dir` (whose key segments are `rel`) that sort after `after`, in name order
+/// per segment, until `limit` keys are collected. Sets `more` when a key past
+/// the page exists. A directory that vanishes mid-walk is skipped.
+fn walk_page<'a>(
+    dir: PathBuf,
+    rel: Vec<String>,
+    after: &'a [String],
+    limit: usize,
+    keys: &'a mut Vec<String>,
+    more: &'a mut bool,
+) -> futures::future::BoxFuture<'a, Result<()>> {
+    Box::pin(async move {
+        let mut entries = match fs::read_dir(&dir).await {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        let mut names = Vec::new();
+        while let Some(entry) = entries.next_entry().await? {
+            let is_dir = entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false);
+            names.push((entry.file_name().to_string_lossy().into_owned(), is_dir));
+        }
+        names.sort_unstable();
+        // The cursor's segment at this depth, while `dir` is on the cursor's
+        // path; below or beside it every entry already sorts after the cursor.
+        let depth = rel.len();
+        let bound = (after.len() > depth && after[..depth] == rel[..]).then(|| &after[depth]);
+        for (name, is_dir) in names {
+            if *more {
+                return Ok(());
+            }
+            let on_cursor = match bound {
+                Some(b) if name.as_str() < b.as_str() => continue,
+                Some(b) => name == *b,
+                None => false,
+            };
+            let mut child = rel.clone();
+            child.push(name.clone());
+            if is_dir {
+                walk_page(dir.join(&name), child, after, limit, keys, more).await?;
+            } else if !on_cursor {
+                if keys.len() == limit {
+                    *more = true;
+                    return Ok(());
+                }
+                keys.push(child.join("/"));
+            }
+        }
+        Ok(())
+    })
+}
+
 #[async_trait]
 impl StorageBackend for FilesystemBackend {
     async fn put(&self, key: &str, content: Bytes) -> Result<()> {
@@ -245,6 +343,36 @@ impl StorageBackend for FilesystemBackend {
         }
 
         Ok(keys)
+    }
+
+    /// Walks only the directories on the way to `cursor` and after it, in
+    /// name order, and stops once the page is full (#6429), so a page costs
+    /// about one page of directory reads however large the tree is. The
+    /// listing order is name order per path segment, which the cursor (the
+    /// last key returned) is compared in.
+    async fn list_page(&self, prefix: &str, cursor: Option<&str>, limit: usize) -> Result<KeyPage> {
+        let limit = limit.max(1);
+        let root = self.key_to_path(prefix);
+        let root_rel: Vec<String> = match root.strip_prefix(&self.base_path) {
+            Ok(rel) => rel
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                .collect(),
+            Err(_) => return Ok(KeyPage::default()),
+        };
+        let after: Vec<String> = cursor
+            .map(|c| {
+                c.split('/')
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut keys = Vec::new();
+        let mut more = false;
+        walk_page(root, root_rel, &after, limit, &mut keys, &mut more).await?;
+        let next = if more { keys.last().cloned() } else { None };
+        Ok(KeyPage { keys, next })
     }
 
     async fn copy(&self, source: &str, dest: &str) -> Result<()> {
@@ -439,6 +567,14 @@ macro_rules! impl_storage_wrapper {
             }
             async fn list(&self, prefix: Option<&str>) -> Result<Vec<String>> {
                 self.inner.list(prefix).await
+            }
+            async fn list_page(
+                &self,
+                prefix: &str,
+                cursor: Option<&str>,
+                limit: usize,
+            ) -> Result<KeyPage> {
+                self.inner.list_page(prefix, cursor, limit).await
             }
             async fn copy(&self, source: &str, dest: &str) -> Result<()> {
                 self.inner.copy(source, dest).await
@@ -2044,5 +2180,115 @@ mod tests {
         };
         restore("S3_BUCKET", orig_bucket);
         restore("S3_PREFIX", orig_prefix);
+    }
+
+    #[test]
+    fn key_page_from_sorted_slices_after_the_cursor_6429() {
+        let keys = |v: &[&str]| v.iter().map(|k| k.to_string()).collect::<Vec<_>>();
+        let all = keys(&["a", "b", "c", "d", "e"]);
+        let first = KeyPage::from_sorted(all.clone(), None, 2);
+        assert_eq!(first.keys, keys(&["a", "b"]));
+        assert_eq!(first.next.as_deref(), Some("b"));
+        let second = KeyPage::from_sorted(all.clone(), first.next.as_deref(), 2);
+        assert_eq!(second.keys, keys(&["c", "d"]));
+        let last = KeyPage::from_sorted(all.clone(), second.next.as_deref(), 2);
+        assert_eq!(last.keys, keys(&["e"]));
+        assert_eq!(last.next, None);
+        // Exactly a full page at the end: no further page.
+        let exact = KeyPage::from_sorted(keys(&["a", "b"]), None, 2);
+        assert_eq!(exact.next, None);
+        assert_eq!(KeyPage::from_sorted(all, Some("z"), 0), KeyPage::default());
+    }
+
+    /// Pages through a filesystem tree cover every key under the prefix once,
+    /// in name order per segment, and nothing outside it (#6429).
+    #[tokio::test]
+    async fn filesystem_list_page_walks_the_tree_in_bounded_pages_6429() {
+        let temp = TempDir::new().unwrap();
+        let backend = FilesystemBackend::new(temp.path().to_path_buf());
+        let expected = [
+            "proxy-cache/r/a/__cache_meta__.json",
+            "proxy-cache/r/a/__content__",
+            "proxy-cache/r/a.b/x",
+            "proxy-cache/r/a/b/__content__",
+            "proxy-cache/r/z/deep/er/f",
+        ];
+        for key in expected
+            .iter()
+            .chain(["proxy-cache/rr/other", "proxy-cache/s"].iter())
+        {
+            backend.put(key, Bytes::from_static(b"x")).await.unwrap();
+        }
+        for limit in 1..=6 {
+            let mut seen = Vec::new();
+            let mut cursor: Option<String> = None;
+            let mut calls = 0;
+            loop {
+                let page = backend
+                    .list_page("proxy-cache/r/", cursor.as_deref(), limit)
+                    .await
+                    .unwrap();
+                assert!(page.keys.len() <= limit);
+                seen.extend(page.keys);
+                calls += 1;
+                match page.next {
+                    Some(next) => cursor = Some(next),
+                    None => break,
+                }
+            }
+            let mut sorted_seen = seen.clone();
+            sorted_seen.sort();
+            let mut sorted_expected: Vec<String> = expected.iter().map(|k| k.to_string()).collect();
+            sorted_expected.sort();
+            assert_eq!(sorted_seen, sorted_expected, "limit {limit}");
+            assert_eq!(
+                seen.len(),
+                expected.len(),
+                "limit {limit}: a key listed twice"
+            );
+            assert!(
+                calls <= expected.len().div_ceil(limit) + 1,
+                "limit {limit}: {calls} calls"
+            );
+        }
+        // A prefix with nothing under it is one empty page.
+        let empty = backend
+            .list_page("proxy-cache/none/", None, 10)
+            .await
+            .unwrap();
+        assert_eq!(empty, KeyPage::default());
+    }
+
+    /// A backend without its own `list_page` pages through its full listing.
+    #[tokio::test]
+    async fn default_list_page_slices_the_full_listing_6429() {
+        struct Listed;
+        #[async_trait]
+        impl StorageBackend for Listed {
+            async fn put(&self, _: &str, _: Bytes) -> Result<()> {
+                Ok(())
+            }
+            async fn get(&self, _: &str) -> Result<Bytes> {
+                Ok(Bytes::new())
+            }
+            async fn exists(&self, _: &str) -> Result<bool> {
+                Ok(false)
+            }
+            async fn delete(&self, _: &str) -> Result<()> {
+                Ok(())
+            }
+            async fn list(&self, _: Option<&str>) -> Result<Vec<String>> {
+                Ok(vec!["p/c".into(), "p/a".into(), "p/b".into()])
+            }
+            async fn copy(&self, _: &str, _: &str) -> Result<()> {
+                Ok(())
+            }
+            async fn size(&self, _: &str) -> Result<u64> {
+                Ok(0)
+            }
+        }
+        let page = Listed.list_page("p/", Some("p/a"), 1).await.unwrap();
+        assert_eq!(page.keys, vec!["p/b".to_string()]);
+        assert_eq!(page.next.as_deref(), Some("p/b"));
     }
 }

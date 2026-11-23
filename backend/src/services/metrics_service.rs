@@ -767,6 +767,25 @@ pub fn record_webhook_dead_letter(event: &str) {
     .increment(1);
 }
 
+/// Record a failed send to one webhook endpoint and the backoff it now waits
+/// out (#5195). Labelled by webhook id: webhooks are created by
+/// administrators, so the label set stays small.
+pub fn record_webhook_endpoint_failure(webhook_id: uuid::Uuid, backoff_secs: f64) {
+    let id = webhook_id.to_string();
+    counter!("ak_webhook_endpoint_failures_total", "webhook_id" => id.clone()).increment(1);
+    gauge!("ak_webhook_endpoint_backoff_seconds", "webhook_id" => id).set(backoff_secs);
+}
+
+/// Record that a backed-off webhook endpoint accepted a delivery again.
+pub fn record_webhook_endpoint_recovered(webhook_id: uuid::Uuid) {
+    gauge!("ak_webhook_endpoint_backoff_seconds", "webhook_id" => webhook_id.to_string()).set(0.0);
+}
+
+/// Pending (not delivered, not dead-lettered) deliveries for one webhook.
+pub fn set_webhook_delivery_backlog(webhook_id: uuid::Uuid, pending: f64) {
+    gauge!("ak_webhook_delivery_backlog", "webhook_id" => webhook_id.to_string()).set(pending);
+}
+
 /// Record download side-effect events (stats/audit) dropped by the bounded
 /// dispatcher (#2522). `kind` is `"stats"` or `"audit"`; `reason` is
 /// `"queue_full"` (overflow shed under load), `"closed"` (workers gone),
@@ -1015,6 +1034,20 @@ pub fn record_proxy_cache_cap_refusing(repo_key: &str) {
         "repository" => repo_key.to_string()
     )
     .increment(1);
+}
+
+/// One re-catalog sweep pass's counts (#6429), by `outcome`: `scanned` keys
+/// listed, `recataloged` rows restored from a sidecar, the `skipped_*`
+/// reasons, `met_row`, `raced` and `failed`. A steady `recataloged` rate means
+/// catalog rows are being lost (a database crash or failover under the async
+/// catalog commit, or failing catalog writes).
+pub fn record_proxy_cache_recatalog(outcome: &'static str, count: u64) {
+    counter!("ak_proxy_cache_recatalog_total", "outcome" => outcome).increment(count);
+}
+
+/// Bytes the re-catalog sweep put back on Remotes' ledgers (#6429).
+pub fn record_proxy_cache_recatalog_bytes(bytes: u64) {
+    counter!("ak_proxy_cache_recatalog_bytes_total").increment(bytes);
 }
 
 /// Counters recorded while a test ran, as `(name, labels, value)`; read one
@@ -1440,6 +1473,14 @@ mod tests {
     #[test]
     fn test_record_webhook_dead_letter_does_not_panic() {
         record_webhook_dead_letter("artifact.uploaded");
+    }
+
+    #[test]
+    fn test_record_webhook_endpoint_metrics_do_not_panic() {
+        let id = uuid::Uuid::new_v4();
+        record_webhook_endpoint_failure(id, 30.0);
+        record_webhook_endpoint_recovered(id);
+        set_webhook_delivery_backlog(id, 3.0);
     }
 
     #[test]

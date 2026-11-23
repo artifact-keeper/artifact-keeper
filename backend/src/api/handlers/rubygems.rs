@@ -141,8 +141,10 @@ async fn gem_info(
     // present (RFC 9110 §8.4, #3260) and its own `Content-Type` is served
     // (#3281), with the JSON literal only as the fallback for a member that
     // declared none.
+    // #6426: a member that could not answer makes an empty walk the retryable
+    // 503, not a 404 `gem` reports as "not found" (#5504).
     if repo.repo_type == RepositoryType::Virtual {
-        return proxy_helpers::resolve_virtual_metadata(
+        return proxy_helpers::resolve_virtual_metadata_reporting_unavailable(
             &state.db,
             auth.as_ref(),
             state.proxy_service.as_deref(),
@@ -235,7 +237,9 @@ async fn download_gem(
     )?;
 
     let artifact =
-        match proxy_helpers::find_local_by_filename_suffix(&state.db, repo.id, filename).await? {
+        match proxy_helpers::find_servable_local_by_filename_suffix(&state, repo.id, filename)
+            .await?
+        {
             Some(a) => a,
             None => {
                 let upstream_path = format!("gems/{}", filename);
@@ -1412,8 +1416,9 @@ async fn quick_spec(
         // re-declaring the member's `Content-Encoding` when present
         // (RFC 9110 §8.4, #3260) and serving the member's own `Content-Type`
         // (#3281), with the octet-stream literal only as the fallback for a
-        // member that declared none.
-        return proxy_helpers::resolve_virtual_metadata(
+        // member that declared none. An unavailable member is the 503, not a
+        // miss (#6426).
+        return proxy_helpers::resolve_virtual_metadata_reporting_unavailable(
             &state.db,
             auth.as_ref(),
             state.proxy_service.as_deref(),
@@ -3533,6 +3538,49 @@ mod db_cov_tests {
         assert_eq!(shed_builds, 0, "a shed request builds nothing");
         assert_eq!(status, axum::http::StatusCode::OK);
         assert!(decode_body(&body).contains(&"private-gem 1.0.0 ruby".to_string()));
+    }
+
+    /// #6426: through a Virtual, the gem info and quick spec walks answer a
+    /// member that could not answer (here its upstream is unreachable) with
+    /// 503 + `Retry-After`, and a member whose upstream does not have the gem
+    /// with 404. Both answered 404 before.
+    #[tokio::test]
+    async fn test_virtual_gem_metadata_walks_answer_member_outage_with_503_6426() {
+        let Some(fx) = tdh::Fixture::setup("remote", "rubygems").await else {
+            return;
+        };
+        let missing = wiremock::MockServer::start().await;
+        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &missing.uri()).await;
+        let (dead_id, _, dead_virt, dead_key) =
+            tdh::create_remote_and_virtual(&fx.pool, "rubygems", "http://127.0.0.1:1").await;
+        let (miss_id, _, miss_virt, miss_key) =
+            tdh::create_remote_and_virtual(&fx.pool, "rubygems", &missing.uri()).await;
+        let mut got = Vec::new();
+        for (key, down) in [(&dead_key, true), (&miss_key, false)] {
+            for uri in [
+                format!("/{key}/api/v1/gems/nogem6426.json"),
+                format!("/{key}/quick/Marshal.4.8/nogem6426-1.0.0.gemspec.rz"),
+            ] {
+                let app = tdh::router_anon(super::router(), state.clone());
+                let (status, _, headers) = tdh::send_with_headers(app, tdh::get(uri.clone())).await;
+                got.push((uri, down, status, headers.contains_key("retry-after")));
+            }
+        }
+        for id in [dead_virt, dead_id, miss_virt, miss_id] {
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(id)
+                .execute(&fx.pool)
+                .await;
+        }
+        fx.teardown().await;
+        for (uri, down, status, retry_after) in got {
+            if down {
+                assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE, "{uri}");
+                assert!(retry_after, "{uri}: Retry-After");
+            } else {
+                assert_eq!(status, axum::http::StatusCode::NOT_FOUND, "{uri}");
+            }
+        }
     }
 
     /// #3260: the Virtual arms of `gem_info` and `quick_spec` forward the

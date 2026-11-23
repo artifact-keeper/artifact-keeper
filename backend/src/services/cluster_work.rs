@@ -324,6 +324,17 @@ impl SchedulerLease {
         self.lease_expires_at
     }
 
+    /// The job this lease is for.
+    pub fn job_name(&self) -> &str {
+        &self.job_name
+    }
+
+    /// This holder's claim on the lease row; a write tied to the lease
+    /// checks it is still the row's (#6429).
+    pub fn lease_claim_token(&self) -> Uuid {
+        self.claim_token
+    }
+
     /// Keep this scheduler lease alive until the returned guard is dropped.
     ///
     /// This is for singleton jobs whose side effects may run longer than one

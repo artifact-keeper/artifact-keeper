@@ -566,6 +566,7 @@ pub fn spawn_all(
     {
         let db = db.clone();
         let check_secs = config.lifecycle_check_interval_secs;
+        let proxy_service = proxy_service.clone();
         tokio::spawn(async move {
             tokio::time::sleep(jittered_startup_delay(60)).await;
             let service = LifecycleService::new(db.clone())
@@ -997,18 +998,13 @@ pub fn spawn_all(
         });
     }
 
-    // Webhook delivery retry processor (every 30 seconds)
+    // Webhook delivery worker (#5195): claims when a delivery is enqueued or a
+    // lane finishes, and polls every few seconds for retries that came due.
     {
         let db = db.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(15)).await;
-            let mut ticker = interval(Duration::from_secs(30));
-            loop {
-                ticker.tick().await;
-                if let Err(e) = crate::api::handlers::webhooks::process_webhook_retries(&db).await {
-                    tracing::warn!("Webhook retry processing failed: {}", e);
-                }
-            }
+            crate::api::handlers::webhooks::run_webhook_delivery_worker(db).await;
         });
     }
 
@@ -1260,6 +1256,70 @@ pub fn spawn_all(
                         Err(e) => {
                             tracing::warn!("Download statistics retention pass failed: {}", e)
                         }
+                    }
+                    drop(renewal);
+                    lease.release(&db).await;
+                }
+            });
+        }
+    }
+
+    // Proxy-cache re-catalog sweep (#6429): restores the catalog row of a
+    // cached entry whose row was lost (the async catalog commit of #5635, or
+    // a failed best-effort write). One replica at a time; the lease is renewed
+    // for the whole pass and a lost lease stops it between pages. Off with
+    // PROXY_CACHE_RECATALOG_INTERVAL_SECS=0.
+    if let Some(proxy) = proxy_service.as_ref() {
+        use crate::services::proxy_cache_recatalog as recatalog;
+        let config = recatalog::SweepConfig::from_env();
+        tracing::info!("{}", config.startup_message());
+        if let Some(every) = config.interval {
+            let db = db.clone();
+            let startup = config.startup_delay_secs();
+            let sweep = recatalog::RecatalogSweep::new(
+                db.clone(),
+                proxy.cache_storage_backend(),
+                proxy.cache_scope().clone(),
+                config,
+            );
+            tokio::spawn(async move {
+                tokio::time::sleep(jittered_startup_delay(startup)).await;
+                let mut ticker = interval(every);
+                ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+                // A chunk that stopped mid-walk is continued after a short
+                // pause; the interval separates complete walks.
+                let mut mid_walk = false;
+                loop {
+                    if mid_walk {
+                        tokio::time::sleep(recatalog::CONTINUE_DELAY).await;
+                    } else {
+                        ticker.tick().await;
+                    }
+                    mid_walk = false;
+                    let Some(lease) =
+                        crate::services::cluster_work::try_acquire_scheduler_lease_quiet(
+                            &db,
+                            recatalog::LEASE_NAME,
+                            recatalog::LEASE_TTL_SECS,
+                        )
+                        .await
+                    else {
+                        tracing::debug!("Another replica owns the proxy-cache re-catalog lease");
+                        continue;
+                    };
+                    let (renewal, lost) = lease
+                        .spawn_renewal_with_cancellation(db.clone(), recatalog::LEASE_TTL_SECS);
+                    match sweep.run_pass(Some(&lost), Some(&lease)).await {
+                        Ok(report) => {
+                            recatalog::log_pass(&report);
+                            mid_walk = !report.complete && !report.interrupted;
+                            if report.complete {
+                                // The next walk starts a full interval after
+                                // this one ended, however long it took.
+                                ticker.reset();
+                            }
+                        }
+                        Err(e) => tracing::warn!("Proxy-cache re-catalog pass failed: {}", e),
                     }
                     drop(renewal);
                     lease.release(&db).await;

@@ -917,7 +917,9 @@ async fn download_chart(
 
     // Find artifact by filename pattern; helper escapes wildcards in `filename`.
     let artifact =
-        match proxy_helpers::find_local_by_filename_suffix(&state.db, repo.id, &filename).await? {
+        match proxy_helpers::find_servable_local_by_filename_suffix(&state, repo.id, &filename)
+            .await?
+        {
             Some(a) => a,
             None => {
                 // Not in local storage. On a remote/proxy (or virtual) repo, resolve

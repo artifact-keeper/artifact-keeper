@@ -1836,6 +1836,33 @@ pub async fn proxy_fetch_capped_with_cache_key_and_accept_budgeted(
     Ok((content, content_type, permit))
 }
 
+/// [`proxy_fetch_capped_with_cache_key_and_accept_budgeted`] for a document
+/// the handler parses and never serves as fetched, asking the upstream for
+/// `gzip` and caching the decoded document
+/// ([`ProxyService::fetch_parsed_document_capped`], #5983). `format` is the
+/// one the cache entry is classified under, as the caller's other fetches of
+/// the same key use.
+#[allow(clippy::too_many_arguments)]
+pub async fn proxy_fetch_parsed_budgeted(
+    proxy_service: &ProxyService,
+    repo_id: Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    fetch_path: &str,
+    cache_path: &str,
+    accept: Option<&str>,
+    max: usize,
+    format: RepositoryFormat,
+) -> Result<(Bytes, Option<String>, OwnedSemaphorePermit), Response> {
+    let permit = proxy_metadata_budget().reserve(max).await;
+    let repo = build_remote_repo_with_format(repo_id, repo_key, upstream_url, format);
+    let body = proxy_service
+        .fetch_parsed_document_capped(&repo, fetch_path, cache_path, accept, max)
+        .await
+        .map_err(|e| map_proxy_error(repo_key, fetch_path, e))?;
+    Ok((body.content, body.content_type, permit))
+}
+
 /// Streaming sibling of [`proxy_fetch`] that does NOT buffer the artifact
 /// body in memory (#895). Returns an axum [`Response`] whose body is a
 /// stream the framework drives directly from the upstream HTTP response,
@@ -5092,8 +5119,8 @@ where
 ///
 /// The Go `.info` route needs it because `go` reads a 404 as "this proxy does
 /// not have the module" and falls through to the next `GOPROXY` entry. The
-/// other callers (RubyGems, Hex) keep the plain form until their own routes
-/// are moved (#6426).
+/// RubyGems gem info and quick spec routes and the Hex package route use it
+/// too (#6426).
 pub async fn resolve_virtual_metadata_reporting_unavailable<F, Fut>(
     db: &PgPool,
     auth: Option<&crate::api::middleware::auth::AuthExtension>,
@@ -7338,6 +7365,31 @@ async fn local_lookup_artifact(
     Ok((artifact, storage))
 }
 
+/// [`local_lookup_artifact`] for the streaming local fetches: a proxy-cache
+/// row its sidecar does not vouch for ([`vouched_row`]) is the non-terminal
+/// [`proxy_cache_row_declined`] 404, as in [`local_fetch_or_redirect`]
+/// (#6433).
+async fn local_lookup_vouched(
+    db: &PgPool,
+    state: &AppState,
+    repo_id: Uuid,
+    location: &StorageLocation,
+    lookup: LocalLookup<'_>,
+) -> Result<
+    (
+        LocalArtifactRow,
+        std::sync::Arc<dyn crate::storage::StorageBackend>,
+    ),
+    Response,
+> {
+    let looked_up = local_lookup_artifact(db, state, repo_id, location, lookup).await?;
+    vouched_row(state, repo_id, Some(looked_up), |(row, _)| {
+        ServedRowRef::new(&row.storage_key, Some(row.size_bytes))
+    })
+    .await?
+    .ok_or_else(proxy_cache_row_declined)
+}
+
 /// Shared skeleton step 2: open the artifact body as a byte stream (so large
 /// artifact bodies never buffer in memory) while keeping the `NotFound` →
 /// coordinated-retry hydration fallback. On a storage miss we still funnel
@@ -7427,7 +7479,7 @@ pub async fn local_fetch_by_path_verifying(
     artifact_path: &str,
     verify: bool,
 ) -> Result<StreamingFetchResult, Response> {
-    let (artifact, storage) = local_lookup_artifact(
+    let (artifact, storage) = local_lookup_vouched(
         db,
         state,
         repo_id,
@@ -7466,7 +7518,7 @@ pub(crate) async fn local_fetch_by_lookup(
     location: &StorageLocation,
     lookup: LocalLookup<'_>,
 ) -> Result<StreamingFetchResult, Response> {
-    let (artifact, storage) = local_lookup_artifact(db, state, repo_id, location, lookup).await?;
+    let (artifact, storage) = local_lookup_vouched(db, state, repo_id, location, lookup).await?;
     read_local_stream(db, &artifact, &*storage).await
 }
 
@@ -7483,7 +7535,7 @@ pub async fn local_fetch_by_name_version_and_suffix(
     version: &str,
     suffix_pattern: &str,
 ) -> Result<StreamingFetchResult, Response> {
-    let (artifact, storage) = local_lookup_artifact(
+    let (artifact, storage) = local_lookup_vouched(
         db,
         state,
         repo_id,
@@ -7550,6 +7602,34 @@ pub async fn local_fetch_or_redirect_by_suffix(
     local_fetch_or_redirect(db, state, repo_id, location, &path, ctx).await
 }
 
+/// [`local_fetch_or_redirect_by_suffix`] for a virtual walk, declining
+/// proxy-cache rows when `defer_proxy_cache_rows` (see
+/// [`local_fetch_or_redirect_with`]).
+pub async fn local_fetch_or_redirect_by_suffix_for_walk(
+    db: &PgPool,
+    state: &AppState,
+    repo_id: Uuid,
+    location: &StorageLocation,
+    path_suffix: &str,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
+    defer_proxy_cache_rows: bool,
+) -> Result<Response, Response> {
+    let path = resolve_local_artifact_by_suffix(db, repo_id, path_suffix)
+        .await?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "Artifact not found").into_response())?
+        .path;
+    local_fetch_or_redirect_with(
+        db,
+        state,
+        repo_id,
+        location,
+        &path,
+        ctx,
+        defer_proxy_cache_rows,
+    )
+    .await
+}
+
 /// Build the reversed-+-escaped LIKE prefix for a path-suffix query
 /// against the functional `reverse(path) text_pattern_ops` index.
 ///
@@ -7577,6 +7657,8 @@ pub struct ResolvedLocalArtifact {
     pub id: Uuid,
     pub path: String,
     pub storage_key: String,
+    /// The size the row records (#6433: checked against the cache sidecar).
+    pub size_bytes: i64,
 }
 
 /// Resolve a single local artifact by trailing path-suffix, with an
@@ -7610,7 +7692,7 @@ pub async fn resolve_local_artifact_by_suffix(
     use sqlx::Row;
     let reversed_pattern = reverse_suffix_for_like(path_suffix);
     let row = sqlx::query(
-        "SELECT id, path, storage_key FROM artifacts \
+        "SELECT id, path, storage_key, size_bytes FROM artifacts \
          WHERE repository_id = $1 \
            AND is_deleted = false \
            AND reverse(path) LIKE $2 || '%' ESCAPE '\\' \
@@ -7625,7 +7707,7 @@ pub async fn resolve_local_artifact_by_suffix(
     let row = match row {
         Some(r) => Some(r),
         None => sqlx::query(
-            "SELECT id, path, storage_key FROM artifacts \
+            "SELECT id, path, storage_key, size_bytes FROM artifacts \
              WHERE repository_id = $1 \
                AND is_deleted = false \
                AND path = $2 \
@@ -7642,7 +7724,160 @@ pub async fn resolve_local_artifact_by_suffix(
         id: r.try_get("id").unwrap_or_default(),
         path: r.try_get("path").unwrap_or_default(),
         storage_key: r.try_get("storage_key").unwrap_or_default(),
+        size_bytes: r.try_get("size_bytes").unwrap_or_default(),
     }))
+}
+
+/// A proxy-cache `artifacts` row that passed [`proxy_cache_row_gate`]: the
+/// object to sign (through the proxy's no-prefix backend, #1555) and the size
+/// its sidecar records (#6035).
+pub(crate) struct GatedCacheRow<'a> {
+    proxy: &'a ProxyService,
+    cache_key: String,
+    /// The body size the sidecar records.
+    pub(crate) size_bytes: i64,
+    /// The body digest the sidecar records (may be empty).
+    pub(crate) checksum_sha256: String,
+}
+
+/// The non-terminal answer for a proxy-cache row that is not served from the
+/// row (#6416): the PyPI virtual walk goes on to the member's Remote path.
+pub(crate) fn proxy_cache_row_declined() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        "proxy-cache entry is not fresh; resolve it through its Remote",
+    )
+        .into_response()
+}
+
+/// The gate an `artifacts` row whose `storage_key` is a proxy-cache content
+/// key (a Remote's cached upstream object, recorded as a row before #1278)
+/// passes before [`local_fetch_or_redirect`] serves it in any form: a
+/// redirect, a streamed GET or a HEAD (#6416).
+///
+/// The row proves only that the entry was once cached, and the row-level
+/// gates in [`local_lookup_artifact`] know nothing of the cache. So the
+/// entry's sidecar is read once ([`ProxyService::fresh_cache_redirect`], the
+/// probe every proxy-cache fast path uses) and every check comes from that
+/// copy (#6361): freshness, the Package Age Policy hold (#2075), the origin
+/// policy (#4506) and the stored scan verdict of the cached body (#4514).
+///
+/// * `Err(409)` while held, `Err(403)` when the origin policy or the stored
+///   verdict refuses it: terminal for a virtual walk
+///   ([`is_member_policy_block_response`]), as on the fetch paths.
+/// * `Err(404)` when nothing vouches for the row's bytes: no proxy service,
+///   a key that is not this Remote's cache entry under this deployment's
+///   scope, a stale entry, a missing or unreadable sidecar, or (under
+///   fail-closed scanning) no reusable clean verdict. Not terminal: the PyPI
+///   virtual walk, the one caller, goes on to the member's own Remote path,
+///   which revalidates or refetches the entry under every gate.
+pub(crate) async fn proxy_cache_row_gate<'a>(
+    db: &PgPool,
+    state: &'a AppState,
+    repo_id: Uuid,
+    storage_key: &str,
+) -> Result<GatedCacheRow<'a>, Response> {
+    let declined = proxy_cache_row_declined;
+    let Some(proxy) = state.proxy_service.as_deref() else {
+        return Err(declined());
+    };
+    let Some((repo_key, cache_path)) =
+        ProxyService::cache_entry_of_content_key(proxy.cache_scope(), storage_key)
+    else {
+        return Err(declined());
+    };
+    // The policies below are the Remote's own, so the key must name the
+    // repository that holds the row.
+    let row_repo_key: Option<String> =
+        sqlx::query_scalar("SELECT key FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .fetch_optional(db)
+            .await
+            .map_err(|e| internal_error("Database", e))?;
+    if row_repo_key.as_deref() != Some(repo_key) {
+        return Err(declined());
+    }
+    let Some(entry) = proxy.fresh_cache_redirect(repo_key, cache_path).await else {
+        return Err(declined());
+    };
+    let refused = |e| map_proxy_error(repo_key, cache_path, e);
+    entry.quarantine_gate().map_err(refused)?;
+    proxy
+        .cache_origin_policy_gate(repo_key)
+        .await
+        .map_err(refused)?;
+    match cache_scan_gate_for_redirect(state, proxy, repo_key, cache_path, &entry, true).await {
+        Some(CacheScanGate::Serve) => {}
+        Some(CacheScanGate::Block) => {
+            return Err(scan_blocked_response(
+                cache_path_filename(cache_path).unwrap_or(cache_path),
+            ))
+        }
+        Some(CacheScanGate::NotForFastPath) | None => return Err(declined()),
+    }
+    Ok(GatedCacheRow {
+        proxy,
+        cache_key: storage_key.to_string(),
+        size_bytes: entry.size_bytes(),
+        checksum_sha256: entry.checksum_sha256().to_string(),
+    })
+}
+
+/// What a format route read of an `artifacts` row it is about to serve
+/// (#6433): the key it reads, and the size it advertises when it has one.
+pub(crate) struct ServedRowRef<'r> {
+    pub(crate) storage_key: &'r str,
+    pub(crate) size_bytes: Option<i64>,
+}
+
+impl<'r> ServedRowRef<'r> {
+    pub(crate) fn new(storage_key: &'r str, size_bytes: Option<i64>) -> Self {
+        Self {
+            storage_key,
+            size_bytes,
+        }
+    }
+}
+
+/// [`proxy_cache_row_gate`] for a format route that resolved an `artifacts`
+/// row itself and serves it from storage in any form: bytes, a range, a
+/// HEAD's headers, a redirect, or metadata extracted from it (#6433). `key`
+/// names the row's storage key and the size the route advertises.
+///
+/// * `Ok(Some(row))`: serve the row. It is not a proxy-cache row (no extra
+///   read), or its cache sidecar vouches for it: fresh, outside its hold,
+///   allowed by the origin policy and the stored verdict, and recording the
+///   size the route advertises (the cache may have been refilled since the row
+///   was written).
+/// * `Ok(None)`: a proxy-cache row nothing vouches for (stale, no sidecar, a
+///   key naming another Remote, a refill of another size, or no reusable clean
+///   verdict under fail-closed scanning). The route answers as though it had
+///   no row, so a Remote's route resolves the file through its proxy path,
+///   which revalidates or refetches it under every gate.
+/// * `Err`: the hold's 409, the origin policy's or verdict's 403 (terminal
+///   for a virtual walk, [`is_member_policy_block_response`]), or a fault.
+pub(crate) async fn vouched_row<R>(
+    state: &AppState,
+    repo_id: Uuid,
+    row: Option<R>,
+    key: impl FnOnce(&R) -> ServedRowRef<'_>,
+) -> Result<Option<R>, Response> {
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let (storage_key, size_bytes) = {
+        let r = key(&row);
+        if !ProxyService::is_proxy_cache_key(r.storage_key) {
+            return Ok(Some(row));
+        }
+        (r.storage_key.to_string(), r.size_bytes)
+    };
+    match proxy_cache_row_gate(&state.db, state, repo_id, &storage_key).await {
+        Ok(gated) if size_bytes.is_none_or(|size| size == gated.size_bytes) => Ok(Some(row)),
+        Ok(_) => Ok(None),
+        Err(resp) if resp.status() == StatusCode::NOT_FOUND => Ok(None),
+        Err(resp) => Err(resp),
+    }
 }
 
 /// Look up a local artifact by path and return a presigned redirect if the
@@ -7659,7 +7894,24 @@ pub async fn local_fetch_or_redirect(
     artifact_path: &str,
     ctx: &crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
-    let (artifact, storage) = local_lookup_artifact(
+    local_fetch_or_redirect_with(db, state, repo_id, location, artifact_path, ctx, false).await
+}
+
+/// [`local_fetch_or_redirect`], declining every proxy-cache row (the
+/// non-terminal 404) when `defer_proxy_cache_rows`: for a virtual walk whose
+/// stricter-of-two scan policy (#3023) is on, so the member's Remote path,
+/// which scans under that policy, answers instead (#6416).
+#[allow(clippy::too_many_arguments)]
+async fn local_fetch_or_redirect_with(
+    db: &PgPool,
+    state: &AppState,
+    repo_id: Uuid,
+    location: &StorageLocation,
+    artifact_path: &str,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
+    defer_proxy_cache_rows: bool,
+) -> Result<Response, Response> {
+    let (mut artifact, storage) = local_lookup_artifact(
         db,
         state,
         repo_id,
@@ -7682,9 +7934,25 @@ pub async fn local_fetch_or_redirect(
     // `proxy-cache/`) is NOT our artifact, so it stays unrecorded (#1278;
     // accounting for those is #2270/#2218, out of scope). This helper also
     // serves those for redirect-capable virtual members, so gate on the key.
-    if !ProxyService::is_proxy_cache_key(&artifact.storage_key) {
+    // #6416: a proxy-cache row is served in no form (redirect, stream or HEAD)
+    // before its cache sidecar has been checked.
+    let cache_row = if ProxyService::is_proxy_cache_key(&artifact.storage_key) {
+        if defer_proxy_cache_rows {
+            return Err(proxy_cache_row_declined());
+        }
+        let row = proxy_cache_row_gate(db, state, repo_id, &artifact.storage_key).await?;
+        // The stored object is the one the sidecar vouches for: the cache may
+        // have been refilled since the row was written, so it is served (and
+        // verified) against the sidecar's size and digest, not the row's.
+        artifact.size_bytes = row.size_bytes;
+        if !row.checksum_sha256.is_empty() {
+            artifact.checksum_sha256.clone_from(&row.checksum_sha256);
+        }
+        Some(row)
+    } else {
         crate::services::artifact_service::record_download(db, artifact.id, ctx).await;
-    }
+        None
+    };
 
     // #3209 (sibling of #3181): a presigned URL is signed for ONE HTTP method —
     // the method is the FIRST line of the SigV4 canonical request
@@ -7712,96 +7980,28 @@ pub async fn local_fetch_or_redirect(
         // #1555: proxy-cache content (remote members) lives at the storage root
         // with no key prefix, so it must be signed through the proxy's own
         // no-prefix backend. Hosted artifacts are content-addressed under the
-        // global prefix and sign correctly via the repo handle — only switch
-        // handles for proxy-cache keys.
-        //
-        // The two handles live on different traits (the proxy's no-prefix
-        // backend is the facade `storage_service::StorageBackend`; the repo
-        // handle is the inner `crate::storage::StorageBackend`), so branch on
-        // the key shape rather than coercing both into one trait object.
-        let proxy_cache_backend = if ProxyService::is_proxy_cache_key(&artifact.storage_key) {
-            state
-                .proxy_service
-                .as_deref()
-                .map(|p| p.cache_storage_backend())
+        // global prefix and sign correctly via the repo handle.
+        let redirect = if let Some(row) = &cache_row {
+            try_proxy_cache_redirect(
+                row.proxy.cache_storage_backend().as_ref(),
+                &row.cache_key,
+                /* presigned_enabled = */ true,
+                expiry,
+                /* cache_is_fresh = */ true,
+                row.size_bytes,
+            )
+            .await
         } else {
-            None
+            try_presigned_redirect(
+                storage.as_ref(),
+                &artifact.storage_key,
+                true,
+                expiry,
+                artifact.size_bytes,
+            )
+            .await
         };
-        let redirect = match &proxy_cache_backend {
-            Some(b) => {
-                // The artifacts row alone does not prove the cached object
-                // still exists: retention tooling (e.g. an object-store
-                // lifecycle policy expiring cache entries by age) deletes
-                // proxy-cache objects without updating the database. A
-                // redirect signed for a missing key 404s at the object store,
-                // where the client is beyond any fallback we control — and the
-                // row keeps serving dead redirects until manual repair. So
-                // probe existence through the same no-prefix handle before
-                // signing. Capability check first, mirroring #1555 — never pay
-                // the probe on a backend that cannot redirect anyway.
-                //
-                // Scope, deliberately understated: this is an EXISTENCE probe,
-                // strictly narrower than the `is_cache_fresh` gate the sibling
-                // paths (`proxy_fetch_or_redirect`, `try_member_cache_redirect`)
-                // apply. Those additionally read the `__cache_meta__.json`
-                // sidecar for TTL, revalidate the pinned ETag, and apply
-                // the #2075 Package Age Policy hold (from the probe's own read
-                // since #6361). None of that happens here, so a present-but-stale
-                // or still-held entry can still be signed. That gap is
-                // pre-existing (this argument was hardcoded `true`); closing it
-                // needs the repo_key/path pair and is tracked in #6416. This
-                // change only removes the dead-redirect case.
-                //
-                // On a miss the streaming fallback below takes over. Note it
-                // does NOT simply return NotFound: it routes through
-                // `coordinated_retry_get`, which takes a cluster-wide advisory
-                // lease (#1609) and returns 507 if the object is still absent.
-                // The self-heal comes from the sole caller (the PyPI
-                // virtual-member loop) discarding that error and continuing to
-                // the remote member's upstream re-fetch.
-                //
-                // An `Err` from the probe means "unknown", not "absent", so it
-                // is logged rather than swallowed — otherwise an object-store
-                // brownout silently converts every redirect on this path into a
-                // streamed read through the backend, with no signal that it
-                // happened. We still fall through on `Err` (never sign a
-                // redirect we could not verify); the log is what makes that
-                // transition visible.
-                let object_present = b.supports_redirect()
-                    && match b.exists(&artifact.storage_key).await {
-                        Ok(present) => present,
-                        Err(e) => {
-                            tracing::warn!(
-                                storage_key = %artifact.storage_key,
-                                error = %e,
-                                "proxy-cache existence probe failed; treating as absent \
-                                 and falling through to the streaming read"
-                            );
-                            false
-                        }
-                    };
-                try_proxy_cache_redirect(
-                    b.as_ref(),
-                    &artifact.storage_key,
-                    /* presigned_enabled = */ true,
-                    expiry,
-                    /* cache_is_fresh = */ object_present,
-                    artifact.size_bytes,
-                )
-                .await
-            }
-            None => {
-                try_presigned_redirect(
-                    storage.as_ref(),
-                    &artifact.storage_key,
-                    true,
-                    expiry,
-                    artifact.size_bytes,
-                )
-                .await
-            }
-        };
-        // Tagged with `artifact.size_bytes` by the builder: the transfer quota
+        // Tagged with the object's size by the builder: the transfer quota
         // counts the object when the URL is issued (#6035).
         if let Some(redirect) = redirect {
             return Ok(redirect);
@@ -9239,6 +9439,29 @@ pub async fn find_local_by_filename_suffix(
                 storage_key: r.storage_key,
             }),
     )
+}
+
+/// [`find_local_by_filename_suffix`] for a route that serves the hit: a
+/// proxy-cache row its cache sidecar does not vouch for is a miss, so the
+/// route resolves the file through its proxy path, and a held or refused one
+/// is the gate's 409 / 403 ([`vouched_row`], #6433).
+#[allow(clippy::result_large_err)]
+pub async fn find_servable_local_by_filename_suffix(
+    state: &AppState,
+    repository_id: Uuid,
+    path_suffix: &str,
+) -> Result<Option<LocalArtifactHit>, Response> {
+    let row = resolve_local_artifact_by_suffix(&state.db, repository_id, path_suffix).await?;
+    // The row's size goes to the gate: a cache refilled at another size is a
+    // miss (refetched), not a serve the checksum check would turn into a 502.
+    let row = vouched_row(state, repository_id, row, |r| {
+        ServedRowRef::new(&r.storage_key, Some(r.size_bytes))
+    })
+    .await?;
+    Ok(row.map(|r| LocalArtifactHit {
+        id: r.id,
+        storage_key: r.storage_key,
+    }))
 }
 
 /// Parse a two-field multipart upload (`file` + a named JSON metadata field).
@@ -13909,6 +14132,46 @@ pub(crate) async fn serve_scanned_proxy_file<F: ScannedProxyFile>(
             );
             Ok(resp)
         }
+    }
+}
+
+/// The decision [`serve_scanned_proxy_file`] makes on `bytes` already in the
+/// proxy cache at `req.cache_path`, for a request that answers ABOUT the file
+/// without serving it (PyPI `.metadata`, #6444): `Ok` where the file would be
+/// served, its `403` or `423` otherwise.
+///
+/// Nothing is fetched from the upstream, served, committed or recorded as a
+/// download. `digest` is the SHA-256 of exactly `bytes`. When the gate has
+/// to scan, the scan is the in-flight one a pull of the same bytes joins (or
+/// the durable job it waits on), so the verdict it records is reused by that
+/// pull rather than repeated.
+pub(crate) async fn gate_cached_proxy_bytes<F: ScannedProxyFile>(
+    state: &crate::api::SharedState,
+    req: &ScannedProxyRequest<'_>,
+    file: &F,
+    bytes: &Bytes,
+    digest: &str,
+) -> Result<(), Response> {
+    file.after_buffered_fetch(state, req, bytes, digest).await?;
+    let identity = gate_identity(file, req, bytes, digest);
+    let synthetic = F::synthetic_artifact(req.repo_id, req.filename, digest, bytes.len() as i64);
+    match gate_proxy_scan_serve(
+        state,
+        req.repo_id,
+        req.filename,
+        digest,
+        Some(req.cache_path),
+        synthetic,
+        bytes,
+        req.action,
+        req.severity_gate,
+        identity,
+        ProxyScanMode::File,
+    )
+    .await
+    {
+        ProxyScanServeOutcome::Serve(_) => Ok(()),
+        ProxyScanServeOutcome::Deny(resp) => Err(resp),
     }
 }
 
@@ -21468,14 +21731,6 @@ mod tests {
                 exists_result: true,
             }
         }
-
-        /// Override the `exists()` result — for the #3067/#3068 existence-gate
-        /// tests, where `supports_redirect() == true` must not be enough on
-        /// its own to trigger a presign.
-        fn with_exists(mut self, exists_result: bool) -> Self {
-            self.exists_result = exists_result;
-            self
-        }
     }
 
     #[async_trait::async_trait]
@@ -24664,7 +24919,8 @@ mod tests {
                 let src = include_str!($module_file);
                 assert!(
                     src.contains("proxy_fetch_capped_budgeted(")
-                        || src.contains("proxy_fetch_capped_with_cache_key_and_accept_budgeted("),
+                        || src.contains("proxy_fetch_capped_with_cache_key_and_accept_budgeted(")
+                        || src.contains("proxy_fetch_parsed_budgeted("),
                     "{} MUST route its buffered proxy-metadata fetch through a \
                      `*_budgeted` helper so it reserves against the shared \
                      process-wide byte budget (#2684).",
@@ -25158,7 +25414,8 @@ mod tests {
             // The Virtual streaming resolver's presign moved into this helper
             // (#2069 two-phase refactor); it is where the no-prefix handle is used.
             "async fn try_member_cache_redirect(",
-            "pub async fn local_fetch_or_redirect(",
+            // `local_fetch_or_redirect`'s body (#6416).
+            "async fn local_fetch_or_redirect_with(",
         ] {
             let fn_start = src
                 .find(fn_name)
@@ -26018,11 +26275,32 @@ mod tests {
 
         // Seed a proxy-cache artifact: the storage_key starts with
         // `proxy-cache/`, so is_proxy_cache_key() is true and the no-prefix
-        // handle branch is taken.
+        // handle branch is taken. #6416: the entry has a fresh sidecar, which
+        // the row is served only after.
         let body: &[u8] = b"cached-fs";
         let artifact_path = "simple/foo/foo-1.0-py3-none-any.whl";
-        let storage_key = format!("proxy-cache/{}/{}", fx.repo_key, artifact_path);
+        let storage_key = format!("proxy-cache/{}/{}/__content__", fx.repo_key, artifact_path);
         assert!(crate::services::proxy_service::ProxyService::is_proxy_cache_key(&storage_key));
+        {
+            let mut meta: crate::services::proxy_service::CacheMetadata =
+                serde_json::from_slice(&tdh::fresh_cache_sidecar_bytes()).unwrap();
+            meta.size_bytes = body.len() as i64;
+            let cache = proxy.cache_storage_backend();
+            cache
+                .put(&storage_key, Bytes::from_static(body))
+                .await
+                .expect("seed cache body");
+            cache
+                .put(
+                    &format!(
+                        "proxy-cache/{}/{}/__cache_meta__.json",
+                        fx.repo_key, artifact_path
+                    ),
+                    Bytes::from(serde_json::to_vec(&meta).unwrap()),
+                )
+                .await
+                .expect("seed cache sidecar");
+        }
 
         super::put_artifact_bytes(&state, &repo_info, &storage_key, Bytes::from_static(body))
             .await
@@ -26215,53 +26493,239 @@ mod tests {
         );
     }
 
-    /// #3067/#3068: `supports_redirect() == true` alone must not be enough to
-    /// sign a redirect — `exists()` returning false (a DB row surviving an
-    /// out-of-band delete, e.g. a lifecycle rule) must fall through to the
-    /// streaming read instead of presigning. Complements the #1555 test above,
-    /// which only covers the `supports_redirect() == false` short-circuit.
-    ///
-    /// Runs both `exists()` outcomes so the `true` case is a positive
-    /// control: without it, this test would pass identically if the
-    /// proxy-cache redirect branch were never entered at all (e.g. from a
-    /// storage-key shape regression), not because `exists()` gates it.
+    /// #6416: a proxy-cache `artifacts` row is served in no form before its
+    /// cache sidecar is checked, whether presigned downloads are on (a
+    /// redirect) or off (the default: the row is streamed), for a GET and a
+    /// HEAD alike. A fresh entry outside its hold whose stored verdict allows
+    /// it is served (signed at the row's own key, or streamed from the row).
+    /// A held entry answers the hold's 409 and a refusing verdict the scan
+    /// gate's 403, both terminal for a virtual walk. A stale entry, a missing
+    /// sidecar or a key that names another Remote answers a non-terminal 404,
+    /// so the PyPI virtual walk resolves the file through the member's Remote
+    /// path. Before #6416 every one of these was served: signed after an
+    /// existence check, or streamed with no look at the sidecar.
     #[tokio::test]
-    async fn test_local_fetch_or_redirect_gated_by_object_existence_3068() {
+    async fn test_local_fetch_or_redirect_proxy_cache_row_takes_the_sidecar_gate_6416() {
         use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::proxy_service::CacheMetadata;
 
-        for exists in [false, true] {
+        fn sidecar(expires_in: chrono::Duration, hold: bool, digest: &str, size: i64) -> Bytes {
+            let now = Utc::now();
+            Bytes::from(
+                serde_json::to_vec(&CacheMetadata {
+                    cached_at: now,
+                    upstream_etag: None,
+                    storage_etag: None,
+                    last_modified: None,
+                    negative_cached_until: None,
+                    quarantine_until: hold.then(|| now + chrono::Duration::hours(1)),
+                    expires_at: now + expires_in,
+                    content_type: Some("application/zip".to_string()),
+                    content_encoding: None,
+                    upstream_commit_sha: None,
+                    size_bytes: size,
+                    checksum_sha256: digest.to_string(),
+                })
+                .expect("serialize sidecar"),
+            )
+        }
+
+        #[derive(Debug, Clone, Copy, PartialEq)]
+        enum Case {
+            Fresh,
+            Held,
+            ScanBlocked,
+            Stale,
+            NoSidecar,
+            OtherRepoKey,
+        }
+
+        for presign in [true, false] {
+            for is_head in [false, true] {
+                for case in [
+                    Case::Fresh,
+                    Case::Held,
+                    Case::ScanBlocked,
+                    Case::Stale,
+                    Case::NoSidecar,
+                    Case::OtherRepoKey,
+                ] {
+                    let label = format!("{case:?} presign={presign} head={is_head}");
+                    let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
+                        return;
+                    };
+                    let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+                    let repo_info = fx.repo_info("remote", Some("https://upstream.example.test"));
+                    let (proxy, backend) = tdh::build_scoped_presign_proxy(
+                        fx.pool.clone(),
+                        crate::services::proxy_cache_scope::ProxyCacheScope::unscoped(),
+                    );
+                    let state = if presign {
+                        tdh::build_state_with_proxy_presigned(fx.pool.clone(), &storage_path, proxy)
+                    } else {
+                        tdh::build_state_with_proxy(fx.pool.clone(), &storage_path, proxy)
+                    };
+
+                    let artifact_path = "simple/foo/foo-1.0-py3-none-any.whl";
+                    let key_repo = if case == Case::OtherRepoKey {
+                        "some-other-remote".to_string()
+                    } else {
+                        fx.repo_key.clone()
+                    };
+                    let storage_key = format!("proxy-cache/{key_repo}/{artifact_path}/__content__");
+                    let metadata_key =
+                        format!("proxy-cache/{key_repo}/{artifact_path}/__cache_meta__.json");
+                    let body = Bytes::from(format!("still-here-{}", Uuid::new_v4()));
+                    // The sidecar records the body's real digest: a streamed
+                    // row is verified against it (#6416).
+                    let digest = {
+                        use sha2::Digest as _;
+                        hex::encode(sha2::Sha256::digest(&body))
+                    };
+
+                    {
+                        let hour = chrono::Duration::hours(1);
+                        let mut objects = backend.objects.lock().unwrap();
+                        objects.insert(storage_key.clone(), body.clone());
+                        let meta = match case {
+                            Case::Fresh | Case::OtherRepoKey | Case::ScanBlocked => {
+                                Some(sidecar(hour, false, &digest, body.len() as i64))
+                            }
+                            Case::Held => Some(sidecar(hour, true, &digest, body.len() as i64)),
+                            Case::Stale => Some(sidecar(-hour, false, &digest, body.len() as i64)),
+                            Case::NoSidecar => None,
+                        };
+                        if let Some(meta) = meta {
+                            objects.insert(metadata_key.clone(), meta);
+                        }
+                    }
+                    if case == Case::ScanBlocked {
+                        tdh::enable_proxy_scan(&fx.pool, fx.repo_id, "fail_open").await;
+                        crate::services::proxy_scan_service::ProxyScanService::new(fx.pool.clone())
+                            .record_verdict(
+                                &digest,
+                                PROXY_SCAN_TYPE,
+                                crate::services::proxy_scan_service::VERDICT_VULNERABLE,
+                                1,
+                                1,
+                                0,
+                                0,
+                                0,
+                                Some("critical"),
+                                Some("grype-test"),
+                                Some(fx.repo_id),
+                            )
+                            .await
+                            .unwrap();
+                    }
+                    // The row's bytes are also on the repo's own storage, so a
+                    // path that streamed the row ungated would answer 200.
+                    tdh::seed_artifact(
+                        &state,
+                        &fx.pool,
+                        &repo_info,
+                        &storage_key,
+                        artifact_path,
+                        "foo",
+                        "1.0",
+                        "application/zip",
+                        body.clone(),
+                        fx.user_id,
+                    )
+                    .await;
+
+                    let ctx = crate::api::middleware::download_telemetry::DownloadContext {
+                        is_head,
+                        ..Default::default()
+                    };
+                    let result = super::local_fetch_or_redirect(
+                        &fx.pool,
+                        &state,
+                        fx.repo_id,
+                        &repo_info.storage_location(),
+                        artifact_path,
+                        &ctx,
+                    )
+                    .await;
+                    for sql in [
+                        "DELETE FROM proxy_scan_results WHERE repository_id = $1",
+                        "DELETE FROM audit_log WHERE action = 'PROXY_SCAN_BLOCKED' \
+                         AND resource_id = $1",
+                        "DELETE FROM scan_configs WHERE repository_id = $1",
+                    ] {
+                        let _ = sqlx::query(sqlx::AssertSqlSafe(sql))
+                            .bind(fx.repo_id)
+                            .execute(&fx.pool)
+                            .await;
+                    }
+                    fx.teardown().await;
+
+                    let want = match case {
+                        Case::Fresh if presign && !is_head => StatusCode::FOUND,
+                        Case::Fresh => StatusCode::OK,
+                        Case::Held => StatusCode::CONFLICT,
+                        Case::ScanBlocked => StatusCode::FORBIDDEN,
+                        Case::Stale | Case::NoSidecar | Case::OtherRepoKey => StatusCode::NOT_FOUND,
+                    };
+                    let resp = match result {
+                        Ok(resp) | Err(resp) => resp,
+                    };
+                    assert_eq!(resp.status(), want, "{label}");
+                    if want == StatusCode::FOUND {
+                        let location = resp.headers()["location"].to_str().unwrap();
+                        assert!(
+                            location
+                                .starts_with(&format!("https://signed.example.com/{storage_key}")),
+                            "{label}: the row's own key is signed: {location}"
+                        );
+                    } else {
+                        assert!(resp.headers().get("location").is_none(), "{label}");
+                    }
+                    if want == StatusCode::OK && !is_head {
+                        let served = axum::body::to_bytes(resp.into_body(), 1 << 16)
+                            .await
+                            .unwrap();
+                        assert_eq!(served, body, "{label}");
+                    } else if want.is_client_error() {
+                        assert_eq!(
+                            super::is_member_policy_block_response(&resp),
+                            matches!(case, Case::Held | Case::ScanBlocked),
+                            "{label}: only a refusal ends the virtual walk"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// #6416 / #3023: a virtual walk whose stricter-of-two scan policy is on
+    /// defers every proxy-cache row (the non-terminal 404) to the member's
+    /// scanned Remote path, even a fresh, unheld one the member's own policy
+    /// would let through; the same row is served when nothing scans.
+    #[tokio::test]
+    async fn test_walk_defers_proxy_cache_rows_while_scanning_6416() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        for defer in [false, true] {
             let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
                 return;
             };
-
             let storage_path = fx.storage_dir.to_str().unwrap().to_string();
             let repo_info = fx.repo_info("remote", Some("https://upstream.example.test"));
-
-            // Redirect-capable proxy-cache backend whose exists() is the
-            // thing under test: false simulates a DB row surviving an
-            // out-of-band delete; true is the ordinary fresh-cache case.
-            let proxy_backend = StdArc::new(RecordingStorage::new(true).with_exists(exists));
-            let service = StdArc::new(crate::services::storage_service::StorageService::new(
-                proxy_backend.clone(),
-            ));
-            let proxy = StdArc::new(crate::services::proxy_service::ProxyService::new(
+            let (proxy, backend) = tdh::build_scoped_presign_proxy(
                 fx.pool.clone(),
-                service,
                 crate::services::proxy_cache_scope::ProxyCacheScope::unscoped(),
-            ));
-            let state =
-                tdh::build_state_with_proxy_presigned(fx.pool.clone(), &storage_path, proxy);
-
-            // Seed real bytes on the repo's own (filesystem) storage,
-            // separate from the mock proxy-cache backend above, so the
-            // exists() == false case has something real to fall through to.
-            let body: &[u8] = b"still-here";
+            );
+            let state = tdh::build_state_with_proxy(fx.pool.clone(), &storage_path, proxy);
             let artifact_path = "simple/foo/foo-1.0-py3-none-any.whl";
-            // Use the real content-key shape `CacheKeys::derive` produces
-            // (`proxy-cache/<repo>/<path>/__content__`), not just something
-            // that satisfies the `proxy-cache/` prefix check — otherwise the
-            // fixture exercises a key namespace the cache writer never emits.
-            let storage_key = format!("proxy-cache/{}/{}/__content__", fx.repo_key, artifact_path);
+            let storage_key = format!("proxy-cache/{}/{artifact_path}/__content__", fx.repo_key);
+            let body = Bytes::from_static(b"cached-body");
+            backend.seed_fresh_entry(
+                &storage_key,
+                &format!(
+                    "proxy-cache/{}/{artifact_path}/__cache_meta__.json",
+                    fx.repo_key
+                ),
+            );
             tdh::seed_artifact(
                 &state,
                 &fx.pool,
@@ -26271,58 +26735,101 @@ mod tests {
                 "foo",
                 "1.0",
                 "application/zip",
-                Bytes::from_static(body),
+                body.clone(),
                 fx.user_id,
             )
             .await;
-
-            let location = repo_info.storage_location();
-            let ctx = crate::api::middleware::download_telemetry::DownloadContext {
-                client_ip: None,
-                user_id: None,
-                user_agent: None,
-                is_head: false,
-            };
-            let result = super::local_fetch_or_redirect(
+            let result = super::local_fetch_or_redirect_by_suffix_for_walk(
                 &fx.pool,
                 &state,
                 fx.repo_id,
-                &location,
-                artifact_path,
-                &ctx,
+                &repo_info.storage_location(),
+                "foo-1.0-py3-none-any.whl",
+                &Default::default(),
+                defer,
             )
             .await;
-
             fx.teardown().await;
-
-            let resp = result.expect("fetch must succeed (redirect or streamed fallback)");
-            if exists {
-                assert_eq!(
-                    resp.status(),
-                    StatusCode::FOUND,
-                    "exists() == true must sign a redirect"
-                );
-                assert_eq!(
-                    proxy_backend.presigned_calls.load(Ordering::SeqCst),
-                    1,
-                    "exists() == true must attempt exactly one presign"
-                );
+            let resp = match result {
+                Ok(resp) | Err(resp) => resp,
+            };
+            if defer {
+                assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+                assert!(!super::is_member_policy_block_response(&resp));
             } else {
-                assert_eq!(
-                    resp.status(),
-                    StatusCode::OK,
-                    "exists() == false must fall through to a streamed 200, never a stale 302"
-                );
-                assert!(
-                    resp.headers().get("location").is_none(),
-                    "a redirect-capable backend reporting the object absent must NOT redirect"
-                );
-                assert_eq!(
-                    proxy_backend.presigned_calls.load(Ordering::SeqCst),
-                    0,
-                    "get_presigned_url must never be attempted when exists() == false"
-                );
+                assert_eq!(resp.status(), StatusCode::OK);
+                let served = axum::body::to_bytes(resp.into_body(), 1 << 16)
+                    .await
+                    .unwrap();
+                assert_eq!(served, body);
             }
+        }
+    }
+
+    /// #6433: a format route that resolved an `artifacts` row itself serves a
+    /// proxy-cache row only through `vouched_row` (the #6416 sidecar gate): a
+    /// fresh entry recording the row's size is served, a held one answers the
+    /// hold's 409 (terminal for a virtual walk), and a stale entry, a missing
+    /// sidecar or a refill of another size is treated as no row, so the
+    /// Remote's proxy path resolves it. The streaming local fetches and the
+    /// filename lookup the format routes share take the same gate, with the
+    /// row's size, so a refill of another size is a miss there too.
+    #[tokio::test]
+    async fn test_vouched_row_takes_the_sidecar_gate_6433() {
+        use crate::api::handlers::test_db_helpers::{CacheRowRig, CacheRowSidecar as S};
+        let Some(rig) = CacheRowRig::setup("pypi").await else {
+            return;
+        };
+        let hosted = super::vouched_row(&rig.state, rig.fx.repo_id, Some("pypi/x/x.whl"), |k| {
+            super::ServedRowRef::new(k, Some(1))
+        })
+        .await;
+        assert!(matches!(hosted, Ok(Some(_))), "a hosted key is not gated");
+
+        let mut outcomes = Vec::new();
+        for (i, case) in [S::Fresh, S::Held, S::Stale, S::Missing, S::OtherSize]
+            .into_iter()
+            .enumerate()
+        {
+            let file = format!("row{i}-1.0.tar.gz");
+            let path = format!("simple/row{i}/{file}");
+            let body = rig.row(&path, &format!("row{i}"), "1.0", case).await;
+            let key = format!("proxy-cache/{}/{path}/__content__", rig.fx.repo_key);
+            let vouched = super::vouched_row(&rig.state, rig.fx.repo_id, Some(key.as_str()), |k| {
+                super::ServedRowRef::new(k, Some(body.len() as i64))
+            })
+            .await
+            .map(|row| row.is_some())
+            .map_err(|r| r.status());
+            let fetched = super::local_fetch_by_path(
+                &rig.fx.pool,
+                &rig.state,
+                rig.fx.repo_id,
+                &rig.repo.storage_location(),
+                &path,
+            )
+            .await
+            .map(|_| ())
+            .map_err(|r| (r.status(), super::is_member_policy_block_response(&r)));
+            let found =
+                super::find_servable_local_by_filename_suffix(&rig.state, rig.fx.repo_id, &file)
+                    .await
+                    .map(|hit| hit.is_some())
+                    .map_err(|r| r.status());
+            outcomes.push((case, vouched, fetched, found));
+        }
+        rig.teardown().await;
+
+        let held = StatusCode::CONFLICT;
+        let declined = Err((StatusCode::NOT_FOUND, false));
+        for (case, vouched, fetched, found) in outcomes {
+            let want = match case {
+                S::Fresh => (Ok(true), Ok(()), Ok(true)),
+                S::Held => (Err(held), Err((held, true)), Err(held)),
+                S::Stale | S::Missing => (Ok(false), declined, Ok(false)),
+                S::OtherSize => (Ok(false), declined, Ok(false)),
+            };
+            assert_eq!((vouched, fetched, found), want, "{case:?}");
         }
     }
 

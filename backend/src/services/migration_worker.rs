@@ -1133,9 +1133,30 @@ impl MigrationWorker {
             let artifacts = client
                 .list_artifacts_with_date_filter(repo_key, offset, limit, date_from, date_to)
                 .await?;
-            pages_fetched += 1;
+            // A call the source cut short on its fetch budget (#6260) has
+            // walked its budget of upstream pages and is followed by a
+            // pause/cancel check below, so it is not a runaway: counting it
+            // would let a narrow date window over a large repository use up
+            // the guard and end the walk early while reporting success.
+            if !artifacts.incomplete {
+                pages_fetched += 1;
+            }
 
             let page_len = artifacts.results.len();
+
+            // A source that stopped on its per-call fetch budget (#6260) hands
+            // back a short or empty page that is not the end of the listing.
+            // The per-artifact pause/cancel check below never runs for an
+            // empty one, so check here: a narrow date window over a large
+            // Nexus repository can return many empty pages in a row.
+            if artifacts.incomplete {
+                if self.cancel_token.is_cancelled() || self.is_paused(job_id).await? {
+                    return Ok(RepoProcessOutcome::Interrupted);
+                }
+                if page_len == 0 {
+                    continue;
+                }
+            }
 
             if page_len == 0 {
                 break;
@@ -1197,6 +1218,15 @@ impl MigrationWorker {
 
                 // Skip if already completed in THIS job (resume support within same job)
                 if self.is_item_already_completed(job_id, &source_path).await? {
+                    if artifact.possible_duplicate {
+                        // The source listed this row twice in one walk
+                        // (#6360: a Nexus asset walk past its dedupe cap).
+                        // It is one artifact, already done: take it back out
+                        // of the totals instead of counting it as skipped.
+                        *discovered -= 1;
+                        *discovered_bytes -= size;
+                        continue;
+                    }
                     *skipped += 1;
                     continue;
                 }
@@ -1356,7 +1386,7 @@ impl MigrationWorker {
             // termination must be decided from the page shape, not from a
             // running total. A short page (fewer rows than `limit`) means
             // the result set is exhausted.
-            if !should_fetch_next_page(page_len, limit) {
+            if !artifacts.incomplete && !should_fetch_next_page(page_len, limit) {
                 break;
             }
 
@@ -7029,7 +7059,9 @@ mod tests {
                 // One short page ends pagination; reads must use the SOURCE key.
                 assert_eq!(repo_key, "dry-src", "source must be read by source key");
                 Ok(AqlResponse {
+                    incomplete: false,
                     results: vec![AqlResult {
+                        possible_duplicate: false,
                         repo: repo_key.to_string(),
                         path: "pkg/1.0".into(),
                         name: "thing.tar.gz".into(),
@@ -7254,6 +7286,7 @@ mod tests {
             match self.interrupt {
                 MockInterrupt::None => {
                     return Ok(AqlResponse {
+                        incomplete: false,
                         results: vec![],
                         range: AqlRange {
                             start_pos: offset,
@@ -7287,6 +7320,7 @@ mod tests {
                     // for the per-artifact check to interrupt on, so the run
                     // reaches finalize_job_status with the flipped status.
                     return Ok(AqlResponse {
+                        incomplete: false,
                         results: vec![],
                         range: AqlRange {
                             start_pos: offset,
@@ -7297,7 +7331,9 @@ mod tests {
                 }
             }
             Ok(AqlResponse {
+                incomplete: false,
                 results: vec![AqlResult {
+                    possible_duplicate: false,
                     repo: repo_key.to_string(),
                     path: "pkg/1.0".into(),
                     name: "thing.tar.gz".into(),
@@ -7827,6 +7863,7 @@ mod tests {
         let results: Vec<AqlResult> = artifacts[start..end]
             .iter()
             .map(|(name, size)| AqlResult {
+                possible_duplicate: false,
                 repo: repo_key.to_string(),
                 path: "pkg/1.0".into(),
                 name: name.clone(),
@@ -7839,6 +7876,7 @@ mod tests {
             .collect();
 
         AqlResponse {
+            incomplete: false,
             range: AqlRange {
                 start_pos: offset,
                 end_pos: offset + limit,
@@ -10031,6 +10069,378 @@ mod tests {
             .ok();
     }
 
+    /// A Nexus whose `test-data` raw repository holds `old_pages` pages of
+    /// components modified in 2020, then one page with a single component
+    /// modified in 2026, so a `date_from` of 2025 leaves the first
+    /// `old_pages` pages empty (#6260). Returns the server and a client whose
+    /// listing calls fetch at most `budget` upstream pages each.
+    async fn windowed_nexus(
+        old_pages: usize,
+        budget: usize,
+    ) -> (
+        wiremock::MockServer,
+        crate::services::nexus_client::NexusClient,
+    ) {
+        use crate::services::nexus_client::{NexusAuth, NexusClient, NexusClientConfig};
+        use wiremock::matchers::{method, path, query_param, query_param_is_missing};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let body: &[u8] = b"new bytes";
+        let component = |n: usize, modified: &str, sha256: String| {
+            serde_json::json!({
+                "id": format!("c{n}"),
+                "repository": "test-data",
+                "format": "raw",
+                "name": format!("f{n}"),
+                "assets": [{
+                    "id": format!("a{n}"),
+                    "format": "raw",
+                    "path": format!("w/f{n}.bin"),
+                    "checksum": { "sha256": sha256 },
+                    "fileSize": body.len(),
+                    "lastModified": modified
+                }]
+            })
+        };
+        let server = MockServer::start().await;
+        for page in 0..=old_pages {
+            let items = if page < old_pages {
+                vec![component(
+                    page,
+                    "2020-01-01T00:00:00.000+00:00",
+                    "0".repeat(64),
+                )]
+            } else {
+                vec![component(
+                    page,
+                    "2026-01-01T00:00:00.000+00:00",
+                    sha256_hex_of(body),
+                )]
+            };
+            let next = (page < old_pages).then(|| format!("t{}", page + 1));
+            let route = Mock::given(method("GET"))
+                .and(path("/service/rest/v1/components"))
+                .and(query_param("repository", "test-data"));
+            let route = if page == 0 {
+                route.and(query_param_is_missing("continuationToken"))
+            } else {
+                route.and(query_param("continuationToken", format!("t{page}")))
+            };
+            route
+                .respond_with(ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({ "items": items, "continuationToken": next }),
+                ))
+                .mount(&server)
+                .await;
+        }
+        Mock::given(method("GET"))
+            .and(path("/service/rest/v1/assets"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "items": [], "continuationToken": null })),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/repository/test-data/w/f{old_pages}.bin")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.to_vec()))
+            .mount(&server)
+            .await;
+        let client = NexusClient::new(NexusClientConfig {
+            base_url: server.uri(),
+            auth: NexusAuth {
+                username: "u".into(),
+                password: "p".into(),
+            },
+            throttle_delay_ms: 0,
+            list_page_budget: budget,
+            ..Default::default()
+        })
+        .expect("build nexus client");
+        (server, client)
+    }
+
+    async fn component_requests(server: &wiremock::MockServer) -> usize {
+        server
+            .received_requests()
+            .await
+            .expect("wiremock records requests")
+            .iter()
+            .filter(|r| r.url.path() == "/service/rest/v1/components")
+            .count()
+    }
+
+    /// A Nexus listing call that stops on its page budget hands back an empty
+    /// page that is not the end of the repository (#6260). The worker must
+    /// list again rather than read it as the end, or a narrow window over a
+    /// large repository would migrate nothing.
+    #[tokio::test]
+    async fn test_nexus_budgeted_empty_pages_do_not_end_the_walk_6260() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (worker, storage, _tmp, _repo_id, target_key) =
+            setup_repo_for_import(&pool, "mig-nexus-budget", "generic").await;
+        let (_unused_key, conn_id, job_id) = seed_single_repo_job(&pool, "mig-nexus-budget").await;
+        let (server, client) = windowed_nexus(6, 2).await;
+
+        let keys = RepoKeys {
+            source: "test-data".to_string(),
+            target: target_key.clone(),
+        };
+        let (mut completed, mut failed, mut skipped, mut transferred) = (0i32, 0i32, 0i32, 0i64);
+        let (mut discovered, mut discovered_bytes) = (0i32, 0i64);
+        let outcome = worker
+            .process_repository_artifacts(
+                job_id,
+                Arc::new(client),
+                storage.clone(),
+                &keys,
+                "generic",
+                Some("2025-01-01T00:00:00+00:00"),
+                None,
+                ConflictResolution::Skip,
+                false,
+                &mut completed,
+                &mut failed,
+                &mut skipped,
+                &mut transferred,
+                &mut discovered,
+                &mut discovered_bytes,
+                None,
+            )
+            .await
+            .expect("process the windowed Nexus repository");
+
+        assert!(matches!(outcome, RepoProcessOutcome::Completed));
+        assert_eq!(
+            (discovered, completed, failed),
+            (1, 1, 0),
+            "the one in-window component behind six out-of-window pages migrates"
+        );
+        assert_eq!(
+            component_requests(&server).await,
+            7,
+            "each upstream page is still fetched exactly once"
+        );
+
+        sqlx::query("DELETE FROM migration_jobs WHERE id = $1")
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM source_connections WHERE id = $1")
+            .bind(conn_id)
+            .execute(&pool)
+            .await
+            .ok();
+    }
+
+    /// While a Nexus listing walks pages that hold nothing in the window, a
+    /// cancel must stop the job within one page budget, not after the whole
+    /// repository (#6260). The per-artifact check never runs for an empty
+    /// page, so the worker checks between budgeted calls.
+    #[tokio::test]
+    async fn test_nexus_cancel_is_seen_between_budgeted_listing_calls_6260() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (worker, storage, _tmp, _repo_id, target_key) =
+            setup_repo_for_import(&pool, "mig-nexus-cancel", "generic").await;
+        let (_unused_key, conn_id, job_id) = seed_single_repo_job(&pool, "mig-nexus-cancel").await;
+        sqlx::query("UPDATE migration_jobs SET status = 'cancelled' WHERE id = $1")
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .expect("cancel the job");
+        let (server, client) = windowed_nexus(40, 3).await;
+
+        let keys = RepoKeys {
+            source: "test-data".to_string(),
+            target: target_key.clone(),
+        };
+        let (mut completed, mut failed, mut skipped, mut transferred) = (0i32, 0i32, 0i32, 0i64);
+        let (mut discovered, mut discovered_bytes) = (0i32, 0i64);
+        let outcome = worker
+            .process_repository_artifacts(
+                job_id,
+                Arc::new(client),
+                storage.clone(),
+                &keys,
+                "generic",
+                Some("2025-01-01T00:00:00+00:00"),
+                None,
+                ConflictResolution::Skip,
+                false,
+                &mut completed,
+                &mut failed,
+                &mut skipped,
+                &mut transferred,
+                &mut discovered,
+                &mut discovered_bytes,
+                None,
+            )
+            .await
+            .expect("process the windowed Nexus repository");
+
+        assert!(matches!(outcome, RepoProcessOutcome::Interrupted));
+        assert_eq!(
+            component_requests(&server).await,
+            3,
+            "the cancel is seen after one budget of pages, not after all 41"
+        );
+        assert_eq!(completed, 0);
+
+        sqlx::query("DELETE FROM migration_jobs WHERE id = $1")
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM source_connections WHERE id = $1")
+            .bind(conn_id)
+            .execute(&pool)
+            .await
+            .ok();
+    }
+
+    /// Past the Nexus dedupe cap the asset walk lists a component's file a
+    /// second time (#6360). The worker must drop that row without counting it:
+    /// the job's totals and its skipped count describe three artifacts, not
+    /// four.
+    #[tokio::test]
+    async fn test_nexus_duplicate_past_the_dedupe_cap_is_not_counted_6360() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::nexus_client::{NexusAuth, NexusClient, NexusClientConfig};
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (worker, storage, _tmp, _repo_id, target_key) =
+            setup_repo_for_import(&pool, "mig-nexus-dupcap", "generic").await;
+        let (_unused_key, conn_id, job_id) = seed_single_repo_job(&pool, "mig-nexus-dupcap").await;
+
+        let files: [(&str, &[u8]); 3] = [
+            ("com/ex/lib/1.0/lib-1.0.jar", b"jar bytes"),
+            ("com/ex/lib/1.0/lib-1.0.pom", b"<project/>"),
+            ("docs/install.txt", b"read me"),
+        ];
+        let asset = |(p, body): (&str, &[u8])| {
+            serde_json::json!({
+                "id": p,
+                "format": "maven2",
+                "path": p,
+                "checksum": { "sha256": sha256_hex_of(body) },
+                "fileSize": body.len()
+            })
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/service/rest/v1/components"))
+            .and(query_param("repository", "test-data"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "items": [{
+                    "id": "c1", "repository": "test-data", "format": "maven2",
+                    "group": "com.ex", "name": "lib", "version": "1.0",
+                    "assets": [asset(files[0]), asset(files[1])]
+                }],
+                "continuationToken": null
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/service/rest/v1/assets"))
+            .and(query_param("repository", "test-data"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "items": [asset(files[0]), asset(files[1]), asset(files[2])],
+                "continuationToken": null
+            })))
+            .mount(&server)
+            .await;
+        for (p, body) in files {
+            Mock::given(method("GET"))
+                .and(path(format!("/repository/test-data/{p}")))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(body.to_vec()))
+                .mount(&server)
+                .await;
+        }
+        let client = NexusClient::new(NexusClientConfig {
+            base_url: server.uri(),
+            auth: NexusAuth {
+                username: "u".into(),
+                password: "p".into(),
+            },
+            throttle_delay_ms: 0,
+            // The jar is recorded; the pom is not and is listed again.
+            listed_paths_cap: 1,
+            ..Default::default()
+        })
+        .expect("build nexus client");
+
+        let keys = RepoKeys {
+            source: "test-data".to_string(),
+            target: target_key.clone(),
+        };
+        let (mut completed, mut failed, mut skipped, mut transferred) = (0i32, 0i32, 0i32, 0i64);
+        let (mut discovered, mut discovered_bytes) = (0i32, 0i64);
+        let outcome = worker
+            .process_repository_artifacts(
+                job_id,
+                Arc::new(client),
+                storage.clone(),
+                &keys,
+                "generic",
+                None,
+                None,
+                ConflictResolution::Overwrite,
+                false,
+                &mut completed,
+                &mut failed,
+                &mut skipped,
+                &mut transferred,
+                &mut discovered,
+                &mut discovered_bytes,
+                None,
+            )
+            .await
+            .expect("process the Nexus repository");
+
+        assert!(matches!(outcome, RepoProcessOutcome::Completed));
+        let bytes: i64 = files.iter().map(|(_, b)| b.len() as i64).sum();
+        assert_eq!(
+            (discovered, discovered_bytes, completed, failed, skipped),
+            (3, bytes, 3, 0, 0),
+            "three artifacts, each counted once, even with overwrite"
+        );
+        assert_eq!(
+            server
+                .received_requests()
+                .await
+                .expect("wiremock records requests")
+                .iter()
+                .filter(|r| r.url.path().starts_with("/repository/"))
+                .count(),
+            3,
+            "the duplicate row is not downloaded again"
+        );
+
+        sqlx::query("DELETE FROM migration_jobs WHERE id = $1")
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM source_connections WHERE id = $1")
+            .bind(conn_id)
+            .execute(&pool)
+            .await
+            .ok();
+    }
+
     /// End-to-end #2457 import over the Artifactory source layout: a config
     /// blob, a layer blob, and a tagged image manifest must land in the OCI
     /// index (oci_blobs + oci_tags + manifest_blob_refs) with bytes at the
@@ -12199,6 +12609,7 @@ mod tests {
             let results: Vec<AqlResult> = self.files[start..end]
                 .iter()
                 .map(|(dir, name)| AqlResult {
+                    possible_duplicate: false,
                     repo: repo_key.to_string(),
                     path: (*dir).to_string(),
                     name: (*name).to_string(),
@@ -12211,6 +12622,7 @@ mod tests {
                 .collect();
             let page = results.len() as i64;
             Ok(AqlResponse {
+                incomplete: false,
                 results,
                 range: AqlRange {
                     start_pos: offset,

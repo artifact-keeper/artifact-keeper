@@ -1148,7 +1148,7 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     );
 
     // Start webhooks v2 producer: subscribes to EventBus and enqueues rows
-    // into webhook_deliveries. The retry scheduler (every 30s) drives
+    // into webhook_deliveries. The delivery worker (woken on enqueue) drives
     // actual HTTP delivery. See backend/src/services/webhook_producer.rs.
     //
     // Gated behind WEBHOOKS_V2_PRODUCER_ENABLED (default off) so v1.1.9
