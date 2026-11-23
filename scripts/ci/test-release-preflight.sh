@@ -1248,6 +1248,103 @@ else
   sed 's/^/        /' "$WORK/out.txt" >&2
 fi
 
+# 12. BACKED-OUT PRS (#6363). A PR and its full revert, both in range, cancel
+#     out: neither ships, so neither can carry an entry, and before this every
+#     such cut needed a hand-written citation PR (#6251 for 1.12.2). A pair
+#     cancels only on an EXACT inverse (git patch-id), so a partial back-out
+#     still needs its entry, and a reapply leaves the original PR to cite.
+REPO5D="$WORK/repo5d"
+cp -r "$REPO5" "$REPO5D"
+git -C "$REPO5D" reset -q --hard "$(git -C "$REPO5D" log --format=%H -1 --grep='(#104)$')"
+git5d() { git -C "$REPO5D" -c user.email=t@t -c user.name=t "$@"; }
+BASE_CL='# Changelog
+
+## [Unreleased]
+
+### Fixed
+- **alpha is fixed** (#201). prose about alpha.
+- **beta is fixed** (#202). prose about beta.
+
+## [9.9.8] - 2026-01-01
+- older work'
+run5d() { # <closes map>: runs check 5 on REPO5D with BASE_CL
+  printf '%s\n' "$BASE_CL" > "$REPO5D/CHANGELOG.md"
+  ( cd "$REPO5D" && PATH="$STUB4:$PATH" PREFLIGHT_REPO=artifact-keeper/artifact-keeper \
+      PREFLIGHT_SKIP_DOCKER_HEALTH=1 PREFLIGHT_SKIP_VERSION_PIN=1 \
+      FAKE_CLOSES_MAP="$1" \
+      bash scripts/ci/release-preflight.sh >"$WORK/out.txt" 2>&1 )
+}
+expect5d() { # <label> <want exit> <closes map> <needle> [absent needle]
+  local rc absent=""
+  [ -n "${5-}" ] && absent=" and no '$5'"
+  run5d "$3"; rc=$?
+  if [ "$rc" != "$2" ] || ! grep -qF -- "$4" "$WORK/out.txt" \
+     || { [ -n "${5-}" ] && grep -qF -- "$5" "$WORK/out.txt"; }; then
+    fail "$1: expected exit $2 with '$4'${absent}, got $rc"
+    sed 's/^/        /' "$WORK/out.txt" >&2
+  else
+    pass "$1 (exit $rc)"
+  fi
+}
+MAP5D=$'101:201\n102:202\n103:\n104:'
+
+# 12a. `git revert` of a PR, merged as its own PR: both cancel -> READY.
+mkdir -p "$REPO5D/backend/src"
+printf 'pub fn x() {}\n' > "$REPO5D/backend/src/x.rs"
+git5d add backend/src/x.rs; git5d commit -qm "feat(x): add x (#107)"
+git5d revert --no-edit HEAD >/dev/null
+git5d commit -q --amend -m "Revert \"feat(x): add x (#107)\" (#108)" \
+  -m "This reverts commit $(git5d rev-parse HEAD~1)."
+MAP5D+=$'\n107:301\n108:'
+expect5d "a PR and its full revert in range cancel out -> READY" 0 "$MAP5D" \
+  "#107 cancels out with #108"
+
+# 12b. A back-out that GitHub's revert button wrote (`Reverts owner/repo#N`
+#      body, no `This reverts commit`) is paired by the PR number it cites.
+printf 'pub fn y() {}\n' > "$REPO5D/backend/src/y.rs"
+git5d add backend/src/y.rs; git5d commit -qm "feat(y): add y (#109)"
+git5d rm -q backend/src/y.rs
+git5d commit -qm "fix(y): back out y (#110)" -m "Reverts artifact-keeper/artifact-keeper#109"
+MAP5D+=$'\n109:302\n110:'
+expect5d "a back-out citing the PR number cancels out -> READY" 0 "$MAP5D" \
+  "4 backed out" "only in part"
+
+# 12b'. ...and an entry still leading with a cancelled PR's issue is a
+#       warning, not a failure.
+SAVED_CL="$BASE_CL"
+BASE_CL="${BASE_CL/'prose about beta.'/'prose about beta.'
+- **y is added** (#302). prose about y.}"
+expect5d "an entry for a backed-out PR warns but stays READY" 0 "$MAP5D" \
+  "still leads with #302, but #109 was backed out"
+BASE_CL="$SAVED_CL"
+
+# 12c. A PARTIAL back-out (#6235 shape) is not an inverse: both still need an
+#      entry, and the near miss is named.
+printf 'pub fn z1() {}\n' > "$REPO5D/backend/src/z1.rs"
+printf 'pub fn z2() {}\n' > "$REPO5D/backend/src/z2.rs"
+git5d add backend/src; git5d commit -qm "feat(z): add z1 and z2 (#111)"
+git5d rm -q backend/src/z2.rs
+git5d commit -qm "fix(z): back out z2 from #111 (#112)"
+MAP5D+=$'\n111:303\n112:'
+expect5d "a partial back-out does not cancel -> NOT READY" 1 "$MAP5D" \
+  "#112 backs out #111 only in part"
+
+# 12d. A REAPPLY. #114 reverts #113 and #115 reverts #114: the change ships
+#      again, so #113 still needs its entry; #114 and #115 cancel.
+git -C "$REPO5D" reset -q --hard HEAD~2
+printf 'pub fn w() {}\n' > "$REPO5D/backend/src/w.rs"
+git5d add backend/src/w.rs; git5d commit -qm "feat(w): add w (#113)"
+git5d revert --no-edit HEAD >/dev/null
+git5d commit -q --amend -m "Revert \"feat(w): add w (#113)\" (#114)" -m "This reverts commit $(git5d rev-parse HEAD~1)."
+git5d revert --no-edit HEAD >/dev/null
+git5d commit -q --amend -m "Reapply \"feat(w): add w (#113)\" (#115)" -m "This reverts commit $(git5d rev-parse HEAD~1)."
+MAP5D=$'101:201\n102:202\n103:\n104:\n107:301\n108:\n109:302\n110:\n113:304\n114:\n115:'
+expect5d "a reapply leaves the original PR to cite -> NOT READY" 1 "$MAP5D" \
+  "  - #113" "#113 cancels out"
+BASE_CL="${BASE_CL/'prose about beta.'/'prose about beta.'
+- **w is back** (#304). prose about w.}"
+expect5d "...and citing it reconciles -> READY" 0 "$MAP5D" "#114 cancels out with #115"
+
 echo
 echo "release-preflight check 6 (curated notes finished, #4468)"
 
