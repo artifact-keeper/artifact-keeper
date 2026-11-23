@@ -2546,6 +2546,18 @@ impl MigrationWorker {
                 use tokio::io::BufReader;
                 use tokio_util::io::ReaderStream;
 
+                // The disk usage threshold (#5191), from its cached reading:
+                // an item that would take the volume to the block threshold is
+                // not written. The job pauses at the next artifact while the
+                // volume stays blocked (`is_paused`).
+                let staged = tokio::fs::metadata(&temp_path).await.map(|m| m.len()).ok();
+                if let Some(refusal) = crate::services::quota::disk::refusal(staged) {
+                    return Err(MigrationError::StorageError(format!(
+                        "{} ({})",
+                        refusal.message,
+                        refusal.code()
+                    )));
+                }
                 let file = tokio::fs::File::open(&temp_path).await.map_err(|e| {
                     MigrationError::StorageError(format!(
                         "Failed to reopen temp file for upload: {e}"
@@ -3476,8 +3488,29 @@ impl MigrationWorker {
         Ok(())
     }
 
-    /// Check if the job has been paused via the database
+    /// Check if the job has been paused via the database.
+    ///
+    /// Also pauses a running job while the storage volume is at its disk
+    /// block threshold (#5191): the import would fill the disk, and a paused
+    /// job resumes where it stopped once space is freed (`/resume`).
     async fn is_paused(&self, job_id: Uuid) -> Result<bool, MigrationError> {
+        if crate::services::quota::disk::refusal(None).is_some() {
+            let paused = sqlx::query(
+                "UPDATE migration_jobs SET status = 'paused', error_summary = $2 \
+                 WHERE id = $1 AND status = 'running'",
+            )
+            .bind(job_id)
+            .bind(DISK_PAUSE_SUMMARY)
+            .execute(&self.db)
+            .await?;
+            if paused.rows_affected() > 0 {
+                tracing::warn!(
+                    job_id = %job_id,
+                    "migration paused: storage volume at its disk block threshold; free disk \
+                     or add storage, then resume the job"
+                );
+            }
+        }
         let status: (String,) = sqlx::query_as("SELECT status FROM migration_jobs WHERE id = $1")
             .bind(job_id)
             .fetch_one(&self.db)
@@ -3529,6 +3562,11 @@ impl MigrationWorker {
             .await
     }
 }
+
+/// The `error_summary` of a job paused at the disk block threshold (#5191).
+pub(crate) const DISK_PAUSE_SUMMARY: &str = "Paused: server storage nearly full: free disk or add \
+     storage (DISK_THRESHOLD_EXCEEDED). Resume the job once usage is below \
+     STORAGE_DISK_BLOCK_PERCENT.";
 
 /// Result of a successful artifact transfer.
 ///
@@ -13847,6 +13885,61 @@ mod tests {
     /// worker can observe. If someone later makes the in-process token real
     /// (a registry of running workers, per the issue's second option), the
     /// token assertion here fails and points at this exit.
+    /// #5191: at the disk block threshold a running import pauses (resumable,
+    /// with a summary naming the cause) instead of filling the volume.
+    #[tokio::test]
+    async fn test_a_blocked_disk_pauses_the_running_job_5191() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_key, conn_id, job_id) = seed_single_repo_job(&pool, "disk-5191").await;
+        sqlx::query("UPDATE migration_jobs SET status='running', started_at=NOW() WHERE id=$1")
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .expect("running");
+        let staging = tempfile::tempdir().expect("tempdir");
+        let registry = Arc::new(StorageRegistry::new(
+            std::collections::HashMap::new(),
+            "filesystem".to_string(),
+        ));
+        let worker = MigrationWorker::new(
+            pool.clone(),
+            registry,
+            WorkerConfig {
+                staging_path: staging.path().to_str().unwrap().to_string(),
+                ..WorkerConfig::default()
+            },
+            CancellationToken::new(),
+        );
+
+        crate::services::quota::disk::block_for_tests(false);
+        assert!(
+            !worker.is_paused(job_id).await.unwrap(),
+            "not blocked: runs on"
+        );
+        crate::services::quota::disk::block_for_tests(true);
+        assert!(
+            worker.is_paused(job_id).await.unwrap(),
+            "blocked: the job stops"
+        );
+        crate::services::quota::disk::block_for_tests(false);
+        assert_eq!(
+            worker.job_status(job_id).await.unwrap().as_deref(),
+            Some("paused")
+        );
+        assert_eq!(
+            read_error_summary(&pool, job_id).await.as_deref(),
+            Some(DISK_PAUSE_SUMMARY)
+        );
+        let _ = sqlx::query("DELETE FROM repositories WHERE key = $1")
+            .bind(&repo_key)
+            .execute(&pool)
+            .await;
+        cleanup_single_repo_job(&pool, job_id, conn_id).await;
+    }
+
     #[tokio::test]
     async fn test_the_real_api_cancel_is_what_the_worker_observes_3498() {
         use crate::api::handlers::test_db_helpers as tdh;

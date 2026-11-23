@@ -1271,6 +1271,11 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     // Instance quotas: add this replica's download transfer count to the
     // shared monthly counter, and keep the quota gauges current.
     let _transfer_quota_flusher = state.transfer_meter.spawn_flusher();
+    // #5191: read how full the storage volume is, for the disk thresholds.
+    let _disk_monitor = artifact_keeper_backend::services::quota::disk::spawn_monitor(
+        &state.config,
+        runtime_shutdown_token.clone(),
+    );
     if state.config.quotas.storage_quota_bytes > 0 || state.config.quotas.transfer_quota_bytes > 0 {
         tracing::info!(
             storage_quota_bytes = state.config.quotas.storage_quota_bytes,

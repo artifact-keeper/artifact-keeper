@@ -235,6 +235,11 @@ async fn copy_object_if_missing(
     if target.exists(key).await? {
         return Ok(());
     }
+    // A promotion that writes bytes is refused at the disk block threshold
+    // (#5191); one whose objects the target already holds is not.
+    if let Some(refusal) = crate::services::quota::disk::refusal(None) {
+        return Err(AppError::QuotaRefused(Box::new(refusal)));
+    }
     let copied = match body {
         Some(body) => target.put(key, body).await,
         None => match source.get_stream(key).await {

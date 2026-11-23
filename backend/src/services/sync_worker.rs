@@ -2521,6 +2521,10 @@ pub(crate) fn failure_scope_for_send_error(e: &reqwest::Error) -> FailureScope {
 /// the peer key is not an administrator's token (#5455): it then replicates
 /// as an ordinary writer. Counting them against the peer would back off
 /// every other delivery to it.
+///
+/// A `403 DISK_THRESHOLD_EXCEEDED` (#5191) stays a peer failure: the
+/// receiver's volume refuses every write until disk is freed, so the peer is
+/// backed off and the task retried, never failed as an item.
 pub(crate) fn failure_scope_for_peer_response(status: u16, body: &str) -> FailureScope {
     let body = body.to_ascii_lowercase();
     let item = match status {
@@ -6192,6 +6196,17 @@ mod tests {
                 r#"{"code":"STORAGE_QUOTA_EXCEEDED","message":"Storage quota reached: 1.0 GiB of 1.0 GiB used.","scope":"instance"}"#
             ),
             FailureScope::Item
+        );
+        // #5191: a receiver whose storage volume is at its disk block
+        // threshold refuses every write until disk is freed. That is the
+        // peer's condition, not this item's, and it clears on its own: back
+        // the peer off and keep the task for a retry, never fail the item.
+        assert_eq!(
+            failure_scope_for_peer_response(
+                403,
+                r#"{"code":"DISK_THRESHOLD_EXCEEDED","message":"server storage nearly full: free disk or add storage (the storage volume is 98.4% full, 98.4 GiB of 100.0 GiB; writes are refused from 98%). Downloads are not affected.","limit_bytes":105226698752,"used_bytes":105656795136,"threshold_percent":98,"used_percent":98.4}"#
+            ),
+            FailureScope::Peer
         );
         // A chunk still in progress is a transient 409.
         assert_eq!(
