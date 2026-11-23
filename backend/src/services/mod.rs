@@ -204,6 +204,7 @@ pub mod curation_service;
 pub mod curation_sync;
 pub mod health_monitor_service;
 pub mod lifecycle_service;
+pub mod log_throttle;
 pub mod metrics_service;
 pub mod scheduler_service;
 pub mod sync_worker;

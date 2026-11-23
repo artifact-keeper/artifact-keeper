@@ -61,3 +61,51 @@ sum by (backend, class) (rate(ak_proxy_cache_publish_failures_total[5m])) > 0
 
 Each failure is also logged at `warn` with the cache key and the error, so the
 counter tells you that writes are failing and the log tells you which and why.
+
+## Detached fills
+
+A cache fill can outlive the request that started it (#5220, #5509): a
+buffered fill runs on its own task from the start, and the rest of a streamed
+body whose client stopped reading is drained on its own task so the cache entry
+still commits. `PROXY_UPSTREAM_MAX_DETACHED_FILLS` (default 16, `0` keeps every
+fill in its request) caps how many run at once, buffered fills and drains
+together.
+
+| Metric | Type | Labels | Moves when |
+|---|---|---|---|
+| `ak_proxy_detached_fills_total` | counter | `kind`, `outcome` | a detached fill takes a permit (`started`), ends within its deadline (`finished`, cached or not), is dropped at its deadline (`abandoned`), or finds no permit free (`refused`) |
+| `ak_proxy_detached_fills_in_flight` | gauge | `kind` | detached fills running now |
+| `ak_proxy_detached_fills_limit` | gauge | | the `PROXY_UPSTREAM_MAX_DETACHED_FILLS` this process runs with |
+| `ak_proxy_fill_followers_inherited_total` | counter | | a request waiting on a buffered fill took that fill's fetch-deadline verdict instead of fetching again (see below) |
+
+`kind` is `buffered` or `stream_drain`. On `refused`:
+
+- a `buffered` fill runs in its request instead, so it is cancelled if the
+  client goes away and a retry starts from scratch;
+- a `stream_drain` is not started, so the body is dropped unfinished and the
+  object is not cached.
+
+A `refused` rate that does not drop to zero means the cap is too low for the
+traffic. The first refusal, and then at most one a minute, is also logged at
+`warn` with the number held back since the previous line; the rest are at
+`debug`. An abandoned drain is logged the same way.
+
+The deadline of a detached fill is `PROXY_UPSTREAM_FETCH_DEADLINE_SECS` plus a
+60-second commit allowance. For a buffered fill it counts from the start of the
+fill. For a drain it counts from the moment the client went away, not from the
+start of the download.
+
+**A request waiting on a fill takes the fill's fetch deadline (1.13.0).** When
+a buffered fill's upstream fetch hits `PROXY_UPSTREAM_FETCH_DEADLINE_SECS`,
+every request of this process that was already waiting on it answers with the
+same verdict: the stale copy under stale-if-error when there is one, else the
+`502`. Before, the first of them became the next leader and asked the same
+upstream again, so it answered after about twice the deadline. A request that
+arrives after the deadline fetches as usual. With
+`PROXY_SINGLEFLIGHT_ADVISORY_LOCKS_ENABLED`, a request waiting on another
+replica's fill still fetches once itself.
+
+```promql
+# The detached-fill cap is turning fills away.
+sum by (kind) (rate(ak_proxy_detached_fills_total{outcome="refused"}[5m])) > 0
+```

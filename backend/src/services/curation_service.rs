@@ -185,8 +185,9 @@ impl CurationService {
     ///   the npm downloads API and stays on the staging sync. A rule with no
     ///   lexical signal, or a `format` with no popularity ecosystem (or none
     ///   given), has no effect and evaluation continues.
-    ///   - A `Block` (only a homoglyph or mixed-script match under
-    ///     `block_typosquat`) decides as `"block"`.
+    ///   - A `Block` (only a homoglyph or mixed-script match on a name with a
+    ///     non-ASCII character under `block_typosquat`, or an all-ASCII one
+    ///     with `ascii_lookalikes: "block"` too, #5840) decides as `"block"`.
     ///   - Edit-distance and affix matches are only a `Flag` on downloads:
     ///     edit distance 2 from the short seed names reaches real packages
     ///     (npm `preact`, `vite`, `chai`, `vuex`; PyPI `numba`, `httpie`,

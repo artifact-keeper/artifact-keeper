@@ -400,6 +400,10 @@ where
         return Err(proxy_helpers::no_accessible_members_response());
     }
 
+    // #5620: whether a Remote member could not answer (an upstream `5xx`, a
+    // transport failure or timeout, an open circuit), as opposed to not having
+    // the package. When no member serves, "not found" is unknowable.
+    let mut unavailable = false;
     for member in &members {
         // Local/Staging members: serve from the local DB.
         if member.repo_type == RepositoryType::Local || member.repo_type == RepositoryType::Staging
@@ -444,21 +448,33 @@ where
                 let content = rewrite_remote_metadata_body(base_url, virtual_repo_key, &content);
                 return Ok(build_composer_proxy_response(content, content_type));
             }
-            Err(_e) => {
+            Err(e) => {
                 tracing::debug!(
                     member_key = %member.key,
                     path = %upstream_path,
                     "composer metadata proxy fetch missed for virtual member"
                 );
+                unavailable |= proxy_helpers::is_member_unavailable_response(&e);
             }
         }
     }
 
-    Err((
-        StatusCode::NOT_FOUND,
-        "Package not found in any member repository",
-    )
-        .into_response())
+    Err(composer_walk_miss(unavailable))
+}
+
+/// The answer of a virtual Composer metadata walk (`p2/` and v1 `p/`) no member
+/// served (#5620): the retryable 503 with `Retry-After` when a member could not
+/// answer, the 404 otherwise. A 404 tells Composer the package does not exist.
+fn composer_walk_miss(unavailable: bool) -> Response {
+    if unavailable {
+        proxy_helpers::member_unavailable_response()
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            "Package not found in any member repository",
+        )
+            .into_response()
+    }
 }
 
 /// Build a version entry JSON for a composer package.
@@ -2706,6 +2722,16 @@ mod tests {
         assert!(not_found, "v2 upstream miss must stay a 404, got {status}");
     }
     use super::*;
+
+    /// #5620: a virtual Composer metadata walk no member served answers the
+    /// retryable 503 when a member could not answer, and the 404 otherwise.
+    #[test]
+    fn test_composer_walk_miss_5620() {
+        let down = composer_walk_miss(true);
+        assert_eq!(down.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(down.headers().contains_key(axum::http::header::RETRY_AFTER));
+        assert_eq!(composer_walk_miss(false).status(), StatusCode::NOT_FOUND);
+    }
 
     // -----------------------------------------------------------------------
     // RepoInfo struct

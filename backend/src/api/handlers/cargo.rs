@@ -1084,7 +1084,11 @@ async fn fetch_index_upstream_overrides(
 ///
 /// Fail-closed, member-scoped: a fetch that fails, or a body this build cannot
 /// decode, yields `None` — the member contributes nothing rather than
-/// contributing lines whose age was never evaluated. That matches
+/// contributing lines whose age was never evaluated. A fetch that failed
+/// because the member could not answer (an upstream `5xx`, a transport
+/// failure, a timeout, an open circuit) also sets `*unavailable`, so a walk no
+/// member contributed to answers the retryable `503` rather than a `404`, as
+/// the ungated arm does (#5620). That matches
 /// `npm::remote_member_packument_value`, which returns the member as a miss for
 /// a body it cannot parse, and matches this loop's pre-existing treatment of a
 /// failed member fetch. An age-gate EVALUATION failure is the opposite case and
@@ -1099,16 +1103,17 @@ async fn gated_member_index_contribution(
     base_url: &str,
     index_path: &str,
     name_lower: &str,
+    unavailable: &mut bool,
 ) -> Result<Option<Bytes>, Response> {
     let Some(proxy) = state.proxy_service.as_ref() else {
         return Ok(None);
     };
-    let Ok(proxy_helpers::CachedBody {
+    let proxy_helpers::CachedBody {
         content,
         content_type: _,
         content_encoding,
         ..
-    }) = proxy_helpers::proxy_fetch_capped_encoded(
+    } = match proxy_helpers::proxy_fetch_capped_encoded(
         proxy,
         member.id,
         &member.key,
@@ -1117,8 +1122,12 @@ async fn gated_member_index_contribution(
         proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
     )
     .await
-    else {
-        return Ok(None);
+    {
+        Ok(body) => body,
+        Err(e) => {
+            *unavailable |= proxy_helpers::is_member_unavailable_response(&e);
+            return Ok(None);
+        }
     };
     let Ok(decoded) = decode_cargo_index_body(&content, content_encoding.as_deref()) else {
         tracing::warn!(
@@ -3311,6 +3320,7 @@ async fn try_virtual_index(
                         &base_url,
                         &index_path,
                         name_lower,
+                        &mut member_unavailable,
                     )
                     .await
                     {
@@ -9175,6 +9185,44 @@ mod age_gate_tests {
         assert!(
             text.contains("\"vers\":\"1.0.0\""),
             "a healthy member is unaffected by its neighbour's broken coding; got {text}"
+        );
+
+        rig.teardown().await;
+    }
+
+    /// #5620: an age-gated Remote member that cannot answer (its upstream
+    /// answers `503`) is an unavailable member, not a miss, exactly as an
+    /// ungated one is: a walk no member contributed to answers the retryable
+    /// `503` with `Retry-After`, not a `404` cargo reports as "not found".
+    /// A gated member that genuinely lacks the crate (`404`) is still a miss.
+    #[tokio::test]
+    async fn test_gated_virtual_member_outage_answers_503_5620() {
+        let name = "gated-outage";
+        let Some(mut rig) = VirtualRig::new(true).await else {
+            return;
+        };
+        let gated = rig.add_remote(1, true, true).await;
+        rig.mount_index(gated, name, ResponseTemplate::new(503))
+            .await;
+        let (status, _body, headers) = rig.get(rig.index_uri(name)).await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a gated member that could not answer must not read as a miss"
+        );
+        assert!(
+            headers.get("retry-after").is_some(),
+            "503 without Retry-After"
+        );
+
+        let missing = "gated-missing";
+        rig.mount_index(gated, missing, ResponseTemplate::new(404))
+            .await;
+        let (status, _, _) = rig.get(rig.index_uri(missing)).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "a gated member's 404 is a miss"
         );
 
         rig.teardown().await;

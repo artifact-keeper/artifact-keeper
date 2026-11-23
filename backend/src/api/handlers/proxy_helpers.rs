@@ -11249,10 +11249,12 @@ impl<'a> From<&'a RepoInfo> for CurationTarget<'a> {
 /// typo-squat, homoglyph and affix comparisons against the popular list,
 /// which need no network call. The download-count threshold and
 /// `publisher_trust` rules still run only on the staging sync. A `popularity`
-/// `Block` (a homoglyph or mixed-script match under `block_typosquat`)
-/// refuses the pull like a `block` rule. Edit-distance and affix matches only
-/// flag. A `Flag` serves the pull and logs it, because the proxy path has no
-/// review queue.
+/// `Block` (a homoglyph or mixed-script match on a name with a non-ASCII
+/// character, under `block_typosquat`) refuses the pull like a `block` rule.
+/// Edit-distance and affix matches only flag, and so does an all-ASCII
+/// confusable (`c1ick`) unless the rule sets `ascii_lookalikes: "block"`
+/// (#5840). A `Flag` serves the pull and logs it, because the proxy path has
+/// no review queue.
 #[allow(clippy::result_large_err)]
 pub async fn enforce_curation<'a>(
     db: &PgPool,
@@ -11311,6 +11313,14 @@ pub async fn evaluate_curation<'a>(
 /// so the pull is served and the flag is logged with the rule and reason.
 /// A `review` default stance with no matching rule serves silently, as it
 /// always has.
+///
+/// The flag line is logged at `warn` the first time a (repository, package,
+/// rule) is flagged within [`CURATION_FLAG_LOG_WINDOW`], and at `debug` after
+/// that (#5840): a flagged package is pulled again and again (on PyPI the
+/// index and then the file, on a Virtual once per member checked), and the
+/// repeats buried the first sighting of a new name. Every flag is counted in
+/// `ak_curation_proxy_flags_total{repository, rule_id}`, so the volume stays
+/// visible.
 fn curation_verdict(
     target: &CurationTarget<'_>,
     package: &str,
@@ -11323,20 +11333,52 @@ fn curation_verdict(
             unavailable: false,
         }),
         ("review", Some(rule_id)) => {
+            crate::services::metrics_service::record_curation_proxy_flag(target.key, rule_id);
             // `warn`, like the failed-evaluation line above: a flagged download is
-            // served, so deployments that log at warn must still see it.
-            tracing::warn!(
-                repo_id = %target.id,
-                repo_key = %target.key,
-                package = %package,
-                rule_id = %rule_id,
-                reason = %eval.reason,
-                "curation flagged a proxy download; serving it (no review queue on the proxy path)"
-            );
+            // served, so deployments that log at warn must still see it. Once per
+            // window per (repository, package, rule); repeats at `debug` (#5840).
+            if curation_flag_first_sighting(target.id, package, rule_id) {
+                tracing::warn!(
+                    repo_id = %target.id,
+                    repo_key = %target.key,
+                    package = %package,
+                    rule_id = %rule_id,
+                    reason = %eval.reason,
+                    repeat_log_window_secs = CURATION_FLAG_LOG_WINDOW.as_secs(),
+                    "curation flagged a proxy download; serving it (no review queue on the proxy path)"
+                );
+            } else {
+                tracing::debug!(
+                    repo_id = %target.id,
+                    repo_key = %target.key,
+                    package = %package,
+                    rule_id = %rule_id,
+                    reason = %eval.reason,
+                    "curation flagged a proxy download again; serving it"
+                );
+            }
             Ok(())
         }
         _ => Ok(()),
     }
+}
+
+/// How long a curation flag on a proxy download is logged at `warn` only once
+/// per (repository, package, rule) (#5840).
+pub(crate) const CURATION_FLAG_LOG_WINDOW: std::time::Duration =
+    std::time::Duration::from_secs(3600);
+
+/// Most (repository, package, rule) keys the flag-log dedup remembers.
+const CURATION_FLAG_LOG_MAX_KEYS: usize = 10_000;
+
+/// Whether this is the first flag of `package` by `rule_id` on `repo_id`
+/// within [`CURATION_FLAG_LOG_WINDOW`] in this process (#5840).
+fn curation_flag_first_sighting(repo_id: Uuid, package: &str, rule_id: Uuid) -> bool {
+    use crate::services::log_throttle::FirstSighting;
+    static SEEN: std::sync::OnceLock<FirstSighting<(Uuid, String, Uuid)>> =
+        std::sync::OnceLock::new();
+    SEEN.get_or_init(|| FirstSighting::new(CURATION_FLAG_LOG_WINDOW, CURATION_FLAG_LOG_MAX_KEYS))
+        .first((repo_id, package.to_owned(), rule_id))
 }
 
 /// Curation enforcement (#2930) for handlers whose repo struct does NOT carry
@@ -30485,6 +30527,177 @@ mod tests {
 
         assert!(flagged.is_ok(), "a Flag must serve the download");
         assert!(other_format.is_ok(), "popularity applies to npm/PyPI only");
+    }
+
+    /// #5840: an all-ASCII confusable (`c1ick` for `click`) is served and
+    /// flagged on a download, while a Unicode lookalike of the same name is
+    /// still refused. `ascii_lookalikes: "block"` restores the block.
+    #[tokio::test]
+    async fn test_curation_ascii_confusable_serves_and_unicode_still_blocks_5840() {
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let (user_id, repo_id, key) = seed_curated_repo(&pool, "remote", true, None).await;
+        let rule_id = insert_popularity_rule(
+            &pool,
+            repo_id,
+            user_id,
+            serde_json::json!({
+                "block_typosquat": true,
+                "download_name_checks": true,
+                "popular_packages": ["lodash"],
+            }),
+        )
+        .await;
+        let repo = repo_info_for(repo_id, &key, "remote", true);
+        let ascii = evaluate_curation(&pool, &repo, "1odash", None).await;
+        let unicode = evaluate_curation(&pool, &repo, LODASH_HOMOGLYPH, None).await;
+        sqlx::query("UPDATE curation_rules SET config = config || $2 WHERE id = $1")
+            .bind(rule_id)
+            .bind(serde_json::json!({"ascii_lookalikes": "block"}))
+            .execute(&pool)
+            .await
+            .expect("opt into ASCII blocks");
+        let strict = evaluate_curation(&pool, &repo, "1odash", None).await;
+        curation_cleanup(&pool, repo_id, user_id).await;
+
+        assert!(ascii.is_ok(), "an ASCII confusable is served: {ascii:?}");
+        let block = unicode.expect_err("a Unicode lookalike is still refused");
+        assert!(block.reason.contains("Unicode"), "{}", block.reason);
+        let block = strict.expect_err("ascii_lookalikes: block refuses the ASCII one");
+        assert!(block.reason.contains("ASCII lookalike"), "{}", block.reason);
+    }
+
+    /// #5840 upgrade safety: migration 421 stamps `ascii_lookalikes: "block"`
+    /// on every `popularity` rule that had `block_typosquat: true`, so such a
+    /// rule keeps refusing `paypa1` after the upgrade, while a rule written
+    /// after it (no key) flags it. Rules without `block_typosquat`, and rules
+    /// that already say "flag", are left alone, and a second run changes
+    /// nothing.
+    #[tokio::test]
+    async fn test_migration_421_keeps_existing_ascii_lookalike_blocks_5840() {
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let (user_id, repo_id, key) = seed_curated_repo(&pool, "remote", true, None).await;
+        let base =
+            serde_json::json!({"download_name_checks": true, "popular_packages": ["paypal"]});
+        let with = |extra: serde_json::Value| {
+            let mut c = base.clone();
+            c.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            c
+        };
+        let existing = insert_popularity_rule(
+            &pool,
+            repo_id,
+            user_id,
+            with(serde_json::json!({"block_typosquat": true})),
+        )
+        .await;
+        let said_flag = insert_popularity_rule(
+            &pool,
+            repo_id,
+            user_id,
+            with(serde_json::json!({"block_typosquat": true, "ascii_lookalikes": "flag"})),
+        )
+        .await;
+        let no_block = insert_popularity_rule(&pool, repo_id, user_id, base.clone()).await;
+        let repo = repo_info_for(repo_id, &key, "remote", true);
+        // Only the existing rule active: before the migration it flags (the
+        // 1.13 default), after it blocks as it did in 1.12.
+        let only = |id: uuid::Uuid| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query(
+                    "UPDATE curation_rules SET enabled = (id = $2) WHERE staging_repo_id = $1",
+                )
+                .bind(repo_id)
+                .bind(id)
+                .execute(&pool)
+                .await
+                .expect("select the active rule");
+            }
+        };
+        only(existing).await;
+        let before = evaluate_curation(&pool, &repo, "paypa1", None).await;
+
+        let migration =
+            include_str!("../../../migrations/421_curation_popularity_ascii_lookalikes_block.sql");
+        for _ in 0..2 {
+            let mut tx = pool.begin().await.expect("tx");
+            sqlx::raw_sql(migration)
+                .execute(&mut *tx)
+                .await
+                .expect("migration 421");
+            tx.commit().await.expect("commit");
+        }
+        let after = evaluate_curation(&pool, &repo, "paypa1", None).await;
+        let config_of = |id: uuid::Uuid| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, serde_json::Value>(
+                    "SELECT config FROM curation_rules WHERE id = $1",
+                )
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .expect("config")
+            }
+        };
+        let (c_existing, c_flag, c_none) = (
+            config_of(existing).await,
+            config_of(said_flag).await,
+            config_of(no_block).await,
+        );
+        only(said_flag).await;
+        let new_rule = evaluate_curation(&pool, &repo, "paypa1", None).await;
+        curation_cleanup(&pool, repo_id, user_id).await;
+
+        assert!(
+            before.is_ok(),
+            "without the stamp the 1.13 default flags: {before:?}"
+        );
+        let block = after.expect_err("the stamped existing rule still refuses paypa1");
+        assert!(block.reason.contains("ASCII lookalike"), "{}", block.reason);
+        assert_eq!(c_existing["ascii_lookalikes"], "block", "{c_existing}");
+        assert_eq!(
+            c_flag["ascii_lookalikes"], "flag",
+            "an explicit flag is kept: {c_flag}"
+        );
+        assert!(
+            c_none.get("ascii_lookalikes").is_none(),
+            "no block_typosquat, no stamp: {c_none}"
+        );
+        assert!(
+            new_rule.is_ok(),
+            "a rule that says flag serves paypa1: {new_rule:?}"
+        );
+    }
+
+    /// #5840: the flag line is a first sighting per (repository, package,
+    /// rule) within the window; the repeats are not.
+    #[test]
+    fn test_curation_flag_log_is_once_per_repository_package_and_rule_5840() {
+        let (repo, other_repo) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let (rule, other_rule) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        assert!(curation_flag_first_sighting(repo, "preact", rule));
+        for _ in 0..5 {
+            assert!(!curation_flag_first_sighting(repo, "preact", rule));
+        }
+        assert!(
+            curation_flag_first_sighting(repo, "vite", rule),
+            "another package"
+        );
+        assert!(
+            curation_flag_first_sighting(other_repo, "preact", rule),
+            "another repository"
+        );
+        assert!(
+            curation_flag_first_sighting(repo, "preact", other_rule),
+            "another rule"
+        );
     }
 
     fn proxy_eval(

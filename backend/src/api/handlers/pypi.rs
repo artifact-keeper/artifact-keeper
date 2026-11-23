@@ -6501,6 +6501,11 @@ async fn serve_legacy_json(
     let mut local_file_rank: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
     let mut remote_rank = usize::MAX;
+    // #5620: whether a Remote member could not answer (an upstream `5xx`, a
+    // transport failure or timeout, an open circuit), as opposed to not having
+    // the project. When no member describes it, "not found" is unknowable and
+    // the view answers the retryable 503, as `/simple/` does.
+    let mut remote_unavailable = false;
     for (rank, member) in members.iter().enumerate() {
         let member_info = proxy_helpers::repo_info_from_member(member);
         if enforce_pypi_curation(state, &member_info, normalized.as_str(), version)
@@ -6551,11 +6556,12 @@ async fn serve_legacy_json(
                         }
                         remote_doc = doc;
                     }
-                    Err(_) => {
+                    Err(e) => {
                         debug!(
                             member_key = %member.key,
                             "legacy JSON API miss for virtual member"
                         );
+                        remote_unavailable |= proxy_helpers::is_member_unavailable_response(&e);
                     }
                 }
             }
@@ -6581,10 +6587,17 @@ async fn serve_legacy_json(
         version,
     ) {
         Some(doc) => Ok(respond(doc)),
-        None => Err(
-            AppError::NotFound("Package not found in any member repository".to_string())
-                .into_response(),
-        ),
+        None => Err(legacy_json_walk_miss(remote_unavailable)),
+    }
+}
+
+/// The answer of a virtual legacy JSON API view no member described (#5620):
+/// the retryable 503 when a Remote member could not answer, the 404 otherwise.
+fn legacy_json_walk_miss(unavailable: bool) -> Response {
+    if unavailable {
+        proxy_helpers::member_unavailable_response()
+    } else {
+        AppError::NotFound("Package not found in any member repository".to_string()).into_response()
     }
 }
 
@@ -25763,6 +25776,16 @@ mod legacy_json_xmlrpc_route_tests {
         (status, json)
     }
 
+    /// The status and whether `Retry-After` is set.
+    async fn get_raw(app: Router, repo_key: &str, path: &str) -> (StatusCode, bool) {
+        let (status, _body, headers) =
+            tdh::send_with_headers(app, tdh::get(format!("/{repo_key}{path}"))).await;
+        (
+            status,
+            headers.contains_key(axum::http::header::RETRY_AFTER),
+        )
+    }
+
     fn pair(name: &str, version: &str) -> String {
         format!(
             "<value><array><data><value><string>{name}</string></value>\
@@ -26597,6 +26620,87 @@ mod legacy_json_xmlrpc_route_tests {
         assert!(
             !browsed.contains("ak-only-remote") && !browsed.contains("9.9.0"),
             "{browsed}"
+        );
+    }
+
+    /// #5620: the legacy JSON API view of a Virtual follows the #5504 rule.
+    /// Over a Remote member whose upstream misses (`404`) and one whose
+    /// upstream is down (`503`), the project and release forms answer the
+    /// retryable `503` with `Retry-After`, not a `404` (Poetry and pip report
+    /// that as "package not found"). Over [`404`, `403`] a permanent `4xx` is
+    /// a miss and the view stays `404`.
+    #[tokio::test]
+    async fn legacy_json_virtual_member_outage_answers_503_5620() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "pypi").await else {
+            return;
+        };
+        // One mock server (one outbound-policy guard per test, #5537); each
+        // member is its own path prefix.
+        let (upstream, _ssrf_allowlist) = tdh::non_loopback_mock_server().await;
+        let mut members = Vec::new();
+        for (priority, status) in [(1, 404u16), (2, 503u16), (3, 403u16)] {
+            Mock::given(method("GET"))
+                .and(path_regex(format!("^/m{status}/")))
+                .respond_with(ResponseTemplate::new(status))
+                .mount(&upstream)
+                .await;
+            let (id, _k, dir) = tdh::create_repo(&fx.pool, "remote", "pypi").await;
+            sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+                .bind(format!("{}/m{status}", upstream.uri()))
+                .bind(id)
+                .execute(&fx.pool)
+                .await
+                .expect("point remote member at wiremock");
+            tdh::grant_repo_access(&fx.pool, id, fx.user_id).await;
+            members.push((id, dir, priority, status));
+        }
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), &storage_path);
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), &storage_path, proxy);
+        let auth = tdh::make_auth(fx.user_id, &fx.username);
+        let app = || tdh::router_with_auth(super::router(), state.clone(), auth.clone());
+        let key = fx.repo_key.clone();
+
+        // [404, 503]
+        for (id, _, priority, status) in &members {
+            if *status != 403 {
+                tdh::link_virtual_member(&fx.pool, fx.repo_id, *id, *priority).await;
+            }
+        }
+        let project = get_raw(app(), &key, "/pypi/down-5620/json").await;
+        let release = get_raw(app(), &key, "/pypi/down-5620/1.0/json").await;
+        // [404, 403]
+        sqlx::query(
+            "DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1 AND member_repo_id = $2",
+        )
+        .bind(fx.repo_id)
+        .bind(members[1].0)
+        .execute(&fx.pool)
+        .await
+        .expect("unlink the down member");
+        tdh::link_virtual_member(&fx.pool, fx.repo_id, members[2].0, members[2].2).await;
+        let control = get_raw(app(), &key, "/pypi/down-5620/json").await;
+
+        for (id, dir, _, _) in &members {
+            tdh::cleanup_member_repo(&fx.pool, *id, dir).await;
+        }
+        fx.teardown().await;
+
+        for (form, (status, retry_after)) in [("project", project), ("release", release)] {
+            assert_eq!(
+                status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{form} form over [404, 503]"
+            );
+            assert!(retry_after, "{form} form: 503 without Retry-After");
+        }
+        assert_eq!(
+            control.0,
+            StatusCode::NOT_FOUND,
+            "[404, 403]: a permanent 4xx is a miss"
         );
     }
 

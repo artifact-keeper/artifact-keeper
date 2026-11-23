@@ -117,8 +117,22 @@ pub struct CreateRuleRequest {
     #[serde(default = "default_rule_type")]
     pub rule_type: String,
     /// Engine-specific parameters (JSON object). `{}` for `pattern` rules.
+    ///
+    /// `popularity` keys used on Remote and Virtual downloads (#5274, #5840):
+    /// `download_name_checks` (bool, default `false`) opts the rule into the
+    /// download-path name checks; `block_typosquat` (bool) refuses a
+    /// lookalike of a popular name; `ascii_lookalikes` (`"block"` or `"flag"`,
+    /// default `"flag"`; any other value is a 400) decides an all-ASCII
+    /// lookalike such as `paypa1` under `block_typosquat`. A lookalike with a
+    /// non-ASCII character is refused either way. On update, a config that
+    /// leaves out `ascii_lookalikes` keeps the rule's stored value.
     #[serde(default = "default_config")]
-    #[schema(value_type = Object)]
+    #[schema(value_type = Object, example = json!({
+        "download_name_checks": true,
+        "block_typosquat": true,
+        "ascii_lookalikes": "block",
+        "popular_packages": ["paypal", "click"]
+    }))]
     pub config: serde_json::Value,
     /// `repository` (default when `staging_repo_id` is set) or `global`.
     /// When present it must be consistent with `staging_repo_id`: `global`
@@ -161,8 +175,22 @@ pub struct UpdateRuleRequest {
     #[serde(default = "default_rule_type")]
     pub rule_type: String,
     /// Engine-specific parameters (JSON object). `{}` for `pattern` rules.
+    ///
+    /// `popularity` keys used on Remote and Virtual downloads (#5274, #5840):
+    /// `download_name_checks` (bool, default `false`) opts the rule into the
+    /// download-path name checks; `block_typosquat` (bool) refuses a
+    /// lookalike of a popular name; `ascii_lookalikes` (`"block"` or `"flag"`,
+    /// default `"flag"`; any other value is a 400) decides an all-ASCII
+    /// lookalike such as `paypa1` under `block_typosquat`. A lookalike with a
+    /// non-ASCII character is refused either way. On update, a config that
+    /// leaves out `ascii_lookalikes` keeps the rule's stored value.
     #[serde(default = "default_config")]
-    #[schema(value_type = Object)]
+    #[schema(value_type = Object, example = json!({
+        "download_name_checks": true,
+        "block_typosquat": true,
+        "ascii_lookalikes": "block",
+        "popular_packages": ["paypal", "click"]
+    }))]
     pub config: serde_json::Value,
 }
 
@@ -197,6 +225,19 @@ pub struct RuleResponse {
     /// is global or attached to a Remote or Virtual repository.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
+}
+
+/// Copy the stored `ascii_lookalikes` into an updated `popularity` config
+/// that leaves the key out (#5840). An explicit value in the update wins.
+fn keep_ascii_lookalikes(new: &mut serde_json::Value, stored: &serde_json::Value) {
+    use crate::services::curation::popularity::ASCII_LOOKALIKES_KEY;
+    let Some(stored_value) = stored.get(ASCII_LOOKALIKES_KEY) else {
+        return;
+    };
+    if let Some(obj) = new.as_object_mut() {
+        obj.entry(ASCII_LOOKALIKES_KEY)
+            .or_insert_with(|| stored_value.clone());
+    }
 }
 
 /// Where a curation rule applies, as far as the proxy-download warning is
@@ -350,6 +391,16 @@ fn validate_typed_rule_fields(
         crate::services::curation::publisher_trust::parse_config(config).map_err(|err| {
             AppError::Validation(format!("Invalid publisher_trust config: {err}"))
         })?;
+    }
+    // #5840: a typo of the value must not silently mean "flag".
+    if rule_type == "popularity"
+        && crate::services::curation::popularity::invalid_ascii_lookalikes(config)
+    {
+        return Err(AppError::Validation(format!(
+            "Invalid popularity config: \"{}\" must be one of {:?}",
+            crate::services::curation::popularity::ASCII_LOOKALIKES_KEY,
+            crate::services::curation::popularity::ASCII_LOOKALIKES_VALUES
+        )));
     }
     if let Some(scope) = declared_scope {
         if !crate::models::curation::CURATION_RULE_SCOPES.contains(&scope) {
@@ -652,6 +703,14 @@ async fn update_rule(
     auth.require_admin()?;
     validate_typed_rule_fields(&req.action, &req.rule_type, &req.config, None, None)?;
     let svc = CurationService::new(state.db.clone());
+    let mut req = req;
+    // #5840: an update that leaves `ascii_lookalikes` out keeps the stored
+    // value, so a rule migration 421 stamped "block" does not silently fall
+    // back to the "flag" default (fail closed on a partial config).
+    if req.rule_type == "popularity" {
+        let existing = svc.get_rule(id).await?;
+        keep_ascii_lookalikes(&mut req.config, &existing.config);
+    }
     let rule = svc
         .update_rule(
             id,
@@ -1719,6 +1778,56 @@ mod tests {
             matches!(err, AppError::Validation(ref m) if m.contains("mystery")),
             "unknown rule_type must be a Validation error: {err:?}"
         );
+    }
+
+    /// #5840: an update without `ascii_lookalikes` keeps the stored value (a
+    /// stamped "block" is not lost); an explicit value wins; a rule that never
+    /// had one stays without it.
+    #[test]
+    fn test_update_keeps_stored_ascii_lookalikes_5840() {
+        let stored = serde_json::json!({"block_typosquat": true, "ascii_lookalikes": "block"});
+        let mut partial =
+            serde_json::json!({"block_typosquat": true, "download_name_checks": true});
+        keep_ascii_lookalikes(&mut partial, &stored);
+        assert_eq!(partial["ascii_lookalikes"], "block", "{partial}");
+        assert_eq!(partial["download_name_checks"], true);
+
+        let mut explicit = serde_json::json!({"block_typosquat": true, "ascii_lookalikes": "flag"});
+        keep_ascii_lookalikes(&mut explicit, &stored);
+        assert_eq!(
+            explicit["ascii_lookalikes"], "flag",
+            "an explicit value wins"
+        );
+
+        let mut never = serde_json::json!({"block_typosquat": true});
+        keep_ascii_lookalikes(&mut never, &serde_json::json!({"block_typosquat": true}));
+        assert!(never.get("ascii_lookalikes").is_none(), "{never}");
+    }
+
+    /// #5840: `ascii_lookalikes` takes "block" or "flag"; anything else is a
+    /// 400, so a typo never silently means "flag".
+    #[test]
+    fn test_validate_typed_rule_fields_checks_ascii_lookalikes_5840() {
+        for ok in [
+            serde_json::json!({}),
+            serde_json::json!({"ascii_lookalikes": "block"}),
+            serde_json::json!({"ascii_lookalikes": "flag"}),
+        ] {
+            validate_typed_rule_fields("block", "popularity", &ok, None, None)
+                .unwrap_or_else(|e| panic!("{ok} must be accepted: {e:?}"));
+        }
+        for bad in [
+            serde_json::json!({"ascii_lookalikes": "Block"}),
+            serde_json::json!({"ascii_lookalikes": true}),
+            serde_json::json!({"ascii_lookalikes": null}),
+        ] {
+            let err =
+                validate_typed_rule_fields("block", "popularity", &bad, None, None).unwrap_err();
+            assert!(
+                matches!(err, AppError::Validation(ref m) if m.contains("ascii_lookalikes")),
+                "{bad} must be rejected: {err:?}"
+            );
+        }
     }
 
     #[test]
