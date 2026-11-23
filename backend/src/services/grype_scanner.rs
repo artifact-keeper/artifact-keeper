@@ -1820,8 +1820,9 @@ fn grype_artifact_purl(artifact: &GrypeArtifact) -> Option<String> {
 
 /// Reduce a Grype `licenses` array to a SPDX-safe joined expression.
 /// Mirrors the Trivy-side [`crate::services::scanner_service::sanitize_trivy_licenses`]
-/// pipeline: each input term passes through the SPDX whitelist so a hostile
-/// metadata field cannot smuggle a non-standard identifier into the SBOM.
+/// pipeline: conjunctive SPDX expressions are kept (#6379), while other
+/// terms pass through the SPDX whitelist so a hostile metadata field cannot
+/// smuggle a non-standard identifier into the SBOM.
 fn grype_artifact_license(artifact: &GrypeArtifact) -> Option<String> {
     let licenses = artifact.licenses.as_ref()?;
     let terms: Vec<String> = licenses

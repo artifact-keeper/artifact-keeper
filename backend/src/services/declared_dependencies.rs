@@ -340,13 +340,14 @@ pub fn helm_deps_from_chart(chart: &Value) -> Vec<DependencyInfo> {
 /// scanner-resolved exact versions that the declared manifest lacks. Declared
 /// rows then fill in dependencies the scanner did not enumerate.
 ///
-/// Two scanners can catalog the same component (#5629): the Trivy filesystem
-/// scan stores a license it cannot parse as a single SPDX id wrapped as
-/// `LicenseRef-<sanitised>` (#1152), while Grype stores the same text as
-/// found, e.g. `MIT AND PSF-2.0`. When the kept row's license is exactly the
-/// wrapped form of the colliding row's, the unwrapped text is kept, so the
-/// SBOM can emit it as an expression whichever row the query returned first.
-/// Licenses that differ in substance are never swapped.
+/// Two scanners can catalog the same component (#5629): a scanner can store
+/// free-form license text wrapped as `LicenseRef-<sanitised>` (#1152) while
+/// another stores the same text as found. Conjunctive SPDX expressions are
+/// now preserved by the sanitiser (#6379), so this rescue mostly covers
+/// free-form terms. When the kept row's license is exactly the wrapped form
+/// of the colliding row's, the unwrapped text is kept, so the SBOM can emit
+/// it as an expression whichever row the query returned first. Licenses
+/// that differ in substance are never swapped.
 pub fn merge_dependencies(
     scanner: Vec<DependencyInfo>,
     declared: Vec<DependencyInfo>,

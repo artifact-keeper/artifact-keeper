@@ -19,6 +19,12 @@
 //! audit purposes but prevents a downstream SPDX-aware policy engine
 //! from interpreting the string as a known permissive license.
 //!
+//! A term that is already a conjunctive SPDX expression is the one
+//! exception (#6379): [`crate::services::scanner_service::sanitize_trivy_licenses`]
+//! keeps it as an expression so the SBOM carries its real operands instead
+//! of an opaque `LicenseRef-` for the whole term. An `OR` offers a choice
+//! between arms, so it stays wrapped as before.
+//!
 //! The identifier list is a curated subset of the SPDX license registry
 //! (https://spdx.org/licenses/) covering the licenses commonly seen in
 //! OSS lockfiles. It is intentionally vendored rather than fetched at
@@ -543,6 +549,34 @@ pub fn is_compound_spdx_expression(input: &str) -> bool {
     parser.or_expr(0) && parser.pos == tokens.len()
 }
 
+/// A scanner license-list element that is already a conjunctive SPDX
+/// expression, kept as written instead of being wrapped as one opaque
+/// `LicenseRef-` by [`sanitize_license_term`] (#6379).
+///
+/// It qualifies when it is compound ([`is_compound_spdx_expression`]: `AND`
+/// or `WITH`), has no `OR` anywhere, and is within
+/// [`LICENSE_TERM_INPUT_CAP`]. Whitespace runs collapse to one space.
+///
+/// Every arm of a conjunction applies, so keeping it cannot let a policy
+/// pass the package on one arm: a policy approving MIT alone still fails
+/// `MIT AND PSF-2.0`. An `OR` offers a choice, so an element containing one
+/// stays wrapped (#1152), as do prose, lone identifiers, and oversized
+/// fields. The result joins with other terms under ` AND ` without extra
+/// parentheses: `AND` is associative and `WITH` binds tighter than it.
+pub fn conjunctive_spdx_expression(term: &str) -> Option<String> {
+    let trimmed = term.trim();
+    if trimmed.chars().count() > LICENSE_TERM_INPUT_CAP {
+        return None;
+    }
+    let tokens = tokenize_spdx_expression(trimmed)?;
+    if tokens.iter().any(|token| matches!(token, SpdxToken::Or))
+        || !is_compound_spdx_expression(trimmed)
+    {
+        return None;
+    }
+    Some(trimmed.split_whitespace().collect::<Vec<_>>().join(" "))
+}
+
 #[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod tests {
@@ -739,5 +773,40 @@ mod tests {
             .join(" AND ");
         assert!(long.len() > 255);
         assert!(is_compound_spdx_expression(&long));
+    }
+
+    #[test]
+    fn conjunctive_spdx_expression_keeps_only_conjunctions() {
+        for (input, want) in [
+            ("MIT AND PSF-2.0", Some("MIT AND PSF-2.0")),
+            (" MIT\tAND  PSF-2.0 ", Some("MIT AND PSF-2.0")),
+            ("(MIT AND ISC) AND Zlib", Some("(MIT AND ISC) AND Zlib")),
+            ("GPL-2.0+ AND MIT", Some("GPL-2.0+ AND MIT")),
+            (
+                "Apache-2.0 WITH LLVM-exception",
+                Some("Apache-2.0 WITH LLVM-exception"),
+            ),
+            ("LicenseRef-Foo AND MIT", Some("LicenseRef-Foo AND MIT")),
+            ("MIT OR Apache-2.0", None),
+            ("MIT AND (ISC OR Zlib)", None),
+            ("MIT", None),
+            ("(MIT)", None),
+            ("GPL v2 and MIT", None),
+            ("MIT/Apache-2.0 AND ISC", None),
+            ("", None),
+        ] {
+            assert_eq!(
+                conjunctive_spdx_expression(input).as_deref(),
+                want,
+                "{input:?}"
+            );
+        }
+
+        let at_cap = format!("MIT{}", " AND MIT".repeat((LICENSE_TERM_INPUT_CAP - 3) / 8));
+        assert!(at_cap.chars().count() <= LICENSE_TERM_INPUT_CAP);
+        assert!(conjunctive_spdx_expression(&at_cap).is_some());
+        let over_cap = format!("{at_cap} AND ISC");
+        assert!(over_cap.chars().count() > LICENSE_TERM_INPUT_CAP);
+        assert_eq!(conjunctive_spdx_expression(&over_cap), None);
     }
 }

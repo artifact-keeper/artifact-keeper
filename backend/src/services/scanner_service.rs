@@ -4870,15 +4870,19 @@ pub(crate) fn validate_trivy_purl(raw: &str) -> Option<String> {
 /// between them, so inferring ` OR ` would let a package carrying GPL or a
 /// proprietary `LicenseRef-` pass any policy that approves its other arm once
 /// the value is exported as an evaluable CycloneDX `expression` (#3866).
-/// Known SPDX identifiers (case-insensitive)
-/// pass through in their canonical case; unknown terms and single-element
-/// pre-joined expressions like `"MIT OR Apache-2.0"` are wrapped as
-/// `LicenseRef-<sanitised>` so a downstream policy engine cannot silently
-/// classify them as permissive. (#1152)
+/// Known SPDX identifiers (case-insensitive) pass through in their canonical
+/// case. An element that is already a conjunctive SPDX expression (`AND` /
+/// `WITH`, no `OR`, such as `MIT AND PSF-2.0`) is kept as written, so
+/// `["MIT AND PSF-2.0", "ISC"]` is stored as `MIT AND PSF-2.0 AND ISC`
+/// instead of an expression with an opaque `LicenseRef-` operand (#6379).
+/// Every arm of a conjunction applies, so this cannot green-light a package
+/// on one arm; an element with `OR` stays wrapped (#1152). Everything else,
+/// including prose, is wrapped as `LicenseRef-<sanitised>` too.
 pub(crate) fn sanitize_trivy_licenses(raw: &[String]) -> Option<String> {
+    use crate::services::spdx_licenses::{conjunctive_spdx_expression, sanitize_license_term};
     let terms: Vec<String> = raw
         .iter()
-        .filter_map(|s| crate::services::spdx_licenses::sanitize_license_term(s))
+        .filter_map(|s| conjunctive_spdx_expression(s).or_else(|| sanitize_license_term(s)))
         .collect();
     if terms.is_empty() {
         None
@@ -4939,14 +4943,13 @@ pub(crate) fn convert_trivy_packages(
                         .as_ref()
                         .and_then(|id| id.purl.as_deref())
                         .and_then(validate_trivy_purl),
-                    // #1152: validate each license element against the SPDX
-                    // identifier list before joining with " AND " (#3866:
-                    // every detected license applies, so the join is a
-                    // conjunction, never an inferred choice);
-                    // hostile elements (unknown terms, smuggled pre-joined
-                    // expressions) are wrapped as LicenseRef-... so a
-                    // permissive-license policy check cannot green-light
-                    // them.
+                    // #1152: validate each license element before joining
+                    // with " AND " (#3866: every detected license applies,
+                    // so the join is a conjunction, never an inferred
+                    // choice). Conjunctive SPDX expressions are kept as
+                    // written (#6379); prose, choices and unknown terms are
+                    // wrapped as LicenseRef-... so a permissive-license
+                    // policy check cannot green-light them.
                     license: pkg.licenses.as_deref().and_then(sanitize_trivy_licenses),
                     source_target: if result.target.is_empty() {
                         None
@@ -28372,8 +28375,7 @@ tonic-build = "0.12"
                         ]),
                         identifier: None,
                     },
-                    // Case 2: smuggled SPDX expression as a single element.
-                    // Must not pass through as a permissive expression.
+                    // Case 2: a choice as a single element stays wrapped.
                     TrivyPackage {
                         name: "smuggled-expression".to_string(),
                         version: "1.0.0".to_string(),
@@ -28386,6 +28388,14 @@ tonic-build = "0.12"
                         name: "lowercase-canonical".to_string(),
                         version: "1.0.0".to_string(),
                         licenses: Some(vec!["apache-2.0".to_string()]),
+                        identifier: None,
+                    },
+                    // Case 4: a choice joined with another term stays
+                    // wrapped, even though #6379 keeps conjunctions.
+                    TrivyPackage {
+                        name: "joined-choice".to_string(),
+                        version: "1.0.0".to_string(),
+                        licenses: Some(vec!["MIT OR Apache-2.0".to_string(), "ISC".to_string()]),
                         identifier: None,
                     },
                 ]),
@@ -28411,19 +28421,15 @@ tonic-build = "0.12"
             mixed
         );
 
-        // Case 2: the single smuggled element becomes a LicenseRef, not
-        // a plain SPDX OR expression. A policy permitting MIT alone
-        // would otherwise green-light this package.
+        // Case 2: a choice is still a LicenseRef, not a plain OR expression
+        // a policy permitting MIT alone could green-light.
         let smuggled = by_name("smuggled-expression").license.clone().unwrap();
         assert!(
             smuggled.starts_with("LicenseRef-"),
-            "single-element smuggled expression must be neutered into LicenseRef; got {}",
+            "single-element choice must stay wrapped; got {}",
             smuggled
         );
-        assert!(
-            smuggled != "MIT OR Apache-2.0",
-            "must not collapse to a permissive OR expression"
-        );
+        assert_ne!(smuggled, "MIT OR Apache-2.0");
 
         // Case 3: lowercase input promotes to canonical SPDX casing.
         assert_eq!(
@@ -28431,6 +28437,70 @@ tonic-build = "0.12"
             Some("Apache-2.0"),
             "canonical-case promotion must happen at conversion time"
         );
+
+        // Case 4: #6379 does not change the #1152 protection for a choice.
+        assert_eq!(
+            by_name("joined-choice").license.as_deref(),
+            Some("LicenseRef-MIT-OR-Apache-2.0 AND ISC")
+        );
+    }
+
+    /// #6379: a conjunctive Trivy term must survive the array join, or
+    /// CycloneDX receives an expression with an opaque `LicenseRef-`
+    /// operand even when the other scanner saw every term. Parentheses,
+    /// `+`, `WITH`, whitespace and elements longer than the 64-character
+    /// LicenseRef body survive too. A choice with `OR` stays wrapped
+    /// (#1152), alone or joined, and so does prose.
+    #[test]
+    fn test_sanitize_trivy_licenses_keeps_conjunctive_expressions() {
+        let long = "Apache-2.0 AND BSD-3-Clause AND MIT AND ISC AND Zlib AND BSL-1.0 AND 0BSD";
+        assert!(long.len() > 64);
+        let long_want = format!("{long} AND MIT");
+        for (raw, expected) in [
+            (vec!["MIT AND PSF-2.0", "ISC"], "MIT AND PSF-2.0 AND ISC"),
+            (vec!["ISC", "MIT AND PSF-2.0"], "ISC AND MIT AND PSF-2.0"),
+            (vec!["MIT AND PSF-2.0"], "MIT AND PSF-2.0"),
+            (
+                vec!["(MIT AND PSF-2.0)", "ISC"],
+                "(MIT AND PSF-2.0) AND ISC",
+            ),
+            (vec!["GPL-2.0+ AND MIT", "ISC"], "GPL-2.0+ AND MIT AND ISC"),
+            (
+                vec!["Apache-2.0 WITH LLVM-exception", "MIT"],
+                "Apache-2.0 WITH LLVM-exception AND MIT",
+            ),
+            (
+                vec!["  MIT   AND\tPSF-2.0 ", "ISC"],
+                "MIT AND PSF-2.0 AND ISC",
+            ),
+            (vec![long, "MIT"], long_want.as_str()),
+            // #1152 unchanged: a choice is never kept as an expression.
+            (
+                vec!["MIT OR Apache-2.0", "ISC"],
+                "LicenseRef-MIT-OR-Apache-2.0 AND ISC",
+            ),
+            (
+                vec!["(MIT AND ISC) OR GPL-3.0-only"],
+                "LicenseRef-MIT-AND-ISC-OR-GPL-3.0-only",
+            ),
+            // Prose with operator words is not an expression.
+            (
+                vec!["GPL v2 and MIT", "ISC"],
+                "LicenseRef-GPL-v2-and-MIT AND ISC",
+            ),
+        ] {
+            let raw: Vec<String> = raw.into_iter().map(str::to_string).collect();
+            assert_eq!(
+                sanitize_trivy_licenses(&raw).as_deref(),
+                Some(expected),
+                "{raw:?}"
+            );
+        }
+
+        // Oversized elements are still wrapped and capped.
+        let huge = vec![format!("MIT{}", " AND MIT".repeat(64))];
+        let out = sanitize_trivy_licenses(&huge).unwrap();
+        assert!(out.starts_with("LicenseRef-") && out.len() <= 75, "{out}");
     }
 
     // -----------------------------------------------------------------------
