@@ -1403,6 +1403,22 @@ pub struct Config {
     /// [`Config::database_request_slots`]). `0` turns the gate off.
     pub database_request_concurrency: Option<usize>,
 
+    /// Share of the admission slots (percent) that only requests presenting
+    /// a credential (`Authorization`, `X-API-Key`, the session cookie, a
+    /// `/t/<token>/` path) may take while the pool is busy (#6344), so an
+    /// anonymous flood cannot shed authenticated clients. Env var:
+    /// `DATABASE_REQUEST_CREDENTIALED_RESERVE_PERCENT`. Default 25; `0`
+    /// turns the reserve off.
+    pub database_request_credentialed_reserve_percent: u8,
+
+    /// Share of the admission slots (percent) one client (best-effort client
+    /// IP) may hold or wait for while another client is waiting (#6344);
+    /// past it the client's next request is shed at once. A client alone on
+    /// a busy pool is not limited. Env var:
+    /// `DATABASE_REQUEST_CLIENT_SHARE_PERCENT`. Default 25; `0` turns the
+    /// share off.
+    pub database_request_client_share_percent: u8,
+
     /// Maximum number of bcrypt-bound auth operations (login,
     /// password verification, API-token verification) allowed to run
     /// concurrently across the process. Acts as a fast-fail load shed:
@@ -2019,6 +2035,8 @@ redacted_debug!(Config {
     show database_request_acquire_wait_ms,
     show database_probe_connections,
     show database_request_concurrency,
+    show database_request_credentialed_reserve_percent,
+    show database_request_client_share_percent,
     show database_idle_timeout_secs,
     show database_max_lifetime_secs,
     show database_tcp_keepalives,
@@ -2195,6 +2213,8 @@ impl Default for Config {
             database_request_acquire_wait_ms: None,
             database_probe_connections: 1,
             database_request_concurrency: None,
+            database_request_credentialed_reserve_percent: 25,
+            database_request_client_share_percent: 25,
             database_idle_timeout_secs: 600,
             database_max_lifetime_secs: 1800,
             database_tcp_keepalives: true,
@@ -2628,6 +2648,16 @@ impl Config {
             database_request_concurrency: env::var("DATABASE_REQUEST_CONCURRENCY")
                 .ok()
                 .and_then(|v| v.trim().parse().ok()),
+            database_request_credentialed_reserve_percent: env_parse::<u8>(
+                "DATABASE_REQUEST_CREDENTIALED_RESERVE_PERCENT",
+                25,
+            )
+            .min(100),
+            database_request_client_share_percent: env_parse::<u8>(
+                "DATABASE_REQUEST_CLIENT_SHARE_PERCENT",
+                25,
+            )
+            .min(100),
             database_idle_timeout_secs: env_parse("DATABASE_IDLE_TIMEOUT_SECS", 600),
             database_max_lifetime_secs: env_parse("DATABASE_MAX_LIFETIME_SECS", 1800),
             database_tcp_keepalives: !matches!(

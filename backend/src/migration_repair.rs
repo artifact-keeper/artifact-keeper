@@ -897,7 +897,9 @@ async fn migrate_locked(
     // session already holds it.
     let unlocked = sqlx::migrate::Migrator {
         migrations: std::borrow::Cow::Owned(migrator.migrations.to_vec()),
-        ignore_missing: migrator.ignore_missing,
+        // MIGRATIONS_IGNORE_MISSING (#5920), decided under the lock.
+        ignore_missing: migrator.ignore_missing
+            || crate::migration_compat::ignore_missing_for(conn, migrator).await?,
         locking: false,
         no_tx: migrator.no_tx,
         table_name: migrator.table_name.clone(),

@@ -19,7 +19,8 @@
 # Env: OUT_DIR (default ./perf-results), DATABASE_MAX_CONNECTIONS (8),
 #      DB_DELAY_MS (2; 0 = no netem), BACKEND_CPUS (4), INSTALLERS (24),
 #      PARALLEL (50), FILES (200), RETRIES (5), CLIENT_TIMEOUT (30 s per
-#      attempt), PORT (18182), EXTRA_ENV
+#      attempt), PORT (18182), AUTH_CLIENTS (0: authenticated clients next
+#      to the anonymous fleet, #6344), EXTRA_ENV
 #      (space-separated KEY=VALUE pairs passed to the backend).
 # Each run writes $OUT_DIR/<label>.json; a summary table is printed at the end.
 # Removes its containers and network on exit.
@@ -76,7 +77,8 @@ for spec in "$@"; do
   fi
   python3 "$HERE/db-pool-burst.py" --base-url "http://127.0.0.1:${PORT}" \
     --files "${FILES:-200}" --installers "${INSTALLERS:-24}" --parallel "${PARALLEL:-50}" \
-    --retries "${RETRIES:-5}" --timeout "${CLIENT_TIMEOUT:-30}" --label "$label" --out "${OUT_DIR}/${label}.json" >/dev/null
+    --retries "${RETRIES:-5}" --timeout "${CLIENT_TIMEOUT:-30}" --label "$label" --out "${OUT_DIR}/${label}.json" \
+    --auth-clients "${AUTH_CLIENTS:-0}" --admin-user admin --admin-pass "$ADMIN_PASS" >/dev/null
   docker logs "$BE" 2>&1 | grep -E "WARN|ERROR" | tail -n 400 >"${OUT_DIR}/${label}.backend.log" || true
   echo ">> ${label}: ${OUT_DIR}/${label}.json" >&2
 done
@@ -92,9 +94,12 @@ for spec in sys.argv[2:]:
     rows.append((label, i["ok"], i["failed"], i["wall_s"], a["total"], a["error_rate"],
                  a["all"]["p50_ms"], a["all"]["p99_ms"], a["ok_2xx"]["p99_ms"],
                  a["shed_503"]["p50_ms"], a["shed_503"]["p99_ms"],
-                 json.dumps(a["status_mix"]), json.dumps(z["status_mix"]), z["latency"]["max_ms"]))
+                 json.dumps(a["status_mix"]), json.dumps(z["status_mix"]), z["latency"]["max_ms"],
+                 r["authenticated"]["requests"], r["authenticated"]["first_attempt_ok_rate"],
+                 r["authenticated"]["latency"]["p99_ms"], json.dumps(r["authenticated"]["status_mix"])))
 hdr = ("run", "inst_ok", "inst_fail", "wall_s", "attempts", "err_rate", "p50_ms", "p99_ms",
-       "2xx_p99_ms", "503_p50_ms", "503_p99_ms", "status_mix", "readyz_mix", "readyz_max_ms")
+       "2xx_p99_ms", "503_p50_ms", "503_p99_ms", "status_mix", "readyz_mix", "readyz_max_ms",
+       "auth_reqs", "auth_first_ok", "auth_p99_ms", "auth_mix")
 print("| " + " | ".join(hdr) + " |")
 print("|" + "---|" * len(hdr))
 for row in rows:

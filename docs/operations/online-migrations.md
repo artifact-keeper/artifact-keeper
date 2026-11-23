@@ -327,6 +327,97 @@ migrations across two releases. If the change is a pure widening of a
 update and none of this is needed
 (`211_packages_version_oci_tag_length.sql`).
 
+## Rolling deploys: expand, then contract
+
+With more than one replica, a rolling update (Kubernetes `RollingUpdate`,
+blue/green, N+1) runs the old and new release against the same database for
+the length of the rollout. The first new pod applies the new migrations, so
+**the previous release serves on the new schema** until the rollout ends.
+
+A migration is safe for that window only if it **expands** the schema: new
+tables, new columns that are nullable or have a default, new indexes, looser
+constraints, new enum values. A statement that removes or tightens something
+the previous release may still read or write is a **contract**:
+
+- `DROP TABLE`, `DROP VIEW`, `DROP TYPE`, `DROP COLUMN`;
+- `RENAME` of a table, column or enum value;
+- `SET NOT NULL`, or `ADD COLUMN ... NOT NULL` without a `DEFAULT`;
+- `ALTER COLUMN ... TYPE`;
+- a new `CHECK`, `UNIQUE`, `PRIMARY KEY`, `EXCLUDE` or `FOREIGN KEY`
+  constraint (`NOT VALID` only skips the existing rows; new writes are
+  checked), or a `CREATE UNIQUE INDEX` on an existing table.
+
+Ship every such change in two releases. Release N expands: it adds the new
+object and moves the code off the old one. Release N+1 or later contracts, in
+a migration named `NNN_contract_of_MMM_<what>.sql`, where MMM is the expand
+migration it completes:
+
+```sql
+-- backend/migrations/436_contract_of_431_drop_legacy_path.sql
+-- 431 moved every reader to artifacts.path.
+ALTER TABLE artifacts DROP COLUMN legacy_path;
+```
+
+`migration_safety::migrations_are_expand_only_unless_named_as_contracts`
+fails CI for a migration from 418 on that contracts without that name, and
+for a contract whose MMM is not an earlier migration. The scanner reads every
+`ALTER TABLE` action in its long and short forms (`DROP c`, `ALTER c TYPE`,
+`ADD c int NOT NULL`, `ALTER c DROP DEFAULT`, ...), every `DROP` of a table,
+view, type, domain, function, procedure, sequence, schema or trigger, and the
+renames of other objects. `DROP INDEX` and `ALTER TABLE ... DROP CONSTRAINT`
+count as contracts too, because the previous release's `ON CONFLICT` may name
+the index or constraint. A migration whose drops were reviewed says so in its
+leading comments, with the reason:
+
+```sql
+-- migration-safety: index-only, artifacts_old_name_idx is a plain index; no ON CONFLICT names it
+DROP INDEX CONCURRENTLY IF EXISTS artifacts_old_name_idx;
+```
+
+Other reviewed false positives go in `CONTRACT_ALLOWLIST` with the reason.
+Migrations 1-417 are frozen history: the set of files is pinned
+(`FROZEN_HISTORY`), so no new file can be slotted into a numbering gap, and
+the ones that contract are listed in `HISTORICAL_CONTRACTS` with what they
+contract. Number every new migration above the newest one. Reviewers check
+that MMM shipped in an earlier release.
+
+### An old pod restarting mid-rollout
+
+If a pod of the previous release restarts during the rollout (OOM, node
+drain, crash), it finds migrations in `_sqlx_migrations` that it doesn't
+embed, and by default fails with `VersionMissing` until the rollout finishes.
+Set `MIGRATIONS_IGNORE_MISSING=true` on deployments that roll. Under the
+migration lock, the pod reads each newer migration's recorded description
+(sqlx records the file name, so a contract reads `contract of MMM ...`):
+
+- a newer expand is ignored;
+- a newer contract of an expand the pod itself embeds is ignored too: the
+  pod is the expand release or later, so it no longer uses what the contract
+  removes;
+- a newer contract of an expand the pod does not embed, or one whose expand
+  can't be read, makes the pod refuse to start, naming the migration.
+
+In every allowed case the pod applies its own pending migrations as usual
+and logs a WARN naming the newer ones. The setting is read by 1.13 and
+later; a binary older than 1.13 ignores it.
+
+**Which upgrades can roll:**
+
+- An upgrade whose new migrations are all expands can roll. With
+  `MIGRATIONS_IGNORE_MISSING=true` the old pods keep working, restarts
+  included.
+- An upgrade that contains a contract can roll only when every old pod runs a
+  release that already has the contract's expand MMM, for example N to N+1
+  when N shipped the expand. Those pods restart cleanly.
+- An upgrade from a release older than the expand cannot roll: its pods would
+  refuse to start, by design. Upgrade in two steps (to the expand release
+  first, then to the contract release), or use a stop-the-world deploy (scale
+  to zero, upgrade, scale up).
+
+The release notes call out every contract migration and its expand. Rolling
+back across a contract to a release older than its expand still fails, as it
+must; see `docs/operations/rollback.md`.
+
 ## Before you merge
 
 - [ ] The migration touches `artifacts`, `download_statistics`, `audit_log`,

@@ -21,6 +21,12 @@ Reported, per run, as JSON on stdout (and to --out):
     the fleet wall time;
   * readyz: status mix and latency of the probes taken during the burst.
 
+With --auth-clients N, N authenticated clients (a Bearer token from logging
+in as --admin-user) fetch the same files one at a time for as long as the
+anonymous fleet runs, the shape of a CI job or a developer next to an
+anonymous flood (#6344). Their attempts are reported separately under
+"authenticated", with the share answered 2xx on the first attempt.
+
 Seed the repository first with --seed (needs admin credentials), then run the
 burst. Example, against a backend on :8080:
 
@@ -65,7 +71,8 @@ class Answer:
     seconds: float
 
 
-async def http_get(host: str, port: int, path: str, timeout: float) -> Answer:
+async def http_get(host: str, port: int, path: str, timeout: float,
+                   auth: str | None = None) -> Answer:
     started = time.monotonic()
     writer = None
     try:
@@ -75,7 +82,8 @@ async def http_get(host: str, port: int, path: str, timeout: float) -> Answer:
         request = (
             f"GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\n"
             "User-Agent: ak-perf-db-pool-burst\r\nAccept: */*\r\n"
-            "Connection: close\r\n\r\n"
+            + (f"Authorization: {auth}\r\n" if auth else "")
+            + "Connection: close\r\n\r\n"
         )
         writer.write(request.encode())
         await writer.drain()
@@ -160,12 +168,20 @@ class Stats:
     installs_failed: int = 0
     files_failed: int = 0
     readyz: list[Answer] = field(default_factory=list)
+    auth_attempts: list[Answer] = field(default_factory=list)
+    auth_first: list[Answer] = field(default_factory=list)
+    auth_failed: int = 0
 
 
-async def fetch_with_retries(host, port, path, args, stats: Stats) -> bool:
+async def fetch_with_retries(host, port, path, args, stats: Stats, auth: str | None = None) -> bool:
     for attempt in range(args.retries + 1):
-        answer = await http_get(host, port, path, args.timeout)
-        stats.attempts.append(answer)
+        answer = await http_get(host, port, path, args.timeout, auth)
+        if auth:
+            stats.auth_attempts.append(answer)
+            if attempt == 0:
+                stats.auth_first.append(answer)
+        else:
+            stats.attempts.append(answer)
         if 200 <= answer.status < 300:
             return True
         if answer.status in (404, 401, 403):
@@ -204,6 +220,28 @@ async def installer(host, port, args, stats: Stats) -> None:
         stats.installs_ok += 1
 
 
+async def auth_client(host, port, args, stats: Stats, auth: str, done: asyncio.Event) -> None:
+    """One authenticated client fetching files one at a time until the fleet ends."""
+    i = random.randrange(args.files)
+    while not done.is_set():
+        path = f"/api/v1/repositories/{args.repo}/download/{file_path(i % args.files)}"
+        if not await fetch_with_retries(host, port, path, args, stats, auth):
+            stats.auth_failed += 1
+        i += 1
+
+
+def login(args: argparse.Namespace) -> str:
+    body = json.dumps({"username": args.admin_user, "password": args.admin_pass}).encode()
+    req = urllib.request.Request(args.base_url + "/api/v1/auth/login", data=body, method="POST")
+    req.add_header("Content-Type", "application/json")
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        data = json.load(resp)
+    token = data.get("access_token") or data.get("token")
+    if not token:
+        sys.exit("login answered no access token")
+    return f"Bearer {token}"
+
+
 async def readyz_poller(host, port, args, stats: Stats, done: asyncio.Event) -> None:
     while not done.is_set():
         stats.readyz.append(await http_get(host, port, "/readyz", 10.0))
@@ -239,11 +277,17 @@ async def burst(args: argparse.Namespace) -> dict:
     stats = Stats()
     done = asyncio.Event()
     poller = asyncio.create_task(readyz_poller(host, port, args, stats, done))
+    auth = login(args) if args.auth_clients else None
+    clients = [
+        asyncio.create_task(auth_client(host, port, args, stats, auth, done))
+        for _ in range(args.auth_clients)
+    ]
     started = time.monotonic()
     await asyncio.gather(*(installer(host, port, args, stats) for _ in range(args.installers)))
     wall = time.monotonic() - started
     done.set()
     await poller
+    await asyncio.gather(*clients)
 
     mix = Counter(str(a.status) if a.status else "timeout/conn" for a in stats.attempts)
     total = len(stats.attempts)
@@ -276,6 +320,20 @@ async def burst(args: argparse.Namespace) -> dict:
             "status_mix": dict(sorted(ready_mix.items())),
             "latency": latency(stats.readyz),
         },
+        "authenticated": authenticated_report(stats, args.auth_clients),
+    }
+
+
+def authenticated_report(stats: Stats, clients: int) -> dict:
+    mix = Counter(str(a.status) if a.status else "timeout/conn" for a in stats.auth_attempts)
+    first_ok = sum(1 for a in stats.auth_first if 200 <= a.status < 300)
+    return {
+        "clients": clients,
+        "requests": len(stats.auth_first),
+        "first_attempt_ok_rate": round(first_ok / len(stats.auth_first), 4) if stats.auth_first else None,
+        "gave_up": stats.auth_failed,
+        "status_mix": dict(sorted(mix.items())),
+        "latency": latency(stats.auth_attempts),
     }
 
 
@@ -293,6 +351,8 @@ def main() -> None:
     p.add_argument("--retries", type=int, default=5)
     p.add_argument("--timeout", type=float, default=30.0, help="client timeout per attempt (s)")
     p.add_argument("--readyz-interval", type=float, default=0.5)
+    p.add_argument("--auth-clients", type=int, default=0,
+                   help="authenticated clients fetching alongside the fleet (#6344); needs --admin-pass")
     p.add_argument("--label", default="run")
     p.add_argument("--out")
     args = p.parse_args()
@@ -302,6 +362,8 @@ def main() -> None:
             sys.exit("--seed needs --admin-pass")
         seed(args)
         return
+    if args.auth_clients and not args.admin_pass:
+        sys.exit("--auth-clients needs --admin-pass")
     report = asyncio.run(burst(args))
     text = json.dumps(report, indent=2)
     print(text)
