@@ -204,6 +204,13 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     let db_pool = db::create_pool(&config).await?;
     tracing::info!("Connected to database");
 
+    // #5941: the read retry replays only once a write statement has been
+    // seen through this process's real subscriber; otherwise it stays off.
+    if artifact_keeper_backend::api::middleware::db_read_retry::enabled_from_env() {
+        artifact_keeper_backend::api::middleware::db_read_retry::prove_write_detection(&db_pool)
+            .await;
+    }
+
     // Reconcile stale/diverged `_sqlx_migrations` ledgers BEFORE the
     // SKIP_MIGRATIONS gate. These repairs each no-op on fresh and healthy
     // databases, so running them unconditionally is safe -- and it is

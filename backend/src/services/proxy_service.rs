@@ -10433,6 +10433,9 @@ impl ProxyService {
         repo_id: Uuid,
         etag: &str,
     ) -> Result<Option<UpstreamResponse>> {
+        // #5941: a request that reached the upstream (a cache fill) is never
+        // replayed after a lost database connection.
+        crate::api::middleware::db_read_retry::note_write();
         let upstream_auth = self
             .upstream_client
             .upstream_auth_for(
@@ -12431,6 +12434,9 @@ impl ProxyService {
         repo_id: Uuid,
         max: usize,
     ) -> Result<UpstreamResponse> {
+        // #5941: a request that reached the upstream (a cache fill) is never
+        // replayed after a lost database connection.
+        crate::api::middleware::db_read_retry::note_write();
         self.fetch_from_upstream_with_accept(url, repo_id, None, max)
             .await
     }
@@ -12449,6 +12455,9 @@ impl ProxyService {
         accept: Option<&str>,
         max: usize,
     ) -> Result<UpstreamResponse> {
+        // #5941: a request that reached the upstream (a cache fill) is never
+        // replayed after a lost database connection.
+        crate::api::middleware::db_read_retry::note_write();
         self.fetch_from_upstream_negotiated(url, repo_id, accept, None, max)
             .await
     }
@@ -12468,6 +12477,9 @@ impl ProxyService {
         accept_encoding: Option<&str>,
         max: usize,
     ) -> Result<UpstreamResponse> {
+        // #5941: a request that reached the upstream (a cache fill) is never
+        // replayed after a lost database connection.
+        crate::api::middleware::db_read_retry::note_write();
         let mut resp = self
             .upstream_client
             .fetch_buffered_coded(
@@ -12550,6 +12562,9 @@ impl ProxyService {
         url: &str,
         repo_id: Uuid,
     ) -> Result<UpstreamStream> {
+        // #5941: a request that reached the upstream (a cache fill) is never
+        // replayed after a lost database connection.
+        crate::api::middleware::db_read_retry::note_write();
         self.upstream_client.fetch_stream(url, repo_id).await
     }
 

@@ -3,6 +3,7 @@
 pub mod auth;
 pub mod client_ip;
 pub mod db_admission;
+pub mod db_read_retry;
 pub mod demo;
 pub mod download_telemetry;
 pub mod guest_access;

@@ -685,8 +685,12 @@ pub fn init_tracing(otel_endpoint: Option<&str>, service_name: &str) -> Option<O
             Some(guard)
         }
         None => {
+            // The root filter is wrapped so the read-retry layer can see what
+            // a request wrote (#5941); what is logged is unchanged.
             tracing_subscriber::registry()
-                .with(rust_log_filter())
+                .with(crate::api::middleware::db_read_retry::observe_writes(
+                    rust_log_filter(),
+                ))
                 .with(build_fmt_layer(log_format, log_ansi))
                 .init();
             None
@@ -764,8 +768,12 @@ fn subscriber_filters(
 
 /// The stdout layer of the OTLP-path subscriber, under its global filter.
 type FmtLayer = Box<
-    dyn Layer<tracing_subscriber::layer::Layered<EnvFilter, tracing_subscriber::Registry>>
-        + Send
+    dyn Layer<
+            tracing_subscriber::layer::Layered<
+                crate::api::middleware::db_read_retry::WriteObserver<EnvFilter>,
+                tracing_subscriber::Registry,
+            >,
+        > + Send
         + Sync,
 >;
 
@@ -785,7 +793,11 @@ fn otel_path_subscriber(
         exported_logs,
     } = filters;
     tracing_subscriber::registry()
-        .with(global)
+        // Wrapped so the read-retry layer can see what a request wrote
+        // (#5941); what is logged and exported is unchanged.
+        .with(crate::api::middleware::db_read_retry::observe_writes(
+            global,
+        ))
         .with(fmt_layer.with_filter(stdout))
         .with(layer_or_identity(
             log_layer.map(|layer| layer.with_filter(exported_logs)),
@@ -797,6 +809,14 @@ fn otel_path_subscriber(
         .with(layer_or_identity(
             db_tracer.map(db_spans::DbQuerySpanLayer::new),
         ))
+        // With per-layer filters, `tracing::enabled!` follows them: keep
+        // sqlx's statement events enabled inside a read-retry scope so the
+        // write observer sees them whatever RUST_LOG says (#5941).
+        .with(
+            crate::api::middleware::db_read_retry::statement_interest_layer(
+                crate::api::middleware::db_read_retry::enabled_from_env(),
+            ),
+        )
 }
 
 /// `layer`, or a layer that does nothing.
@@ -1302,6 +1322,41 @@ mod tests {
             tracing::debug!(target: "other_crate", "dropped at debug");
         });
         (capture.text(), exported)
+    }
+
+    /// #5941: on the production OTLP-path subscriber at `RUST_LOG=info`, in
+    /// every DB_QUERY_SPANS mode, a write statement inside a read-retry scope
+    /// is seen by the write observer, a read is not, and the statement does
+    /// not reach stdout.
+    #[tokio::test]
+    async fn the_otlp_subscriber_lets_the_read_retry_see_writes_at_rust_log_info() {
+        use crate::api::middleware::db_read_retry::tests::sqlx_like_statement_marks_write;
+        for mode in [
+            db_spans::DbQuerySpans::Log,
+            db_spans::DbQuerySpans::All,
+            db_spans::DbQuerySpans::Off,
+        ] {
+            let capture = Capture::default();
+            let exported = crate::testing::otel::ExportedSpans::default();
+            let subscriber = otel_path_subscriber(
+                subscriber_filters(|| EnvFilter::new("info"), mode),
+                build_fmt_layer_with_writer(LogFormat::Json, false, capture.clone()),
+                None,
+                exported.tracer(),
+                mode.enabled().then(|| exported.tracer()),
+            );
+            let _g = tracing::subscriber::set_default(subscriber);
+            assert!(sqlx_like_statement_marks_write("BEGIN").await, "{mode:?}");
+            assert!(
+                !sqlx_like_statement_marks_write("SELECT 1").await,
+                "{mode:?}"
+            );
+            assert!(
+                !capture.text().contains("BEGIN"),
+                "{mode:?}: {}",
+                capture.text()
+            );
+        }
     }
 
     const DEFAULT_FILTER_WITH_OTHER_AT_INFO: &str =
