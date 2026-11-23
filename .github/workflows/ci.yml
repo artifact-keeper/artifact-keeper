@@ -1164,7 +1164,12 @@ jobs:
           for sock in /var/run/docker.sock /run/docker.sock; do
             [ -e "$sock" ] && { rm -f "$sock" 2>/dev/null || sudo rm -f "$sock"; }
           done
-          rm -rf "$HOME/.docker" 2>/dev/null || sudo rm -rf "$HOME/.docker"
+          # ~/.docker is a volume mount on the pool, so empty it rather than
+          # remove it.
+          if [ -d "$HOME/.docker" ]; then
+            find "$HOME/.docker" -mindepth 1 -delete 2>/dev/null \
+              || sudo find "$HOME/.docker" -mindepth 1 -delete
+          fi
           unset DOCKER_HOST
           echo "DOCKER_HOST=unix:///nonexistent/docker.sock" >> "$GITHUB_ENV"
           if [ -e /var/run/docker.sock ] || [ -e /run/docker.sock ] || [ -e "$HOME/.docker/config.json" ]; then
