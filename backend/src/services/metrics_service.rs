@@ -728,6 +728,33 @@ pub fn record_scan_inventory_success(scan_type: &str) {
     .increment(1);
 }
 
+/// `ak_health_monitor_up{service}`: 1 when the health monitor's last check of
+/// `service` was healthy, else 0 (#5651). One series per checked dependency
+/// (database, storage, scanner-adapter, ...), so an alert can fire on a
+/// component going down without polling the health log.
+pub fn record_health_monitor_status(service: &str, healthy: bool) {
+    metrics::describe_gauge!(
+        "ak_health_monitor_up",
+        "1 when the health monitor's last check of the service was healthy, else 0."
+    );
+    gauge!("ak_health_monitor_up", "service" => service.to_string()).set(if healthy {
+        1.0
+    } else {
+        0.0
+    });
+}
+
+/// `ak_health_monitor_postgres_restarts_total`: Postgres restarts the health
+/// monitor detected (#5651). A restart is usually over before the next check,
+/// so the up gauge alone would not show it.
+pub fn record_health_monitor_postgres_restart() {
+    metrics::describe_counter!(
+        "ak_health_monitor_postgres_restarts_total",
+        "Postgres restarts detected by the health monitor (pg_postmaster_start_time after the last check)."
+    );
+    counter!("ak_health_monitor_postgres_restarts_total").increment(1);
+}
+
 /// Record a webhook delivery event.
 pub fn record_webhook_delivery(event: &str, success: bool) {
     let status = if success { "success" } else { "failure" };

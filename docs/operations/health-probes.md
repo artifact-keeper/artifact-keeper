@@ -47,6 +47,10 @@ healthchecks keep working on 1.12.0 too.
 That is the definition of "can serve artifacts": downloads, uploads and
 repository metadata need the database and nothing else from this list.
 
+Both are one query, bounded to 1 second and run alongside the dependency
+probes below, so with the database down `/readyz` answers `503` in about a
+second, inside a 5 second probe timeout (#5651).
+
 Initial setup (the default admin password not yet changed) is reported as
 `checks.setup_complete` but never makes `/readyz` fail, so an operator can
 finish setup through `kubectl exec` without the pod being restarted (#889).
@@ -176,3 +180,44 @@ appears under `failing` as `database` or `migrations`.
 Keep in mind that every replica shares the same OpenSearch cluster: with
 `READYZ_REQUIRE_SEARCH=true`, an OpenSearch outage takes every replica out of
 rotation, including for artifact downloads that would have worked.
+
+## Health monitor
+
+Besides the probes, one replica (whichever holds the `health_monitor`
+scheduler lease) checks the dependencies every 60 seconds and records each
+result in the health log and the alert state that
+`GET /api/v1/admin/monitoring/health-log` and `GET /api/v1/admin/monitoring/alerts`
+return (`POST /api/v1/admin/monitoring/check` runs a check at once). It
+records:
+
+| Service name | Checked when | Probe |
+|---|---|---|
+| `database` | always | one query; also compares `pg_postmaster_start_time()` with the last database check, so a Postgres restart between two checks is recorded as an `unavailable` row stamped with the restart time, followed by the recovery |
+| `storage` | always | the `/health` storage check (a HEAD for object stores, a small write for the filesystem), shared with its 5 s cache and 2 s bound |
+| `scanner-adapter` | `TRIVY_ADAPTER_URL` is set | `GET /probe/healthy` |
+| `scanner-adapter-worker` | `SCAN_WORKER_TRIVY_ADAPTER_URL` is set to a different adapter | `GET /probe/healthy` |
+| `trivy` | `TRIVY_URL` is set | `GET /healthz` |
+| `opensearch` | `OPENSEARCH_URL` is set | `GET /_cluster/health` |
+| `openscap` | `OPENSCAP_URL` is set | `GET /health` |
+| `dependency-track` | `DEPENDENCY_TRACK_ENABLED=true` and a URL is set | `GET /api/version` |
+
+The probes run at the same time, each bounded (5 s for HTTP, 2 s for
+storage), so a check costs the slowest probe, not the sum.
+
+For alerting, every recorded check also sets the gauge
+`ak_health_monitor_up{service}` (1 healthy, 0 not), and each detected
+Postgres restart increments `ak_health_monitor_postgres_restarts_total`.
+Both are per process, and only the replica that runs a check (the
+`health_monitor` lease holder, or the one serving a manual check) updates
+them. A replica that held the lease earlier keeps its last values and one
+that never held it exports neither, so alert on the restart counter's
+`sum(increase(...))` across replicas, and on the up gauge of the current
+lease holder only. A
+restart is usually over before the next check, so alert on the counter's
+`increase()` rather than on the gauge. A restart is recorded once, even when
+the scheduled check and `POST /api/v1/admin/monitoring/check` see it
+together, and it stamps the database's `last_alert_sent_at` at once instead
+of waiting for three consecutive failures. A failover to a standby that has
+been up longer than the last check is not detected as a restart. The monitor cannot
+write while the database is down, so an outage that ends without a Postgres
+restart (a network partition, say) leaves no row in the health log.

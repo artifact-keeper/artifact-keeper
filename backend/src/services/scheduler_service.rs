@@ -337,7 +337,7 @@ pub(crate) async fn run_storage_gc_tick_follow_on(
 pub fn spawn_all(
     db: PgPool,
     config: Config,
-    _primary_storage: Arc<dyn crate::storage::StorageBackend>,
+    primary_storage: Arc<dyn crate::storage::StorageBackend>,
     storage_registry: Arc<crate::storage::StorageRegistry>,
     smtp_service: Option<Arc<SmtpService>>,
     event_bus: Arc<EventBus>,
@@ -516,6 +516,7 @@ pub fn spawn_all(
     {
         let db = db.clone();
         let config_clone = config.clone();
+        let storage = primary_storage.clone();
         tokio::spawn(async move {
             tokio::time::sleep(jittered_startup_delay(15)).await;
             let monitor = HealthMonitorService::new(db.clone(), MonitorConfig::default());
@@ -534,7 +535,10 @@ pub fn spawn_all(
                     tracing::debug!("Another replica owns the health monitor lease; skipping");
                     continue;
                 };
-                match monitor.check_all_services(&config_clone).await {
+                match monitor
+                    .check_all_services(&config_clone, Some(&storage))
+                    .await
+                {
                     Ok(results) => {
                         for entry in &results {
                             if entry.status != "healthy" {
