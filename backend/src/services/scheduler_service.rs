@@ -1407,6 +1407,10 @@ pub fn spawn_all(
     }
 
     // Password expiry notifications (configurable interval, default: hourly)
+    //
+    // Named in the one "Background schedulers started" line below; it used
+    // to log its own copy of that line as well (#5656).
+    let password_expiry: &str;
     if config.password_expiry_days > 0 {
         if let Some(smtp) = smtp_service {
             let db = db.clone();
@@ -1439,18 +1443,12 @@ pub fn spawn_all(
                     }
                 }
             });
-            tracing::info!(
-                "Background schedulers started: metrics, health monitor, lifecycle, stuck-scan janitor, backup schedules, sync policies, webhook retries, curation sync, upload cleanup, password expiry notifications"
-            );
+            password_expiry = ", password expiry notifications";
         } else {
-            tracing::info!(
-                "Background schedulers started: metrics, health monitor, lifecycle, stuck-scan janitor, backup schedules, sync policies, webhook retries, curation sync, upload cleanup (password expiry notifications skipped: SMTP not configured)"
-            );
+            password_expiry = " (password expiry notifications skipped: SMTP not configured)";
         }
     } else {
-        tracing::info!(
-            "Background schedulers started: metrics, health monitor, lifecycle, stuck-scan janitor, backup schedules, sync policies, webhook retries, curation sync, upload cleanup"
-        );
+        password_expiry = "";
     }
     // Download-ticket cleanup (every 10 minutes).
     //
@@ -1576,7 +1574,7 @@ pub fn spawn_all(
     }
 
     tracing::info!(
-        "Background schedulers started: metrics, health monitor, lifecycle, stuck-scan janitor, backup schedules, sync policies, webhook retries, curation sync, upload cleanup, download ticket cleanup, age-gate auto-approval, environment advisory re-evaluation, audit retention"
+        "Background schedulers started: metrics, health monitor, lifecycle, stuck-scan janitor, backup schedules, sync policies, webhook retries, curation sync, upload cleanup, download ticket cleanup, age-gate auto-approval, environment advisory re-evaluation, audit retention{password_expiry}"
     );
 }
 

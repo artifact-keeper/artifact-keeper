@@ -85,6 +85,23 @@ pub fn init_metrics() -> PrometheusHandle {
     handle
 }
 
+/// Publish `ak_build_info{version, git} 1` (#5656): the running build, for
+/// dashboards that join it onto other series and for spotting a mixed-version
+/// rollout. Called at startup, after the recorder is installed. It carries
+/// `# HELP` text, like every family that is described.
+pub fn publish_build_info() {
+    metrics::describe_gauge!(
+        "ak_build_info",
+        "Always 1. The labels name the running build: version and git commit."
+    );
+    gauge!(
+        "ak_build_info",
+        "version" => crate::build_info::VERSION,
+        "git" => crate::build_info::short_sha()
+    )
+    .set(1.0);
+}
+
 /// The recorder [`init_metrics`] installs: the Prometheus recorder alone, or a
 /// fan-out of it and `otel`.
 pub(crate) fn build_global_recorder(
@@ -1452,6 +1469,24 @@ mod tests {
     fn test_record_scan_inventory_failure_does_not_panic() {
         record_scan_inventory_failure("trivy");
         record_scan_inventory_failure("openscap");
+    }
+
+    #[test]
+    fn build_info_is_exported_with_help_text_5656() {
+        let recorder = prometheus_builder().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, publish_build_info);
+        let text = handle.render();
+        assert!(text.contains("# HELP ak_build_info "), "{text}");
+        let line = text
+            .lines()
+            .find(|l| l.starts_with("ak_build_info{"))
+            .unwrap_or_else(|| panic!("no ak_build_info sample: {text}"));
+        assert!(
+            line.contains(&format!("version=\"{}\"", crate::build_info::VERSION)),
+            "{line}"
+        );
+        assert!(line.ends_with(" 1"), "{line}");
     }
 
     #[test]

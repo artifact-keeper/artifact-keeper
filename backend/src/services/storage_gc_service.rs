@@ -1430,13 +1430,8 @@ impl StorageGcService {
 
         match self.run_gc(false).await {
             Ok(result) => {
+                // run_gc logs the pass's summary line (#5656).
                 if result.storage_keys_deleted > 0 {
-                    tracing::info!(
-                        "Storage GC: deleted {} keys, removed {} artifacts, freed {} bytes",
-                        result.storage_keys_deleted,
-                        result.artifacts_removed,
-                        result.bytes_freed
-                    );
                     crate::services::metrics_service::record_cleanup(
                         "storage_gc",
                         result.artifacts_removed as u64,
@@ -1505,6 +1500,7 @@ impl StorageGcService {
         repo_scope: Option<Uuid>,
         dry_run: bool,
     ) -> Result<StorageGcResult> {
+        let gc_started = std::time::Instant::now();
         let mut result = empty_gc_result(dry_run);
         let mut meter = GcBudgetMeter::new(self.run_budget);
 
@@ -1625,9 +1621,19 @@ impl StorageGcService {
             result.errors.push(msg);
         }
 
-        if result.storage_keys_deleted > 0 {
+        // One summary line per live (not dry-run) pass, also when it found
+        // nothing: a scheduled pass used to log only "Running scheduled
+        // storage garbage collection", which did not say whether it finished
+        // or what it did (#5656). Dry runs answer their caller instead.
+        if !dry_run {
             tracing::info!(
-                "Storage GC: deleted {} keys, removed {} artifacts, freed {} bytes",
+                storage_keys_deleted = result.storage_keys_deleted,
+                artifacts_removed = result.artifacts_removed,
+                bytes_freed = result.bytes_freed,
+                errors = result.errors.len(),
+                budget_exhausted = result.budget_exhausted.as_deref().unwrap_or(""),
+                elapsed_ms = u64::try_from(gc_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                "Storage GC complete: deleted {} keys, removed {} artifacts, freed {} bytes",
                 result.storage_keys_deleted,
                 result.artifacts_removed,
                 result.bytes_freed

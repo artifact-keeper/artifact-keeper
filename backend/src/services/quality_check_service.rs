@@ -8,7 +8,7 @@ use futures::stream::BoxStream;
 use sqlx::PgPool;
 use std::sync::{Arc, OnceLock};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 /// Hard ceiling on the artifact size we will stage for quality-gate
@@ -155,6 +155,18 @@ pub struct UpdateQualityGateInput {
     pub accepted_grade_status: Option<AcceptedGradeStatus>,
 }
 
+/// Repository formats whose uploads carry no package manifest, so there is
+/// no description, license, author or documentation link for the metadata
+/// completeness check to find (#5656). Scoring them graded every generic
+/// file F. They are not scored on metadata; their health score is built from
+/// the other components.
+const FORMATS_WITHOUT_PACKAGE_METADATA: &[&str] = &["generic"];
+
+/// Whether the metadata completeness check applies to `format` (#5656).
+fn format_carries_package_metadata(format: &str) -> bool {
+    !FORMATS_WITHOUT_PACKAGE_METADATA.contains(&format)
+}
+
 const WEIGHT_SECURITY: i32 = 40;
 const WEIGHT_LICENSE: i32 = 20;
 const WEIGHT_QUALITY: i32 = 25;
@@ -238,55 +250,63 @@ impl QualityCheckService {
                     ))
                 })?;
 
-        // PF-006 (#2522): bound total in-flight quality checks across ALL
-        // trigger paths before doing any heavy work. Everything from here on
-        // stages the full artifact body (heap or mmap spill) and runs the
-        // checkers; upload finalization fire-and-forgets one detached
-        // `tokio::spawn` per artifact, so a publish burst could otherwise start
-        // an unbounded number of these at once with no shared resource budget.
-        // The permit is held for the rest of the method, so peak concurrent
-        // checks are capped at `max_concurrent_quality_checks()`. A legitimate
-        // check is only serialized under load, never shed. Mirrors the
-        // scanner's #2540 extraction-permit bound. Acquired after the cheap
-        // metadata lookups so a queued check holds no storage handle while it
-        // waits.
-        let _qc_permit = acquire_quality_check_permit().await;
+        // 4. Run MetadataCompletenessChecker, where the format carries
+        //    package metadata to score (#5656). It reads only the name,
+        //    version and extracted metadata, never the content.
+        if format_carries_package_metadata(&format) {
+            let meta_checker = MetadataCompletenessChecker;
+            let meta_output = meta_checker.check(
+                &artifact.name,
+                artifact.version.as_deref(),
+                metadata.as_ref().map(|m| &m.metadata),
+            );
 
-        // 4. Fetch artifact content from storage
-        let content = self.fetch_artifact_content(&artifact).await?;
+            // DEBUG, not INFO: this ran on every upload (#5656).
+            debug!(
+                artifact_id = %artifact_id,
+                check_type = meta_checker.check_type(),
+                score = meta_output.score,
+                passed = meta_output.passed,
+                issues = meta_output.issues.len(),
+                "Quality check completed"
+            );
 
-        // 5. Run MetadataCompletenessChecker
-        let meta_checker = MetadataCompletenessChecker;
-        let meta_output = meta_checker.check(
-            &artifact.name,
-            artifact.version.as_deref(),
-            metadata.as_ref().map(|m| &m.metadata),
-        );
+            self.persist_check_result(
+                artifact_id,
+                artifact.repository_id,
+                meta_checker.check_type(),
+                "1.0.0",
+                &meta_output,
+            )
+            .await?;
+        }
 
-        info!(
-            artifact_id = %artifact_id,
-            check_type = meta_checker.check_type(),
-            score = meta_output.score,
-            passed = meta_output.passed,
-            issues = meta_output.issues.len(),
-            "Quality check completed"
-        );
-
-        self.persist_check_result(
-            artifact_id,
-            artifact.repository_id,
-            meta_checker.check_type(),
-            "1.0.0",
-            &meta_output,
-        )
-        .await?;
-
-        // 6. If format is "helm", run HelmLintChecker
+        // 5. If format is "helm", run HelmLintChecker, the one checker that
+        //    reads the artifact's content. Every other format skips the
+        //    storage read (#5656): it used to stage the whole object, up to
+        //    MAX_QUALITY_INPUT_BYTES, on every upload and then drop it.
         if format == "helm" {
+            // PF-006 (#2522): bound total in-flight quality checks across ALL
+            // trigger paths before doing any heavy work. Everything from here
+            // on stages the full artifact body (heap or mmap spill) and runs
+            // the checker; upload finalization fire-and-forgets one detached
+            // `tokio::spawn` per artifact, so a publish burst could otherwise
+            // start an unbounded number of these at once with no shared
+            // resource budget. The permit is held to the end of the checker,
+            // so peak concurrent content checks are capped at
+            // `max_concurrent_quality_checks()`. A legitimate check is only
+            // serialized under load, never shed. Mirrors the scanner's #2540
+            // extraction-permit bound. Acquired after the cheap metadata
+            // lookups so a queued check holds no storage handle while it
+            // waits.
+            let _qc_permit = acquire_quality_check_permit().await;
+
+            let content = self.fetch_artifact_content(&artifact).await?;
             let helm_checker = HelmLintChecker;
             let helm_output = helm_checker.check(&content);
+            drop(content);
 
-            info!(
+            debug!(
                 artifact_id = %artifact_id,
                 check_type = helm_checker.check_type(),
                 score = helm_output.score,
@@ -305,7 +325,7 @@ impl QualityCheckService {
             .await?;
         }
 
-        // 7. Recalculate artifact health
+        // 6. Recalculate artifact health
         self.recalculate_artifact_health(artifact_id).await?;
 
         Ok(())
@@ -429,10 +449,22 @@ impl QualityCheckService {
                 check_type, score, passed, critical_count, high_count, medium_count, low_count
             FROM quality_check_results
             WHERE artifact_id = $1 AND status = 'completed'
+              -- #5656: a metadata score recorded before the check stopped
+              -- running for formats without package metadata no longer
+              -- counts.
+              AND NOT (
+                  check_type = 'metadata_completeness'
+                  AND EXISTS (
+                      SELECT 1 FROM artifacts a
+                      JOIN repositories r ON r.id = a.repository_id
+                      WHERE a.id = $1 AND r.format::text = ANY($2)
+                  )
+              )
             ORDER BY check_type, created_at DESC
             "#,
         )
         .bind(artifact_id)
+        .bind(FORMATS_WITHOUT_PACKAGE_METADATA)
         .fetch_all(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -480,8 +512,10 @@ impl QualityCheckService {
             metadata: metadata_score,
         };
 
+        // None: unrated (no component has a score); stored as NULL score and
+        // grade (#5656).
         let health_score = compute_weighted_health_score(&component_scores);
-        let health_grade = Grade::from_score(health_score).as_char().to_string();
+        let health_grade = health_score.map(|score| Grade::from_score(score).as_char().to_string());
 
         // 5. Total issues = sum of all check critical+high+medium+low counts
         let mut total_issues: i32 = 0;
@@ -536,10 +570,10 @@ impl QualityCheckService {
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
-        info!(
+        debug!(
             artifact_id = %artifact_id,
-            health_score = health_score,
-            health_grade = %health_grade,
+            health_score = ?health_score,
+            health_grade = ?health_grade,
             "Artifact health score recalculated"
         );
 
@@ -681,13 +715,22 @@ impl QualityCheckService {
         // 3. Check each gate condition, collecting violations
         let mut violations: Vec<QualityGateViolation> = Vec::new();
 
-        check_min_score(
-            &mut violations,
-            "min_health_score",
-            "Health",
-            gate.min_health_score,
-            health.health_score,
-        );
+        // An unrated artifact (no component scored, #5656) does not meet a
+        // health minimum: the gate fails it as it did when it scored F.
+        match health.health_score {
+            Some(score) => check_min_score(
+                &mut violations,
+                "min_health_score",
+                "Health",
+                gate.min_health_score,
+                score,
+            ),
+            None => {
+                if let Some(min) = gate.min_health_score {
+                    violations.push(unrated_health_violation(min));
+                }
+            }
+        }
         check_min_score(
             &mut violations,
             "min_security_score",
@@ -1485,6 +1528,22 @@ fn check_min_score(
     }
 }
 
+/// The `min_health_score` violation for an unrated artifact (#5656): nothing
+/// was scored, so the minimum is not met.
+fn unrated_health_violation(min: i32) -> QualityGateViolation {
+    QualityGateViolation {
+        rule: "min_health_score".to_string(),
+        expected: format!(">= {min}"),
+        actual: "unrated".to_string(),
+        // Same "below minimum N" wording as a scored miss, for clients that
+        // match on it.
+        message: format!(
+            "Health is unrated (no security, license, quality or metadata score), \
+             below minimum {min}"
+        ),
+    }
+}
+
 /// Push a violation if `actual` exceeds `threshold`.
 fn check_max_issues(
     violations: &mut Vec<QualityGateViolation>,
@@ -1509,8 +1568,11 @@ fn check_max_issues(
 ///
 /// Weights: security=40, license=20, quality=25, metadata=15.
 /// Components with no data (None) are excluded and the denominator is reduced
-/// accordingly. If all components are None, returns 100 (no data = healthy).
-pub(crate) fn compute_weighted_health_score(scores: &ComponentScores) -> i32 {
+/// accordingly. If all components are None the artifact is **unrated**
+/// (`None`): there is nothing to grade (#5656). It used to score 100 (A),
+/// which, once generic artifacts stopped being scored on metadata, would have
+/// let every unscanned generic file through a `min_health_score` gate.
+pub(crate) fn compute_weighted_health_score(scores: &ComponentScores) -> Option<i32> {
     let components: [(Option<i32>, i32); 4] = [
         (scores.security, WEIGHT_SECURITY),
         (scores.license, WEIGHT_LICENSE),
@@ -1527,10 +1589,10 @@ pub(crate) fn compute_weighted_health_score(scores: &ComponentScores) -> i32 {
             });
 
     if weight_sum == 0 {
-        return 100;
+        return None;
     }
 
-    weighted_sum / weight_sum
+    Some(weighted_sum / weight_sum)
 }
 
 #[cfg(ak_test_shard = "services-1")]
@@ -1756,13 +1818,20 @@ mod tests {
         health: &ArtifactHealthScore,
         gate: &QualityGate,
     ) {
-        check_min_score(
-            violations,
-            "min_health_score",
-            "Health",
-            gate.min_health_score,
-            health.health_score,
-        );
+        match health.health_score {
+            Some(score) => check_min_score(
+                violations,
+                "min_health_score",
+                "Health",
+                gate.min_health_score,
+                score,
+            ),
+            None => {
+                if let Some(min) = gate.min_health_score {
+                    violations.push(unrated_health_violation(min));
+                }
+            }
+        }
         check_min_score(
             violations,
             "min_security_score",
@@ -1879,7 +1948,7 @@ mod tests {
         // (80*40 + 100*20 + 60*25 + 40*15) / (40+20+25+15)
         // = (3200 + 2000 + 1500 + 600) / 100
         // = 7300 / 100 = 73
-        assert_eq!(compute_weighted_health_score(&scores), 73);
+        assert_eq!(compute_weighted_health_score(&scores), Some(73));
     }
 
     #[test]
@@ -1891,7 +1960,7 @@ mod tests {
             metadata: Some(100),
         };
         // (100*40 + 100*20 + 100*25 + 100*15) / 100 = 10000 / 100 = 100
-        assert_eq!(compute_weighted_health_score(&scores), 100);
+        assert_eq!(compute_weighted_health_score(&scores), Some(100));
     }
 
     #[test]
@@ -1902,19 +1971,19 @@ mod tests {
             quality: Some(0),
             metadata: Some(0),
         };
-        assert_eq!(compute_weighted_health_score(&scores), 0);
+        assert_eq!(compute_weighted_health_score(&scores), Some(0));
     }
 
     #[test]
-    fn test_no_components_returns_100() {
+    fn test_no_components_is_unrated_5656() {
         let scores = ComponentScores {
             security: None,
             license: None,
             quality: None,
             metadata: None,
         };
-        // No data = assume healthy
-        assert_eq!(compute_weighted_health_score(&scores), 100);
+        // No data = unrated, never an implicit A (#5656).
+        assert_eq!(compute_weighted_health_score(&scores), None);
     }
 
     #[test]
@@ -1926,7 +1995,7 @@ mod tests {
             metadata: None,
         };
         // (80*40) / 40 = 80
-        assert_eq!(compute_weighted_health_score(&scores), 80);
+        assert_eq!(compute_weighted_health_score(&scores), Some(80));
     }
 
     #[test]
@@ -1938,7 +2007,7 @@ mod tests {
             metadata: Some(60),
         };
         // (60*15) / 15 = 60
-        assert_eq!(compute_weighted_health_score(&scores), 60);
+        assert_eq!(compute_weighted_health_score(&scores), Some(60));
     }
 
     #[test]
@@ -1950,7 +2019,7 @@ mod tests {
             metadata: None,
         };
         // (90*40 + 70*25) / (40+25) = (3600 + 1750) / 65 = 5350 / 65 = 82
-        assert_eq!(compute_weighted_health_score(&scores), 82);
+        assert_eq!(compute_weighted_health_score(&scores), Some(82));
     }
 
     #[test]
@@ -1962,7 +2031,7 @@ mod tests {
             metadata: Some(50),
         };
         // (100*40 + 50*15) / (40+15) = (4000 + 750) / 55 = 4750 / 55 = 86
-        assert_eq!(compute_weighted_health_score(&scores), 86);
+        assert_eq!(compute_weighted_health_score(&scores), Some(86));
     }
 
     #[test]
@@ -1974,7 +2043,7 @@ mod tests {
             metadata: None,
         };
         // (100*20 + 80*25) / (20+25) = (2000 + 2000) / 45 = 4000 / 45 = 88
-        assert_eq!(compute_weighted_health_score(&scores), 88);
+        assert_eq!(compute_weighted_health_score(&scores), Some(88));
     }
 
     #[test]
@@ -1986,7 +2055,7 @@ mod tests {
             metadata: Some(100),
         };
         // (90*40 + 70*20 + 100*15) / (40+20+15) = (3600 + 1400 + 1500) / 75 = 6500 / 75 = 86
-        assert_eq!(compute_weighted_health_score(&scores), 86);
+        assert_eq!(compute_weighted_health_score(&scores), Some(86));
     }
 
     #[test]
@@ -2014,7 +2083,7 @@ mod tests {
             metadata: None,
         };
         // (33*40 + 67*25) / (40+25) = (1320 + 1675) / 65 = 2995 / 65 = 46 (integer division)
-        assert_eq!(compute_weighted_health_score(&scores), 46);
+        assert_eq!(compute_weighted_health_score(&scores), Some(46));
     }
 
     #[test]
@@ -2026,7 +2095,7 @@ mod tests {
             quality: None,
             metadata: None,
         };
-        assert_eq!(compute_weighted_health_score(&scores), 1);
+        assert_eq!(compute_weighted_health_score(&scores), Some(1));
 
         // Score of 99
         let scores = ComponentScores {
@@ -2035,7 +2104,7 @@ mod tests {
             quality: Some(99),
             metadata: None,
         };
-        assert_eq!(compute_weighted_health_score(&scores), 99);
+        assert_eq!(compute_weighted_health_score(&scores), Some(99));
     }
 
     // =======================================================================
@@ -2076,7 +2145,7 @@ mod tests {
             quality: None,
             metadata: None,
         };
-        assert_eq!(compute_weighted_health_score(&scores), 50);
+        assert_eq!(compute_weighted_health_score(&scores), Some(50));
     }
 
     #[test]
@@ -2087,7 +2156,7 @@ mod tests {
             quality: Some(72),
             metadata: None,
         };
-        assert_eq!(compute_weighted_health_score(&scores), 72);
+        assert_eq!(compute_weighted_health_score(&scores), Some(72));
     }
 
     #[test]
@@ -2099,7 +2168,7 @@ mod tests {
             metadata: Some(100),
         };
         // (20*40 + 100*15) / (40+15) = (800+1500) / 55 = 2300/55 = 41
-        let result = compute_weighted_health_score(&scores);
+        let result = compute_weighted_health_score(&scores).expect("rated");
         assert_eq!(result, 41);
         assert!(result < 50, "Security weight should dominate");
     }
@@ -2113,7 +2182,7 @@ mod tests {
             quality: None,
             metadata: None,
         };
-        assert_eq!(compute_weighted_health_score(&scores), 100);
+        assert_eq!(compute_weighted_health_score(&scores), Some(100));
 
         // security + metadata both zero
         let scores = ComponentScores {
@@ -2122,7 +2191,7 @@ mod tests {
             quality: None,
             metadata: Some(0),
         };
-        assert_eq!(compute_weighted_health_score(&scores), 0);
+        assert_eq!(compute_weighted_health_score(&scores), Some(0));
 
         // license + metadata
         let scores = ComponentScores {
@@ -2132,7 +2201,7 @@ mod tests {
             metadata: Some(60),
         };
         // (80*20 + 60*15) / (20+15) = 2500/35 = 71
-        assert_eq!(compute_weighted_health_score(&scores), 71);
+        assert_eq!(compute_weighted_health_score(&scores), Some(71));
 
         // quality + metadata
         let scores = ComponentScores {
@@ -2142,7 +2211,7 @@ mod tests {
             metadata: Some(80),
         };
         // (40*25 + 80*15) / (25+15) = 2200/40 = 55
-        assert_eq!(compute_weighted_health_score(&scores), 55);
+        assert_eq!(compute_weighted_health_score(&scores), Some(55));
     }
 
     #[test]
@@ -2154,7 +2223,7 @@ mod tests {
             metadata: Some(100),
         };
         assert_eq!(
-            Grade::from_score(compute_weighted_health_score(&perfect)),
+            Grade::from_score(compute_weighted_health_score(&perfect).expect("rated")),
             Grade::A
         );
 
@@ -2165,7 +2234,7 @@ mod tests {
             metadata: Some(0),
         };
         assert_eq!(
-            Grade::from_score(compute_weighted_health_score(&zero)),
+            Grade::from_score(compute_weighted_health_score(&zero).expect("rated")),
             Grade::F
         );
 
@@ -2175,10 +2244,8 @@ mod tests {
             quality: None,
             metadata: None,
         };
-        assert_eq!(
-            Grade::from_score(compute_weighted_health_score(&none)),
-            Grade::A
-        );
+        // Nothing scored: unrated, no grade at all (#5656).
+        assert_eq!(compute_weighted_health_score(&none), None);
     }
 
     #[test]
@@ -2191,7 +2258,7 @@ mod tests {
             metadata: None,
         };
         assert_eq!(
-            Grade::from_score(compute_weighted_health_score(&s)),
+            Grade::from_score(compute_weighted_health_score(&s).expect("rated")),
             Grade::A
         );
         // B: 75-89
@@ -2202,7 +2269,7 @@ mod tests {
             metadata: None,
         };
         assert_eq!(
-            Grade::from_score(compute_weighted_health_score(&s)),
+            Grade::from_score(compute_weighted_health_score(&s).expect("rated")),
             Grade::B
         );
         let s = ComponentScores {
@@ -2212,7 +2279,7 @@ mod tests {
             metadata: None,
         };
         assert_eq!(
-            Grade::from_score(compute_weighted_health_score(&s)),
+            Grade::from_score(compute_weighted_health_score(&s).expect("rated")),
             Grade::B
         );
         // C: 50-74
@@ -2223,7 +2290,7 @@ mod tests {
             metadata: None,
         };
         assert_eq!(
-            Grade::from_score(compute_weighted_health_score(&s)),
+            Grade::from_score(compute_weighted_health_score(&s).expect("rated")),
             Grade::C
         );
         // D: 25-49
@@ -2234,7 +2301,7 @@ mod tests {
             metadata: None,
         };
         assert_eq!(
-            Grade::from_score(compute_weighted_health_score(&s)),
+            Grade::from_score(compute_weighted_health_score(&s).expect("rated")),
             Grade::D
         );
         // F: 0-24
@@ -2245,7 +2312,7 @@ mod tests {
             metadata: None,
         };
         assert_eq!(
-            Grade::from_score(compute_weighted_health_score(&s)),
+            Grade::from_score(compute_weighted_health_score(&s).expect("rated")),
             Grade::F
         );
     }
@@ -2258,7 +2325,7 @@ mod tests {
             quality: None,
             metadata: None,
         };
-        assert_eq!(compute_weighted_health_score(&scores), -10);
+        assert_eq!(compute_weighted_health_score(&scores), Some(-10));
     }
 
     #[test]
@@ -2269,7 +2336,7 @@ mod tests {
             quality: None,
             metadata: None,
         };
-        assert_eq!(compute_weighted_health_score(&scores), 200);
+        assert_eq!(compute_weighted_health_score(&scores), Some(200));
     }
 
     // =======================================================================
@@ -2514,8 +2581,8 @@ mod tests {
             passed: true,
             action: "block".to_string(),
             gate_name: "prod-gate".to_string(),
-            health_score: 92,
-            health_grade: "A".to_string(),
+            health_score: Some(92),
+            health_grade: Some("A".to_string()),
             violations: vec![],
             component_scores: ComponentScores {
                 security: Some(95),
@@ -2534,8 +2601,8 @@ mod tests {
             passed: false,
             action: "block".to_string(),
             gate_name: "strict-gate".to_string(),
-            health_score: 45,
-            health_grade: "D".to_string(),
+            health_score: Some(45),
+            health_grade: Some("D".to_string()),
             violations: vec![
                 QualityGateViolation {
                     rule: "min_health_score".to_string(),
@@ -2569,8 +2636,8 @@ mod tests {
             passed: false,
             action: "warn".to_string(),
             gate_name: "default".to_string(),
-            health_score: 70,
-            health_grade: "C".to_string(),
+            health_score: Some(70),
+            health_grade: Some("C".to_string()),
             violations: vec![QualityGateViolation {
                 rule: "min_security_score".to_string(),
                 expected: ">= 80".to_string(),
@@ -3234,5 +3301,127 @@ mod tests {
     #[test]
     fn test_check_max_threshold_fails() {
         assert!(!check_max_threshold(Some(5), 6));
+    }
+
+    // =======================================================================
+    // #5656: formats without package metadata, and no content read
+    // =======================================================================
+
+    #[test]
+    fn unrated_artifact_fails_a_health_minimum_5656() {
+        let v = unrated_health_violation(50);
+        assert_eq!(v.rule, "min_health_score");
+        assert_eq!(v.actual, "unrated");
+        assert_eq!(v.expected, ">= 50");
+        assert!(v.message.ends_with("below minimum 50"), "{}", v.message);
+    }
+
+    #[test]
+    fn metadata_check_skips_formats_without_package_metadata_5656() {
+        assert!(!format_carries_package_metadata("generic"));
+        for format in ["npm", "maven", "pypi", "helm", "cargo", "docker"] {
+            assert!(format_carries_package_metadata(format), "{format}");
+        }
+    }
+
+    /// Against a live database: a generic artifact whose bytes are NOT in
+    /// storage still checks cleanly (no content read for a non-helm format),
+    /// gets no metadata_completeness result, and a metadata score recorded
+    /// earlier no longer drags its health grade to F. An npm artifact with
+    /// the same missing bytes is still scored on metadata.
+    #[tokio::test]
+    async fn generic_artifact_is_not_graded_on_metadata_and_not_read_5656() {
+        let Some(pool) = crate::testing::try_pool_with(3).await else {
+            return;
+        };
+        let suffix = Uuid::new_v4().simple().to_string();
+        let mut ids = Vec::new();
+        for format in ["generic", "npm"] {
+            let key = format!("qc5656-{format}-{suffix}");
+            let repo: Uuid = sqlx::query_scalar(
+                "INSERT INTO repositories (key, name, format, repo_type, storage_path) \
+                 VALUES ($1, $1, $2::repository_format, 'local', $3) RETURNING id",
+            )
+            .bind(&key)
+            .bind(format)
+            .bind(format!("/nonexistent/{key}"))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            let artifact: Uuid = sqlx::query_scalar(
+                "INSERT INTO artifacts (repository_id, path, name, version, size_bytes, \
+                 checksum_sha256, content_type, storage_key) \
+                 VALUES ($1, 'f.bin', 'f.bin', '1.0', 4, $2, 'application/octet-stream', $3) \
+                 RETURNING id",
+            )
+            .bind(repo)
+            .bind(format!("{:064x}", 5656))
+            .bind(format!("missing/{key}"))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            ids.push((format, repo, artifact));
+        }
+        // An F-grade metadata result from before the change.
+        let (_, generic_repo, generic_id) = ids[0];
+        sqlx::query(
+            "INSERT INTO quality_check_results (artifact_id, repository_id, check_type, status, \
+             score, passed, details, issues_count, critical_count, high_count, medium_count, \
+             low_count, info_count, checker_version, started_at, completed_at) \
+             VALUES ($1, $2, 'metadata_completeness', 'completed', 20, false, '{}'::jsonb, \
+             4, 0, 0, 1, 3, 0, '1.0.0', NOW(), NOW())",
+        )
+        .bind(generic_id)
+        .bind(generic_repo)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let svc = QualityCheckService::new(pool.clone());
+        for (format, _, id) in &ids {
+            svc.check_artifact(*id)
+                .await
+                .unwrap_or_else(|e| panic!("{format}: {e}"));
+        }
+
+        let new_metadata_rows = |id: Uuid| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM quality_check_results \
+                     WHERE artifact_id = $1 AND check_type = 'metadata_completeness'",
+                )
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        assert_eq!(new_metadata_rows(generic_id).await, 1, "only the old row");
+        assert_eq!(new_metadata_rows(ids[1].2).await, 1, "npm is scored");
+
+        // No security scan, no metadata score: unrated (NULL score and
+        // grade), never an implicit A.
+        let (score, grade, metadata_score): (Option<i32>, Option<String>, Option<i32>) =
+            sqlx::query_as(
+                "SELECT health_score, health_grade, metadata_score \
+                 FROM artifact_health_scores WHERE artifact_id = $1",
+            )
+            .bind(generic_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            (score, grade.as_deref(), metadata_score),
+            (None, None, None)
+        );
+
+        for (_, repo, _) in &ids {
+            sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(repo)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
     }
 }
