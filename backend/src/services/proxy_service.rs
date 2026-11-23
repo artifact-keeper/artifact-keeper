@@ -10019,6 +10019,9 @@ impl ProxyService {
     /// 3. Check TTL: if `now > expires_at` → expired
     /// 4. All pass → cache hit
     ///
+    /// A cache-only Remote (#5282) skips 2 and 3: it never revalidates, so the
+    /// entry it holds is the answer, expired or not (#6451).
+    ///
     /// On expiry, sends a conditional request (If-None-Match with ETag)
     /// to upstream:
     /// - 304 or same SHA-256 → revalidate metadata (update cached_at + expires_at)
@@ -10058,7 +10061,18 @@ impl ProxyService {
             };
             let ttl_expired = Utc::now() > meta.effective_expires_at(dists_policy);
 
-            if !epoch_expired && !ttl_expired {
+            // #6451: a cache-only Remote never revalidates (#5282), so the
+            // index it holds is served past its TTL and past the epoch, like
+            // every other cached entry. Without this an expired InRelease fell
+            // through to the refill below, which the cache-only gate refuses:
+            // `apt-get update` lost the whole suite `dists_ttl_secs` after the
+            // last upstream contact, while the `.deb` files it indexes were
+            // still served. The mode is only read once the entry has expired,
+            // so the fresh path is unchanged.
+            let serve_as_held =
+                (epoch_expired || ttl_expired) && self.upstream_mode(repo.id).await.is_cache_only();
+
+            if (!epoch_expired && !ttl_expired) || serve_as_held {
                 // Cache hit — read content and verify
                 match self.storage.get(&cache_key).await {
                     Ok(content) => {
@@ -29400,6 +29414,107 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ---- fetch_dists_with_revalidation: cache-only serves the held index --
+
+    #[tokio::test]
+    async fn test_dists_revalidation_cache_only_serves_expired_index_without_upstream() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::upstream_mode::{is_cache_only_refusal, save_upstream_mode};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const INRELEASE: &str = "dists/bookworm/InRelease";
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/dists/bookworm/InRelease"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", "\"v1\"")
+                    .set_body_bytes(b"inrelease-v1".as_ref()),
+            )
+            .mount(&server)
+            .await;
+
+        // `upstream_mode` reads the repository's row, so this needs a real one.
+        let (repo_id, repo_key, dir) = tdh::create_repo(&pool, "remote", "debian").await;
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), dir.to_str().unwrap());
+        let repo = crate::api::handlers::proxy_helpers::build_remote_repo(
+            repo_id,
+            &repo_key,
+            &server.uri(),
+        );
+
+        // Seed while online with a 1-second TTL, let it expire, then seal.
+        let seeded = proxy
+            .fetch_dists_with_revalidation(&repo, INRELEASE, "bookworm", 1)
+            .await;
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+        save_upstream_mode(&pool, repo_id, UpstreamMode::CacheOnly)
+            .await
+            .expect("store cache_only");
+        let hits_after_seed = server.received_requests().await.unwrap().len();
+
+        // Expired by TTL.
+        let ttl_expired = proxy
+            .fetch_dists_with_revalidation(
+                &repo,
+                INRELEASE,
+                "bookworm",
+                DEFAULT_DISTS_INDEX_TTL_SECS,
+            )
+            .await;
+        // Expired by the epoch as well: the suite "changed" after this entry
+        // was cached.
+        proxy
+            .write_release_epoch(&repo_key, "bookworm", Utc::now())
+            .await;
+        let epoch_expired = proxy
+            .fetch_dists_with_revalidation(
+                &repo,
+                INRELEASE,
+                "bookworm",
+                DEFAULT_DISTS_INDEX_TTL_SECS,
+            )
+            .await;
+        // A path the Remote does not hold is still a cache-only miss.
+        let miss = proxy
+            .fetch_dists_with_revalidation(
+                &repo,
+                "dists/bookworm/Release",
+                "bookworm",
+                DEFAULT_DISTS_INDEX_TTL_SECS,
+            )
+            .await
+            .err();
+        let hits = server.received_requests().await.unwrap().len();
+        tdh::cleanup_member_repo(&pool, repo_id, &dir).await;
+
+        let (seeded, _, changed) = seeded.expect("the seeding fetch succeeds");
+        assert_eq!(&seeded[..], b"inrelease-v1");
+        assert!(changed, "the seeding fetch reports a change");
+        assert_eq!(hits_after_seed, 1, "seeding is the only upstream request");
+
+        let (body, _, changed) =
+            ttl_expired.expect("a cache-only Remote serves the index past its TTL");
+        assert_eq!(&body[..], b"inrelease-v1");
+        assert!(!changed, "a held entry is not a change");
+        let (body, _, changed) =
+            epoch_expired.expect("a cache-only Remote serves the index past the epoch");
+        assert_eq!(&body[..], b"inrelease-v1");
+        assert!(!changed, "a held entry is not a change");
+
+        let miss = miss.expect("a path that is not held must fail");
+        assert!(is_cache_only_refusal(&miss), "{miss:?}");
+        assert_eq!(
+            hits, hits_after_seed,
+            "a cache-only Remote must never contact its upstream"
+        );
     }
 
     // ---- fetch_dists_with_revalidation: 200 unchanged (same SHA) --------
