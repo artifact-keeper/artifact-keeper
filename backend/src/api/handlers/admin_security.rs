@@ -62,6 +62,36 @@ pub fn router() -> Router<SharedState> {
         .route("/findings", get(list_cve_findings))
         // The live scan queue behind the Scan Queue page.
         .route("/scan-queue", get(get_scan_queue))
+        // Each scanner's vulnerability-database age (#5177).
+        .route("/vuln-db", get(get_vuln_db_status))
+}
+
+/// Each scanner engine's vulnerability database: version, build time, age and
+/// whether it is past `SCAN_VULN_DB_MAX_AGE_HOURS` (#5177).
+///
+/// Report only: a stale database never changes a scan verdict, quarantine
+/// decision or grade (`affects_verdicts` is always `false`). The report is
+/// computed from cheap probes and reused for 60 seconds, so polling this route
+/// does not run a scanner.
+#[utoipa::path(
+    get,
+    path = "/vuln-db",
+    context_path = "/api/v1/admin/security",
+    tag = "admin",
+    responses(
+        (status = 200, description = "Vulnerability-database age per scanner engine", body = crate::services::vuln_db_status::VulnDbStatusReport),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Admin privileges required")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_vuln_db_status(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+) -> Result<Json<crate::services::vuln_db_status::VulnDbStatusReport>> {
+    auth.require_admin()?;
+    let report = crate::services::vuln_db_status::status(&state).await;
+    Ok(Json((*report).clone()))
 }
 
 /// Outstanding scan jobs plus the queue depth behind them.
@@ -1370,6 +1400,7 @@ pub async fn list_cve_findings(
         cve_accessible_users,
         artifact_accessible_users,
         get_scan_queue,
+        get_vuln_db_status,
         list_cve_findings,
     ),
     components(schemas(
@@ -1388,6 +1419,10 @@ pub async fn list_cve_findings(
         CveFindingRow,
         AffectedArtifactRow,
         ListCveFindingsResponse,
+        crate::services::vuln_db_status::VulnDbStatusReport,
+        crate::services::vuln_db_status::VulnDbEngineStatus,
+        crate::services::vuln_db_status::VulnDbSource,
+        crate::services::vuln_db_status::VulnDbState,
     ))
 )]
 pub struct AdminSecurityApiDoc;

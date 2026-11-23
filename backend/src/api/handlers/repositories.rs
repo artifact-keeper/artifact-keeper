@@ -1254,6 +1254,12 @@ pub struct CreateRepositoryRequest {
     /// Refused (400) on any other repository type.
     #[schema(nullable = false)]
     pub virtual_member_fallback: Option<proxy_helpers::VirtualMemberFallback>,
+    /// Composer Remote repositories only (#6332): forward `search.json` to the
+    /// upstream and merge its hits after the cached ones. Off by default, so no
+    /// search term leaves the instance unless an administrator turns it on for
+    /// this Remote. Stored in `repository_config` under
+    /// `composer_upstream_search`. Refused (400) on any other repository.
+    pub composer_upstream_search: Option<bool>,
     /// Remote repositories only: the upstream mode the repository is born
     /// with (#5402), `online` (the default) or `cache_only`. The same value
     /// `PUT /api/v1/repositories/{key}/upstream-mode` sets, stored before any
@@ -1535,6 +1541,12 @@ pub struct UpdateRepositoryRequest {
     /// other repository type.
     #[schema(nullable = false)]
     pub virtual_member_fallback: Option<proxy_helpers::VirtualMemberFallback>,
+    /// Composer Remote repositories only (#6332): forward `search.json` to the
+    /// upstream and merge its hits after the cached ones. Off by default, so no
+    /// search term leaves the instance unless an administrator turns it on for
+    /// this Remote. Stored in `repository_config` under
+    /// `composer_upstream_search`. Refused (400) on any other repository.
+    pub composer_upstream_search: Option<bool>,
     /// Assign this repository to a project (#2472), or take it out of one
     /// (#4026). Three-way semantics via `Option<Option<Uuid>>`: omit the field
     /// to leave the assignment unchanged; send `null` to clear it; send a
@@ -1795,6 +1807,13 @@ pub struct RepositoryResponse {
     /// other type.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub virtual_member_fallback: Option<proxy_helpers::VirtualMemberFallback>,
+    /// Composer Remote repositories only (#6332): whether `search.json` is
+    /// forwarded to the upstream; see
+    /// `UpdateRepositoryRequest.composer_upstream_search`. Always present on a
+    /// Composer Remote (`false` when never set), omitted on every other
+    /// repository.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub composer_upstream_search: Option<bool>,
     /// Custom User-Agent used for outbound HTTP requests to the upstream,
     /// read back from `repository_config`. `None` when unset.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2327,6 +2346,7 @@ fn repo_to_response(
         quarantine_duration_minutes: None,
         virtual_metadata_partial: None,
         virtual_member_fallback: None,
+        composer_upstream_search: None,
         custom_user_agent: None,
         apt_origin: None,
         apt_label: None,
@@ -2402,6 +2422,14 @@ async fn with_virtual_settings(
             Some(proxy_helpers::virtual_metadata_partial_allowed(db, repo_id).await);
         response.virtual_member_fallback =
             Some(proxy_helpers::virtual_member_fallback(db, repo_id).await);
+    }
+    // #6332: a Composer Remote's search forwarding, read as search reads it.
+    if super::composer_upstream_search::applies_to(&response.repo_type, &response.format) {
+        response.composer_upstream_search = Some(
+            super::composer_upstream_search::enabled_for(db, &[repo_id])
+                .await
+                .contains(&repo_id),
+        );
     }
     response
 }
@@ -4681,19 +4709,26 @@ pub async fn list_repositories(
         std::collections::HashMap::new();
     let mut member_fallback: std::collections::HashMap<Uuid, proxy_helpers::VirtualMemberFallback> =
         std::collections::HashMap::new();
+    // #6332: the Composer Remotes that forward search upstream.
+    let mut upstream_search: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
     if !repo_ids.is_empty() {
         for (id, key, value) in sqlx::query_as::<_, (Uuid, String, Option<String>)>(
             "SELECT repository_id, key, value FROM repository_config \
-             WHERE repository_id = ANY($1) AND key IN ($2, $3)",
+             WHERE repository_id = ANY($1) AND key IN ($2, $3, $4)",
         )
         .bind(&repo_ids)
         .bind(proxy_helpers::VIRTUAL_METADATA_PARTIAL_CONFIG_KEY)
         .bind(proxy_helpers::VIRTUAL_MEMBER_FALLBACK_CONFIG_KEY)
+        .bind(super::composer_upstream_search::CONFIG_KEY)
         .fetch_all(&state.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?
         {
-            if key == proxy_helpers::VIRTUAL_MEMBER_FALLBACK_CONFIG_KEY {
+            if key == super::composer_upstream_search::CONFIG_KEY {
+                if super::composer_upstream_search::opted_in(value.as_deref()) {
+                    upstream_search.insert(id);
+                }
+            } else if key == proxy_helpers::VIRTUAL_MEMBER_FALLBACK_CONFIG_KEY {
                 member_fallback.insert(
                     id,
                     proxy_helpers::VirtualMemberFallback::from_stored(value.as_deref()),
@@ -4730,6 +4765,9 @@ pub async fn list_repositories(
                     Some(partial_opt_in.get(&resp.id).copied().unwrap_or(false));
                 resp.virtual_member_fallback =
                     Some(member_fallback.get(&resp.id).copied().unwrap_or_default());
+            }
+            if super::composer_upstream_search::applies_to(&resp.repo_type, &resp.format) {
+                resp.composer_upstream_search = Some(upstream_search.contains(&resp.id));
             }
             resp
         })
@@ -4911,6 +4949,7 @@ pub async fn create_repository(
     refuse_update_only_fields_on_create(&payload)?;
     let shared_config = SharedRepoConfigSettings::from(&payload);
     shared_config.validate(&repo_type)?;
+    shared_config.validate_for_format(&repo_type, &format)?;
     // #5402: the Remote's upstream mode and egress proxy, validated before
     // the row exists and stored right after it, before anything else.
     let born_remote = born_remote_settings(&payload, &repo_type)?;
@@ -6096,9 +6135,28 @@ struct SharedRepoConfigSettings {
     quarantine_duration_minutes: Option<i64>,
     virtual_metadata_partial: Option<bool>,
     virtual_member_fallback: Option<proxy_helpers::VirtualMemberFallback>,
+    composer_upstream_search: Option<bool>,
 }
 
 impl SharedRepoConfigSettings {
+    /// Reject a setting that does not apply to this repository's format
+    /// (400). Runs before any write, beside [`Self::validate`].
+    fn validate_for_format(
+        &self,
+        repo_type: &RepositoryType,
+        format: &RepositoryFormat,
+    ) -> Result<()> {
+        if self.composer_upstream_search.is_some()
+            && (*repo_type != RepositoryType::Remote || *format != RepositoryFormat::Composer)
+        {
+            return Err(AppError::Validation(
+                "composer_upstream_search is only valid for Composer remote repositories"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Reject a value that does not apply to `repo_type` (400). Runs before
     /// any write.
     fn validate(&self, repo_type: &RepositoryType) -> Result<()> {
@@ -6135,6 +6193,15 @@ impl SharedRepoConfigSettings {
         if let Some(allow) = self.virtual_metadata_partial {
             upsert_repo_config(db, repo_id, "virtual_metadata_partial", bool_str(allow)).await?;
         }
+        if let Some(forward) = self.composer_upstream_search {
+            upsert_repo_config(
+                db,
+                repo_id,
+                super::composer_upstream_search::CONFIG_KEY,
+                bool_str(forward),
+            )
+            .await?;
+        }
         if let Some(fallback) = self.virtual_member_fallback {
             upsert_repo_config(
                 db,
@@ -6169,6 +6236,7 @@ impl From<&UpdateRepositoryRequest> for SharedRepoConfigSettings {
             quarantine_duration_minutes: payload.quarantine_duration_minutes,
             virtual_metadata_partial: payload.virtual_metadata_partial,
             virtual_member_fallback: payload.virtual_member_fallback,
+            composer_upstream_search: payload.composer_upstream_search,
         }
     }
 }
@@ -6180,6 +6248,7 @@ impl From<&CreateRepositoryRequest> for SharedRepoConfigSettings {
             quarantine_duration_minutes: payload.quarantine_duration_minutes,
             virtual_metadata_partial: payload.virtual_metadata_partial,
             virtual_member_fallback: payload.virtual_member_fallback,
+            composer_upstream_search: payload.composer_upstream_search,
         }
     }
 }
@@ -6414,6 +6483,7 @@ fn validate_update_config_fields(
     // Quarantine and `virtual_metadata_partial`: the same rules as on create
     // (#3647, #5324).
     SharedRepoConfigSettings::from(payload).validate(repo_type)?;
+    SharedRepoConfigSettings::from(payload).validate_for_format(repo_type, format)?;
     if payload
         .release_repository_key
         .as_deref()
@@ -20290,6 +20360,7 @@ mod tests {
             quarantine_duration_minutes: None,
             virtual_metadata_partial: None,
             virtual_member_fallback: None,
+            composer_upstream_search: None,
             custom_user_agent: None,
             project_id: None,
             apt_origin: None,
@@ -20355,6 +20426,7 @@ mod tests {
             quarantine_duration_minutes: None,
             virtual_metadata_partial: None,
             virtual_member_fallback: None,
+            composer_upstream_search: None,
             custom_user_agent: None,
             project_id: None,
             apt_origin: None,
@@ -21807,6 +21879,7 @@ mod tests {
             quarantine_duration_minutes: Some(525600),
             virtual_metadata_partial: None,
             virtual_member_fallback: None,
+            composer_upstream_search: None,
             custom_user_agent: None,
             project_id: None,
             apt_origin: None,
@@ -38106,6 +38179,7 @@ mod tests {
             quarantine_duration_minutes: None,
             virtual_metadata_partial: None,
             virtual_member_fallback: None,
+            composer_upstream_search: None,
             custom_user_agent: None,
             project_id: None,
             apt_origin: None,

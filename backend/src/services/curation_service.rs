@@ -171,6 +171,23 @@ impl CurationService {
         ))
     }
 
+    /// [`Self::evaluate_pep503_package`] for many names with no version, on
+    /// ONE read of the rule set (the Composer upstream search, #6332, which
+    /// curates a page of hits at once). One evaluation per name, in order.
+    pub async fn evaluate_pep503_packages(
+        &self,
+        staging_repo_id: Uuid,
+        default_action: &str,
+        format: Option<&str>,
+        package_names: &[&str],
+    ) -> Result<Vec<RuleEvaluation>, sqlx::Error> {
+        let rules = self.fetch_applicable_rules(staging_repo_id).await?;
+        Ok(package_names
+            .iter()
+            .map(|name| Self::evaluate_proxy_rules(&rules, default_action, format, name, None))
+            .collect())
+    }
+
     /// First-match evaluation of a proxy download against a pre-fetched,
     /// priority-ordered rule set (no DB call, no network call).
     ///

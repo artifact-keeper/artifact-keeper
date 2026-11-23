@@ -623,6 +623,7 @@ pub mod ci_auth;
 pub mod ci_auth_admin;
 pub mod cocoapods;
 pub mod composer;
+pub mod composer_upstream_search;
 pub mod conan;
 pub mod conda;
 pub mod cran;

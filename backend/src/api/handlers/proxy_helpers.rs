@@ -3371,6 +3371,27 @@ pub async fn proxy_fetch_uncached_decoded(
     .await
 }
 
+/// [`proxy_fetch_uncached`] under the caller's body cap `max`, for a small
+/// answer that is only parsed and never served or stored (the Composer
+/// upstream search, #6332). Same origin policy, URL gate, upstream
+/// credentials and error mapping as every other upstream read.
+pub async fn proxy_fetch_uncached_capped(
+    proxy_service: &ProxyService,
+    repo_id: Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    path: &str,
+    max: usize,
+) -> Result<Bytes, Response> {
+    with_proxy_repo(repo_id, repo_key, upstream_url, path, |repo| async move {
+        proxy_service
+            .fetch_upstream_direct_dated(&repo, path, max)
+            .await
+            .map(|(content, _)| content)
+    })
+    .await
+}
+
 /// How long the age gate may reuse one upstream read. This is the longest a
 /// "not hosted" answer can outlive a publish, so it stays in seconds: long
 /// enough that a burst for one project costs one read, short enough that it is
