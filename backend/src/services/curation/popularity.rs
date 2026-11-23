@@ -56,11 +56,15 @@
 //! `"download_name_checks": true` ([`checks_downloads`]); a rule without it
 //! is not evaluated on downloads at all. No download-count lookup happens on
 //! that path.
-//! There, `block_typosquat` blocks only homoglyph and mixed-script matches.
-//! Edit-distance and affix matches only flag, because a download has no
-//! review step to absorb their false positives: edit distance 2 from the
-//! seed list reaches real packages such as npm `preact`, `vite`, `chai` and
-//! `vuex`, and PyPI `numba`, `httpie`, `attr` and `pipx`.
+//! There, `block_typosquat` blocks only homoglyph and mixed-script matches
+//! whose name contains a non-ASCII character. An all-ASCII skeleton collision
+//! such as `c1ick` is a flag, like an edit-distance match; set
+//! `"block_ascii_confusables": true` to restore the stricter download block.
+//! The staging sync is unchanged. Edit-distance and affix matches only flag,
+//! because a download has no review step to absorb their false positives:
+//! edit distance 2 from the seed list reaches real packages such as npm
+//! `preact`, `vite`, `chai` and `vuex`, and PyPI `numba`, `httpie`, `attr`
+//! and `pipx`.
 
 use crate::models::curation::CurationDecision;
 
@@ -123,6 +127,7 @@ const DEFAULT_AFFIX_MAX_DOWNLOADS: u64 = 1_000;
 ///   "action": "flag",
 ///   "block_unknown": false,
 ///   "block_typosquat": false,
+///   "block_ascii_confusables": false,
 ///   "download_name_checks": false,
 ///   "popular_packages": ["requests", "..."]
 /// }
@@ -151,6 +156,11 @@ const DEFAULT_AFFIX_MAX_DOWNLOADS: u64 = 1_000;
 /// `download_name_checks` (default `false`) does not affect this function:
 /// it opts the rule into [`evaluate_name_only`] on Remote and Virtual
 /// downloads (#5274); see [`checks_downloads`].
+///
+/// `block_ascii_confusables` (default `false`) only affects
+/// [`evaluate_name_only`]: it lets an all-ASCII skeleton collision escalate
+/// to `Block` on downloads. The staging sync keeps blocking every lexical
+/// match under `block_typosquat`.
 ///
 /// The #2956 sub-toggles (`homoglyph_check`, `affix_check`, both default
 /// `true`) sit under the `typosquat_check` master toggle: turning
@@ -272,7 +282,10 @@ pub async fn evaluate(
 /// * `min_downloads`, `action`, `block_unknown` and `window` have no effect,
 ///   and no "popularity unknown" flag is raised for every package.
 /// * `block_typosquat` escalates to `Block` only on a homoglyph or
-///   mixed-script match, the signals with essentially no legitimate cause.
+///   mixed-script match whose name contains a non-ASCII character, the
+///   signals with essentially no legitimate cause. An all-ASCII skeleton
+///   collision such as `c1ick` is a `Flag` like edit distance, unless
+///   `block_ascii_confusables` is set. The staging sync is unchanged.
 ///   Edit-distance and affix matches are only ever a `Flag` here. On the
 ///   staging sync a false positive lands in review; on a download it would
 ///   refuse a real package outright, and both signals have known ones:
@@ -305,7 +318,9 @@ pub fn evaluate_name_only(
     }
 
     let homoglyph = cfg.homoglyph_reasons(name);
-    let escalate = cfg.block_typosquat && !homoglyph.is_empty();
+    let blocking_homoglyph = !homoglyph.is_empty()
+        && (!name.is_ascii() || is_mixed_script(name) || cfg.block_ascii_confusables);
+    let escalate = cfg.block_typosquat && blocking_homoglyph;
     // Same order as `evaluate`: distance, homoglyph, affix.
     let mut reasons: Vec<String> = cfg.distance_reason(name).into_iter().collect();
     reasons.extend(homoglyph);
@@ -341,7 +356,8 @@ const MAX_CHECKED_NAME_BYTES: usize = 214;
 ///
 /// * any name over [`MAX_CHECKED_NAME_BYTES`];
 /// * on PyPI, a name outside PEP 508, which the PyPI handlers refuse anyway.
-///   So only ASCII confusables (`c1ick`) can match on PyPI;
+///   So only ASCII confusables (`c1ick`) can match on PyPI; on downloads
+///   they are flags unless `block_ascii_confusables` is set;
 /// * on npm, an empty name, one with whitespace or control characters, or
 ///   one with a `/` other than the single scope separator of `@scope/name`.
 ///   Non-ASCII names stay checkable on npm on purpose: a Unicode lookalike
@@ -380,6 +396,7 @@ struct PopularityConfig {
     block_action: bool,
     block_unknown: bool,
     block_typosquat: bool,
+    block_ascii_confusables: bool,
     homoglyph_check: bool,
     affix_check: bool,
     affix_max_downloads: u64,
@@ -424,9 +441,10 @@ impl PopularityConfig {
                 .and_then(serde_json::Value::as_str)
                 .map(|a| a.eq_ignore_ascii_case("block"))
                 .unwrap_or(false),
-            // Opt-in hardening flags; both default false (see `evaluate`).
+            // Opt-in hardening flags, all default false (see `evaluate`).
             block_unknown: flag("block_unknown", false),
             block_typosquat: flag("block_typosquat", false),
+            block_ascii_confusables: flag("block_ascii_confusables", false),
             // #2956 sub-toggles, both under the typosquat_check master toggle.
             homoglyph_check: flag("homoglyph_check", true),
             affix_check: flag("affix_check", true),
@@ -1022,7 +1040,7 @@ mod tests {
         ));
         assert!(matches!(
             evaluate_name_only(&cfg, "pypi", "c1ick"),
-            CurationDecision::Block(_)
+            CurationDecision::Flag(_)
         ));
         assert!(matches!(
             evaluate_name_only(&cfg, "npm", "@scope/preact"),
@@ -1234,16 +1252,50 @@ mod tests {
     }
 
     #[test]
-    fn name_only_ascii_confusable_still_blocks() {
+    fn name_only_ascii_confusable_only_flags() {
         // `c1ick`: digit `1` is a UTS #39 confusable of `l`, so the skeleton
-        // collides with `click`. ASCII survives PEP 503 normalization, so a
-        // PyPI download can still be refused on a homoglyph.
+        // collides with `click`. The name is all ASCII, so a download flags it
+        // like an edit-distance match instead of refusing a real package.
         let cfg = config(serde_json::json!({"block_typosquat": true}));
+        match evaluate_name_only(&cfg, "pypi", "c1ick") {
+            CurationDecision::Flag(reason) => {
+                assert!(reason.contains("homoglyph"), "{reason}");
+                assert!(reason.contains("typo-squat"), "all reasons kept: {reason}");
+            }
+            other => panic!("expected Flag, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn name_only_ascii_confusable_can_opt_into_blocking() {
+        // Operators who accept the false positives can restore the old
+        // download behaviour per rule; the staging sync is unaffected.
+        let off = config(serde_json::json!({"block_ascii_confusables": true}));
+        assert!(matches!(
+            evaluate_name_only(&off, "pypi", "c1ick"),
+            CurationDecision::Flag(_)
+        ));
+        let cfg = config(serde_json::json!({
+            "block_typosquat": true,
+            "block_ascii_confusables": true
+        }));
         match evaluate_name_only(&cfg, "pypi", "c1ick") {
             CurationDecision::Block(reason) => {
                 assert!(reason.contains("homoglyph"), "{reason}");
                 assert!(reason.contains("typo-squat"), "all reasons kept: {reason}");
             }
+            other => panic!("expected Block, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn ascii_confusable_still_blocks_on_staging_sync() {
+        // #5840 changes only the download path. A `popularity` rule with
+        // `block_typosquat: true` still blocks ASCII collisions during sync.
+        let cfg = config(serde_json::json!({"block_typosquat": true, "min_downloads": 10}));
+        let source = FakePopularitySource::new().with("pypi", "c1ick", 50);
+        match evaluate(&cfg, "pypi", "c1ick", "1.0.0", &source).await {
+            CurationDecision::Block(reason) => assert!(reason.contains("homoglyph"), "{reason}"),
             other => panic!("expected Block, got {other:?}"),
         }
     }

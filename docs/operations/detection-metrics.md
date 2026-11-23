@@ -3,9 +3,9 @@
 The backend exports these on `/metrics` (Prometheus text format) so an
 operator can alert on abuse that otherwise shows only as a log line, or not at
 all: connections held open, rate-limit refusals, SSRF refusals, rejected
-credentials and proxy-scan decisions (#4676). Every label value comes from a
-fixed set. No series carries a username, token, address, URL, repository name,
-tag or digest.
+credentials, proxy-scan decisions and curation flags (#4676, #5840). Every
+label value comes from a fixed set. No series carries a username, token,
+address, URL, repository name, tag or digest.
 
 The `LOGIN_RATE_LIMITED` audit row, the
 `ak_permission_condition_evaluations_total` counter and joining gateway and
@@ -120,6 +120,19 @@ and are not counted; the `/v2/token` exchange that hands out those tokens is.
 # A password sweep: many unknown usernames from the login form or package clients
 sum by (surface) (increase(ak_auth_failures_total{reason="unknown_user"}[10m])) > 50
 ```
+
+## Curation flags
+
+| Metric | Type | Labels | Moves when |
+|---|---|---|---|
+| `ak_curation_flagged_downloads_total` | counter | `repository`, `rule_id` | a `popularity` rule flags a package served from a Remote or Virtual repository (#5840) |
+
+A flagged download is also logged at `debug` with the package name, rule id
+and reason. The repeat is the metric; the first sighting stays readable in the
+log instead of filling it at `warn`. `repository` is the repository key and
+`rule_id` is the UUID of the rule that produced the flag; both are
+operator-created and bounded. The package name and the free-text reason stay
+out of the metric labels.
 
 ## Proxy scans
 

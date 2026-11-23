@@ -19776,7 +19776,8 @@ mod tests {
     /// consulted through the virtual in two ways:
     ///
     /// * `numba` (edit distance 2 from the seed `numpy`) is served, and the
-    ///   flag is logged naming the member's popularity rule.
+    ///   flag is logged at `debug` naming the member's popularity rule and
+    ///   reason (#5840).
     /// * The flag does not end evaluation: the member's lower-priority
     ///   `pattern` block on `reqeusts` (itself flagged by the popularity
     ///   rule) still refuses it before its upstream is asked.
@@ -19805,10 +19806,11 @@ mod tests {
             ) {
                 let mut fields = Fields(Default::default());
                 event.record(&mut fields);
-                if fields
-                    .0
-                    .get("message")
-                    .is_some_and(|m| m.contains("curation flagged a proxy download"))
+                if event.metadata().level() == &tracing::Level::DEBUG
+                    && fields
+                        .0
+                        .get("message")
+                        .is_some_and(|m| m.contains("curation flagged a proxy download"))
                 {
                     self.0.lock().unwrap().push(fields.0);
                 }
@@ -19908,6 +19910,9 @@ mod tests {
             "the flag names the member's popularity rule"
         );
         assert_eq!(logged[0].get("repo_id"), Some(&member_id.to_string()));
+        let reason = logged[0].get("reason").expect("the flag keeps its reason");
+        assert!(reason.contains("typo-squat"), "{reason}");
+        assert!(reason.contains("'numpy'"), "{reason}");
         // Dropping the server verifies `reqeusts` was never fetched.
         drop(upstream);
     }

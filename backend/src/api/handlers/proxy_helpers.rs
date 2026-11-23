@@ -11102,10 +11102,13 @@ impl<'a> From<&'a RepoInfo> for CurationTarget<'a> {
 /// typo-squat, homoglyph and affix comparisons against the popular list,
 /// which need no network call. The download-count threshold and
 /// `publisher_trust` rules still run only on the staging sync. A `popularity`
-/// `Block` (a homoglyph or mixed-script match under `block_typosquat`)
-/// refuses the pull like a `block` rule. Edit-distance and affix matches only
-/// flag. A `Flag` serves the pull and logs it, because the proxy path has no
-/// review queue.
+/// `Block` (a homoglyph or mixed-script match with a non-ASCII character
+/// under `block_typosquat`) refuses the pull like a `block` rule. Edit-distance,
+/// affix and all-ASCII homoglyph matches only flag. A `Flag` serves the pull;
+/// it is logged at `debug` with the rule and reason and counted by repository
+/// and rule in `ak_curation_flagged_downloads_total`, because the proxy path
+/// has no review queue and repeating the same line on every pull would bury
+/// new names (#5840).
 #[allow(clippy::result_large_err)]
 pub async fn enforce_curation<'a>(
     db: &PgPool,
@@ -11161,9 +11164,9 @@ pub async fn evaluate_curation<'a>(
 ///
 /// A `review` verdict from a rule is a `popularity` `Flag` (#5159; `pattern`
 /// rules only take `allow` / `block`). The proxy path has no review queue,
-/// so the pull is served and the flag is logged with the rule and reason.
-/// A `review` default stance with no matching rule serves silently, as it
-/// always has.
+/// so the pull is served; the flag is logged at `debug` with the rule and
+/// reason and counted by repository and rule (#5840). A `review` default
+/// stance with no matching rule serves silently, as it always has.
 fn curation_verdict(
     target: &CurationTarget<'_>,
     package: &str,
@@ -11176,9 +11179,10 @@ fn curation_verdict(
             unavailable: false,
         }),
         ("review", Some(rule_id)) => {
-            // `warn`, like the failed-evaluation line above: a flagged download is
-            // served, so deployments that log at warn must still see it.
-            tracing::warn!(
+            // Debug, not warn: a flag is advisory and repeats on every pull of
+            // the same name. The counter carries the volume; the log keeps the
+            // first sighting readable and still names the rule and reason.
+            tracing::debug!(
                 repo_id = %target.id,
                 repo_key = %target.key,
                 package = %package,
@@ -11186,6 +11190,7 @@ fn curation_verdict(
                 reason = %eval.reason,
                 "curation flagged a proxy download; serving it (no review queue on the proxy path)"
             );
+            crate::services::metrics_service::record_curation_flagged_download(target.key, rule_id);
             Ok(())
         }
         _ => Ok(()),
@@ -30112,7 +30117,8 @@ mod tests {
     fn test_curation_verdict_maps_proxy_outcomes() {
         let repo = repo_info_for(uuid::Uuid::new_v4(), "k", "remote", true);
         let target = CurationTarget::from(&repo);
-        let rule = Some(uuid::Uuid::new_v4());
+        let rule_id = uuid::Uuid::new_v4();
+        let rule = Some(rule_id);
 
         let block =
             curation_verdict(&target, "pkg", proxy_eval("block", rule)).expect_err("block refuses");
@@ -30124,10 +30130,22 @@ mod tests {
                 unavailable: false,
             }
         );
-        // A flagged rule and the review default stance both serve.
-        assert!(curation_verdict(&target, "pkg", proxy_eval("review", rule)).is_ok());
-        assert!(curation_verdict(&target, "pkg", proxy_eval("review", None)).is_ok());
-        assert!(curation_verdict(&target, "pkg", proxy_eval("allow", rule)).is_ok());
+        // A flagged rule and the review default stance both serve. Only a
+        // flag from a rule is counted, by its repository key and rule id.
+        let rule_label = rule_id.to_string();
+        let (_, counted) = crate::services::metrics_service::capture_counters(|| {
+            assert!(curation_verdict(&target, "pkg", proxy_eval("review", rule)).is_ok());
+            assert!(curation_verdict(&target, "pkg", proxy_eval("review", None)).is_ok());
+            assert!(curation_verdict(&target, "pkg", proxy_eval("allow", rule)).is_ok());
+        });
+        assert_eq!(
+            counted.get(
+                "ak_curation_flagged_downloads_total",
+                &[("repository", "k"), ("rule_id", &rule_label)]
+            ),
+            1
+        );
+        assert_eq!(counted.get("ak_curation_flagged_downloads_total", &[]), 1);
         assert_eq!(target.format, Some("npm"));
     }
 

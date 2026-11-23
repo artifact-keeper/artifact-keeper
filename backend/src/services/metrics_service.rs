@@ -369,6 +369,19 @@ pub fn record_proxy_scan_unscannable(repo_key: &str, format: &str, reason: &'sta
     .increment(1);
 }
 
+/// Count one curation flag served on a Remote or Virtual download (#5840).
+/// Labelled by the repository key and the rule id: both are operator-created
+/// and bounded. The package name and the free-text reason stay in the `debug`
+/// log instead, because their cardinality is unbounded.
+pub fn record_curation_flagged_download(repo_key: &str, rule_id: uuid::Uuid) {
+    counter!(
+        "ak_curation_flagged_downloads_total",
+        "repository" => repo_key.to_string(),
+        "rule_id" => rule_id.to_string()
+    )
+    .increment(1);
+}
+
 /// Record one committed artifact upload: `ak_artifact_uploads_total` and the
 /// `ak_artifact_upload_size_bytes` histogram. Called from
 /// `scanner_service::trigger_scan_on_upload`, the post-commit step every
