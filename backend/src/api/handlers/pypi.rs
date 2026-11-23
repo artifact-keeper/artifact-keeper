@@ -1814,7 +1814,7 @@ async fn download_or_metadata(
         }
         if repo.repo_type == RepositoryType::Remote {
             if let (Some(upstream_url), Some(proxy)) = (&repo.upstream_url, &state.proxy_service) {
-                remote_metadata_gate(
+                if let Some(metadata) = remote_metadata_gate(
                     &state,
                     proxy,
                     &repo,
@@ -1822,7 +1822,11 @@ async fn download_or_metadata(
                     &normalized,
                     real_filename,
                 )
-                .await?;
+                .await?
+                {
+                    // #6444: the METADATA of the cached copy the gate decided on.
+                    return Ok(pep658_metadata_response(metadata, None, None));
+                }
                 return serve_remote_metadata(
                     &state,
                     proxy,
@@ -2117,7 +2121,7 @@ async fn serve_virtual_metadata(
                 (Some(upstream_url), Some(proxy)) => {
                     // #6439: the member's cached distribution is held or
                     // refused: the answer, as for the distribution itself.
-                    metadata_gate_for_cached_file(
+                    if let Some(metadata) = metadata_gate_for_cached_file(
                         state,
                         proxy,
                         member.id,
@@ -2127,7 +2131,12 @@ async fn serve_virtual_metadata(
                         normalized_project,
                         filename,
                     )
-                    .await?;
+                    .await?
+                    {
+                        // #6444: the METADATA of the cached copy the gate
+                        // decided on.
+                        return Ok(pep658_metadata_response(metadata, None, None));
+                    }
                     serve_remote_metadata(
                         state,
                         proxy,
@@ -2233,7 +2242,7 @@ async fn serve_virtual_metadata(
 /// file recorded as a row before 1.2.0) with the download gate, and a
 /// cached-file row against its cache sidecar (#6433). The same checks run
 /// here, then [`metadata_gate_for_cached_file`] under the Remote's own scan
-/// policy.
+/// policy, whose `Some` METADATA is served in place of the sidecar.
 async fn remote_metadata_gate(
     state: &SharedState,
     proxy: &crate::services::proxy_service::ProxyService,
@@ -2241,7 +2250,7 @@ async fn remote_metadata_gate(
     upstream_url: &str,
     project: &NormalizedProjectName,
     filename: &str,
-) -> Result<(), Response> {
+) -> Result<Option<Bytes>, Response> {
     metadata_age_gate(state, repo, project, filename, false).await?;
     let row = proxy_helpers::resolve_local_artifact_by_suffix(&state.db, repo.id, filename).await?;
     if let Some(row) = &row {
@@ -2310,7 +2319,9 @@ fn metadata_gate_unavailable(what: &str, error: &dyn std::fmt::Display) -> Respo
 
 /// Whether a PEP 658 `.metadata` request may be served, given the
 /// distribution it describes as the Remote `repo_key` caches it (#6439).
-/// `Err` is the answer the distribution itself gets.
+/// `Err` is the answer the distribution itself gets. `Ok(Some(metadata))` is
+/// the METADATA to serve instead of the upstream's sidecar (#6444, below);
+/// `Ok(None)` serves the sidecar as before.
 ///
 /// It follows the distribution, as a conda `.sigs` sidecar follows its
 /// package (#4585), and fails closed:
@@ -2325,11 +2336,20 @@ fn metadata_gate_unavailable(what: &str, error: &dyn std::fmt::Display) -> Respo
 ///   severity gate is the distribution's audited `scan_blocked` `403`; a
 ///   `clean` one serves;
 /// * under `fail_closed` with no usable verdict, the distribution's own scan
-///   gate decides, on the cached bytes whether or not the copy is fresh,
-///   never fetching the distribution ([`metadata_gate_on_cached_bytes`],
-///   #6444): its `423` or `403` is the answer, a serve lets the metadata
-///   through. Under `fail_open` the distribution is served before it is
-///   scanned, so the metadata is too.
+///   gate decides on the cached bytes, never fetching the distribution
+///   ([`metadata_gate_on_cached_bytes`], #6444): its `423` or `403` is the
+///   answer, a serve lets the metadata through. Under `fail_open` the
+///   distribution is served before it is scanned, so the metadata is too.
+///
+/// Under `fail_closed` every serve above decides on the CACHED copy. While
+/// that copy is fresh, it is also what the distribution's own request serves.
+/// Once it is stale, the distribution's request refetches and gates whatever
+/// the upstream now holds under the file name, which an upstream that reuses
+/// file names (or a tampered mirror) can make different bytes. So for a stale
+/// copy the METADATA served is the one inside the cached distribution that
+/// was gated ([`metadata_from_cached_distribution`]), not the upstream's
+/// sidecar: the bytes the gate decided on are the bytes the metadata
+/// describes, and the upstream is not contacted for either.
 #[allow(clippy::too_many_arguments)]
 async fn metadata_gate_for_cached_file(
     state: &SharedState,
@@ -2340,14 +2360,15 @@ async fn metadata_gate_for_cached_file(
     policy: Option<proxy_helpers::MemberScanPolicy>,
     project: &NormalizedProjectName,
     filename: &str,
-) -> Result<(), Response> {
+) -> Result<Option<Bytes>, Response> {
     use crate::services::proxy_scan_service::{verdict_blocks, ProxyScanAction, ProxyScanService};
+    let cache_path = build_pypi_proxy_cache_path(project, filename);
     let cached = proxy
-        .get_cache_metadata_strict(repo_key, &build_pypi_proxy_cache_path(project, filename))
+        .get_cache_metadata_strict(repo_key, &cache_path)
         .await
         .map_err(|e| metadata_gate_unavailable("the distribution's cache sidecar", &e))?;
     let Some(cached) = cached.filter(|m| m.negative_cached_until.is_none()) else {
-        return Ok(());
+        return Ok(None);
     };
     if cached
         .quarantine_until
@@ -2359,10 +2380,10 @@ async fn metadata_gate_for_cached_file(
         .into_response());
     }
     let Some((action, severity_gate)) = policy else {
-        return Ok(());
+        return Ok(None);
     };
     if matches!(action, ProxyScanAction::RecordOnly) || severity_gate.is_record_only() {
-        return Ok(());
+        return Ok(None);
     }
     let digest = cached.checksum_sha256.as_str();
     if digest.is_empty() {
@@ -2375,23 +2396,29 @@ async fn metadata_gate_for_cached_file(
         .lookup_verdict(digest, proxy_helpers::PROXY_SCAN_TYPE)
         .await
         .map_err(|e| metadata_gate_unavailable("the distribution's scan verdict", &e))?;
-    match verdict {
+    let fail_closed = matches!(action, ProxyScanAction::FailClosed);
+    // #6444: decided on the cached copy, which the distribution's own request
+    // no longer serves once it is stale.
+    let from_cached = fail_closed && !proxy.is_cache_fresh(repo_key, &cache_path).await;
+    let passes = match verdict {
         Some(row) if verdict_blocks(&row.verdict) => {
-            if !proxy_helpers::stored_verdict_blocks_under_gate(Some(&row), severity_gate) {
-                return Ok(());
+            if proxy_helpers::stored_verdict_blocks_under_gate(Some(&row), severity_gate) {
+                tracing::warn!(
+                    repo_key = %repo_key, file = %filename, digest = %digest,
+                    "refusing PEP 658 metadata: its distribution has a blocking scan verdict"
+                );
+                return Err(proxy_helpers::audited_scan_blocked_response(
+                    &state.db, repo_id, filename, digest,
+                ));
             }
-            tracing::warn!(
-                repo_key = %repo_key, file = %filename, digest = %digest,
-                "refusing PEP 658 metadata: its distribution has a blocking scan verdict"
-            );
-            Err(proxy_helpers::audited_scan_blocked_response(
-                &state.db, repo_id, filename, digest,
-            ))
+            None
         }
-        Some(row) if row.verdict == crate::services::proxy_scan_service::VERDICT_CLEAN => Ok(()),
-        _ if matches!(action, ProxyScanAction::FailClosed) => {
+        Some(row) if row.verdict == crate::services::proxy_scan_service::VERDICT_CLEAN => None,
+        _ if fail_closed => {
             // No usable verdict: the distribution's own scan gate decides,
             // on the cached bytes, fresh or stale (#6444).
+            let body =
+                read_cached_distribution(proxy, repo_key, &cache_path, filename, &cached).await?;
             metadata_gate_on_cached_bytes(
                 state,
                 proxy,
@@ -2400,37 +2427,80 @@ async fn metadata_gate_for_cached_file(
                 upstream_url,
                 project,
                 filename,
-                &cached,
+                &cache_path,
+                &body,
                 action,
                 severity_gate,
             )
-            .await
+            .await?;
+            Some(body)
         }
-        _ => Ok(()),
+        _ => return Ok(None),
+    };
+    if !from_cached {
+        return Ok(None);
     }
+    let body = match passes {
+        Some(body) => body,
+        None => read_cached_distribution(proxy, repo_key, &cache_path, filename, &cached).await?,
+    };
+    metadata_from_cached_distribution(filename, body)
+        .await
+        .map(Some)
+}
+
+/// The cached body of a distribution the metadata gate decides on (#6444),
+/// read past its expiry, never from the upstream.
+///
+/// It fails closed: a sidecar whose size cannot be a body, a body that cannot
+/// be read, or one whose digest is not the sidecar's is a `503`. A copy over
+/// the scan byte cap, by its sidecar or by the bytes read, is the `423` the
+/// distribution gets under fail-closed, and the sidecar's size is checked
+/// before anything is read.
+async fn read_cached_distribution(
+    proxy: &crate::services::proxy_service::ProxyService,
+    repo_key: &str,
+    cache_path: &str,
+    filename: &str,
+    cached: &crate::services::proxy_service::CacheMetadata,
+) -> Result<proxy_helpers::CachedBody, Response> {
+    const WHAT: &str = "the cached distribution";
+    const CAP: usize = crate::services::scanner_service::PROXY_SCAN_MAX_BYTES;
+    let size = usize::try_from(cached.size_bytes)
+        .map_err(|_| metadata_gate_unavailable(WHAT, &"the sidecar records a negative size"))?;
+    if size > CAP {
+        return Err(proxy_helpers::scan_pending_locked_response(filename));
+    }
+    let body = proxy
+        .get_cached_artifact_by_path_ignoring_expiry(repo_key, cache_path)
+        .await
+        .map_err(|e| metadata_gate_unavailable(WHAT, &e))?
+        .ok_or_else(|| metadata_gate_unavailable(WHAT, &"its body could not be read"))?;
+    if body.content.len() > CAP {
+        return Err(proxy_helpers::scan_pending_locked_response(filename));
+    }
+    if proxy_helpers::sha256_hex(&body.content) != cached.checksum_sha256 {
+        return Err(metadata_gate_unavailable(
+            WHAT,
+            &"its body does not match the sidecar's digest",
+        ));
+    }
+    Ok(body)
 }
 
 /// The fail-closed scan gate of a cached distribution with no usable verdict,
 /// for its PEP 658 metadata (#6444): the wheel's own gate
-/// ([`proxy_helpers::gate_cached_proxy_bytes`]) run on the bytes the proxy
-/// cache holds, whether or not the copy is still fresh. The upstream is never
-/// contacted.
+/// ([`proxy_helpers::gate_cached_proxy_bytes`]) run on `body`, the bytes the
+/// proxy cache holds ([`read_cached_distribution`]), whether or not the copy
+/// is still fresh. The upstream is never contacted.
 ///
 /// Before, a stale copy went through [`serve_scanned_pypi_file`], which
 /// re-resolves the index and downloads the whole distribution to answer a
 /// request for a few KB of METADATA. A resolver reading the metadata of many
 /// candidate versions it never installs paid a wheel download per candidate.
 ///
-/// The verdict decides on the cached copy, as a stored verdict on that
-/// copy's digest already does above. That is the bytes the client is served
-/// unless the upstream now has different bytes under the same file name, and
-/// those the distribution's own request scans before serving a byte of them.
 /// The scan is the in-flight one the distribution's request joins, or whose
-/// verdict it reuses, so no wheel is scanned twice.
-///
-/// It fails closed: a sidecar whose size cannot be a body, a body that cannot
-/// be read, or one whose digest is not the sidecar's is a `503`. A copy over
-/// the scan byte cap is the `423` the distribution gets under fail-closed.
+/// verdict it reuses, so no copy is scanned twice.
 #[allow(clippy::too_many_arguments)]
 async fn metadata_gate_on_cached_bytes(
     state: &SharedState,
@@ -2440,37 +2510,19 @@ async fn metadata_gate_on_cached_bytes(
     upstream_url: &str,
     project: &NormalizedProjectName,
     filename: &str,
-    cached: &crate::services::proxy_service::CacheMetadata,
+    cache_path: &str,
+    body: &proxy_helpers::CachedBody,
     action: crate::services::proxy_scan_service::ProxyScanAction,
     severity_gate: crate::services::proxy_scan_service::ProxySeverityGate,
 ) -> Result<(), Response> {
-    const WHAT: &str = "the cached distribution";
-    let size = usize::try_from(cached.size_bytes)
-        .map_err(|_| metadata_gate_unavailable(WHAT, &"the sidecar records a negative size"))?;
-    if size > crate::services::scanner_service::PROXY_SCAN_MAX_BYTES {
-        return Err(proxy_helpers::scan_pending_locked_response(filename));
-    }
-    let cache_path = build_pypi_proxy_cache_path(project, filename);
-    let body = proxy
-        .get_cached_artifact_by_path_ignoring_expiry(repo_key, &cache_path)
-        .await
-        .map_err(|e| metadata_gate_unavailable(WHAT, &e))?
-        .ok_or_else(|| metadata_gate_unavailable(WHAT, &"its body could not be read"))?;
-    let bytes = body.content;
-    let digest = proxy_helpers::sha256_hex(&bytes);
-    if digest != cached.checksum_sha256 {
-        return Err(metadata_gate_unavailable(
-            WHAT,
-            &"its body does not match the sidecar's digest",
-        ));
-    }
+    let digest = proxy_helpers::sha256_hex(&body.content);
     let req = proxy_helpers::ScannedProxyRequest {
         repo_id,
         repo_key,
         fetch_base: upstream_url,
         format: RepositoryFormat::Pypi,
-        source_path: &cache_path,
-        cache_path: &cache_path,
+        source_path: cache_path,
+        cache_path,
         filename,
         action,
         severity_gate,
@@ -2484,7 +2536,47 @@ async fn metadata_gate_on_cached_bytes(
         project,
         index_path: "",
     };
-    proxy_helpers::gate_cached_proxy_bytes(state, &req, &file, &bytes, &digest).await
+    proxy_helpers::gate_cached_proxy_bytes(state, &req, &file, &body.content, &digest).await
+}
+
+/// The METADATA inside a cached distribution the gate decided on (#6444): a
+/// wheel's `*.dist-info/METADATA`, an sdist's `PKG-INFO`, under one ingest
+/// extraction permit and on a blocking thread, with the bounded readers every
+/// other extraction uses. A distribution it cannot be read from answers
+/// "Metadata not available" (`404`), as the upstream-wheel fallback does; a
+/// client then reads it from the distribution, which is gated on its own.
+async fn metadata_from_cached_distribution(
+    filename: &str,
+    body: proxy_helpers::CachedBody,
+) -> Result<Bytes, Response> {
+    let _permit = crate::util::bounded_archive::acquire_ingest_extraction_waiting()
+        .await
+        .map_err(|e| e.into_response())?;
+    let name = filename.to_ascii_lowercase();
+    let proxy_helpers::CachedBody {
+        content,
+        content_encoding,
+        ..
+    } = body;
+    let text = tokio::task::spawn_blocking(move || -> Result<Option<String>, AppError> {
+        use crate::util::content_coding::{strip_content_coding, Decoded};
+        let plain = match strip_content_coding(&content, content_encoding.as_deref())? {
+            Decoded::Bytes(plain) => plain,
+            Decoded::Unsupported => return Ok(None),
+        };
+        Ok(if name.ends_with(".whl") {
+            extract_metadata_from_wheel(&plain)
+        } else if name.ends_with(".tar.gz") {
+            extract_metadata_from_sdist(&plain)
+        } else {
+            None
+        })
+    })
+    .await
+    .map_err(|e| metadata_gate_unavailable("the cached distribution's METADATA", &e))?
+    .map_err(|e| e.into_response())?;
+    text.map(Bytes::from)
+        .ok_or_else(|| AppError::NotFound("Metadata not available".to_string()).into_response())
 }
 
 /// Serve a PEP 658 `.metadata` resource from a remote upstream.
@@ -23590,7 +23682,7 @@ mod tests {
                 )
                 .await
                 {
-                    Ok(()) => StatusCode::OK,
+                    Ok(_) => StatusCode::OK,
                     Err(r) => r.status(),
                 }
             }
@@ -23666,19 +23758,29 @@ mod tests {
         assert_eq!(scanned_gate, StatusCode::FORBIDDEN, "the Remote scans");
     }
 
-    /// #6444: under fail_closed, the METADATA of a STALE cached wheel with no
-    /// verdict is gated on the cached bytes, never by fetching the wheel. The
-    /// answer is the wheel's own (no scanner here: `423`), and the upstream
-    /// sees no request. Before, the gate re-resolved the index and downloaded
-    /// the whole wheel. A cached body that does not match its sidecar's digest
-    /// is a `503`, also with no upstream request. The upstream serves the index
-    /// and the wheel, so a refetch would be counted. That the status equals the
-    /// wheel's is checked end to end (tier pypi-metadata-gate-index-fetch).
+    /// #6444: under fail_closed, the METADATA of a STALE cached wheel is
+    /// gated on the cached bytes and never fetches the wheel; the upstream,
+    /// which serves the index and the wheel so a refetch would be counted,
+    /// sees no request for any case here. Before, a stale copy with no verdict
+    /// re-resolved the index and downloaded the whole wheel.
+    /// * no verdict, no scanner: the wheel's own `423`;
+    /// * no verdict, a wheel with two METADATA entries: the inline gate's
+    ///   `423 scan_identity_unestablished`, the refusal the wheel gets, with
+    ///   nothing scanned;
+    /// * a stored blocking verdict for the cached copy: `403`;
+    /// * a stored clean verdict, stale: the METADATA served is the one inside
+    ///   the cached wheel the gate decided on, not the upstream's sidecar; fresh:
+    ///   the sidecar is served as before (`None`);
+    /// * a cached body that does not match its sidecar's digest: `503`.
+    ///
+    /// That each status equals the wheel's is checked end to end (tier
+    /// pypi-metadata-gate-index-fetch).
     #[tokio::test]
     async fn test_stale_unscanned_metadata_never_fetches_the_wheel_6444() {
         use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::archive_entry_paths::test_support::zip_with;
         use crate::services::proxy_scan_service::{ProxyScanAction, ProxySeverityGate};
-        use wiremock::matchers::{method, path};
+        use wiremock::matchers::{method, path_regex};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
@@ -23702,59 +23804,99 @@ mod tests {
             proxy.clone(),
         );
         let remote = fx.repo_info("remote", Some(&uri));
-        let stale = "stalewheel-1.0-py3-none-any.whl";
-        let torn = "tornwheel-1.0-py3-none-any.whl";
+        // (project, aged, stored verdict, replace the body with)
+        let dup_wheel = Bytes::from(zip_with(&[
+            (
+                "dupwheel-1.0.dist-info/METADATA",
+                b"Metadata-Version: 2.1\nName: dupwheel\nVersion: 1.0\n",
+            ),
+            ("dupwheel/__init__.py", b""),
+            (
+                "dupwheel-1.0.dist-info/./METADATA",
+                b"Metadata-Version: 2.1\nName: dupwheel\nVersion: 1.0\nRequires-Dist: other\n",
+            ),
+        ]));
+        let cases: [(&str, bool, Option<&str>, Option<Bytes>); 6] = [
+            ("stalewheel", true, None, None),
+            ("tornwheel", true, None, Some(Bytes::from_static(b"torn"))),
+            ("dupwheel", true, None, Some(dup_wheel)),
+            ("vulnstale", true, Some("vulnerable"), None),
+            ("cleanstale", true, Some("clean"), None),
+            ("cleanfresh", false, Some("clean"), None),
+        ];
         let mut digests = Vec::new();
-        for (project, file) in [("stalewheel", stale), ("tornwheel", torn)] {
-            digests.push(
-                seed_cached_wheel_6439(&state, &backend, &fx, &remote, project, file, false).await,
-            );
+        for (project, aged, verdict, body) in &cases {
+            let file = format!("{project}-1.0-py3-none-any.whl");
+            let mut digest =
+                seed_cached_wheel_6439(&state, &backend, &fx, &remote, project, &file, false).await;
             let prefix = format!("proxy-cache/{}/simple/{project}/{file}", remote.key);
-            let mut objects = backend.objects.lock().unwrap();
-            let key = format!("{prefix}/__cache_meta__.json");
-            let mut meta: serde_json::Value =
-                serde_json::from_slice(&objects[&key]).expect("sidecar json");
-            let past = chrono::Utc::now() - chrono::Duration::hours(2);
-            meta["cached_at"] = serde_json::json!(past);
-            meta["expires_at"] = serde_json::json!(past + chrono::Duration::hours(1));
-            objects.insert(key, Bytes::from(serde_json::to_vec(&meta).unwrap()));
-            if project == "tornwheel" {
-                objects.insert(format!("{prefix}/__content__"), Bytes::from_static(b"torn"));
+            {
+                let mut objects = backend.objects.lock().unwrap();
+                let key = format!("{prefix}/__cache_meta__.json");
+                let mut meta: serde_json::Value =
+                    serde_json::from_slice(&objects[&key]).expect("sidecar json");
+                if *aged {
+                    let past = chrono::Utc::now() - chrono::Duration::hours(2);
+                    meta["cached_at"] = serde_json::json!(past);
+                    meta["expires_at"] = serde_json::json!(past + chrono::Duration::hours(1));
+                }
+                if let Some(body) = body {
+                    objects.insert(format!("{prefix}/__content__"), body.clone());
+                    if *project == "dupwheel" {
+                        digest = proxy_helpers::sha256_hex(body);
+                        meta["checksum_sha256"] = serde_json::json!(digest);
+                        meta["size_bytes"] = serde_json::json!(body.len());
+                    }
+                }
+                objects.insert(key, Bytes::from(serde_json::to_vec(&meta).unwrap()));
             }
+            if let Some(verdict) = verdict {
+                sqlx::query(
+                    "INSERT INTO proxy_scan_results (checksum_sha256, scan_type, verdict, \
+                     findings_count, critical_count, max_severity) \
+                     VALUES ($1, 'grype', $2, $3, $3, $4) ON CONFLICT DO NOTHING",
+                )
+                .bind(&digest)
+                .bind(verdict)
+                .bind(i32::from(*verdict == "vulnerable"))
+                .bind((*verdict == "vulnerable").then_some("critical"))
+                .execute(&fx.pool)
+                .await
+                .expect("verdict");
+            }
+            digests.push(digest);
         }
         assert!(
             !proxy
-                .is_cache_fresh(&remote.key, &format!("simple/stalewheel/{stale}"))
+                .is_cache_fresh(
+                    &remote.key,
+                    "simple/stalewheel/stalewheel-1.0-py3-none-any.whl"
+                )
                 .await,
             "the seeded copy must be stale"
         );
-        // What a refetch would read: the index naming the file, and the
-        // file, the same bytes as the cached copy.
-        let wheel_bytes = backend.objects.lock().unwrap()[&format!(
-            "proxy-cache/{}/simple/stalewheel/{stale}/__content__",
-            remote.key
-        )]
-            .clone();
+        // Anything a refetch would read: an index naming the file, the file.
         Mock::given(method("GET"))
-            .and(path("/simple/stalewheel/"))
+            .and(path_regex("^/simple/.*"))
             .respond_with(ResponseTemplate::new(200).set_body_string(format!(
-                "<html><body><a href=\"{uri}/files/{stale}\">{stale}</a></body></html>"
+                "<html><body><a href=\"{uri}/files/x-1.0-py3-none-any.whl\">x</a></body></html>"
             )))
             .mount(&upstream)
             .await;
         Mock::given(method("GET"))
-            .and(path(format!("/files/{stale}")))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(wheel_bytes.to_vec()))
+            .and(path_regex("^/files/.*"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"upstream".to_vec()))
             .mount(&upstream)
             .await;
 
         let policy = Some((ProxyScanAction::FailClosed, ProxySeverityGate::BlockOnAny));
-        let metadata = |project: &'static str, filename: &'static str| {
+        let metadata = |project: &'static str| {
             let state = state.clone();
             let proxy = proxy.clone();
             let remote = remote.clone();
             let uri = uri.clone();
             async move {
+                let file = format!("{project}-1.0-py3-none-any.whl");
                 match super::metadata_gate_for_cached_file(
                     &state,
                     &proxy,
@@ -23763,17 +23905,30 @@ mod tests {
                     &uri,
                     policy,
                     &proj(project),
-                    filename,
+                    &file,
                 )
                 .await
                 {
-                    Ok(()) => StatusCode::OK,
-                    Err(r) => r.status(),
+                    Ok(served) => (
+                        StatusCode::OK,
+                        served.map(|b| String::from_utf8_lossy(&b).into_owned()),
+                    ),
+                    Err(r) => {
+                        let status = r.status();
+                        let body = axum::body::to_bytes(r.into_body(), 1 << 16)
+                            .await
+                            .unwrap_or_default();
+                        (status, Some(String::from_utf8_lossy(&body).into_owned()))
+                    }
                 }
             }
         };
-        let stale_status = metadata("stalewheel", stale).await;
-        let torn_status = metadata("tornwheel", torn).await;
+        let stale = metadata("stalewheel").await;
+        let torn = metadata("tornwheel").await;
+        let dup = metadata("dupwheel").await;
+        let vuln = metadata("vulnstale").await;
+        let clean_stale = metadata("cleanstale").await;
+        let clean_fresh = metadata("cleanfresh").await;
         let fetched_for_metadata = upstream.received_requests().await.unwrap_or_default().len();
 
         for d in &digests {
@@ -23789,14 +23944,41 @@ mod tests {
             "a .metadata request must not contact the upstream for a stale cached wheel"
         );
         assert_eq!(
-            stale_status,
+            stale.0,
             StatusCode::LOCKED,
-            "no scanner, fail_closed: the cached bytes cannot be scanned"
+            "no scanner, fail_closed: the cached bytes cannot be scanned: {stale:?}"
+        );
+        assert_eq!(dup.0, StatusCode::LOCKED, "{dup:?}");
+        assert!(
+            dup.1
+                .as_deref()
+                .is_some_and(|b| b.contains("scan_identity_unestablished")),
+            "the inline gate refuses the cached bytes as it refuses the wheel: {dup:?}"
+        );
+        assert_eq!(vuln.0, StatusCode::FORBIDDEN, "{vuln:?}");
+        assert!(
+            vuln.1
+                .as_deref()
+                .is_some_and(|b| b.contains("scan_blocked")),
+            "{vuln:?}"
+        );
+        assert_eq!(clean_stale.0, StatusCode::OK, "{clean_stale:?}");
+        assert!(
+            clean_stale
+                .1
+                .as_deref()
+                .is_some_and(|m| m.contains("Summary: from-row") && m.contains("Name: cleanstale")),
+            "a stale copy's METADATA is the gated wheel's own, not the sidecar's: {clean_stale:?}"
         );
         assert_eq!(
-            torn_status,
+            clean_fresh,
+            (StatusCode::OK, None),
+            "a fresh copy, which the wheel's request also serves, keeps the sidecar"
+        );
+        assert_eq!(
+            torn.0,
             StatusCode::SERVICE_UNAVAILABLE,
-            "a cached body that is not the sidecar's is never decided on"
+            "a cached body that is not the sidecar's is never decided on: {torn:?}"
         );
     }
 
