@@ -10580,6 +10580,110 @@ mod tests {
             .expect("cleanup repo");
     }
 
+    /// #5264: an Artifactory `helmoci` chart (Helm config blob, chart layer,
+    /// OCI image manifest with Helm media types) imported into a `helm_oci`
+    /// repo must land in the OCI index the way a native `helm push` does, so
+    /// `helm pull oci://` resolves the imported tag.
+    #[tokio::test]
+    async fn test_helm_oci_import_registers_manifest_and_blobs_artifactory_layout() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (worker, storage, _tmp, repo_id, repo_key) =
+            setup_repo_for_import(&pool, "mig5264-helmoci", "helm_oci").await;
+
+        let config_bytes =
+            bytes::Bytes::from_static(b"{\"name\":\"mychart\",\"version\":\"0.1.0\"}");
+        let chart_bytes = bytes::Bytes::from_static(b"chart-tgz-bytes-5264");
+        let config_hex = sha256_hex_of(&config_bytes);
+        let chart_hex = sha256_hex_of(&chart_bytes);
+        let manifest = format!(
+            "{{\"schemaVersion\":2,\
+              \"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\
+              \"config\":{{\"mediaType\":\"application/vnd.cncf.helm.config.v1+json\",\"size\":{},\"digest\":\"sha256:{}\"}},\
+              \"layers\":[{{\"mediaType\":\"application/vnd.cncf.helm.chart.content.v1.tar+gzip\",\"size\":{},\"digest\":\"sha256:{}\"}}]}}",
+            config_bytes.len(),
+            config_hex,
+            chart_bytes.len(),
+            chart_hex
+        );
+        let manifest_bytes = bytes::Bytes::from(manifest);
+        let manifest_digest = format!("sha256:{}", sha256_hex_of(&manifest_bytes));
+
+        let config_path = format!("mychart/0.1.0/sha256__{config_hex}");
+        let chart_path = format!("mychart/0.1.0/sha256__{chart_hex}");
+        let manifest_path = "mychart/0.1.0/manifest.json".to_string();
+        let mut files = std::collections::HashMap::new();
+        files.insert(config_path.clone(), config_bytes.clone());
+        files.insert(chart_path.clone(), chart_bytes.clone());
+        files.insert(manifest_path.clone(), manifest_bytes.clone());
+
+        for path in [&config_path, &chart_path, &manifest_path] {
+            transfer_one(&worker, &storage, &files, &repo_key, "helm_oci", path)
+                .await
+                .unwrap_or_else(|e| panic!("transfer of {path} failed: {e}"));
+        }
+
+        let digest: Option<String> = sqlx::query_scalar(
+            "SELECT manifest_digest FROM oci_tags \
+             WHERE repository_id = $1 AND name = 'mychart' AND tag = '0.1.0'",
+        )
+        .bind(repo_id)
+        .fetch_optional(&pool)
+        .await
+        .expect("query oci_tags");
+        assert_eq!(
+            digest.as_deref(),
+            Some(manifest_digest.as_str()),
+            "mychart:0.1.0 must resolve to the manifest digest"
+        );
+
+        for hex in [&config_hex, &chart_hex] {
+            let blob: Option<(String,)> = sqlx::query_as(
+                "SELECT storage_key FROM oci_blobs WHERE repository_id = $1 AND digest = $2",
+            )
+            .bind(repo_id)
+            .bind(format!("sha256:{hex}"))
+            .fetch_optional(&pool)
+            .await
+            .expect("query oci_blobs");
+            let (key,) = blob.expect("blob must be registered in oci_blobs");
+            assert!(storage.exists(&key).await.unwrap(), "blob bytes at {key}");
+        }
+
+        let ref_count: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM manifest_blob_refs WHERE repository_id = $1 AND manifest_digest = $2",
+        )
+        .bind(repo_id)
+        .bind(&manifest_digest)
+        .fetch_one(&pool)
+        .await
+        .expect("count manifest_blob_refs");
+        assert_eq!(
+            ref_count.0, 2,
+            "config + chart layer edges must be recorded"
+        );
+
+        let artifact_count: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM artifacts WHERE repository_id = $1 AND is_deleted = false",
+        )
+        .bind(repo_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count artifacts");
+        assert_eq!(
+            artifact_count.0, 1,
+            "only the manifest gets an artifacts row"
+        );
+
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup repo");
+    }
+
     /// Multi-arch over the Nexus source layout: the child image manifest
     /// (digest reference) and the index (tag reference) are separate source
     /// artifacts; importing both must record the parent->child edge in
