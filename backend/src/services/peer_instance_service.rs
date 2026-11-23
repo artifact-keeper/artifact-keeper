@@ -31,6 +31,7 @@ const QUEUE_RESTORED_PUSH_SQL: &str = r#"
         status = 'pending',
         priority = GREATEST(sync_tasks.priority, 0),
         retry_count = 0,
+        unreachable_since = NULL,
         error_message = NULL,
         started_at = NULL,
         completed_at = NULL,
@@ -110,6 +111,7 @@ const QUEUE_REMOVAL_DELETE_TASKS_SQL: &str = r#"
     ON CONFLICT (peer_instance_id, artifact_id, task_type) DO UPDATE SET
         status = 'pending',
         retry_count = 0,
+        unreachable_since = NULL,
         error_message = NULL,
         started_at = NULL,
         completed_at = NULL,
@@ -232,6 +234,7 @@ const REARM_SUPERSEDED_PUSH_SQL: &str = r#"
     UPDATE sync_tasks st
     SET status = 'pending',
         retry_count = 0,
+        unreachable_since = NULL,
         error_message = NULL,
         started_at = NULL,
         completed_at = NULL,

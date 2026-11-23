@@ -365,7 +365,7 @@ pub fn merge_dependencies(
         match seen.get(&key) {
             Some(&i) => {
                 if let (Some(kept), Some(other)) = (&out[i].license, &dep.license) {
-                    if is_wrapped_form_of(kept, other) {
+                    if is_wrapped_form_of(kept, other) || is_canonical_form_of(kept, other) {
                         out[i].license = dep.license;
                     }
                 }
@@ -412,6 +412,22 @@ fn is_wrapped_form_of(wrapped: &str, raw: &str) -> bool {
         && only_spaces_rewritten
         && !raw.starts_with("LicenseRef-")
         && crate::services::spdx_licenses::sanitize_license_term(raw).as_deref() == Some(wrapped)
+}
+
+/// Whether `canonical` is the expression that
+/// [`crate::services::spdx_licenses::conjunctive_spdx_expression`] makes of
+/// the other scanner's `raw` text, differing from it (#6379): Trivy stores
+/// `MIT AND PSF-2.0` as `MIT AND LicenseRef-PSF-2.0`, Grype the text. As with
+/// [`is_wrapped_form_of`], the same license text kept by two scanners, so
+/// the SBOM keeps the text whichever row came first (#5629). A `raw` with a
+/// `+` or a `LicenseRef-` does not count: wrapping an unlisted `X+` drops the
+/// `+`, and a reference is already opaque.
+fn is_canonical_form_of(canonical: &str, raw: &str) -> bool {
+    canonical != raw
+        && !raw.contains('+')
+        && !raw.contains("LicenseRef-")
+        && crate::services::spdx_licenses::conjunctive_spdx_expression(raw).as_deref()
+            == Some(canonical)
 }
 
 /// Extract declared dependencies from already-loaded manifest metadata for a
@@ -858,6 +874,29 @@ mod tests {
             vec![],
         );
         assert_eq!(out[0].license.as_deref(), Some("Public Domain"));
+        // #6379: Trivy keeps a conjunction with an unlisted id wrapped alone.
+        for (first, second) in [
+            ("MIT AND LicenseRef-PSF-2.0", "MIT AND PSF-2.0"),
+            ("MIT AND PSF-2.0", "MIT AND LicenseRef-PSF-2.0"),
+        ] {
+            let out = merge_dependencies(
+                vec![
+                    licensed("pkg:npm/r@1.0.0", first),
+                    licensed("pkg:npm/r@1.0.0", second),
+                ],
+                vec![],
+            );
+            assert_eq!(out[0].license.as_deref(), Some("MIT AND PSF-2.0"));
+        }
+        // Different texts are never swapped.
+        let out = merge_dependencies(
+            vec![
+                licensed("pkg:npm/s@1.0.0", "MIT AND LicenseRef-Acme"),
+                licensed("pkg:npm/s@1.0.0", "MIT AND Other"),
+            ],
+            vec![],
+        );
+        assert_eq!(out[0].license.as_deref(), Some("MIT AND LicenseRef-Acme"));
     }
 
     #[test]

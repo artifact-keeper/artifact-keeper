@@ -60,6 +60,7 @@ const ENQUEUE_DELETE_SYNC_TASKS_SQL: &str = r#"
                 ON CONFLICT (peer_instance_id, artifact_id, task_type) DO UPDATE SET
                     status = 'pending',
                     retry_count = 0,
+                    unreachable_since = NULL,
                     error_message = NULL,
                     started_at = NULL,
                     completed_at = NULL,

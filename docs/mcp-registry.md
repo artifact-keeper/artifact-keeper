@@ -1919,7 +1919,15 @@ scheduled, on any replica) holds the lock; once it is `false`,
 `lastFinishedAt`, `lastError` and `lastSummary` describe the pass that ended
 last. A failure the old trigger answered `502` (the first upstream page
 unreadable) is now recorded there: `lastError` is set and
-`lastSummary.pages` is `0`. Only one pass runs at a time: a trigger while one runs answers `409`
+`lastSummary.pages` is `0`. A pass that ended without recording an outcome
+(its process exited, or it panicked or was cancelled; its lock goes with its
+database connection) is reported as finished by the first poll that finds
+the lock free: `lastFinishedAt` is set and `lastError` reads `the sync pass
+ended without recording an outcome: its sync lock was released while it
+ran (...)`. A pass that loses its lock while its process lives on stops at its
+next lock check (every 5 s) and records `the sync pass lost its repository
+sync lock ...`; a pass's state writes match its own start, so it never
+overwrites a pass that started after it. Only one pass runs at a time: a trigger while one runs answers `409`
 and starts nothing. A trigger while scheduled upstream jobs are paused
 (`upstream_jobs_paused`, `UPSTREAM_JOBS_PAUSED`) also answers `409`, without
 contacting the upstream, as the scheduled pass skips its tick. A cache-only

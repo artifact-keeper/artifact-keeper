@@ -4875,10 +4875,20 @@ pub(crate) fn validate_trivy_purl(raw: &str) -> Option<String> {
 /// pre-joined expressions like `"MIT OR Apache-2.0"` are wrapped as
 /// `LicenseRef-<sanitised>` so a downstream policy engine cannot silently
 /// classify them as permissive. (#1152)
+///
+/// An element that is already a conjunctive SPDX expression (`AND` /
+/// `WITH`, no `OR`, such as `MIT AND PSF-2.0`) is kept as an expression,
+/// each operand canonicalised (an unlisted id wrapped on its own), so
+/// `["MIT AND PSF-2.0", "ISC"]` is stored as `MIT AND LicenseRef-PSF-2.0 AND ISC`
+/// instead of `LicenseRef-MIT-AND-PSF-2.0 AND ISC`, an expression with an
+/// opaque operand (#6379). Every arm of a conjunction applies, so this
+/// cannot green-light a package on one of them; an element with `OR` stays
+/// wrapped. See [`crate::services::spdx_licenses::conjunctive_spdx_expression`].
 pub(crate) fn sanitize_trivy_licenses(raw: &[String]) -> Option<String> {
+    use crate::services::spdx_licenses::{conjunctive_spdx_expression, sanitize_license_term};
     let terms: Vec<String> = raw
         .iter()
-        .filter_map(|s| crate::services::spdx_licenses::sanitize_license_term(s))
+        .filter_map(|s| conjunctive_spdx_expression(s).or_else(|| sanitize_license_term(s)))
         .collect();
     if terms.is_empty() {
         None
@@ -28431,6 +28441,81 @@ tonic-build = "0.12"
             Some("Apache-2.0"),
             "canonical-case promotion must happen at conversion time"
         );
+    }
+
+    /// #6379: a Trivy license list that joins a conjunctive compound
+    /// expression with other terms keeps the expression, so the SBOM
+    /// exports an expression of real licenses, not one with an opaque
+    /// `LicenseRef-MIT-AND-PSF-2.0` operand. Parentheses, `+` and an
+    /// element longer than the 64-character LicenseRef body survive too.
+    /// An element with `OR` stays wrapped (#1152), alone or joined, and so
+    /// does prose that is not an SPDX expression.
+    #[test]
+    fn test_sanitize_trivy_licenses_keeps_conjunctive_expressions_6379() {
+        let long = "Apache-2.0 AND BSD-3-Clause AND MIT AND ISC AND Zlib AND BSL-1.0 AND 0BSD";
+        assert!(long.len() > 64);
+        let long_want = format!("{long} AND MIT");
+        for (raw, want) in [
+            (
+                vec!["MIT AND PSF-2.0", "ISC"],
+                "MIT AND LicenseRef-PSF-2.0 AND ISC",
+            ),
+            (
+                vec!["ISC", "MIT AND PSF-2.0"],
+                "ISC AND MIT AND LicenseRef-PSF-2.0",
+            ),
+            (vec!["MIT AND PSF-2.0"], "MIT AND LicenseRef-PSF-2.0"),
+            (
+                vec!["(MIT AND PSF-2.0)", "isc"],
+                "(MIT AND LicenseRef-PSF-2.0) AND ISC",
+            ),
+            (vec!["GPL-2.0+ AND MIT", "ISC"], "GPL-2.0+ AND MIT AND ISC"),
+            (
+                vec!["Apache-2.0 WITH LLVM-exception", "MIT"],
+                "Apache-2.0 WITH LLVM-exception AND MIT",
+            ),
+            (
+                vec!["  MIT   AND\tPSF-2.0 ", "ISC"],
+                "MIT AND LicenseRef-PSF-2.0 AND ISC",
+            ),
+            // Operands are canonicalised: known ids take their case, an
+            // unlisted id is wrapped on its own.
+            (vec!["mit AND zlib", "isc"], "MIT AND Zlib AND ISC"),
+            (
+                vec!["MIT AND Acme-EULA", "ISC"],
+                "MIT AND LicenseRef-Acme-EULA AND ISC",
+            ),
+            (vec![long, "MIT"], long_want.as_str()),
+            // #1152 unchanged: a choice is never kept as an expression.
+            (
+                vec!["MIT OR Apache-2.0", "ISC"],
+                "LicenseRef-MIT-OR-Apache-2.0 AND ISC",
+            ),
+            (
+                vec!["(MIT AND ISC) OR GPL-3.0-only"],
+                "LicenseRef-MIT-AND-ISC-OR-GPL-3.0-only",
+            ),
+            // Prose with operator words is not an expression.
+            (
+                vec!["GPL v2 and MIT", "ISC"],
+                "LicenseRef-GPL-v2-and-MIT AND ISC",
+            ),
+            (
+                vec!["MIT/Apache-2.0 AND ISC"],
+                "LicenseRef-MIT-Apache-2.0-AND-ISC",
+            ),
+        ] {
+            let raw: Vec<String> = raw.into_iter().map(str::to_string).collect();
+            assert_eq!(
+                sanitize_trivy_licenses(&raw).as_deref(),
+                Some(want),
+                "{raw:?}"
+            );
+        }
+        // An oversized element is still wrapped and capped.
+        let huge = vec![format!("MIT{}", " AND MIT".repeat(64))];
+        let out = sanitize_trivy_licenses(&huge).unwrap();
+        assert!(out.starts_with("LicenseRef-") && out.len() <= 75, "{out}");
     }
 
     // -----------------------------------------------------------------------
