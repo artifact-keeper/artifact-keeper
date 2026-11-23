@@ -405,6 +405,19 @@ pub fn record_proxy_fill_follower_inherited() {
     counter!("ak_proxy_fill_followers_inherited_total").increment(1);
 }
 
+/// A `popularity` curation rule flagged a Remote or Virtual download, which
+/// is served (#5840). Counted on every flag; the log line is written at
+/// `warn` once per (repository, package, rule) per hour. `rule_id` is the
+/// rule's UUID, so the cardinality is bounded by the number of rules.
+pub fn record_curation_proxy_flag(repo_key: &str, rule_id: uuid::Uuid) {
+    counter!(
+        "ak_curation_proxy_flags_total",
+        "repository" => repo_key.to_string(),
+        "rule_id" => rule_id.to_string(),
+    )
+    .increment(1);
+}
+
 /// A queued `fail_closed` proxy scan dropped because no request wanted it any
 /// more (#5231).
 pub fn record_proxy_scan_abandoned() {
