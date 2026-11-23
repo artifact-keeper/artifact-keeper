@@ -14135,6 +14135,46 @@ pub(crate) async fn serve_scanned_proxy_file<F: ScannedProxyFile>(
     }
 }
 
+/// The decision [`serve_scanned_proxy_file`] makes on `bytes` already in the
+/// proxy cache at `req.cache_path`, for a request that answers ABOUT the file
+/// without serving it (PyPI `.metadata`, #6444): `Ok` where the file would be
+/// served, its `403` or `423` otherwise.
+///
+/// Nothing is fetched from the upstream, served, committed or recorded as a
+/// download. `digest` is the SHA-256 of exactly `bytes`. When the gate has
+/// to scan, the scan is the in-flight one a pull of the same bytes joins (or
+/// the durable job it waits on), so the verdict it records is reused by that
+/// pull rather than repeated.
+pub(crate) async fn gate_cached_proxy_bytes<F: ScannedProxyFile>(
+    state: &crate::api::SharedState,
+    req: &ScannedProxyRequest<'_>,
+    file: &F,
+    bytes: &Bytes,
+    digest: &str,
+) -> Result<(), Response> {
+    file.after_buffered_fetch(state, req, bytes, digest).await?;
+    let identity = gate_identity(file, req, bytes, digest);
+    let synthetic = F::synthetic_artifact(req.repo_id, req.filename, digest, bytes.len() as i64);
+    match gate_proxy_scan_serve(
+        state,
+        req.repo_id,
+        req.filename,
+        digest,
+        Some(req.cache_path),
+        synthetic,
+        bytes,
+        req.action,
+        req.severity_gate,
+        identity,
+        ProxyScanMode::File,
+    )
+    .await
+    {
+        ProxyScanServeOutcome::Serve(_) => Ok(()),
+        ProxyScanServeOutcome::Deny(resp) => Err(resp),
+    }
+}
+
 /// The identity the gate acts on for `bytes`: the format's own
 /// [`ScannedProxyFile::identity`], unless the bytes are an archive with two
 /// entries at one path. The format readers take the first such entry and the
