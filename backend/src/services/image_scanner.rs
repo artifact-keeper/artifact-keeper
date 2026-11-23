@@ -8,11 +8,12 @@ use crate::error::{AppError, Result};
 use crate::models::artifact::{Artifact, ArtifactMetadata};
 use crate::models::user::User;
 use crate::services::auth_service::AuthService;
+use crate::services::http_client::ReloadableClient as Client;
 use crate::services::scanner_adapter_client::{
     adapter_reports_too_large, adapter_status_is_unreachable, initial_adapter_ready_wait,
     log_adapter_ready_outcome, probe_adapter_ready, wait_until_adapter_ready,
-    with_adapter_resubmits, AdapterAttemptError, AdapterAuth, AdapterPollClock, AdapterReadyWait,
-    AdapterResubmit,
+    with_adapter_resubmits, AdapterAttemptError, AdapterAuth, AdapterHttpClients, AdapterPollClock,
+    AdapterReadyWait, AdapterResubmit,
 };
 use crate::services::scanner_service::{ScanOutput, ScanTarget, Scanner};
 
@@ -470,10 +471,7 @@ pub struct ImageScanner {
     /// How long to wait for `/probe/ready` before each scan submission
     /// (#5945, `SCANNER_ADAPTER_READY_TIMEOUT_SECS`).
     ready_wait: AdapterReadyWait,
-    http: reqwest::Client,
-    /// Dedicated client with redirects disabled so a `302 Found` "report not
-    /// ready" response from the adapter is observed rather than followed.
-    poll_http: reqwest::Client,
+    http: std::result::Result<AdapterHttpClients, reqwest::Error>,
     /// Optional token minter for private-repo pulls. When both an
     /// `AuthService` and a system scan identity are wired, each scan request
     /// carries a short-lived scoped JWT as `registry.authorization` so the
@@ -506,17 +504,7 @@ impl ImageScanner {
         Self {
             adapter_url,
             ready_wait: initial_adapter_ready_wait(),
-            http: auth
-                .apply(crate::services::http_client::internal_service_client_builder())
-                .timeout(std::time::Duration::from_secs(300))
-                .build()
-                .unwrap_or_default(),
-            poll_http: auth
-                .apply(crate::services::http_client::internal_service_client_builder())
-                .redirect(reqwest::redirect::Policy::none())
-                .timeout(std::time::Duration::from_secs(30))
-                .build()
-                .unwrap_or_default(),
+            http: AdapterHttpClients::build(&auth, std::time::Duration::from_secs(300)),
             auth: None,
             scan_identity: None,
             scan_token_ttl_seconds: 300,
@@ -699,7 +687,7 @@ impl ImageScanner {
     /// budget (#5945). Every failed attempt counts
     /// `ak_scanner_health_check_failures_total{scanner="trivy"}` with reason
     /// `unreachable` or `unhealthy`, as before.
-    async fn check_adapter_health(&self) -> Result<()> {
+    async fn check_adapter_health(&self, http: &Client) -> Result<()> {
         if let Some(why) = self.adapter_auth.unusable() {
             return Err(AppError::BadGateway(format!(
                 "Scanner adapter at {} cannot be called: {}",
@@ -712,7 +700,7 @@ impl ImageScanner {
         let started = tokio::time::Instant::now();
         let outcome = wait_until_adapter_ready(
             wait,
-            |t| probe_adapter_ready(&self.http, &url, t),
+            |t| probe_adapter_ready(http, &url, t),
             |attempt, kind, detail| {
                 crate::services::metrics_service::record_scanner_health_check_failure(
                     "trivy",
@@ -758,9 +746,9 @@ impl ImageScanner {
     }
 
     /// Submit a scan request and return the adapter-assigned scan id.
-    async fn submit_scan(&self, body: &serde_json::Value) -> Result<String> {
+    async fn submit_scan(&self, http: &Client, body: &serde_json::Value) -> Result<String> {
         let url = format!("{}/api/v1/scan", self.adapter_url);
-        let resp = self.http.post(&url).json(body).send().await.map_err(|e| {
+        let resp = http.post(&url).json(body).send().await.map_err(|e| {
             // #5994: the adapter went away between the readiness gate and the
             // submit; a queued scan retries.
             crate::services::scan_queue::note_engine_unavailable();
@@ -803,6 +791,7 @@ impl ImageScanner {
     /// resubmittable (#5657, [`AdapterResubmit`]); `run_image_scan` decides.
     async fn poll_report(
         &self,
+        poll_http: &Client,
         scan_id: &str,
     ) -> std::result::Result<HarborScanReport, AdapterAttemptError> {
         let url = format!("{}/api/v1/scan/{}/report", self.adapter_url, scan_id);
@@ -810,8 +799,7 @@ impl ImageScanner {
             AdapterPollClock::new("Scanner adapter image scan", Self::REPORT_POLL_BUDGET);
 
         loop {
-            let sent = self
-                .poll_http
+            let sent = poll_http
                 .get(&url)
                 .header(
                     reqwest::header::ACCEPT,
@@ -910,6 +898,11 @@ impl ImageScanner {
         mime_type: &str,
         repo_key: Option<&str>,
     ) -> Result<ScanOutput> {
+        let http = self.http.as_ref().map_err(|err| {
+            AppError::Internal(format!(
+                "Cannot initialize scanner-adapter HTTP clients: {err}"
+            ))
+        })?;
         let registry_url = self.registry_url().await;
         // Mint a per-repository scoped pull token only when we know which repo
         // is being scanned (the repository-aware `scan_target` path). The
@@ -930,9 +923,9 @@ impl ImageScanner {
         // the scan with a clear BadGateway rather than mid-stream.
         let (this, body) = (self, &body);
         let report = with_adapter_resubmits("Scanner adapter image scan", move || async move {
-            this.check_adapter_health().await?;
-            let scan_id = this.submit_scan(body).await?;
-            this.poll_report(&scan_id).await
+            this.check_adapter_health(&http.request).await?;
+            let scan_id = this.submit_scan(&http.request, body).await?;
+            this.poll_report(&http.poll, &scan_id).await
         })
         .await?;
 

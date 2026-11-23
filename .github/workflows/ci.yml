@@ -3667,7 +3667,8 @@ jobs:
           load: true
           tags: artifact-keeper-backend:pr-test
           # Read-only registry cache, warmed on main by docker-publish.yml
-          # and by the Warm CI Image Cache job below.
+          # and by the Warm CI Image Cache job below. Fork runs read the
+          # same upstream public cache as runs in the main repository.
           # No cache-to of any kind:
           #   - registry: PR-triggered jobs must not get packages:write (fork
           #     PRs would inherit it — pwn-request risk), and anonymous GHCR
@@ -3686,8 +3687,8 @@ jobs:
           # below); `buildcache-ci-amd64`, warmed on `main` by the Warm CI
           # Image Cache job below, holds the `ci` cook (#6133).
           cache-from: |
-            type=registry,ref=ghcr.io/${{ github.repository }}-backend:buildcache-ci-amd64
-            type=registry,ref=ghcr.io/${{ github.repository }}-backend:buildcache-amd64
+            type=registry,ref=ghcr.io/artifact-keeper/artifact-keeper-backend:buildcache-ci-amd64
+            type=registry,ref=ghcr.io/artifact-keeper/artifact-keeper-backend:buildcache-amd64
           # CARGO_BUILD_JOBS=4: the hosted runner's core count, which is what
           # cargo would use anyway; passed explicitly because the Dockerfile
           # defaults to 8 for the self-hosted pools (see

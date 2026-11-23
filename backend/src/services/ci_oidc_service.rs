@@ -896,7 +896,7 @@ fn jwks_cache() -> &'static RwLock<HashMap<String, JwksCacheEntry>> {
 /// CI OIDC provider service.
 pub struct CiOidcService {
     db: PgPool,
-    http: reqwest::Client,
+    http: crate::services::http_client::ReloadableClient,
 }
 
 /// The claim checks every exchanged CI assertion must pass, whatever the
@@ -930,7 +930,7 @@ impl CiOidcService {
             // SSO_ALLOW_PRIVATE_IPS / AK_SSRF_ALLOW_PRIVATE_CIDRS instead of
             // the fail-closed upstream default (issue #2405). Cloud-metadata,
             // loopback and link-local addresses stay hard-blocked regardless.
-            http: crate::services::http_client::sso_client(),
+            http: crate::services::http_client::reloadable_sso_client(),
         }
     }
 

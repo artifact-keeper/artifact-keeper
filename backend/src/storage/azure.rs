@@ -189,7 +189,7 @@ struct CachedToken {
 ///    Set `AZURE_CLIENT_ID` for user-assigned managed identity.
 #[derive(Debug)]
 pub(crate) struct TokenCredentialProvider {
-    client: reqwest::Client,
+    client: crate::services::http_client::ReloadableClient,
     credential: TokenCredentialSource,
     cache: RwLock<Option<CachedToken>>,
 }
@@ -230,7 +230,7 @@ const SAS_CLOCK_SKEW_ALLOWANCE_MINUTES: i64 = 15;
 
 impl TokenCredentialProvider {
     /// Build a provider from environment variables.
-    fn from_env(client: &reqwest::Client) -> Result<Self> {
+    fn from_env(client: &crate::services::http_client::ReloadableClient) -> Result<Self> {
         let tenant_id = std::env::var("AZURE_TENANT_ID").ok();
         let client_id = std::env::var("AZURE_CLIENT_ID").ok();
         let client_secret = crate::config::secret_or_env("AZURE_CLIENT_SECRET")
@@ -544,11 +544,11 @@ pub enum AzureCopyPath {
 /// Azure Blob Storage backend
 pub struct AzureBackend {
     config: AzureConfig,
-    client: reqwest::Client,
+    client: crate::services::http_client::ReloadableClient,
     /// Client for Put Blob From URL. It has no read timeout, because Azure
     /// answers only once the copy is done; each request sets its own deadline
     /// from [`put_blob_from_url_timeout`].
-    copy_client: reqwest::Client,
+    copy_client: crate::services::http_client::ReloadableClient,
     auth: AzureAuthMode,
     path_format: StoragePathFormat,
 }
@@ -697,15 +697,17 @@ impl AzureBackend {
         // #5649: STORAGE_CONNECT_TIMEOUT_SECS bounds one connection attempt,
         // so a stopped endpoint is reported unavailable promptly.
         let connect_timeout = crate::storage::StorageTimeouts::from_env().connect;
-        let client = crate::services::http_client::large_object_client_builder(needs_http)
-            .connect_timeout(connect_timeout)
-            .build()
-            .map_err(|e| AppError::Storage(format!("Failed to create HTTP client: {}", e)))?;
-        let copy_client = crate::services::http_client::server_side_copy_client_builder(needs_http)
-            .connect_timeout(connect_timeout)
-            .build()
-            .map_err(|e| AppError::Storage(format!("Failed to create HTTP client: {}", e)))?;
-        let token_client = crate::services::http_client::base_client_builder()
+        let client =
+            crate::services::http_client::reloadable_large_object_client_builder(needs_http)
+                .connect_timeout(connect_timeout)
+                .build()
+                .map_err(|e| AppError::Storage(format!("Failed to create HTTP client: {}", e)))?;
+        let copy_client =
+            crate::services::http_client::reloadable_server_side_copy_client_builder(needs_http)
+                .connect_timeout(connect_timeout)
+                .build()
+                .map_err(|e| AppError::Storage(format!("Failed to create HTTP client: {}", e)))?;
+        let token_client = crate::services::http_client::reloadable_base_client_builder()
             .timeout(Duration::from_secs(30))
             .https_only(!needs_http)
             .build()
@@ -2407,7 +2409,7 @@ mod tests {
 
     /// Create an RBAC backend directly without reading env vars.
     fn create_rbac_backend(credential: TokenCredentialSource) -> AzureBackend {
-        let client = reqwest::Client::new();
+        let client = crate::services::http_client::ReloadableClient::new();
         let provider = TokenCredentialProvider {
             client: client.clone(),
             credential,
@@ -2428,7 +2430,7 @@ mod tests {
         endpoint: String,
         path_format: StoragePathFormat,
     ) -> AzureBackend {
-        let client = reqwest::Client::new();
+        let client = crate::services::http_client::ReloadableClient::new();
         let provider = TokenCredentialProvider {
             client: client.clone(),
             credential: service_principal_cred(),
@@ -3874,14 +3876,15 @@ mod tests {
         let mut backend = create_cached_rbac_backend_with_endpoint(endpoint);
         // The clients `AzureBackend::new` builds, minus any proxy from the
         // environment so the requests reach this test's listener.
-        backend.client = crate::services::http_client::large_object_client_builder(true)
+        backend.client = crate::services::http_client::reloadable_large_object_client_builder(true)
             .no_proxy()
             .build()
             .expect("build data-plane client");
-        backend.copy_client = crate::services::http_client::server_side_copy_client_builder(true)
-            .no_proxy()
-            .build()
-            .expect("build copy client");
+        backend.copy_client =
+            crate::services::http_client::reloadable_server_side_copy_client_builder(true)
+                .no_proxy()
+                .build()
+                .expect("build copy client");
         let copy = tokio::spawn(async move {
             StorageBackendTrait::copy(&backend, "source/blob.bin", "dest/blob.bin").await
         });
@@ -3928,14 +3931,15 @@ mod tests {
     /// builds minus any proxy from the environment.
     async fn create_shared_key_backend_at(endpoint: &str) -> AzureBackend {
         let mut backend = create_test_backend_with_endpoint(endpoint).await;
-        backend.client = crate::services::http_client::large_object_client_builder(true)
+        backend.client = crate::services::http_client::reloadable_large_object_client_builder(true)
             .no_proxy()
             .build()
             .expect("build data-plane client");
-        backend.copy_client = crate::services::http_client::server_side_copy_client_builder(true)
-            .no_proxy()
-            .build()
-            .expect("build copy client");
+        backend.copy_client =
+            crate::services::http_client::reloadable_server_side_copy_client_builder(true)
+                .no_proxy()
+                .build()
+                .expect("build copy client");
         backend
     }
 
@@ -4415,7 +4419,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_request_error_leaves_out_the_request_url() {
-        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let client = crate::services::http_client::ReloadableClient::builder()
+            .no_proxy()
+            .build()
+            .unwrap();
         // Port 0 cannot be connected to, so the request fails in transport.
         let err = client
             .get("http://127.0.0.1:0/c/k?sv=2021-06-08&sr=b&sp=cw&sig=c2lnbmF0dXJl")
@@ -5005,7 +5012,7 @@ mod tests {
     #[test]
     fn test_rbac_supports_redirect_false() {
         // Even if redirect_downloads is true in config, RBAC mode disables it
-        let client = reqwest::Client::new();
+        let client = crate::services::http_client::ReloadableClient::new();
         let provider = TokenCredentialProvider {
             client: client.clone(),
             credential: service_principal_cred(),
@@ -5044,7 +5051,7 @@ mod tests {
     #[tokio::test]
     async fn test_token_credential_provider_get_token_with_valid_cache() {
         let provider = TokenCredentialProvider {
-            client: reqwest::Client::new(),
+            client: crate::services::http_client::ReloadableClient::new(),
             credential: managed_identity_cred(None),
             cache: RwLock::new(Some(CachedToken {
                 access_token: "cached-token-value".to_string(),
@@ -5059,7 +5066,7 @@ mod tests {
     #[tokio::test]
     async fn test_token_credential_provider_cache_expired_triggers_refresh() {
         let provider = TokenCredentialProvider {
-            client: reqwest::Client::new(),
+            client: crate::services::http_client::ReloadableClient::new(),
             credential: managed_identity_cred(None),
             cache: RwLock::new(Some(CachedToken {
                 access_token: "expired-token".to_string(),
@@ -5079,7 +5086,7 @@ mod tests {
     #[tokio::test]
     async fn test_token_credential_provider_empty_cache_triggers_refresh() {
         let provider = TokenCredentialProvider {
-            client: reqwest::Client::new(),
+            client: crate::services::http_client::ReloadableClient::new(),
             credential: managed_identity_cred(None),
             cache: RwLock::new(None),
         };
@@ -5094,7 +5101,7 @@ mod tests {
     #[tokio::test]
     async fn test_token_credential_provider_sp_expired_triggers_refresh() {
         let provider = TokenCredentialProvider {
-            client: reqwest::Client::new(),
+            client: crate::services::http_client::ReloadableClient::new(),
             credential: service_principal_cred(),
             cache: RwLock::new(Some(CachedToken {
                 access_token: "old-sp-token".to_string(),
@@ -5111,7 +5118,7 @@ mod tests {
     #[tokio::test]
     async fn test_token_credential_provider_sp_empty_cache_triggers_refresh() {
         let provider = TokenCredentialProvider {
-            client: reqwest::Client::new(),
+            client: crate::services::http_client::ReloadableClient::new(),
             credential: service_principal_cred(),
             cache: RwLock::new(None),
         };
@@ -5125,7 +5132,7 @@ mod tests {
         // Verify the double-check pattern: if cache becomes valid between
         // read lock release and write lock acquisition, it returns cached value.
         let provider = TokenCredentialProvider {
-            client: reqwest::Client::new(),
+            client: crate::services::http_client::ReloadableClient::new(),
             credential: managed_identity_cred(None),
             cache: RwLock::new(Some(CachedToken {
                 access_token: "still-valid".to_string(),
@@ -5143,7 +5150,7 @@ mod tests {
 
     #[test]
     fn test_rbac_blob_url_with_custom_endpoint() {
-        let client = reqwest::Client::new();
+        let client = crate::services::http_client::ReloadableClient::new();
         let provider = TokenCredentialProvider {
             client: client.clone(),
             credential: service_principal_cred(),
@@ -5169,7 +5176,7 @@ mod tests {
 
     #[test]
     fn test_rbac_backend_path_format_preserved() {
-        let client = reqwest::Client::new();
+        let client = crate::services::http_client::ReloadableClient::new();
         let provider = TokenCredentialProvider {
             client: client.clone(),
             credential: service_principal_cred(),

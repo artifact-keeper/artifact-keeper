@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use reqwest::Client;
+use crate::services::http_client::ReloadableClient as Client;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -206,7 +206,7 @@ impl OidcService {
             config,
             // SSO trust class: connect-time SSRF check honors
             // SSO_ALLOW_PRIVATE_IPS / AK_SSRF_ALLOW_PRIVATE_CIDRS (issue #2380).
-            http_client: crate::services::http_client::sso_client(),
+            http_client: crate::services::http_client::reloadable_sso_client(),
             discovery: None,
         })
     }
@@ -218,7 +218,7 @@ impl OidcService {
             config,
             // SSO trust class: connect-time SSRF check honors
             // SSO_ALLOW_PRIVATE_IPS / AK_SSRF_ALLOW_PRIVATE_CIDRS (issue #2380).
-            http_client: crate::services::http_client::sso_client(),
+            http_client: crate::services::http_client::reloadable_sso_client(),
             discovery: None,
         }
     }

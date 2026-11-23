@@ -56,7 +56,8 @@
 //!
 //! See: https://docs.dependencytrack.org/integrations/rest-api/
 
-use reqwest::{Client, StatusCode};
+use crate::services::http_client::ReloadableClient as Client;
+use reqwest::StatusCode;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::error::Error as _;
@@ -706,7 +707,7 @@ impl DependencyTrackService {
             );
         }
 
-        let client = crate::services::http_client::internal_service_client_builder()
+        let client = crate::services::http_client::reloadable_internal_service_client_builder()
             .timeout(Duration::from_secs(30))
             .https_only(!allow_http)
             .build()

@@ -1,14 +1,17 @@
 //! Shared HTTP client builder with custom CA certificate support.
 //!
-//! All code that creates a `reqwest::Client` should call [`default_client`] for
+//! For short-lived clients, call [`default_client`] for
 //! a ready-to-use client, or [`base_client_builder`] when extra configuration
 //! (timeouts, user-agent, etc.) is needed before building. This ensures that
 //! custom CA certificates (configured via `CUSTOM_CA_CERT_PATH`) are loaded
-//! consistently across the application.
+//! consistently across the application. Use the explicit reloadable builders
+//! for pools that are retained beyond a single operation.
 
+use super::http_client_reload::ClientBuilder;
+pub use super::http_client_reload::{
+    Client as ReloadableClient, ClientBuilder as ReloadableClientBuilder,
+};
 use reqwest::redirect::Policy;
-use reqwest::tls::Certificate;
-use reqwest::ClientBuilder;
 use std::time::Duration;
 
 use crate::services::env_proxy_guard::EnvProxyGuard;
@@ -23,14 +26,14 @@ const MAX_REDIRECTS: usize = 10;
 /// it makes this backend's traffic identifiable in upstream logs.
 pub const DEFAULT_USER_AGENT: &str = concat!("artifact-keeper/", env!("CARGO_PKG_VERSION"));
 
-/// A bare [`ClientBuilder`] that already sends [`DEFAULT_USER_AGENT`].
+/// A bare [`reqwest::ClientBuilder`] that already sends [`DEFAULT_USER_AGENT`].
 ///
 /// The builders in this module start from it. Code that must not use the SSRF
 /// resolver (cloud metadata endpoints, presigned storage URLs, the AWS control
 /// plane) starts from it too, instead of `reqwest::Client::builder()`, so no
 /// outbound client goes without a User-Agent. A per-request `User-Agent`
 /// header, such as a repository's custom one, still takes precedence.
-pub fn plain_client_builder() -> ClientBuilder {
+pub fn plain_client_builder() -> reqwest::ClientBuilder {
     reqwest::Client::builder().user_agent(DEFAULT_USER_AGENT)
 }
 
@@ -123,8 +126,13 @@ fn warn_on_env_proxy_posture(
 /// removes the routing but keeps the destination-check connector layer, so
 /// the fail-closed checks continue for any destination the environment
 /// proxy would have carried; a caller with its own routing should start from
-/// [`base_client_builder_without_env_proxy`] instead.
-pub fn base_client_builder() -> ClientBuilder {
+/// [`reloadable_base_client_builder_without_env_proxy`] instead.
+pub fn base_client_builder() -> reqwest::ClientBuilder {
+    reloadable_base_client_builder().snapshot()
+}
+
+/// Builder for a retained upstream pool.
+pub fn reloadable_base_client_builder() -> ReloadableClientBuilder {
     use crate::services::env_proxy_guard::{upstream_env_proxy_mode, UpstreamEnvProxyMode};
     let guard = match upstream_env_proxy_mode() {
         UpstreamEnvProxyMode::Check => Some(EnvProxyGuard::from_env(
@@ -138,7 +146,7 @@ pub fn base_client_builder() -> ClientBuilder {
 /// [`base_client_builder`] that never uses the environment proxy, for a
 /// caller that sets its own routing (a per-repository `direct` or
 /// `explicit` egress proxy).
-pub fn base_client_builder_without_env_proxy() -> ClientBuilder {
+pub fn reloadable_base_client_builder_without_env_proxy() -> ReloadableClientBuilder {
     upstream_client_builder(None)
 }
 
@@ -147,7 +155,8 @@ pub fn base_client_builder_without_env_proxy() -> ClientBuilder {
 pub(crate) fn upstream_client_builder(guard: Option<EnvProxyGuard>) -> ClientBuilder {
     log_proxy_env();
 
-    let builder = plain_client_builder().redirect(ssrf_redirect_policy(guard.clone()));
+    let builder =
+        ClientBuilder::new(plain_client_builder).redirect(ssrf_redirect_policy(guard.clone()));
     let builder = match guard {
         Some(guard) => with_guarded_env_proxy(
             builder,
@@ -159,12 +168,12 @@ pub(crate) fn upstream_client_builder(guard: Option<EnvProxyGuard>) -> ClientBui
             crate::services::ssrf_dns::ssrf_guard_resolver_exempting(Default::default()),
         ),
     };
-    let builder = builder
+    builder
         // This crate's own `Cargo.toml` requests only `["json", "stream",
         // "form"]`, but Cargo unifies features for a single resolved
         // `reqwest` version across the whole build: the `opensearch` crate
         // (full-text search) pulls in `reqwest` with its `gzip` feature
-        // enabled, which silently switches EVERY `reqwest::Client` in this
+        // enabled, which silently switches EVERY `Client` in this
         // binary — including this one — into auto content-negotiation mode.
         // That makes the client add `Accept-Encoding: gzip` to outbound
         // upstream requests and, on any response upstream compresses,
@@ -213,9 +222,7 @@ pub(crate) fn upstream_client_builder(guard: Option<EnvProxyGuard>) -> ClientBui
                 reqwest::header::HeaderValue::from_static("identity"),
             );
             headers
-        });
-
-    apply_custom_ca_cert(builder)
+        })
 }
 
 /// Return a [`ClientBuilder`] for **operator-configured, trusted
@@ -232,20 +239,18 @@ pub(crate) fn upstream_client_builder(guard: Option<EnvProxyGuard>) -> ClientBui
 /// for attacker/user-influenceable targets (remote-repo upstreams, proxy
 /// URLs, webhooks, plugins) — those keep using [`base_client_builder`], which
 /// stays fail-closed.
-pub fn internal_service_client_builder() -> ClientBuilder {
+pub fn reloadable_internal_service_client_builder() -> ReloadableClientBuilder {
     log_proxy_env();
 
     let guard =
         EnvProxyGuard::from_env(crate::api::validation::OutboundUrlContext::TrustedInternal);
-    let builder =
-        plain_client_builder().redirect(ssrf_internal_redirect_policy(Some(guard.clone())));
-    let builder = with_guarded_env_proxy(
+    let builder = ClientBuilder::new(plain_client_builder)
+        .redirect(ssrf_internal_redirect_policy(Some(guard.clone())));
+    with_guarded_env_proxy(
         builder,
         &guard,
         crate::services::ssrf_dns::ssrf_guard_resolver_internal,
-    );
-
-    apply_custom_ca_cert(builder)
+    )
 }
 
 /// Return a [`ClientBuilder`] for **webhook delivery** requests. Mirrors
@@ -258,22 +263,24 @@ pub fn internal_service_client_builder() -> ClientBuilder {
 /// identical to [`base_client_builder`] (fail-closed), and cloud-metadata,
 /// loopback and link-local addresses stay hard-blocked at connect time and
 /// across redirects regardless of any toggle.
-pub fn webhook_client_builder() -> ClientBuilder {
+pub fn webhook_client_builder() -> reqwest::ClientBuilder {
+    webhook_client_policy().snapshot()
+}
+
+fn webhook_client_policy() -> ClientBuilder {
     log_proxy_env();
 
     let guard = EnvProxyGuard::from_env(crate::api::validation::OutboundUrlContext::Webhook);
-    let builder =
-        plain_client_builder().redirect(ssrf_webhook_redirect_policy(Some(guard.clone())));
-    let builder = without_idle_plain_http_proxy_connections(
+    let builder = ClientBuilder::new(plain_client_builder)
+        .redirect(ssrf_webhook_redirect_policy(Some(guard.clone())));
+    without_idle_plain_http_proxy_connections(
         with_guarded_env_proxy(
             builder,
             &guard,
             crate::services::ssrf_dns::ssrf_guard_resolver_webhook,
         ),
         &guard,
-    );
-
-    apply_custom_ca_cert(builder)
+    )
 }
 
 /// Build and return a ready-to-use webhook-delivery client (see
@@ -309,11 +316,16 @@ pub fn webhook_client() -> reqwest::Client {
 /// and a burst of logins tied up that many connections and tasks. A
 /// per-request `RequestBuilder::timeout` still overrides the total for the
 /// callers that want a tighter bound.
-pub fn sso_client_builder() -> ClientBuilder {
+pub fn sso_client_builder() -> reqwest::ClientBuilder {
+    sso_client_policy().snapshot()
+}
+
+fn sso_client_policy() -> ClientBuilder {
     log_proxy_env();
 
     let guard = EnvProxyGuard::from_env(crate::api::validation::OutboundUrlContext::SsoDiscovery);
-    let builder = plain_client_builder().redirect(ssrf_sso_redirect_policy(Some(guard.clone())));
+    let builder = ClientBuilder::new(plain_client_builder)
+        .redirect(ssrf_sso_redirect_policy(Some(guard.clone())));
     let builder = without_idle_plain_http_proxy_connections(
         with_guarded_env_proxy(
             builder,
@@ -323,7 +335,7 @@ pub fn sso_client_builder() -> ClientBuilder {
         &guard,
     );
 
-    apply_custom_ca_cert(builder)
+    builder
         .connect_timeout(SSO_CONNECT_TIMEOUT)
         .timeout(SSO_REQUEST_TIMEOUT)
 }
@@ -349,6 +361,13 @@ pub fn sso_client() -> reqwest::Client {
     sso_client_builder()
         .build()
         .expect("failed to build SSO HTTP client")
+}
+
+/// Build the pool retained by the OIDC and CI OIDC services.
+pub fn reloadable_sso_client() -> ReloadableClient {
+    sso_client_policy()
+        .build()
+        .expect("failed to build retained SSO HTTP client")
 }
 
 /// Maximum bytes accepted from an OIDC/SSO identity-provider JSON response
@@ -499,47 +518,6 @@ pub async fn read_idp_token_response(
     }
 }
 
-/// Load operator-provided custom CA certificate(s) (`CUSTOM_CA_CERT_PATH`)
-/// into the builder when configured. Shared by every client builder so the
-/// private-CA handling is identical and lives in one place.
-fn apply_custom_ca_cert(mut builder: ClientBuilder) -> ClientBuilder {
-    // apply_custom_ca_cert runs on every client build (many per request, e.g.
-    // /health's Trivy sub-check), so logging the result per build floods the
-    // logs. Log once for the process lifetime instead, mirroring log_proxy_env.
-    // Applies to the warn arms too: a misconfigured path is the louder flood.
-    use std::sync::Once;
-    static LOG_ONCE: Once = Once::new();
-    if let Ok(ca_path) = std::env::var("CUSTOM_CA_CERT_PATH") {
-        match std::fs::read(&ca_path) {
-            Ok(pem_bytes) => match Certificate::from_pem_bundle(&pem_bytes) {
-                Ok(certs) => {
-                    let count = certs.len();
-                    for cert in certs {
-                        builder = builder.add_root_certificate(cert);
-                    }
-                    // count == 0 (a valid-but-empty bundle) still logs, so the
-                    // "loaded nothing" case stays visible at info.
-                    LOG_ONCE.call_once(|| {
-                        tracing::info!(path = %ca_path, count, "Loaded custom CA certificate(s)");
-                    });
-                }
-                Err(e) => {
-                    LOG_ONCE.call_once(|| {
-                        tracing::warn!(path = %ca_path, error = %e, "Failed to parse CA certificate(s)");
-                    });
-                }
-            },
-            Err(e) => {
-                LOG_ONCE.call_once(|| {
-                    tracing::warn!(path = %ca_path, error = %e, "Failed to read custom CA certificate file");
-                });
-            }
-        }
-    }
-
-    builder
-}
-
 /// Return a client builder suitable for large storage data-plane transfers.
 ///
 /// This intentionally avoids [`ClientBuilder::timeout`], which is a total
@@ -549,8 +527,8 @@ fn apply_custom_ca_cert(mut builder: ClientBuilder) -> ClientBuilder {
 /// bound time spent streaming a large request *body*, so a stalled upstream
 /// that stops reading an upload is governed only by `connect_timeout` and
 /// connection-level (TCP) behavior, not by this timeout.
-pub fn large_object_client_builder(allow_http: bool) -> ClientBuilder {
-    base_client_builder()
+pub fn reloadable_large_object_client_builder(allow_http: bool) -> ReloadableClientBuilder {
+    reloadable_base_client_builder()
         .connect_timeout(Duration::from_secs(10))
         .read_timeout(Duration::from_secs(30))
         .https_only(!allow_http)
@@ -561,12 +539,12 @@ pub fn large_object_client_builder(allow_http: bool) -> ClientBuilder {
 ///
 /// The storage service performs the whole copy before it sends a single
 /// response byte, so read inactivity is the copy's duration. The 30-second
-/// `read_timeout` of [`large_object_client_builder`] therefore aborts any copy
+/// `read_timeout` of [`reloadable_large_object_client_builder`] therefore aborts any copy
 /// that takes longer, even though the service is still working. This builder
 /// sets no read timeout. The caller MUST bound each request with
 /// [`reqwest::RequestBuilder::timeout`], sized to the bytes being copied.
-pub fn server_side_copy_client_builder(allow_http: bool) -> ClientBuilder {
-    base_client_builder()
+pub fn reloadable_server_side_copy_client_builder(allow_http: bool) -> ReloadableClientBuilder {
+    reloadable_base_client_builder()
         .connect_timeout(Duration::from_secs(10))
         .https_only(!allow_http)
 }
@@ -581,6 +559,13 @@ pub fn default_client() -> reqwest::Client {
         .expect("failed to build default HTTP client")
 }
 
+/// Build the upstream pool retained by a service.
+pub fn reloadable_default_client() -> ReloadableClient {
+    reloadable_base_client_builder()
+        .build()
+        .expect("failed to build retained HTTP client")
+}
+
 /// Default connect timeout (seconds) for the remote-instance proxy client.
 const DEFAULT_PROXY_CONNECT_TIMEOUT_SECS: u64 = 10;
 /// Default read-inactivity timeout (seconds) for the remote-instance proxy
@@ -592,7 +577,7 @@ const DEFAULT_PROXY_READ_TIMEOUT_SECS: u64 = 30;
 ///
 /// Same SSRF trust class, redirect policy and plaintext/HTTP semantics as
 /// [`default_client`] — the proxy target is user-influenceable, so it stays
-/// fail-closed and is deliberately NOT switched to [`large_object_client_builder`],
+/// fail-closed and is deliberately NOT switched to [`reloadable_large_object_client_builder`],
 /// which would force `https_only` and change the existing behavior. The only
 /// addition is a `connect_timeout` plus a `read_timeout` that bounds inactivity
 /// while reading the upstream response, so a slow-loris / endless upstream
@@ -622,10 +607,16 @@ fn with_guarded_env_proxy(
     guard: &EnvProxyGuard,
     resolver: fn() -> std::sync::Arc<dyn reqwest::dns::Resolve>,
 ) -> ClientBuilder {
-    builder
-        .proxy(guard.reqwest_proxy())
-        .connector_layer(guard.layer())
-        .dns_resolver(resolver())
+    let guard = guard.clone();
+    // Capture the resolver now: its proxy-host exemptions must match the
+    // original routing even if the process environment changes before reload.
+    let resolver = resolver();
+    builder.configure(move |builder| {
+        builder
+            .proxy(guard.reqwest_proxy())
+            .connector_layer(guard.layer())
+            .dns_resolver(resolver.clone())
+    })
 }
 
 /// Keep no idle connections when plain-HTTP requests are forward-proxied:
@@ -748,8 +739,10 @@ fn ssrf_redirect_policy_with(
 #[cfg(test)]
 mod tests {
     use super::{
-        base_client_builder, default_client, internal_service_client_builder,
-        large_object_client_builder, sso_client_builder, webhook_client_builder,
+        default_client, reloadable_base_client_builder as base_client_builder,
+        reloadable_internal_service_client_builder as internal_service_client_builder,
+        reloadable_large_object_client_builder, sso_client_policy as sso_client_builder,
+        webhook_client_policy as webhook_client_builder, ClientBuilder, ReloadableClient as Client,
         SSO_CONNECT_TIMEOUT, SSO_REQUEST_TIMEOUT,
     };
     use std::io::Write;
@@ -771,8 +764,8 @@ mod tests {
     ///
     /// This is only correct because every user targets a listener the test
     /// itself started. A test that exercises proxy routing must NOT use it.
-    fn loopback_test_client() -> reqwest::Client {
-        loopback_client_from(reqwest::Client::builder())
+    fn loopback_test_client() -> Client {
+        loopback_client_from(Client::builder())
     }
 
     /// The proxy-clearing step of [`loopback_test_client`], split out so it can
@@ -781,7 +774,7 @@ mod tests {
     /// both clears the proxies configured so far and turns off reqwest's
     /// system/environment proxy detection, which is what makes the result
     /// independent of whatever a concurrent test has put in the process env.
-    fn loopback_client_from(builder: reqwest::ClientBuilder) -> reqwest::Client {
+    fn loopback_client_from(builder: ClientBuilder) -> Client {
         builder
             .no_proxy()
             .build()
@@ -804,9 +797,7 @@ mod tests {
     /// The closure must construct the builder AND build it: the exempt-set is
     /// read when the BUILDER is constructed, not at `.build()`. It runs under a
     /// synchronous `std` mutex, so it must not `.await`.
-    fn build_client_outside_proxy_env_window(
-        build: impl FnOnce() -> reqwest::Client,
-    ) -> reqwest::Client {
+    fn build_client_outside_proxy_env_window(build: impl FnOnce() -> Client) -> Client {
         let _proxy_env_guard = PROXY_ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -831,6 +822,78 @@ mod tests {
                  reached this test's own listener (a process-wide HTTP_PROXY leaked from \
                  a concurrent test is the usual cause -- see #3377)"
             ),
+        }
+    }
+
+    /// #5193: rebuilding every shared HTTP trust class retains its resolver
+    /// and per-hop redirect policy, rather than falling back to a bare client.
+    #[tokio::test]
+    async fn test_ca_rotation_preserves_ssrf_policies() {
+        use tokio::net::TcpListener;
+        let pem = include_str!("../../tests/fixtures/test-ca.pem");
+        for make in [
+            base_client_builder as fn() -> ClientBuilder,
+            internal_service_client_builder,
+            webhook_client_builder,
+            sso_client_builder,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("ca.pem");
+            std::fs::write(&path, pem).unwrap();
+            let client = build_client_outside_proxy_env_window(|| {
+                make()
+                    .no_proxy()
+                    .timeout(Duration::from_millis(500))
+                    .build_with_ca_path_for_test(path.clone())
+                    .unwrap()
+            });
+            let dns_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let redirect_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let redirect_addr = redirect_listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                for _ in 0..2 {
+                    let (mut socket, _) = redirect_listener.accept().await.unwrap();
+                    let mut bytes = [0; 2048];
+                    let _ = socket.read(&mut bytes).await;
+                    let _ = socket.write_all(b"HTTP/1.1 302 Found\r\nLocation: http://169.254.169.254/latest/meta-data/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                }
+            });
+            for rotate in [false, true] {
+                if rotate {
+                    let mut update = tempfile::NamedTempFile::new_in(dir.path()).unwrap();
+                    writeln!(update, "{pem}").unwrap();
+                    update.persist(&path).unwrap();
+                    assert!(client.refresh_custom_ca_for_test());
+                }
+                let err = client
+                    .get(format!(
+                        "http://localhost:{}/",
+                        dns_listener.local_addr().unwrap().port()
+                    ))
+                    .send()
+                    .await
+                    .unwrap_err();
+                assert!(
+                    !err.is_timeout(),
+                    "resolver must refuse before a connection timeout: {err}"
+                );
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(50), dns_listener.accept())
+                        .await
+                        .is_err(),
+                    "the DNS guard must not connect to the loopback listener"
+                );
+                let err = client
+                    .get(format!("http://{redirect_addr}/"))
+                    .send()
+                    .await
+                    .unwrap_err();
+                assert!(
+                    err.is_redirect(),
+                    "metadata redirect must be refused: {err}"
+                );
+            }
+            join_loopback_server(server).await;
         }
     }
 
@@ -899,7 +962,7 @@ mod tests {
 
     /// Regression test for the SSRF redirect-follow bypass: any redirect
     /// hop pointing at a blocked address must abort the request, not
-    /// silently follow. A bare `reqwest::Client` would tolerate such a
+    /// silently follow. A bare `Client` would tolerate such a
     /// redirect; the policy installed by `base_client_builder` must not.
     #[tokio::test]
     async fn test_redirect_to_blocked_ip_is_refused() {
@@ -1016,7 +1079,7 @@ mod tests {
             }
         });
 
-        let client = loopback_client_from(reqwest::Client::builder().redirect(
+        let client = loopback_client_from(Client::builder().redirect(
             super::ssrf_redirect_policy_with(|_| None, None, "test redirect", "upstream"),
         ));
         let response = client
@@ -1163,15 +1226,21 @@ mod tests {
     /// were set, which is what this reads.
     #[test]
     fn test_sso_client_builder_sets_connect_and_request_timeouts_5485() {
-        let debug = format!("{:?}", sso_client_builder());
-        assert!(
-            debug.contains(&format!("connect_timeout: {SSO_CONNECT_TIMEOUT:?}")),
-            "SSO client has no connect timeout: {debug}"
-        );
-        assert!(
-            debug.contains(&format!(" timeout: {SSO_REQUEST_TIMEOUT:?}")),
-            "SSO client has no request timeout: {debug}"
-        );
+        sso_client_builder()
+            .configure(|builder| {
+                let debug = format!("{builder:?}");
+                assert!(
+                    debug.contains(&format!("connect_timeout: {SSO_CONNECT_TIMEOUT:?}")),
+                    "SSO client has no connect timeout: {debug}"
+                );
+                assert!(
+                    debug.contains(&format!(" timeout: {SSO_REQUEST_TIMEOUT:?}")),
+                    "SSO client has no request timeout: {debug}"
+                );
+                builder
+            })
+            .build()
+            .expect("build SSO client with bounded timeouts");
         assert!(SSO_CONNECT_TIMEOUT <= SSO_REQUEST_TIMEOUT);
     }
 
@@ -1202,8 +1271,8 @@ mod tests {
         // is parsed from the process env at construction (#2570/#3377), so
         // building the pair up front would put them right back in the race.
         for make_builder in [
-            webhook_client_builder as fn() -> reqwest::ClientBuilder,
-            sso_client_builder as fn() -> reqwest::ClientBuilder,
+            webhook_client_builder as fn() -> ClientBuilder,
+            sso_client_builder as fn() -> ClientBuilder,
         ] {
             let listener = TcpListener::bind("127.0.0.1:0")
                 .await
@@ -1280,11 +1349,13 @@ mod tests {
         // `no_proxy()` for the same reason as
         // `test_redirect_to_blocked_ip_is_refused`: the entry hop must reach
         // this test's own loopback listener (#3377).
-        let client = webhook_client_builder()
-            .no_proxy()
-            .timeout(Duration::from_secs(2))
-            .build()
-            .unwrap();
+        let client = with_env_proxy_5459(&[], || {
+            webhook_client_builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(2))
+                .build()
+                .unwrap()
+        });
         let url = format!("http://127.0.0.1:{}/start", addr.port());
         let result = client.post(&url).send().await;
 
@@ -1309,7 +1380,7 @@ mod tests {
     /// mid-body delay and any total timeout the builder might (wrongly)
     /// apply — which is exactly what this test exists to detect.
     #[tokio::test]
-    async fn test_large_object_client_builder_does_not_apply_total_timeout() {
+    async fn test_reloadable_large_object_client_builder_does_not_apply_total_timeout() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind test server");
@@ -1343,7 +1414,7 @@ mod tests {
         // sets a process-wide `HTTP_PROXY` while building its own client: a
         // lock only helps while every call site remembers to take it, and this
         // round-trip must reach the test's own listener (#3377).
-        let client = large_object_client_builder(true)
+        let client = reloadable_large_object_client_builder(true)
             .no_proxy()
             .build()
             .expect("build large-object client");
@@ -1480,7 +1551,7 @@ mod tests {
         // EMPTY exempt-set (the pre-#2570 fail-closed behavior). No env mutation.
         let empty_exempt_resolver: Arc<dyn reqwest::dns::Resolve> =
             Arc::new(crate::services::ssrf_dns::SsrfGuardResolver::default());
-        let client = reqwest::Client::builder()
+        let client = Client::builder()
             .proxy(reqwest::Proxy::all(format!("http://localhost:{port}")).expect("proxy url"))
             .dns_resolver(empty_exempt_resolver)
             .timeout(Duration::from_secs(2))
@@ -1880,7 +1951,65 @@ mod tests {
         );
     }
 
-    fn build_5459(builder: reqwest::ClientBuilder) -> reqwest::Client {
+    /// CA replacement must replay both the proxy's original hostname
+    /// exemption and its destination checks for every shared trust class.
+    #[tokio::test]
+    async fn test_ca_rotation_preserves_env_proxy_routing_and_guard() {
+        let pem = include_str!("../../tests/fixtures/test-ca.pem");
+        for make in [
+            base_client_builder as fn() -> ClientBuilder,
+            internal_service_client_builder,
+            webhook_client_builder,
+            sso_client_builder,
+        ] {
+            let (listener, _) = proxy_listener_5459().await;
+            let proxy = format!("http://localhost:{}", listener.local_addr().unwrap().port());
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("ca.pem");
+            std::fs::write(&path, pem).unwrap();
+            let client = with_env_proxy_5459(&[("HTTP_PROXY", &proxy)], || {
+                make()
+                    .timeout(Duration::from_secs(2))
+                    .build_with_ca_path_for_test(path.clone())
+                    .unwrap()
+            });
+            for rotate in [false, true] {
+                if rotate {
+                    let mut update = tempfile::NamedTempFile::new_in(dir.path()).unwrap();
+                    writeln!(update, "{pem}").unwrap();
+                    update.persist(&path).unwrap();
+                    assert!(client.refresh_custom_ca_for_test());
+                }
+                assert_ssrf_refusal_5459(
+                    client.get("http://127.0.0.1:9/").send().await,
+                    "loopback destination must stay blocked after CA rotation",
+                );
+                assert_eq!(
+                    next_proxy_request_5459(&listener, Duration::from_millis(50), b"").await,
+                    None,
+                    "blocked destination reached the proxy"
+                );
+                let retained = client.clone();
+                let request =
+                    tokio::spawn(
+                        async move { retained.get("http://93.184.216.34/asset").send().await },
+                    );
+                let seen = next_proxy_request_5459(
+                    &listener,
+                    Duration::from_secs(2),
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await;
+                assert!(
+                    seen.as_deref().is_some_and(|line| line.contains("http://93.184.216.34/asset")),
+                    "allowed destination did not reach the hostname proxy after rotation={rotate}: {seen:?}"
+                );
+                assert!(request.await.unwrap().unwrap().status().is_success());
+            }
+        }
+    }
+
+    fn build_5459(builder: ClientBuilder) -> Client {
         builder
             .timeout(Duration::from_secs(5))
             .build()
@@ -2071,7 +2200,7 @@ mod tests {
             .await;
         // The per-repository client's own routing reaches the upstream.
         let client = loopback_client_from(
-            reqwest::Client::builder().resolve("unresolvable.example", *server.address()),
+            Client::builder().resolve("unresolvable.example", *server.address()),
         );
         let url = format!(
             "http://unresolvable.example:{}/pkg",
@@ -2093,10 +2222,7 @@ mod tests {
     #[tokio::test]
     async fn test_webhook_and_sso_clients_do_not_reuse_plain_http_proxy_connections_5459() {
         for (name, builder) in [
-            (
-                "webhook",
-                webhook_client_builder as fn() -> reqwest::ClientBuilder,
-            ),
+            ("webhook", webhook_client_builder as fn() -> ClientBuilder),
             ("sso", sso_client_builder),
         ] {
             let (listener, proxy_url) = proxy_listener_5459().await;
@@ -2441,10 +2567,8 @@ mod tests {
             }
         });
 
-        let proxied_builder = || {
-            reqwest::Client::builder()
-                .proxy(reqwest::Proxy::all(&blackhole_url).expect("proxy url"))
-        };
+        let proxied_builder =
+            || Client::builder().proxy(reqwest::Proxy::all(&blackhole_url).expect("proxy url"));
 
         // Negative control: without the helper the proxy DOES capture the
         // request, so the black hole is real and the positive case below is not
@@ -2545,7 +2669,7 @@ mod tests {
             format!("artifact-keeper/{}", env!("CARGO_PKG_VERSION"))
         );
         let server = waf_fronted_idp_5036().await;
-        let resp = loopback_client_from(super::sso_client_builder())
+        let resp = with_env_proxy_5459(&[], || loopback_client_from(sso_client_builder()))
             .get(server.uri())
             .send()
             .await
@@ -2581,18 +2705,23 @@ mod tests {
         let expected = format!("artifact-keeper/{}", env!("CARGO_PKG_VERSION"));
         assert_eq!(super::DEFAULT_USER_AGENT, expected);
 
-        let builders = [
-            ("base", base_client_builder()),
-            ("internal", internal_service_client_builder()),
-            ("webhook", webhook_client_builder()),
-            ("sso", sso_client_builder()),
-            ("plain", super::plain_client_builder()),
-            ("large_object", super::large_object_client_builder(true)),
-            (
-                "server_side_copy",
-                super::server_side_copy_client_builder(true),
-            ),
-        ];
+        let builders = with_env_proxy_5459(&[], || {
+            [
+                ("base", base_client_builder()),
+                ("internal", internal_service_client_builder()),
+                ("webhook", webhook_client_builder()),
+                ("sso", sso_client_builder()),
+                ("plain", ClientBuilder::new(super::plain_client_builder)),
+                (
+                    "large_object",
+                    super::reloadable_large_object_client_builder(true),
+                ),
+                (
+                    "server_side_copy",
+                    super::reloadable_server_side_copy_client_builder(true),
+                ),
+            ]
+        });
 
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(method("GET"))
@@ -2693,7 +2822,7 @@ mod tests {
         assert_eq!(err, "OIDC discovery returned HTTP 403 Forbidden");
         assert!(!err.contains("rule-secret-42"), "{err}");
 
-        let resp = loopback_client_from(super::sso_client_builder())
+        let resp = with_env_proxy_5459(&[], || loopback_client_from(sso_client_builder()))
             .get(server.uri())
             .send()
             .await

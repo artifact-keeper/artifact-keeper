@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use moka::future::Cache;
 
+use crate::services::http_client::ReloadableClient as Client;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use futures::stream::{BoxStream, StreamExt};
@@ -17,7 +18,7 @@ use regex::Regex;
 use reqwest::header::{
     ACCEPT, CONTENT_LENGTH, CONTENT_TYPE, ETAG, IF_NONE_MATCH, USER_AGENT, WWW_AUTHENTICATE,
 };
-use reqwest::{Client, StatusCode};
+use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use tokio::sync::{RwLock, Semaphore};
@@ -102,22 +103,26 @@ fn is_detached_fill_wait_error(err: &AppError) -> bool {
 /// the shared upstream client and for every per-Remote egress client, so a
 /// Remote with its own egress routing gets the same bounds.
 pub(crate) fn configure_upstream_client(
-    builder: reqwest::ClientBuilder,
+    builder: crate::services::http_client::ReloadableClientBuilder,
     timeouts: &crate::config::ProxyUpstreamSettings,
-) -> reqwest::ClientBuilder {
-    builder
-        .connect_timeout(timeouts.connect())
-        .read_timeout(timeouts.read())
-        .http2_keep_alive_interval(UPSTREAM_HTTP2_KEEP_ALIVE_INTERVAL)
-        .http2_keep_alive_timeout(UPSTREAM_HTTP2_KEEP_ALIVE_TIMEOUT)
-        .http2_keep_alive_while_idle(true)
-        .pool_idle_timeout(UPSTREAM_POOL_IDLE_TIMEOUT)
+) -> crate::services::http_client::ReloadableClientBuilder {
+    let connect = timeouts.connect();
+    let read = timeouts.read();
+    builder.configure(move |builder| {
+        builder
+            .connect_timeout(connect)
+            .read_timeout(read)
+            .http2_keep_alive_interval(UPSTREAM_HTTP2_KEEP_ALIVE_INTERVAL)
+            .http2_keep_alive_timeout(UPSTREAM_HTTP2_KEEP_ALIVE_TIMEOUT)
+            .http2_keep_alive_while_idle(true)
+            .pool_idle_timeout(UPSTREAM_POOL_IDLE_TIMEOUT)
+    })
 }
 
 /// The shared upstream HTTP client of a [`ProxyService`].
 fn build_upstream_http_client(timeouts: &crate::config::ProxyUpstreamSettings) -> Client {
     configure_upstream_client(
-        crate::services::http_client::base_client_builder(),
+        crate::services::http_client::reloadable_base_client_builder(),
         timeouts,
     )
     .user_agent("artifact-keeper-proxy/1.0")
@@ -450,7 +455,7 @@ pub(crate) struct UpstreamResponse {
     /// `Content-Encoding` from upstream, when it sent one.
     ///
     /// Since the base HTTP client disables reqwest's transparent decompression
-    /// (see `http_client::base_client_builder`), a content-coded body now
+    /// (see `http_client::reloadable_base_client_builder`), a content-coded body now
     /// arrives here still coded — so the coding MUST be carried alongside the
     /// bytes and re-emitted, or the client receives compressed data labelled as
     /// identity. Object stores return a stored `Content-Encoding` regardless of
@@ -928,7 +933,7 @@ struct CacheMetadataTemplate {
 ///   path did. Mirrors with aggressive per-connection idle timeouts
 ///   (Maven Central, dl-cdn.alpinelinux.org) may close the
 ///   connection if storage fsync exceeds the mirror's idle window.
-///   The `http_client::base_client_builder()` read timeout caps the
+///   The `http_client::reloadable_base_client_builder()` read timeout caps the
 ///   total wait; operators with tight storage budgets should verify
 ///   that timeout matches their upstream's tolerance.
 /// * **HTTP/2 client flow-control window (#1184).** The 4 MiB tee cap
@@ -2110,7 +2115,7 @@ pub struct CacheMetadata {
     /// content coded.
     ///
     /// The proxy no longer decompresses upstream bodies (see
-    /// `http_client::base_client_builder`), so a coded body is cached coded and
+    /// `http_client::reloadable_base_client_builder`), so a coded body is cached coded and
     /// the coding has to be replayed on every cache hit — otherwise a hit
     /// serves compressed bytes labelled as identity. `size_bytes` and
     /// `checksum_sha256` describe the stored (still coded) bytes.

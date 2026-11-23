@@ -7,10 +7,10 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use crate::services::http_client::ReloadableClient as Client;
 use quick_xml::escape::{resolve_predefined_entity, unescape};
 use quick_xml::events::Event;
 use quick_xml::Reader;
-use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -666,7 +666,7 @@ impl SamlService {
         Ok(Self {
             db,
             config,
-            http_client: crate::services::http_client::default_client(),
+            http_client: crate::services::http_client::reloadable_default_client(),
         })
     }
 
@@ -718,7 +718,7 @@ impl SamlService {
         Self {
             db,
             config,
-            http_client: crate::services::http_client::default_client(),
+            http_client: crate::services::http_client::reloadable_default_client(),
         }
     }
 
@@ -727,7 +727,7 @@ impl SamlService {
         Self {
             db,
             config,
-            http_client: crate::services::http_client::default_client(),
+            http_client: crate::services::http_client::reloadable_default_client(),
         }
     }
 

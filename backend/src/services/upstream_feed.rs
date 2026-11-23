@@ -359,7 +359,7 @@ fn not_a_base_error(feed_url: &Url) -> AppError {
 /// (the `npm-replicate` engine rejects CouchDB's long-poll controls) and
 /// bootstraps the head cursor from the feed root's `update_seq`.
 pub struct NpmReplicationFeedAdapter {
-    http: reqwest::Client,
+    http: crate::services::http_client::ReloadableClient,
     url: Url,
     feed_key: String,
 }
@@ -368,7 +368,7 @@ impl NpmReplicationFeedAdapter {
     pub fn new(url: &str) -> Result<Self> {
         // Entry-point SSRF check on the configured feed endpoint, the same
         // guard the other outbound-fetch paths (cargo/composer/remote
-        // instances) apply before issuing a request. `base_client_builder`'s
+        // instances) apply before issuing a request. `reloadable_base_client_builder`'s
         // redirect policy only re-validates *redirect* hops, so without this
         // a feed URL pointing straight at a private/link-local/metadata
         // address (169.254.169.254, internal service names, RFC1918, …)
@@ -388,7 +388,7 @@ impl NpmReplicationFeedAdapter {
             .map_err(|e| AppError::Config(format!("invalid npm feed URL '{url}': {e}")))?;
         // The shared builder carries the custom-CA bundle and the SSRF
         // redirect policy every outbound client in the app uses.
-        let http = crate::services::http_client::base_client_builder()
+        let http = crate::services::http_client::reloadable_base_client_builder()
             .timeout(NPM_FEED_HTTP_TIMEOUT)
             .build()
             .map_err(|e| AppError::Config(format!("building npm feed HTTP client: {e}")))?;

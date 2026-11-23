@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use tokio::io::AsyncReadExt;
 
+use crate::services::http_client::ReloadableClient as Client;
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
@@ -20,7 +21,6 @@ use futures::stream::BoxStream;
 use futures::StreamExt;
 use once_cell::sync::Lazy;
 use regex::Regex;
-use reqwest::Client;
 use serde::Deserialize;
 use sqlx::PgPool;
 use tokio::sync::{Notify, OwnedSemaphorePermit, RwLock, Semaphore};
@@ -7483,7 +7483,7 @@ impl AdvisoryClient {
             );
         }
         Self {
-            http: crate::services::http_client::base_client_builder()
+            http: crate::services::http_client::reloadable_base_client_builder()
                 .timeout(Duration::from_secs(30))
                 .user_agent("artifact-keeper-scanner/1.0")
                 .build()
@@ -7520,7 +7520,7 @@ impl AdvisoryClient {
     #[cfg(test)]
     pub(crate) fn for_test(osv_batch_url: String, cache_ttl: Duration) -> Self {
         Self {
-            http: crate::services::http_client::base_client_builder()
+            http: crate::services::http_client::reloadable_base_client_builder()
                 .timeout(Duration::from_secs(5))
                 .build()
                 .expect("failed to build HTTP client"),
@@ -20708,7 +20708,7 @@ tonic-build = "0.12"
         }
 
         let client = AdvisoryClient {
-            http: crate::services::http_client::base_client_builder()
+            http: crate::services::http_client::reloadable_base_client_builder()
                 .timeout(Duration::from_secs(5))
                 .build()
                 .expect("failed to build HTTP client"),
@@ -20801,7 +20801,7 @@ tonic-build = "0.12"
         );
 
         let client = AdvisoryClient {
-            http: crate::services::http_client::base_client_builder()
+            http: crate::services::http_client::reloadable_base_client_builder()
                 .timeout(Duration::from_secs(5))
                 .build()
                 .expect("failed to build HTTP client"),
@@ -20908,7 +20908,7 @@ tonic-build = "0.12"
         );
         let sink = Arc::new(VecDeltaSink(std::sync::Mutex::new(Vec::new())));
         let client = AdvisoryClient {
-            http: crate::services::http_client::base_client_builder()
+            http: crate::services::http_client::reloadable_base_client_builder()
                 .timeout(Duration::from_secs(5))
                 .build()
                 .expect("failed to build HTTP client"),
@@ -20977,7 +20977,7 @@ tonic-build = "0.12"
 
         let sink = Arc::new(VecDeltaSink(std::sync::Mutex::new(Vec::new())));
         let client = AdvisoryClient {
-            http: crate::services::http_client::base_client_builder()
+            http: crate::services::http_client::reloadable_base_client_builder()
                 .timeout(Duration::from_secs(5))
                 .build()
                 .expect("failed to build HTTP client"),
@@ -21035,7 +21035,7 @@ tonic-build = "0.12"
         /// tests that exercise the secondary source.
         fn advisory_client_for(osv_url: &str, github: Option<&str>) -> Arc<AdvisoryClient> {
             Arc::new(AdvisoryClient {
-                http: crate::services::http_client::base_client_builder()
+                http: crate::services::http_client::reloadable_base_client_builder()
                     .timeout(Duration::from_secs(5))
                     .build()
                     .expect("failed to build HTTP client"),
@@ -35832,7 +35832,7 @@ tonic-build = "0.12"
         /// tests that exercise the secondary source.
         fn advisory_client_for(osv_url: &str, github: Option<&str>) -> Arc<AdvisoryClient> {
             Arc::new(AdvisoryClient {
-                http: crate::services::http_client::base_client_builder()
+                http: crate::services::http_client::reloadable_base_client_builder()
                     .timeout(Duration::from_secs(5))
                     .build()
                     .expect("failed to build HTTP client"),
@@ -36682,7 +36682,7 @@ tonic-build = "0.12"
 
         fn advisory_client_for(osv_url: &str, github: Option<&str>) -> Arc<AdvisoryClient> {
             Arc::new(AdvisoryClient {
-                http: crate::services::http_client::base_client_builder()
+                http: crate::services::http_client::reloadable_base_client_builder()
                     .timeout(Duration::from_secs(5))
                     .build()
                     .expect("failed to build HTTP client"),
