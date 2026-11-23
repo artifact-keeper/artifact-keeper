@@ -2410,7 +2410,7 @@ async fn download(
 
                 // #5810: no member scans; the virtual's member-fallback policy.
                 let fallback = proxy_helpers::virtual_member_fallback(&state.db, repo.id).await;
-                let result = resolve_unscanned_crate_members(
+                return resolve_unscanned_crate_members(
                     &state,
                     members,
                     fallback,
@@ -2418,8 +2418,7 @@ async fn download(
                     &member_fetch_urls,
                     &coordinate,
                 )
-                .await?;
-                return Ok(virtual_crate_response(&filename, result));
+                .await;
             }
             return Err(AppError::NotFound("Crate not found".to_string()).into_response());
         }
@@ -2746,7 +2745,9 @@ async fn serve_scanned_crate(
 }
 
 /// One run of members through the shared priority-preserving resolver, each
-/// Remote member fetching from its resolved `dl` URL (#3952).
+/// Remote member fetching from its resolved `dl` URL (#3952). These members
+/// serve without an inline scan, so a Remote member's fresh cached crate may
+/// be answered with a presigned redirect (#5129).
 async fn resolve_unscanned_crate_members(
     state: &SharedState,
     members: Vec<crate::models::repository::Repository>,
@@ -2754,15 +2755,16 @@ async fn resolve_unscanned_crate_members(
     proxy: Option<&crate::services::proxy_service::ProxyService>,
     member_fetch_urls: &HashMap<uuid::Uuid, String>,
     coordinate: &CrateCoordinate<'_>,
-) -> Result<crate::services::proxy_service::StreamingFetchResult, Response> {
+) -> Result<Response, Response> {
     let (name, version) = (coordinate.name, coordinate.version);
-    proxy_helpers::resolve_virtual_download_from_members_with_fetch_urls(
+    let download = proxy_helpers::resolve_virtual_download_or_redirect(
+        state,
         members,
         fallback,
         proxy,
         coordinate.cache_path,
         member_fetch_urls,
-        Some(coordinate.ctx),
+        coordinate.ctx,
         |member_id, location| async move {
             proxy_helpers::local_fetch_by_name_version(
                 &state.db, state, member_id, &location, name, version,
@@ -2770,7 +2772,13 @@ async fn resolve_unscanned_crate_members(
             .await
         },
     )
-    .await
+    .await?;
+    Ok(match download {
+        proxy_helpers::VirtualDownload::Redirect(redirect) => redirect,
+        proxy_helpers::VirtualDownload::Stream(result) => {
+            virtual_crate_response(coordinate.filename, result)
+        }
+    })
 }
 
 /// The Virtual download walk with scan-on-proxy (#4101).
@@ -2908,7 +2916,7 @@ async fn resolve_unscanned_crate_run(
     )
     .await
     {
-        Ok(result) => Some(Ok(virtual_crate_response(coordinate.filename, result))),
+        Ok(resp) => Some(Ok(resp)),
         Err(resp) => proxy_helpers::unscanned_run_failure(resp),
     }
 }

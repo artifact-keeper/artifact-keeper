@@ -6,6 +6,14 @@ CloudFront), artifact downloads answer `302` (OCI blob pulls `307`) with a
 signed URL on the object store, and the client fetches the bytes from there
 instead of through Artifact Keeper.
 
+Through a virtual repository, a Remote member's fresh proxy-cache hit is
+redirected too, for Cargo crates and npm tarballs as for the other formats
+(#5129). It is redirected only once the entry passes the same checks as a
+streamed hit: it is fresh, present in storage, outside its Package Age Policy
+hold, and allowed by the origin policy and the stored scan verdict. Otherwise
+the download is answered as it would be with redirects off, so a held entry is
+still `409`. Index files, packuments and other metadata always stream.
+
 That URL is only useful if the **client** can reach the host in it.
 
 ## The problem: an internal storage endpoint
