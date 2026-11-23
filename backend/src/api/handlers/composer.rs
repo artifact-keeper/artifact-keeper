@@ -2016,24 +2016,122 @@ async fn search_hosted(
     })
 }
 
-/// The hosted repositories a search reads. A Virtual stores nothing itself, so
-/// it searches its Local and Staging members, walked as `packages.json` walks
-/// them: only members this caller may read (#3323), in priority order (#6285).
-/// Remote members contribute nothing, as before.
-async fn search_repo_ids(
+/// Merge source pages in priority order (#6332): the first source naming a
+/// package keeps it, the totals add up (an upper bound when sources share
+/// names), and there is a next page while any source has one. Every source is
+/// asked for the same page, so each of its hits shows up on some page.
+fn merge_search_pages(pages: Vec<SearchPage>) -> SearchPage {
+    let mut seen = std::collections::HashSet::new();
+    let mut merged = SearchPage::default();
+    for page in pages {
+        merged.total = merged.total.saturating_add(page.total);
+        merged.has_next |= page.has_next;
+        for hit in page.results {
+            let name = hit["name"].as_str().unwrap_or_default().to_string();
+            if seen.insert(name) {
+                merged.results.push(hit);
+            }
+        }
+    }
+    merged
+}
+
+/// What one search reads: hosted repositories, and the Remotes whose
+/// upstream it may be forwarded to (#6332) before their opt-in is checked.
+struct SearchSources {
+    hosted: Vec<uuid::Uuid>,
+    remotes: Vec<RepoInfo>,
+}
+
+/// The repositories a search reads. A Virtual stores nothing itself, so it
+/// searches its Local and Staging members, walked as `packages.json` walks
+/// them: only members this caller may read (#3323), in priority order
+/// (#6285). A Remote searches its own cached rows. Remotes, direct or
+/// member, are upstream candidates; only those opted in are forwarded to.
+async fn search_sources(
     db: &PgPool,
     auth: Option<&AuthExtension>,
     repo: &RepoInfo,
-) -> Result<Vec<uuid::Uuid>, Response> {
+) -> Result<SearchSources, Response> {
     if repo.repo_type != RepositoryType::Virtual {
-        return Ok(vec![repo.id]);
+        let remotes = if repo.repo_type == RepositoryType::Remote {
+            vec![repo.clone()]
+        } else {
+            Vec::new()
+        };
+        return Ok(SearchSources {
+            hosted: vec![repo.id],
+            remotes,
+        });
     }
     let members = proxy_helpers::authorized_virtual_members(db, auth, repo.id).await?;
-    Ok(members
-        .iter()
-        .filter(|m| m.repo_type.is_hosted())
-        .map(|m| m.id)
-        .collect())
+    Ok(SearchSources {
+        hosted: members
+            .iter()
+            .filter(|m| m.repo_type.is_hosted())
+            .map(|m| m.id)
+            .collect(),
+        remotes: members
+            .iter()
+            .filter(|m| m.repo_type == RepositoryType::Remote)
+            .map(proxy_helpers::repo_info_from_member)
+            .collect(),
+    })
+}
+
+/// The opted-in Remotes' upstream pages for `params` (#6332), curated, and
+/// the keys of those that were unavailable.
+async fn search_upstreams(
+    state: &SharedState,
+    repo: &RepoInfo,
+    url_repo_key: &str,
+    remotes: Vec<RepoInfo>,
+    params: &SearchParams<'_>,
+) -> (Vec<SearchPage>, Vec<String>) {
+    use super::composer_upstream_search as up;
+    let Some(proxy) = state.proxy_service.as_deref() else {
+        return (Vec::new(), Vec::new());
+    };
+    let remotes = up::forwarding_remotes(&state.db, remotes).await;
+    if remotes.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    let req = up::SearchRequest {
+        query: params.query,
+        type_filter: params.type_filter,
+        per_page: params.per_page,
+        page: params.page,
+    };
+    let outcomes = futures::future::join_all(
+        remotes
+            .iter()
+            .map(|remote| up::search_remote(&state.db, proxy, remote, &req)),
+    )
+    .await;
+    let mut pages = Vec::new();
+    let mut unavailable = Vec::new();
+    for (remote, outcome) in remotes.iter().zip(outcomes) {
+        match outcome {
+            up::Outcome::Page(page) => {
+                let mut targets = vec![remote];
+                if repo.id != remote.id {
+                    targets.push(repo);
+                }
+                let hits = up::curated(&state.db, &targets, &page).await;
+                pages.push(SearchPage {
+                    results: hits
+                        .iter()
+                        .map(|h| search_hit(url_repo_key, &h.name, &h.description))
+                        .collect(),
+                    total: page.total,
+                    has_next: page.has_next,
+                });
+            }
+            up::Outcome::Miss => {}
+            up::Outcome::Unavailable => unavailable.push(remote.key.clone()),
+        }
+    }
+    (pages, unavailable)
 }
 
 async fn search(
@@ -2053,8 +2151,21 @@ async fn search(
         page: params.page.unwrap_or(1).max(1),
     };
 
-    let repo_ids = search_repo_ids(&state.db, auth.as_ref(), &repo).await?;
-    let page = search_hosted(&state.db, &repo_ids, &repo_key, &search_params).await?;
+    let sources = search_sources(&state.db, auth.as_ref(), &repo).await?;
+    // Hosted hits first, then each forwarding Remote's in priority order.
+    let mut pages =
+        vec![search_hosted(&state.db, &sources.hosted, &repo_key, &search_params).await?];
+    let (upstream_pages, unavailable) =
+        search_upstreams(&state, &repo, &repo_key, sources.remotes, &search_params).await;
+    pages.extend(upstream_pages);
+    let page = merge_search_pages(pages);
+
+    // #5495: a Virtual whose search found nothing while a forwarded member
+    // was down cannot say "no such package"; the client retries instead. A
+    // Remote asked directly, or a Virtual with hits, fails soft.
+    if repo.repo_type == RepositoryType::Virtual && !unavailable.is_empty() && page.total == 0 {
+        return Err(super::composer_upstream_search::nothing_found_while_unavailable());
+    }
 
     let mut response = serde_json::json!({
         "results": page.results,
@@ -2072,9 +2183,14 @@ async fn search(
         ));
     }
 
-    Ok(Response::builder()
+    let mut builder = Response::builder()
         .status(StatusCode::OK)
-        .header(CONTENT_TYPE, "application/json")
+        .header(CONTENT_TYPE, "application/json");
+    if !unavailable.is_empty() {
+        // The upstreams this answer is missing, as the partial merges name them.
+        builder = builder.header(proxy_helpers::PARTIAL_MEMBERS_HEADER, unavailable.join(","));
+    }
+    Ok(builder
         .body(Body::from(serde_json::to_string(&response).unwrap()))
         .unwrap())
 }
@@ -4999,6 +5115,282 @@ mod metadata_db_tests {
         assert_eq!(status, axum::http::StatusCode::OK);
         assert_eq!(json, serde_json::json!({"results": [], "total": 0}));
         server.verify().await;
+    }
+
+    // -- Upstream search forwarding, opt-in per Remote (#6332) -------------
+
+    async fn opt_in_upstream_search(pool: &PgPool, repo_id: Uuid) {
+        sqlx::query(
+            "INSERT INTO repository_config (repository_id, key, value) VALUES ($1, $2, 'true') \
+             ON CONFLICT (repository_id, key) DO UPDATE SET value = 'true'",
+        )
+        .bind(repo_id)
+        .bind(super::super::composer_upstream_search::CONFIG_KEY)
+        .execute(pool)
+        .await
+        .expect("opt in");
+    }
+
+    fn upstream_answer(names: &[&str]) -> wiremock::ResponseTemplate {
+        let results: Vec<_> = names
+            .iter()
+            .map(|n| serde_json::json!({"name": n, "description": format!("up {n}"), "url": "https://x"}))
+            .collect();
+        wiremock::ResponseTemplate::new(200).set_body_string(
+            serde_json::json!({"results": results, "total": names.len()}).to_string(),
+        )
+    }
+
+    /// Opted in, a Remote's search returns the upstream's hits re-pointed at
+    /// the Remote, and an identical search inside the TTL reads nothing
+    /// upstream (one read for two searches).
+    #[tokio::test]
+    async fn remote_search_forwards_when_opted_in_and_shares_one_read_6332() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "composer").await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/search.json"))
+            .and(query_param("q", "monolog"))
+            .and(query_param("per_page", "15"))
+            .and(query_param("page", "1"))
+            .respond_with(upstream_answer(&["monolog/monolog", "../evil"]))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &server.uri()).await;
+        opt_in_upstream_search(&fx.pool, fx.repo_id).await;
+
+        let uri = format!("/{}/search.json?q=monolog", fx.repo_key);
+        let (status, json) = search_names(
+            tdh::router_anon(super::router(), state.clone()),
+            uri.clone(),
+        )
+        .await;
+        let (again_status, again) =
+            search_names(tdh::router_anon(super::router(), state), uri).await;
+        fx.teardown().await;
+
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "results": [{
+                    "name": "monolog/monolog",
+                    "description": "up monolog/monolog",
+                    "url": format!("/composer/{}/p2/monolog/monolog.json", fx.repo_key),
+                }],
+                "total": 2,
+            })
+        );
+        assert_eq!(again_status, axum::http::StatusCode::OK);
+        assert_eq!(again, json);
+        server.verify().await;
+    }
+
+    /// Opted in, an upstream that is down costs the search nothing but its
+    /// hits: 200 with the local answer, the Remote named as missing.
+    #[tokio::test]
+    async fn remote_search_fails_soft_when_the_upstream_is_down_6332() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "composer").await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/search.json"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &server.uri()).await;
+        opt_in_upstream_search(&fx.pool, fx.repo_id).await;
+
+        let (status, body, headers) = tdh::send_with_headers(
+            tdh::router_anon(super::router(), state),
+            tdh::get(format!("/{}/search.json?q=monolog", fx.repo_key)),
+        )
+        .await;
+        fx.teardown().await;
+
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json, serde_json::json!({"results": [], "total": 0}));
+        assert_eq!(
+            headers
+                .get(proxy_helpers::PARTIAL_MEMBERS_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some(fx.repo_key.as_str())
+        );
+    }
+
+    /// A Virtual merges hosted hits first, then an opted-in Remote member's
+    /// upstream hits, one per name; a Remote member that did not opt in is
+    /// never asked; a curation `block` on the forwarding Remote drops a hit.
+    #[tokio::test]
+    async fn virtual_search_merges_hosted_then_opted_in_upstreams_6332() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer};
+
+        let Some(vf) = tdh::Fixture::setup("virtual", "composer").await else {
+            return;
+        };
+        let (local, _lk, ld) = tdh::create_repo(&vf.pool, "local", "composer").await;
+        let meta = Some(serde_json::json!({"composer": {"description": "hosted"}}));
+        insert_artifact(&vf.pool, local, "aktest/lib", "1.0.0", "u1", meta).await;
+
+        let on = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/search.json"))
+            .respond_with(upstream_answer(&[
+                "aktest/lib",
+                "aktest/remote",
+                "aktest/blocked",
+            ]))
+            .expect(1)
+            .mount(&on)
+            .await;
+        let off = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/search.json"))
+            .respond_with(upstream_answer(&["aktest/never"]))
+            .expect(0)
+            .mount(&off)
+            .await;
+        let (remote_on, _k1, d1) = tdh::create_repo(&vf.pool, "remote", "composer").await;
+        let (remote_off, _k2, d2) = tdh::create_repo(&vf.pool, "remote", "composer").await;
+        for (id, url) in [(remote_on, on.uri()), (remote_off, off.uri())] {
+            sqlx::query(
+                "UPDATE repositories SET upstream_url = $1, curation_enabled = true, \
+                 curation_default_action = 'allow' WHERE id = $2",
+            )
+            .bind(url)
+            .bind(id)
+            .execute(&vf.pool)
+            .await
+            .expect("remote member");
+        }
+        sqlx::query(
+            "INSERT INTO curation_rules (staging_repo_id, package_pattern, version_constraint, \
+             architecture, action, priority, reason, created_by) \
+             VALUES ($1, 'aktest/blocked', '*', '*', 'block', 100, '#6332 test block', $2)",
+        )
+        .bind(remote_on)
+        .bind(vf.user_id)
+        .execute(&vf.pool)
+        .await
+        .expect("block rule");
+        opt_in_upstream_search(&vf.pool, remote_on).await;
+        add_member(&vf.pool, vf.repo_id, local, 0).await;
+        add_member(&vf.pool, vf.repo_id, remote_on, 5).await;
+        add_member(&vf.pool, vf.repo_id, remote_off, 10).await;
+        for m in [local, remote_on, remote_off] {
+            tdh::grant_repo_access(&vf.pool, m, vf.user_id).await;
+        }
+        let cache = tempfile::tempdir().expect("proxy cache dir");
+        let state = tdh::build_state_with_proxy(
+            vf.pool.clone(),
+            cache.path().to_str().unwrap(),
+            tdh::build_proxy_service_with_fs(vf.pool.clone(), cache.path().to_str().unwrap()),
+        );
+        let auth = tdh::make_auth(vf.user_id, &vf.username);
+
+        let (status, body) = tdh::send(
+            tdh::router_with_auth(super::router(), state, auth),
+            tdh::get(format!("/{}/search.json?q=aktest", vf.repo_key)),
+        )
+        .await;
+        let _ = sqlx::query("DELETE FROM curation_rules WHERE staging_repo_id = $1")
+            .bind(remote_on)
+            .execute(&vf.pool)
+            .await;
+        for (id, dir) in [(local, ld), (remote_on, d1), (remote_off, d2)] {
+            tdh::cleanup(&vf.pool, id, Uuid::new_v4()).await;
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        vf.teardown().await;
+
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let hit = |name: &str, d: &str| {
+            serde_json::json!({"name": name, "description": d,
+                "url": format!("/composer/{}/p2/{name}.json", vf.repo_key)})
+        };
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "results": [hit("aktest/lib", "hosted"), hit("aktest/remote", "up aktest/remote")],
+                // Totals add up: 1 hosted + 3 upstream (an upper bound).
+                "total": 4,
+            })
+        );
+        on.verify().await;
+        off.verify().await;
+    }
+
+    /// A Virtual with hosted hits serves them when its forwarded member is
+    /// down; with nothing found at all it answers 503, since "no such
+    /// package" is unknowable while a member is down (#5495).
+    #[tokio::test]
+    async fn virtual_search_with_a_down_member_serves_local_or_503_6332() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(vf) = tdh::Fixture::setup("virtual", "composer").await else {
+            return;
+        };
+        let (local, _lk, ld) = tdh::create_repo(&vf.pool, "local", "composer").await;
+        insert_artifact(&vf.pool, local, "aktest/lib", "1.0.0", "u2", None).await;
+        let down = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/search.json"))
+            .respond_with(ResponseTemplate::new(502))
+            .mount(&down)
+            .await;
+        let (remote, _rk, rd) = tdh::create_repo(&vf.pool, "remote", "composer").await;
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(down.uri())
+            .bind(remote)
+            .execute(&vf.pool)
+            .await
+            .expect("remote member");
+        opt_in_upstream_search(&vf.pool, remote).await;
+        add_member(&vf.pool, vf.repo_id, local, 0).await;
+        add_member(&vf.pool, vf.repo_id, remote, 5).await;
+        for m in [local, remote] {
+            tdh::grant_repo_access(&vf.pool, m, vf.user_id).await;
+        }
+        let cache = tempfile::tempdir().expect("proxy cache dir");
+        let state = tdh::build_state_with_proxy(
+            vf.pool.clone(),
+            cache.path().to_str().unwrap(),
+            tdh::build_proxy_service_with_fs(vf.pool.clone(), cache.path().to_str().unwrap()),
+        );
+        let auth = tdh::make_auth(vf.user_id, &vf.username);
+        let ask = |q: &str| {
+            tdh::send(
+                tdh::router_with_auth(super::router(), state.clone(), auth.clone()),
+                tdh::get(format!("/{}/search.json?q={q}", vf.repo_key)),
+            )
+        };
+        let (found_status, found_body) = ask("aktest").await;
+        let (none_status, _) = ask("nothing-matches-this").await;
+        for (id, dir) in [(local, ld), (remote, rd)] {
+            tdh::cleanup(&vf.pool, id, Uuid::new_v4()).await;
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        vf.teardown().await;
+
+        assert_eq!(found_status, axum::http::StatusCode::OK);
+        let found: serde_json::Value = serde_json::from_slice(&found_body).unwrap();
+        assert_eq!(found["total"], 1);
+        assert_eq!(found["results"][0]["name"], "aktest/lib");
+        assert_eq!(none_status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
     }
 
     // -- Virtual repo: priority order — first member with the package wins -
