@@ -39,6 +39,65 @@ fn validate_event_version(v: &str) -> std::result::Result<(), AppError> {
     }
 }
 
+/// How many receiver response bytes the three delivery paths keep for
+/// troubleshooting (#6403). The 30 s client timeout bounds time, not size, so
+/// the body needs its own cap. `WEBHOOK_RESPONSE_BODY_MAX_BYTES` overrides it.
+const WEBHOOK_RESPONSE_BODY_MAX_BYTES_DEFAULT: usize = 4 * 1024;
+
+fn webhook_response_body_max_bytes() -> usize {
+    parse_webhook_response_body_max_bytes(
+        std::env::var("WEBHOOK_RESPONSE_BODY_MAX_BYTES")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn parse_webhook_response_body_max_bytes(raw: Option<&str>) -> usize {
+    raw.and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(WEBHOOK_RESPONSE_BODY_MAX_BYTES_DEFAULT)
+}
+
+fn truncated_response_body_marker(limit: usize, declared_len: Option<u64>) -> String {
+    match declared_len {
+        Some(total) => format!(" ... [truncated, {limit} of {total} bytes]"),
+        None => format!(" ... [truncated, {limit}+ bytes]"),
+    }
+}
+
+/// Read at most `limit` bytes of a receiver's response for the delivery log.
+///
+/// Streaming stops at the cap: an oversized body is never fully buffered, and
+/// the remainder is left unread when the response is dropped. Status-code
+/// handling stays with the caller, so a body read failure only loses the
+/// excerpt, never changes the delivery outcome (#6403).
+async fn read_bounded_response_body(response: reqwest::Response, limit: usize) -> Option<String> {
+    use futures::StreamExt;
+
+    let declared_len = response.content_length();
+    let mut stream = response.bytes_stream();
+    let mut kept = Vec::new();
+
+    while kept.len() < limit {
+        let Some(chunk) = stream.next().await else {
+            break;
+        };
+        let chunk = chunk.ok()?;
+        let remaining = limit - kept.len();
+        kept.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+    }
+
+    let truncated = kept.len() == limit
+        && declared_len
+            .map(|total| total > limit as u64)
+            .unwrap_or(true);
+    let mut body = String::from_utf8_lossy(&kept).into_owned();
+    if truncated {
+        body.push_str(&truncated_response_body_marker(limit, declared_len));
+    }
+    Some(body)
+}
+
 /// Create webhook routes
 pub fn router() -> Router<SharedState> {
     Router::new()
@@ -1366,7 +1425,8 @@ pub async fn test_webhook(
     match request.body(body_bytes).send().await {
         Ok(response) => {
             let status = response.status().as_u16();
-            let body = response.text().await.ok();
+            let body =
+                read_bounded_response_body(response, webhook_response_body_max_bytes()).await;
 
             Ok(Json(TestWebhookResponse {
                 success: (200..300).contains(&status),
@@ -1593,7 +1653,8 @@ pub async fn redeliver(
     let (success, response_status, response_body) = match request.body(body_bytes).send().await {
         Ok(response) => {
             let status = response.status().as_u16() as i32;
-            let body = response.text().await.ok();
+            let body =
+                read_bounded_response_body(response, webhook_response_body_max_bytes()).await;
             ((200..300).contains(&status), Some(status), body)
         }
         Err(e) => (false, None, Some(e.to_string())),
@@ -3154,7 +3215,8 @@ async fn deliver_one_claimed_webhook(
     let (success, response_status, response_body) = match request.body(body_bytes).send().await {
         Ok(response) => {
             let status = response.status().as_u16() as i32;
-            let body = response.text().await.ok();
+            let body =
+                read_bounded_response_body(response, webhook_response_body_max_bytes()).await;
             (
                 is_webhook_delivery_success(status as u16),
                 Some(status),
@@ -3449,6 +3511,125 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // #6403: receiver response bodies are capped before they are stored
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_webhook_response_body_cap_parsing() {
+        assert_eq!(
+            parse_webhook_response_body_max_bytes(None),
+            WEBHOOK_RESPONSE_BODY_MAX_BYTES_DEFAULT
+        );
+        assert_eq!(parse_webhook_response_body_max_bytes(Some("8192")), 8192);
+        assert_eq!(parse_webhook_response_body_max_bytes(Some(" 1024 ")), 1024);
+        for raw in [Some("0"), Some("-1"), Some("abc"), Some("")] {
+            assert_eq!(
+                parse_webhook_response_body_max_bytes(raw),
+                WEBHOOK_RESPONSE_BODY_MAX_BYTES_DEFAULT
+            );
+        }
+    }
+
+    #[test]
+    fn test_webhook_response_body_cap_env_override() {
+        let _g = WebhookEnvGuard::new();
+        std::env::set_var("WEBHOOK_RESPONSE_BODY_MAX_BYTES", "8192");
+        assert_eq!(webhook_response_body_max_bytes(), 8192);
+    }
+
+    #[test]
+    fn test_truncated_response_body_marker_names_declared_length() {
+        assert_eq!(
+            truncated_response_body_marker(100, Some(500)),
+            " ... [truncated, 100 of 500 bytes]"
+        );
+        assert_eq!(
+            truncated_response_body_marker(100, None),
+            " ... [truncated, 100+ bytes]"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_bounded_response_body_truncates_large_body() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let full = "x".repeat(WEBHOOK_RESPONSE_BODY_MAX_BYTES_DEFAULT * 2 + 17);
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(full.clone()))
+            .mount(&server)
+            .await;
+
+        let response = reqwest::Client::new()
+            .get(server.uri())
+            .send()
+            .await
+            .expect("mock receiver");
+        assert_eq!(response.content_length(), Some(full.len() as u64));
+
+        let body = read_bounded_response_body(response, WEBHOOK_RESPONSE_BODY_MAX_BYTES_DEFAULT)
+            .await
+            .expect("response body");
+        assert!(
+            body.starts_with(&"x".repeat(WEBHOOK_RESPONSE_BODY_MAX_BYTES_DEFAULT)),
+            "the stored excerpt must start with the first capped bytes"
+        );
+        assert!(body.contains(&format!(
+            "[truncated, {} of {} bytes]",
+            WEBHOOK_RESPONSE_BODY_MAX_BYTES_DEFAULT,
+            full.len()
+        )));
+        assert!(body.len() < full.len(), "the full body must not be stored");
+    }
+
+    #[tokio::test]
+    async fn test_read_bounded_response_body_keeps_exact_cap_without_marker() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let full = "y".repeat(WEBHOOK_RESPONSE_BODY_MAX_BYTES_DEFAULT);
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(full.clone()))
+            .mount(&server)
+            .await;
+
+        let response = reqwest::Client::new()
+            .get(server.uri())
+            .send()
+            .await
+            .expect("mock receiver");
+        let body = read_bounded_response_body(response, WEBHOOK_RESPONSE_BODY_MAX_BYTES_DEFAULT)
+            .await
+            .expect("response body");
+        assert_eq!(body, full, "a body at the cap is not truncated");
+    }
+
+    #[tokio::test]
+    async fn test_read_bounded_response_body_keeps_small_body_verbatim() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let full = "receiver accepted";
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(full))
+            .mount(&server)
+            .await;
+
+        let response = reqwest::Client::new()
+            .get(server.uri())
+            .send()
+            .await
+            .expect("mock receiver");
+        let body = read_bounded_response_body(response, WEBHOOK_RESPONSE_BODY_MAX_BYTES_DEFAULT)
+            .await
+            .expect("response body");
+        assert_eq!(body, full);
+    }
+
+    // -----------------------------------------------------------------------
     // WebhookEvent Display
     // -----------------------------------------------------------------------
 
@@ -3634,14 +3815,15 @@ mod tests {
     /// validator helper functions read env on each call.
     static WEBHOOK_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    /// Snapshot + restore the two private-IP env vars so a test that
-    /// flips one cannot leak state into a sibling.
+    /// Snapshot + restore the webhook env vars the tests below flip so one
+    /// cannot leak state into a sibling.
     struct WebhookEnvGuard {
         _lock: std::sync::MutexGuard<'static, ()>,
         prev_webhook: Option<String>,
         prev_upstream: Option<String>,
         prev_cidrs: Option<String>,
         prev_alias: Option<String>,
+        prev_body_cap: Option<String>,
     }
 
     impl WebhookEnvGuard {
@@ -3653,11 +3835,13 @@ mod tests {
                 prev_upstream: std::env::var("UPSTREAM_ALLOW_PRIVATE_IPS").ok(),
                 prev_cidrs: std::env::var("AK_SSRF_ALLOW_PRIVATE_CIDRS").ok(),
                 prev_alias: std::env::var("UPSTREAM_PRIVATE_IP_ALLOWLIST").ok(),
+                prev_body_cap: std::env::var("WEBHOOK_RESPONSE_BODY_MAX_BYTES").ok(),
             };
             std::env::remove_var("WEBHOOK_ALLOW_PRIVATE_IPS");
             std::env::remove_var("UPSTREAM_ALLOW_PRIVATE_IPS");
             std::env::remove_var("AK_SSRF_ALLOW_PRIVATE_CIDRS");
             std::env::remove_var("UPSTREAM_PRIVATE_IP_ALLOWLIST");
+            std::env::remove_var("WEBHOOK_RESPONSE_BODY_MAX_BYTES");
             g
         }
     }
@@ -3669,6 +3853,7 @@ mod tests {
                 ("UPSTREAM_ALLOW_PRIVATE_IPS", &self.prev_upstream),
                 ("AK_SSRF_ALLOW_PRIVATE_CIDRS", &self.prev_cidrs),
                 ("UPSTREAM_PRIVATE_IP_ALLOWLIST", &self.prev_alias),
+                ("WEBHOOK_RESPONSE_BODY_MAX_BYTES", &self.prev_body_cap),
             ] {
                 match val {
                     Some(v) => std::env::set_var(name, v),
