@@ -30,7 +30,7 @@
 
 use axum::{
     extract::{Extension, Path, Query, State},
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
@@ -64,6 +64,9 @@ pub fn router() -> Router<SharedState> {
         .route("/scan-queue", get(get_scan_queue))
         // Each scanner's vulnerability-database age (#5177).
         .route("/vuln-db", get(get_vuln_db_status))
+        // Conda -> PyPI alias map coverage and in-place reload (#5178).
+        .route("/conda-alias-map", get(get_conda_alias_map_status))
+        .route("/conda-alias-map/reload", post(reload_conda_alias_map))
 }
 
 /// Each scanner engine's vulnerability database: version, build time, age and
@@ -92,6 +95,51 @@ pub async fn get_vuln_db_status(
     auth.require_admin()?;
     let report = crate::services::vuln_db_status::status(&state).await;
     Ok(Json((*report).clone()))
+}
+
+/// Is a conda -> PyPI mapping loaded, how large and how old is it, and did
+/// the last load fail (#5178)? Instance-wide, so repository-scoped tokens
+/// are refused like the other admin security reports.
+#[utoipa::path(
+    get,
+    path = "/conda-alias-map",
+    context_path = "/api/v1/admin/security",
+    tag = "admin",
+    responses(
+        (status = 200, description = "Conda -> PyPI alias map state", body = crate::services::conda_identity::AliasMapStatus),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Admin privileges required")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_conda_alias_map_status(
+    Extension(auth): Extension<AuthExtension>,
+) -> Result<Json<crate::services::conda_identity::AliasMapStatus>> {
+    auth.require_unscoped_admin("conda alias map status")?;
+    Ok(Json(crate::services::conda_identity::status()))
+}
+
+/// Reload the configured mapping in place, without a restart. With
+/// `AK_CONDA_PYPI_ALIAS_MAP_URL` set this fetches the URL, otherwise it
+/// re-reads `AK_CONDA_PYPI_ALIAS_MAP`; a failed attempt keeps the last good
+/// map and is reported by [`get_conda_alias_map_status`].
+#[utoipa::path(
+    post,
+    path = "/conda-alias-map/reload",
+    context_path = "/api/v1/admin/security",
+    tag = "admin",
+    responses(
+        (status = 200, description = "Conda -> PyPI alias map state after the reload", body = crate::services::conda_identity::AliasMapStatus),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Admin privileges required")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn reload_conda_alias_map(
+    Extension(auth): Extension<AuthExtension>,
+) -> Result<Json<crate::services::conda_identity::AliasMapStatus>> {
+    auth.require_unscoped_admin("conda alias map reload")?;
+    Ok(Json(crate::services::conda_identity::refresh().await))
 }
 
 /// Outstanding scan jobs plus the queue depth behind them.
@@ -1401,6 +1449,8 @@ pub async fn list_cve_findings(
         artifact_accessible_users,
         get_scan_queue,
         get_vuln_db_status,
+        get_conda_alias_map_status,
+        reload_conda_alias_map,
         list_cve_findings,
     ),
     components(schemas(
@@ -1423,6 +1473,8 @@ pub async fn list_cve_findings(
         crate::services::vuln_db_status::VulnDbEngineStatus,
         crate::services::vuln_db_status::VulnDbSource,
         crate::services::vuln_db_status::VulnDbState,
+        crate::services::conda_identity::AliasMapStatus,
+        crate::services::conda_identity::AliasMapState,
     ))
 )]
 pub struct AdminSecurityApiDoc;
@@ -1435,6 +1487,38 @@ mod tests {
     // -----------------------------------------------------------------------
     // Pure helpers — no DB required.
     // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn conda_alias_map_handlers_report_to_unscoped_admins() {
+        let _guard = crate::services::conda_identity::runtime_test_lock()
+            .lock()
+            .await;
+        let admin = AuthExtension {
+            is_admin: true,
+            allowed_repo_ids: crate::models::access_scope::AccessScope::Admin,
+            ..AuthExtension::default()
+        };
+        let report = get_conda_alias_map_status(Extension(admin.clone()))
+            .await
+            .expect("admin reads map state")
+            .0;
+        assert!(report.checked_at <= chrono::Utc::now());
+
+        let reloaded = reload_conda_alias_map(Extension(admin.clone()))
+            .await
+            .expect("admin reloads map")
+            .0;
+        assert!(reloaded.checked_at >= report.checked_at);
+
+        let scoped = AuthExtension {
+            allowed_repo_ids: crate::models::access_scope::AccessScope::Restricted(vec![]),
+            ..admin
+        };
+        assert!(get_conda_alias_map_status(Extension(scoped.clone()))
+            .await
+            .is_err());
+        assert!(reload_conda_alias_map(Extension(scoped)).await.is_err());
+    }
 
     /// The severity words the API accepts must map onto the ranks the shared
     /// counts CTE assigns, or a tile and its list disagree silently.
@@ -2598,6 +2682,19 @@ mod router_tests {
         tdh::assert_admin_routes_refuse_repo_scoped_tokens(
             &fx,
             &["/api/v1/admin/security/findings"],
+        )
+        .await;
+        fx.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn conda_alias_map_status_refuses_anonymous_non_admin_and_repo_scoped_admin_tokens() {
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        tdh::assert_admin_routes_refuse_repo_scoped_tokens(
+            &fx,
+            &["/api/v1/admin/security/conda-alias-map"],
         )
         .await;
         fx.teardown().await;

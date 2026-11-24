@@ -79,11 +79,13 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::time::{Duration as StdDuration, Instant};
 
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use utoipa::ToSchema;
 
 // ---------------------------------------------------------------------------
 // Limits
@@ -751,6 +753,121 @@ pub enum Staleness {
     },
 }
 
+/// What is answering conda -> PyPI lookups right now (#5178).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AliasMapState {
+    /// No mapping was loaded; only the vendored table is answering.
+    BuiltInOnly,
+    /// A mapping is loaded and within the configured age limit.
+    Loaded,
+    /// A mapping is loaded but older than the configured limit.
+    Stale,
+}
+
+/// `GET /api/v1/admin/security/conda-alias-map`, the map's state as an
+/// operator sees it (#5178).
+///
+/// This is report only: a missing, bad or stale mapping never changes a scan
+/// verdict. The unmapped coverage it causes still degrades the scan to
+/// `partial`, rather than rendering an unexamined package as clean.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct AliasMapStatus {
+    pub checked_at: DateTime<Utc>,
+    pub state: AliasMapState,
+    /// `source` from the mapping's provenance, or `None` when built-in only.
+    pub source: Option<String>,
+    /// `fetched_at` from the mapping's provenance, not the load time.
+    pub fetched_at: Option<DateTime<Utc>>,
+    /// `checked_at - fetched_at`, clamped at zero. `None` when built-in only.
+    pub age_seconds: Option<i64>,
+    /// Configured limit in seconds, `None` when the check is off.
+    pub max_age_seconds: Option<i64>,
+    /// True only when a limit is set and the loaded map is past it.
+    pub stale: bool,
+    /// Entries from the loaded mapping, excluding the vendored table.
+    pub loaded_entries: usize,
+    /// Entries or values in the source document that could not be used.
+    pub rejected_entries: usize,
+    /// Whether the vendored table still answers for names the map lacks.
+    pub builtin_fallback: bool,
+    /// Last successful load time, including startup.
+    pub last_success_at: Option<DateTime<Utc>>,
+    /// Last failed load or refresh, visible outside the logs.
+    pub last_error: Option<String>,
+    /// Time of the last attempted load or refresh.
+    pub last_attempt_at: Option<DateTime<Utc>>,
+    /// Configured refresh URL, when URL refresh is on.
+    pub refresh_url: Option<String>,
+}
+
+/// Shape of the document served at [`ALIAS_MAP_URL_ENV`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AliasMapFormat {
+    Canonical,
+    Grayskull,
+}
+
+/// `raw` from [`ALIAS_MAP_FORMAT_ENV`]. Unknown values keep the narrow
+/// canonical default rather than guessing at an upstream shape.
+pub fn parse_format(raw: Option<&str>) -> AliasMapFormat {
+    match raw.map(str::trim).filter(|s| !s.is_empty()) {
+        Some("grayskull") => AliasMapFormat::Grayskull,
+        Some(other) => {
+            tracing::warn!(
+                value = %other,
+                "{ALIAS_MAP_FORMAT_ENV} must be canonical or grayskull; using canonical"
+            );
+            AliasMapFormat::Canonical
+        }
+        None => AliasMapFormat::Canonical,
+    }
+}
+
+/// Parse the limit from `raw` (the env value). `None` disables the check:
+/// ages are still reported, but nothing is ever `stale`.
+pub fn parse_max_age(raw: Option<&str>) -> Option<StdDuration> {
+    let v = raw.map(str::trim).filter(|s| !s.is_empty())?;
+    match v.parse::<u64>() {
+        Ok(hours) => {
+            let cap = (i64::MAX / 3600) as u64;
+            (hours > 0).then(|| StdDuration::from_secs(hours.min(cap) * 3600))
+        }
+        Err(_) => {
+            tracing::warn!(
+                "{ALIAS_MAP_MAX_AGE_HOURS_ENV}={v:?} is not a whole number of hours; \
+                 the staleness check is off"
+            );
+            None
+        }
+    }
+}
+
+/// The configured limit, read once per process.
+pub fn max_age() -> Option<StdDuration> {
+    static MAX: OnceLock<Option<StdDuration>> = OnceLock::new();
+    *MAX.get_or_init(|| parse_max_age(std::env::var(ALIAS_MAP_MAX_AGE_HOURS_ENV).ok().as_deref()))
+}
+
+/// Parse the background interval from `raw`. Unset, invalid or too-short
+/// values fall back to one day; a refresh loop must not spin.
+pub fn parse_refresh_interval(raw: Option<&str>) -> StdDuration {
+    let Some(v) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return DEFAULT_REFRESH_INTERVAL;
+    };
+    match v.parse::<u64>() {
+        Ok(secs) if secs >= MIN_REFRESH_INTERVAL_SECS => StdDuration::from_secs(secs),
+        _ => {
+            tracing::warn!(
+                value = %v,
+                "{ALIAS_MAP_REFRESH_SECS_ENV} must be a whole number of seconds \
+                 >= {MIN_REFRESH_INTERVAL_SECS}; using one day"
+            );
+            DEFAULT_REFRESH_INTERVAL
+        }
+    }
+}
+
 /// A loadable conda -> PyPI mapping, plus the vendored fallback table.
 #[derive(Debug, Clone)]
 pub struct AliasMap {
@@ -1158,6 +1275,31 @@ pub const IDENTITY_METADATA_KEY: &str = "identity";
 /// it -- that belongs to a refresh job, not to a process reading a file it
 /// knows nothing about.
 pub const ALIAS_MAP_PATH_ENV: &str = "AK_CONDA_PYPI_ALIAS_MAP";
+
+/// Optional URL a refresh job fetches the mapping from. Unset by default:
+/// air-gapped installs import a canonical file at [`ALIAS_MAP_PATH_ENV`]
+/// instead. A failed fetch keeps the last good map.
+pub const ALIAS_MAP_URL_ENV: &str = "AK_CONDA_PYPI_ALIAS_MAP_URL";
+
+/// Shape served at [`ALIAS_MAP_URL_ENV`]. `canonical` (the default) is the
+/// schema-tagged document this module loads from disk; `grayskull` is the
+/// published conda-forge shape, inverted on fetch with provenance from the
+/// fetch itself. The choice is explicit so a malformed canonical document is
+/// never silently reinterpreted as another shape.
+pub const ALIAS_MAP_FORMAT_ENV: &str = "AK_CONDA_PYPI_ALIAS_MAP_FORMAT";
+
+/// Seconds between background reloads. Defaults to 24 hours; values below
+/// [`MIN_REFRESH_INTERVAL_SECS`] fall back to the default.
+pub const ALIAS_MAP_REFRESH_SECS_ENV: &str = "AK_CONDA_PYPI_ALIAS_REFRESH_SECS";
+
+/// Hours past which a loaded mapping is reported stale. Unset, `0` or
+/// unparsable disables the check, without affecting ages in the status.
+pub const ALIAS_MAP_MAX_AGE_HOURS_ENV: &str = "AK_CONDA_PYPI_ALIAS_MAX_AGE_HOURS";
+
+const DEFAULT_REFRESH_INTERVAL: StdDuration = StdDuration::from_secs(24 * 60 * 60);
+const MIN_REFRESH_INTERVAL_SECS: u64 = 60;
+const FETCH_TIMEOUT: StdDuration = StdDuration::from_secs(30);
+const WARN_EVERY: StdDuration = StdDuration::from_secs(60 * 60);
 
 /// The coordinates the ingest path knows about one conda artifact.
 ///
@@ -1577,35 +1719,147 @@ pub fn load_alias_map_file(path: &std::path::Path) -> Result<AliasMap, AliasMapE
     AliasMap::from_json(&bytes)
 }
 
-/// The alias map this process answers from, loaded once.
+/// Parse a fetched document in the shape named by [`ALIAS_MAP_FORMAT_ENV`].
 ///
-/// [`ALIAS_MAP_PATH_ENV`] names a mapping document; without it, or when the
-/// named document cannot be loaded, the answer is
-/// [`AliasMap::builtin_only`] -- narrow, but honest about it via
-/// [`Staleness::BuiltInOnly`] and via every `Unmapped` reason naming what was
-/// answering. A bad path is logged and falls back rather than failing
-/// startup: identity resolution is enrichment, and losing it must not stop
-/// uploads.
-pub fn process_alias_map() -> &'static AliasMap {
-    static MAP: OnceLock<AliasMap> = OnceLock::new();
-    MAP.get_or_init(|| alias_map_from_setting(std::env::var(ALIAS_MAP_PATH_ENV).ok()))
+/// The shape is explicit rather than sniffed: a malformed canonical document
+/// must be reported as such, never reinterpreted as a grayskull map with an
+/// empty result. For the grayskull shape the caller supplies provenance,
+/// because the upstream file has no fetch time of its own.
+pub fn parse_alias_map_bytes(
+    bytes: &[u8],
+    format: AliasMapFormat,
+    fallback_provenance: MappingProvenance,
+) -> Result<AliasMap, AliasMapError> {
+    match format {
+        AliasMapFormat::Canonical => AliasMap::from_json(bytes),
+        AliasMapFormat::Grayskull => AliasMap::from_grayskull_json(bytes, fallback_provenance),
+    }
 }
 
-/// The decision [`process_alias_map`] makes, with the environment lifted into
-/// an argument so it is testable without a process-wide `OnceLock` or a
-/// mutated environment.
+/// The outcome of one load attempt. `None` with `attempted == false` means no
+/// source was configured, so nothing changed and nothing failed.
+#[derive(Debug)]
+struct AliasLoad {
+    map: Option<AliasMap>,
+    error: Option<String>,
+    success_at: Option<DateTime<Utc>>,
+    attempted: bool,
+}
+
+impl AliasLoad {
+    fn idle() -> Self {
+        AliasLoad {
+            map: None,
+            error: None,
+            success_at: None,
+            attempted: false,
+        }
+    }
+
+    fn success(map: AliasMap) -> Self {
+        AliasLoad {
+            map: Some(map),
+            error: None,
+            success_at: Some(Utc::now()),
+            attempted: true,
+        }
+    }
+
+    fn failure(error: String) -> Self {
+        AliasLoad {
+            map: None,
+            error: Some(error),
+            success_at: None,
+            attempted: true,
+        }
+    }
+}
+
+/// Process-wide map plus the last load attempt. One lock keeps a lookup from
+/// ever pairing a new map with an old error, or the reverse.
+#[derive(Debug)]
+struct AliasMapRuntime {
+    map: Arc<AliasMap>,
+    last_error: Option<String>,
+    last_success_at: Option<DateTime<Utc>>,
+    last_attempt_at: Option<DateTime<Utc>>,
+}
+
+impl AliasMapRuntime {
+    fn new() -> Self {
+        AliasMapRuntime {
+            map: Arc::new(AliasMap::builtin_only()),
+            last_error: None,
+            last_success_at: None,
+            last_attempt_at: None,
+        }
+    }
+}
+
+/// Apply an attempt. A failure replaces only the error: the last good map
+/// keeps answering, so a bad refresh cannot narrow advisory coverage.
+fn apply_load(runtime: &mut AliasMapRuntime, load: AliasLoad) {
+    let AliasLoad {
+        map,
+        error,
+        success_at,
+        attempted,
+    } = load;
+    if !attempted {
+        return;
+    }
+    runtime.last_attempt_at = Some(Utc::now());
+    match map {
+        Some(map) => {
+            runtime.map = Arc::new(map);
+            runtime.last_success_at = success_at.or_else(|| Some(Utc::now()));
+            runtime.last_error = None;
+        }
+        None => runtime.last_error = error,
+    }
+}
+
+fn runtime() -> &'static RwLock<AliasMapRuntime> {
+    static STATE: OnceLock<RwLock<AliasMapRuntime>> = OnceLock::new();
+    STATE.get_or_init(|| {
+        let mut state = AliasMapRuntime::new();
+        apply_load(
+            &mut state,
+            load_from_setting(std::env::var(ALIAS_MAP_PATH_ENV).ok()),
+        );
+        RwLock::new(state)
+    })
+}
+
+fn read_runtime() -> std::sync::RwLockReadGuard<'static, AliasMapRuntime> {
+    runtime().read().unwrap_or_else(|p| p.into_inner())
+}
+
+fn write_runtime() -> std::sync::RwLockWriteGuard<'static, AliasMapRuntime> {
+    runtime().write().unwrap_or_else(|p| p.into_inner())
+}
+
+/// The map this process answers from. An `Arc` is cloned under the read lock
+/// so a reload can swap the map without invalidating a lookup already using
+/// the old one.
+pub fn process_alias_map() -> Arc<AliasMap> {
+    read_runtime().map.clone()
+}
+
+/// The setting-driven load, with the environment lifted into an argument so
+/// the decision is testable without mutating the environment.
 ///
-/// Every failure lands on [`AliasMap::builtin_only`] rather than propagating:
-/// a mis-pointed path must narrow coverage and say so in the log, not refuse
-/// uploads. It is never silently empty -- the built-in floor still answers,
+/// A bad path still falls back to [`AliasMap::builtin_only`] rather than
+/// refusing uploads, but unlike the old startup-only path its error is kept
+/// for [`status`]. It is never silently empty: the built-in floor answers,
 /// and every `Unmapped` reason names what was answering.
-fn alias_map_from_setting(setting: Option<String>) -> AliasMap {
+fn load_from_setting(setting: Option<String>) -> AliasLoad {
     let Some(raw) = setting else {
-        return AliasMap::builtin_only();
+        return AliasLoad::idle();
     };
     let trimmed = raw.trim();
     if trimmed.is_empty() {
-        return AliasMap::builtin_only();
+        return AliasLoad::idle();
     }
     let path = std::path::Path::new(trimmed);
 
@@ -1617,7 +1871,7 @@ fn alias_map_from_setting(setting: Option<String>) -> AliasMap {
                 rejected = map.rejected_entries(),
                 "loaded conda->PyPI alias mapping"
             );
-            map
+            AliasLoad::success(map)
         }
         Err(e) => {
             tracing::warn!(
@@ -1626,9 +1880,206 @@ fn alias_map_from_setting(setting: Option<String>) -> AliasMap {
                 "conda->PyPI alias mapping could not be loaded; falling back to \
                  the built-in table, which covers far less"
             );
-            AliasMap::builtin_only()
+            AliasLoad::failure(e.to_string())
         }
     }
+}
+
+/// The startup decision, kept for the tests that construct it directly.
+#[cfg(test)]
+fn alias_map_from_setting(setting: Option<String>) -> AliasMap {
+    match load_from_setting(setting).map {
+        Some(map) => map,
+        None => AliasMap::builtin_only(),
+    }
+}
+
+fn configured_path() -> Option<String> {
+    std::env::var(ALIAS_MAP_PATH_ENV)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// The configured refresh URL. Operator configuration is never
+/// attacker-influenceable, so [`crate::api::validation::validate_outbound_internal_url`]
+/// can allow private internal hosts without opening a user-facing SSRF path.
+fn configured_url() -> Option<String> {
+    std::env::var(ALIAS_MAP_URL_ENV)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn build_status(
+    runtime: &AliasMapRuntime,
+    now: DateTime<Utc>,
+    max_age: Option<StdDuration>,
+    refresh_url: Option<String>,
+) -> AliasMapStatus {
+    let map = &runtime.map;
+    let provenance = map.provenance();
+    let age_seconds = provenance.map(|p| {
+        let age = (now - p.fetched_at).max(Duration::zero());
+        age.num_seconds()
+    });
+    let stale = max_age.is_some_and(|limit| {
+        // chrono stores milliseconds internally; cap well below i64::MAX.
+        let secs = limit.as_secs().min((i64::MAX / 1000) as u64) as i64;
+        matches!(
+            map.staleness(now, Duration::seconds(secs)),
+            Staleness::Stale { .. }
+        )
+    });
+    let state = if provenance.is_none() {
+        AliasMapState::BuiltInOnly
+    } else if stale {
+        AliasMapState::Stale
+    } else {
+        AliasMapState::Loaded
+    };
+
+    AliasMapStatus {
+        checked_at: now,
+        state,
+        source: provenance.map(|p| truncate(&p.source, 200)),
+        fetched_at: provenance.map(|p| p.fetched_at),
+        age_seconds,
+        max_age_seconds: max_age.and_then(|d| i64::try_from(d.as_secs()).ok()),
+        stale,
+        loaded_entries: map.loaded_entries(),
+        rejected_entries: map.rejected_entries(),
+        builtin_fallback: map.has_builtin_fallback(),
+        last_success_at: runtime.last_success_at,
+        last_error: runtime.last_error.clone(),
+        last_attempt_at: runtime.last_attempt_at,
+        refresh_url,
+    }
+}
+
+fn last_warned() -> &'static Mutex<Option<Instant>> {
+    static LAST: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
+    LAST.get_or_init(|| Mutex::new(None))
+}
+
+/// One throttled warning per hour, only while a loaded map is past the limit.
+/// A missing map is already visible in the status and in `Unmapped` reasons;
+/// warning about it on every request would add noise without new information.
+fn publish_warning(report: &AliasMapStatus) {
+    if !report.stale {
+        return;
+    }
+    let mut guard = last_warned().lock().unwrap_or_else(|p| p.into_inner());
+    let now = Instant::now();
+    if guard.is_some_and(|at| now.duration_since(at) < WARN_EVERY) {
+        return;
+    }
+    *guard = Some(now);
+    tracing::warn!(
+        source = report.source.as_deref().unwrap_or("built-in"),
+        age_seconds = report.age_seconds.unwrap_or(0),
+        max_age_seconds = report.max_age_seconds.unwrap_or(0),
+        env = ALIAS_MAP_MAX_AGE_HOURS_ENV,
+        "conda->PyPI alias map is older than the configured limit; lookups still \
+         run and verdicts are unchanged, but newer renames may be unmapped"
+    );
+}
+
+/// The map's state for `GET /api/v1/admin/security/conda-alias-map`.
+pub fn status() -> AliasMapStatus {
+    let report = build_status(&read_runtime(), Utc::now(), max_age(), configured_url());
+    publish_warning(&report);
+    report
+}
+
+async fn fetch_alias_map_url(url: &str) -> Result<AliasMap, String> {
+    crate::api::validation::validate_outbound_internal_url(url, ALIAS_MAP_URL_ENV)
+        .map_err(|e| e.to_string())?;
+    let client = crate::services::http_client::internal_service_client_builder()
+        .timeout(FETCH_TIMEOUT)
+        .build()
+        .map_err(|e| format!("HTTP client could not be built: {e}"))?;
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+    let http_status = response.status();
+    if !http_status.is_success() {
+        return Err(format!("HTTP {http_status}"));
+    }
+    let bytes = crate::services::http_client::read_body_capped(response, MAX_MAPPING_BYTES).await?;
+    let provenance = MappingProvenance {
+        source: truncate(url, 200),
+        fetched_at: Utc::now(),
+        channel: None,
+    };
+    let format = parse_format(std::env::var(ALIAS_MAP_FORMAT_ENV).ok().as_deref());
+    parse_alias_map_bytes(&bytes, format, provenance).map_err(|e| e.to_string())
+}
+
+fn refresh_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+/// Apply the configured source now: the URL when set, otherwise the file.
+/// Concurrent callers share one fetch, and a failed fetch leaves the last
+/// good map in place.
+pub async fn refresh() -> AliasMapStatus {
+    refresh_from(configured_url(), configured_path()).await
+}
+
+async fn refresh_from(url: Option<String>, path: Option<String>) -> AliasMapStatus {
+    let _guard = refresh_lock().lock().await;
+    let load = match url {
+        Some(url) => match fetch_alias_map_url(&url).await {
+            Ok(map) => {
+                tracing::info!(url = %url, entries = map.loaded_entries(), "refreshed conda->PyPI alias mapping");
+                AliasLoad::success(map)
+            }
+            Err(e) => {
+                let error = format!("{url}: {e}");
+                tracing::warn!(url = %url, error = %e, "conda->PyPI alias map refresh failed; keeping the last good mapping");
+                AliasLoad::failure(error)
+            }
+        },
+        None => load_from_setting(path),
+    };
+    apply_load(&mut write_runtime(), load);
+    status()
+}
+
+/// Keep the map current and warn while it is stale. With no URL and no age
+/// limit this does nothing; the admin reload route still works. With only an
+/// age limit, the periodic pass re-reads the configured file so replacing it
+/// takes effect without a restart even when nobody calls the API.
+pub fn spawn_refresher(shutdown: tokio_util::sync::CancellationToken) {
+    if configured_url().is_none() && max_age().is_none() {
+        return;
+    }
+    let interval =
+        parse_refresh_interval(std::env::var(ALIAS_MAP_REFRESH_SECS_ENV).ok().as_deref());
+    tokio::spawn(async move {
+        // Let startup finish before the first load or probe.
+        tokio::select! {
+            _ = shutdown.cancelled() => return,
+            _ = tokio::time::sleep(StdDuration::from_secs(15)) => {}
+        }
+        loop {
+            refresh().await;
+            tokio::select! {
+                _ = shutdown.cancelled() => return,
+                _ = tokio::time::sleep(interval) => {}
+            }
+        }
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn runtime_test_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
 #[cfg(ak_test_shard = "services-1")]
@@ -2404,6 +2855,250 @@ mod tests {
         assert!(map.has_builtin_fallback());
         assert_eq!(map.loaded_entries(), 0);
         assert_eq!(pypi_aliases("pytorch", &map).status(), "mapped");
+    }
+
+    #[test]
+    fn alias_map_settings_are_parsed_conservatively() {
+        assert_eq!(parse_format(None), AliasMapFormat::Canonical);
+        assert_eq!(parse_format(Some("grayskull")), AliasMapFormat::Grayskull);
+        assert_eq!(parse_format(Some(" nope ")), AliasMapFormat::Canonical);
+
+        assert_eq!(parse_max_age(None), None);
+        assert_eq!(parse_max_age(Some("0")), None);
+        assert_eq!(parse_max_age(Some("bad")), None);
+        assert_eq!(
+            parse_max_age(Some(" 24 ")),
+            Some(StdDuration::from_secs(24 * 3600))
+        );
+
+        assert_eq!(parse_refresh_interval(None), DEFAULT_REFRESH_INTERVAL);
+        assert_eq!(
+            parse_refresh_interval(Some("3600")),
+            StdDuration::from_secs(3600)
+        );
+        assert_eq!(parse_refresh_interval(Some("5")), DEFAULT_REFRESH_INTERVAL);
+        assert_eq!(parse_refresh_interval(Some("x")), DEFAULT_REFRESH_INTERVAL);
+    }
+
+    #[test]
+    fn status_reports_builtin_loaded_and_stale_maps() {
+        let now = fetched(2026, 11, 24);
+        let limit = Some(StdDuration::from_secs(24 * 3600));
+        let mut runtime = AliasMapRuntime::new();
+
+        let report = build_status(&runtime, now, None, None);
+        assert_eq!(report.state, AliasMapState::BuiltInOnly);
+        assert_eq!(report.loaded_entries, 0);
+        assert!(report.source.is_none());
+        assert_eq!(report.age_seconds, None);
+        assert_eq!(report.max_age_seconds, None);
+        assert!(!report.stale);
+
+        let fresh = AliasMap::from_entries(
+            MappingProvenance {
+                source: "conda-forge index".to_string(),
+                fetched_at: now - Duration::hours(2),
+                channel: None,
+            },
+            [("py-opencv".to_string(), vec!["opencv-python".to_string()])],
+        );
+        apply_load(&mut runtime, AliasLoad::success(fresh));
+        let url = "https://mirror.example.test/aliases.json";
+        let report = build_status(&runtime, now, limit, Some(url.to_string()));
+        assert_eq!(report.state, AliasMapState::Loaded);
+        assert_eq!(report.source.as_deref(), Some("conda-forge index"));
+        assert_eq!(report.loaded_entries, 1);
+        assert_eq!(report.age_seconds, Some(2 * 3600));
+        assert_eq!(report.max_age_seconds, Some(24 * 3600));
+        assert_eq!(report.refresh_url.as_deref(), Some(url));
+        assert!(!report.stale);
+
+        let stale = AliasMap::from_entries(
+            MappingProvenance {
+                source: "conda-forge index".to_string(),
+                fetched_at: now - Duration::hours(48),
+                channel: None,
+            },
+            [("py-opencv".to_string(), vec!["opencv-python".to_string()])],
+        );
+        apply_load(&mut runtime, AliasLoad::success(stale));
+        let report = build_status(&runtime, now, limit, None);
+        assert_eq!(report.state, AliasMapState::Stale);
+        assert!(report.stale);
+        assert_eq!(report.age_seconds, Some(48 * 3600));
+        assert_eq!(report.fetched_at, Some(now - Duration::hours(48)));
+    }
+
+    #[tokio::test]
+    async fn reloading_a_changed_file_replaces_the_map_without_a_restart() {
+        let _guard = runtime_test_lock().lock().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir
+            .path()
+            .join("aliases.json")
+            .to_string_lossy()
+            .into_owned();
+
+        std::fs::write(
+            &path,
+            loaded(&[("pytorch", &["torch-nightly"])])
+                .to_json_v1()
+                .expect("serializes"),
+        )
+        .expect("writes");
+        let report = refresh_from(None, Some(path.clone())).await;
+        assert_eq!(report.loaded_entries, 1);
+        assert_eq!(
+            pypi_aliases("pytorch", &process_alias_map()).aliases[0].pypi_name,
+            "torch-nightly"
+        );
+
+        std::fs::write(
+            &path,
+            loaded(&[("py-opencv", &["opencv-python"])])
+                .to_json_v1()
+                .expect("serializes"),
+        )
+        .expect("writes");
+        let report = refresh_from(None, Some(path)).await;
+        assert_eq!(report.loaded_entries, 1);
+        assert_eq!(
+            pypi_aliases("py-opencv", &process_alias_map()).aliases[0].pypi_name,
+            "opencv-python"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_reports_the_current_state() {
+        let _guard = runtime_test_lock().lock().await;
+        let report = refresh().await;
+        assert!(report.checked_at <= Utc::now());
+    }
+
+    #[tokio::test]
+    async fn refresh_without_a_configured_source_keeps_the_last_good_map() {
+        let _guard = runtime_test_lock().lock().await;
+        let mut state = AliasMapRuntime::new();
+        apply_load(
+            &mut state,
+            AliasLoad::success(loaded(&[("pytorch", &["torch-nightly"])])),
+        );
+        *write_runtime() = state;
+
+        let report = refresh_from(None, None).await;
+        assert_eq!(report.loaded_entries, 1);
+        assert_eq!(report.last_error, None);
+        assert_eq!(report.state, AliasMapState::Loaded);
+    }
+
+    #[test]
+    fn a_stale_status_warns_only_once_per_window() {
+        let _guard = runtime_test_lock().blocking_lock();
+        let now = fetched(2026, 11, 24);
+        let mut runtime = AliasMapRuntime::new();
+        apply_load(
+            &mut runtime,
+            AliasLoad::success(AliasMap::from_entries(
+                MappingProvenance {
+                    source: "conda-forge index".to_string(),
+                    fetched_at: now - Duration::hours(48),
+                    channel: None,
+                },
+                [("py-opencv".to_string(), vec!["opencv-python".to_string()])],
+            )),
+        );
+        let report = build_status(&runtime, now, Some(StdDuration::from_secs(24 * 3600)), None);
+        assert!(report.stale);
+        publish_warning(&report);
+        publish_warning(&report);
+    }
+
+    #[test]
+    fn the_refresher_is_inert_without_a_url_or_age_limit() {
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        spawn_refresher(shutdown.clone());
+        assert!(!shutdown.is_cancelled());
+    }
+
+    #[test]
+    fn process_wide_state_exposes_the_current_map_and_last_error() {
+        let _guard = runtime_test_lock().blocking_lock();
+        let mut state = AliasMapRuntime::new();
+        apply_load(
+            &mut state,
+            AliasLoad::success(loaded(&[("pytorch", &["torch-nightly"])])),
+        );
+        apply_load(&mut state, AliasLoad::failure("bad path".to_string()));
+        *write_runtime() = state;
+
+        let map = process_alias_map();
+        assert_eq!(
+            pypi_aliases("pytorch", &map).aliases[0].pypi_name,
+            "torch-nightly"
+        );
+        let report = status();
+        assert_eq!(report.loaded_entries, 1);
+        assert_eq!(report.last_error.as_deref(), Some("bad path"));
+        assert_eq!(report.state, AliasMapState::Loaded);
+    }
+
+    #[test]
+    fn a_failed_reload_keeps_the_last_good_map_and_reports_the_error() {
+        let mut runtime = AliasMapRuntime::new();
+        apply_load(
+            &mut runtime,
+            AliasLoad::success(loaded(&[("pytorch", &["torch-nightly"])])),
+        );
+        let good = runtime.map.clone();
+
+        apply_load(&mut runtime, AliasLoad::failure("missing path".to_string()));
+
+        assert!(Arc::ptr_eq(&runtime.map, &good));
+        let report = build_status(&runtime, Utc::now(), None, None);
+        assert_eq!(report.state, AliasMapState::Loaded);
+        assert_eq!(report.loaded_entries, 1);
+        assert_eq!(report.last_error.as_deref(), Some("missing path"));
+        assert!(report.last_success_at.is_some());
+        assert!(report.last_attempt_at.is_some());
+        assert_eq!(
+            pypi_aliases("pytorch", &runtime.map).aliases[0].pypi_name,
+            "torch-nightly"
+        );
+    }
+
+    #[test]
+    fn fetched_documents_use_the_explicit_shape() {
+        let canonical = loaded(&[("py-opencv", &["opencv-python"])])
+            .to_json_v1()
+            .expect("serializes");
+        let grayskull = r#"{
+          "opencv-python": {"conda_name":"py-opencv","pypi_name":"opencv-python"}
+        }"#;
+        let p = || MappingProvenance {
+            source: "https://mirror.example.test/aliases.json".to_string(),
+            fetched_at: Utc::now(),
+            channel: None,
+        };
+
+        let map = parse_alias_map_bytes(canonical.as_bytes(), AliasMapFormat::Canonical, p())
+            .expect("canonical loads");
+        assert_eq!(
+            pypi_aliases("py-opencv", &map).aliases[0].pypi_name,
+            "opencv-python"
+        );
+        assert!(
+            parse_alias_map_bytes(canonical.as_bytes(), AliasMapFormat::Grayskull, p()).is_err()
+        );
+
+        let map = parse_alias_map_bytes(grayskull.as_bytes(), AliasMapFormat::Grayskull, p())
+            .expect("grayskull loads");
+        assert_eq!(
+            pypi_aliases("py-opencv", &map).aliases[0].pypi_name,
+            "opencv-python"
+        );
+        assert!(
+            parse_alias_map_bytes(grayskull.as_bytes(), AliasMapFormat::Canonical, p()).is_err()
+        );
     }
 
     #[test]

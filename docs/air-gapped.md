@@ -512,6 +512,26 @@ Those coordinates go only to the advisory feeds above (minus any that match
 `ADVISORY_EXCLUDE_PATTERNS`); nothing is resolved against Maven Central. A library built without a
 `pom.properties` (some Gradle and sbt builds) is not named this way.
 
+### Conda alias map (#5178)
+
+Conda advisory coverage needs an explicit conda-to-PyPI alias map (#4042). The
+backend does not guess aliases from similar names. Without a map it falls back
+to its small vendored rename table and grades packages it cannot map as
+`partial`, never clean. For an air-gapped install, import a canonical
+`artifact-keeper/conda-pypi-alias/v1` JSON file by your offline path, mount it
+into the backend container, and set `AK_CONDA_PYPI_ALIAS_MAP` to its path. See
+[docs/security/conda-alias-map.md](security/conda-alias-map.md) for the file
+shape and how to build it from the published grayskull mapping.
+
+Leave `AK_CONDA_PYPI_ALIAS_MAP_URL` unset: no refresh job reaches out. To
+replace the map later, copy the new file over the same path and call
+`POST /api/v1/admin/security/conda-alias-map/reload` as an unscoped admin;
+`GET /api/v1/admin/security/conda-alias-map` reports whether it loaded, how
+many entries it has, when its provenance was fetched, and any load error. A
+reload that fails keeps the last good map. Set
+`AK_CONDA_PYPI_ALIAS_MAX_AGE_HOURS` to get a warning when an imported map gets
+old.
+
 ### Dependency-Track and OpenSCAP
 
 Dependency-Track is off by default (`DEPENDENCY_TRACK_ENABLED`, `dtrack`

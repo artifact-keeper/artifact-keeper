@@ -9253,7 +9253,7 @@ impl DependencyScanner {
             excluded: conda_excluded,
         } = Self::plan_conda_queries(
             batch,
-            crate::services::conda_identity::process_alias_map(),
+            &crate::services::conda_identity::process_alias_map(),
             self.advisory.exclusions(),
         );
 
@@ -10813,7 +10813,7 @@ impl ScannerService {
                             &repository_format,
                             &scope_name,
                             scope_version.as_deref(),
-                            crate::services::conda_identity::process_alias_map(),
+                            &crate::services::conda_identity::process_alias_map(),
                         );
                     let findings = match &component_scope {
                         Some(scope) => {
