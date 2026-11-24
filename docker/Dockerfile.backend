@@ -11,6 +11,19 @@ FROM registry.access.redhat.com/ubi9/ubi:9.8 AS rust-base
 # dead weight. scripts/ci/check-toolchain-pin.sh does not cover Dockerfiles.
 ARG RUST_VERSION=1.98.0
 ARG PROTOC_VERSION=36.1
+# Build tools at exact versions, so the builder stage is reproducible (#6180).
+# cargo-chef is installed from crates.io with its own lockfile (`--locked`);
+# >= 0.1.32 accepts `cook --locked`. cargo-auditable is the upstream release's
+# prebuilt static (musl) binary, pinned by sha256 per architecture: compiling it
+# here cost ~4 minutes of every cold image build. CARGO_AUDITABLE_VERSION must
+# match release.yml's and release-cli-caches.yml's `cargo-auditable@` pin, so
+# the image binary and the release tarballs embed their dependency graph with
+# the same tool. Refresh both sums when the version moves, from the release's
+# cargo-auditable-<arch>-unknown-linux-musl.tar.xz.sha256 assets.
+ARG CARGO_CHEF_VERSION=0.1.78
+ARG CARGO_AUDITABLE_VERSION=0.7.7
+ARG CARGO_AUDITABLE_SHA256_X86_64=7676443367c5e33d9fb22acef63cccb5e9202de12dae1b0579995eb3e2bc7a18
+ARG CARGO_AUDITABLE_SHA256_AARCH64=c324af56990601354bbf40080f582ba46f8ec8b807a1388e25bb7e429d285c18
 
 # sha256 of the protoc release assets, per architecture. Fetching over HTTPS
 # authenticates the host, not the bytes; these pin the bytes. Refresh both when
@@ -22,12 +35,12 @@ ARG PROTOC_SHA256_AARCH64=237a68856edf1bd28b6204bddd0596c1cf46d298bc29c620012540
 RUN dnf install -y --nodocs \
     gcc gcc-c++ make pkg-config perl-core \
     openssl-devel zlib-devel xz-devel bzip2-devel \
-    unzip \
+    unzip xz \
     && dnf clean all && \
     ARCH=$(uname -m) && \
     case "$ARCH" in \
-      x86_64)  PROTOC_ARCH="linux-x86_64";   PROTOC_SHA256="${PROTOC_SHA256_X86_64}" ;; \
-      aarch64) PROTOC_ARCH="linux-aarch_64"; PROTOC_SHA256="${PROTOC_SHA256_AARCH64}" ;; \
+      x86_64)  PROTOC_ARCH="linux-x86_64";   PROTOC_SHA256="${PROTOC_SHA256_X86_64}";  AUDITABLE_SHA256="${CARGO_AUDITABLE_SHA256_X86_64}" ;; \
+      aarch64) PROTOC_ARCH="linux-aarch_64"; PROTOC_SHA256="${PROTOC_SHA256_AARCH64}"; AUDITABLE_SHA256="${CARGO_AUDITABLE_SHA256_AARCH64}" ;; \
       *)       echo "Unsupported architecture: $ARCH" && exit 1 ;; \
     esac && \
     curl --proto '=https' --tlsv1.2 -sSfL "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-${PROTOC_ARCH}.zip" \
@@ -36,7 +49,14 @@ RUN dnf install -y --nodocs \
     unzip -q /tmp/protoc.zip -d /usr/local && rm /tmp/protoc.zip && \
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain ${RUST_VERSION} && \
     . "$HOME/.cargo/env" && \
-    cargo install cargo-chef --locked
+    cargo install cargo-chef --locked --version "${CARGO_CHEF_VERSION}" && \
+    AUDITABLE_DIR="cargo-auditable-${ARCH}-unknown-linux-musl" && \
+    curl --proto '=https' --tlsv1.2 -sSfL "https://github.com/rust-secure-code/cargo-auditable/releases/download/v${CARGO_AUDITABLE_VERSION}/${AUDITABLE_DIR}.tar.xz" \
+      -o /tmp/cargo-auditable.tar.xz && \
+    echo "${AUDITABLE_SHA256}  /tmp/cargo-auditable.tar.xz" | sha256sum -c - && \
+    tar -xJf /tmp/cargo-auditable.tar.xz -C /root/.cargo/bin --strip-components=1 "${AUDITABLE_DIR}/cargo-auditable" && \
+    rm /tmp/cargo-auditable.tar.xz && \
+    cargo auditable --version
 ENV PATH="/root/.cargo/bin:${PATH}"
 
 # ---------- Stage 1: Plan dependencies ----------
@@ -88,11 +108,13 @@ ARG CARGO_PROFILE=release
 # also run on 64 KiB-page arm64 kernels (RHEL's kernel-64k, NVIDIA Grace), so
 # aarch64 builds jemalloc for 64 KiB pages, which also works on 4 KiB kernels.
 # The builder stage sets the same value; a mismatch rebuilds jemalloc there.
+# `--locked` here and on the build below (#6180): the image is built from the
+# committed Cargo.lock, the one `cargo audit` checked, or not at all.
 RUN if [ "$(uname -m)" = aarch64 ]; then export JEMALLOC_SYS_WITH_LG_PAGE=16; fi && \
     if [ -n "$CARGO_FEATURES" ]; then \
-      cargo chef cook --profile "$CARGO_PROFILE" --features "$CARGO_FEATURES" --recipe-path recipe.json; \
+      cargo chef cook --locked --profile "$CARGO_PROFILE" --features "$CARGO_FEATURES" --recipe-path recipe.json; \
     else \
-      cargo chef cook --profile "$CARGO_PROFILE" --recipe-path recipe.json; \
+      cargo chef cook --locked --profile "$CARGO_PROFILE" --recipe-path recipe.json; \
     fi
 
 # ---------- Stage 3: Build binary ----------
@@ -106,7 +128,6 @@ COPY backend ./backend
 ARG GIT_SHA=unknown
 # Same allocator as the deps stage above (#5130); the two must match.
 ARG CARGO_FEATURES="jemalloc"
-ARG APP_VERSION=""
 # Same cap as the deps stage above.
 ARG CARGO_BUILD_JOBS=8
 # Same profile as the deps stage above; the two must match or the cooked
@@ -116,15 +137,23 @@ ENV SQLX_OFFLINE=true
 ENV GIT_SHA=${GIT_SHA}
 ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
 # Same jemalloc page size as the deps stage above.
+#
+# `cargo auditable build` (#6180) embeds the resolved dependency graph in the
+# binary (`.dep-v0`, which survives `strip = true`), as the release tarballs do,
+# so `cargo audit bin`, Trivy and Syft can list the crates in
+# /usr/local/bin/artifact-keeper. It only wraps the workspace crates' rustc, so
+# the dependencies cooked above are reused unchanged.
+#
+# The version the binary reports is the committed Cargo.toml's. This stage used
+# to rewrite Cargo.toml from an APP_VERSION build arg on tag builds; with
+# `--locked` that fails whenever the tag differs from the committed version, and
+# the certified sha-<sha> images never ran it, so it could only make a tag build
+# differ from what was certified. The release-prep PR sets the version.
 RUN if [ "$(uname -m)" = aarch64 ]; then export JEMALLOC_SYS_WITH_LG_PAGE=16; fi && \
-    if [ -n "${APP_VERSION}" ]; then \
-      CLEAN_VERSION=$(echo "${APP_VERSION}" | sed 's/^v//'); \
-      sed -i "s/^version = \".*\"/version = \"${CLEAN_VERSION}\"/" Cargo.toml; \
-    fi && \
     if [ -n "$CARGO_FEATURES" ]; then \
-      cargo build --profile "$CARGO_PROFILE" --features "$CARGO_FEATURES" --bin artifact-keeper; \
+      cargo auditable build --locked --profile "$CARGO_PROFILE" --features "$CARGO_FEATURES" --bin artifact-keeper; \
     else \
-      cargo build --profile "$CARGO_PROFILE" --bin artifact-keeper; \
+      cargo auditable build --locked --profile "$CARGO_PROFILE" --bin artifact-keeper; \
     fi
 
 # ---------- Stage 4: Build minimal rootfs ----------

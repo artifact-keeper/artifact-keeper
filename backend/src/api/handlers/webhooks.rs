@@ -2274,30 +2274,12 @@ const WEBHOOK_LANE_ROWS: i64 = 10;
 /// (`idx_webhook_deliveries_pending_by_webhook`, migration 417), bounded by
 /// `per_webhook`, rather than a ranking of every due row in the table.
 ///
-/// The worker calls [`claim_due_webhook_deliveries_of`] directly with its free
-/// lane count; this default-cap form serves the claim tests.
-#[cfg(test)]
-async fn claim_due_webhook_deliveries(
-    db: &sqlx::PgPool,
-    max_webhooks: i64,
-    claimed_by: &str,
-    claim_ttl_secs: f64,
-) -> std::result::Result<Vec<Claimed<RetryDeliveryRow>>, String> {
-    claim_due_webhook_deliveries_of(
-        db,
-        max_webhooks,
-        WEBHOOK_LANE_ROWS,
-        claimed_by,
-        claim_ttl_secs,
-        None,
-    )
-    .await
-}
-
-/// [`claim_due_webhook_deliveries`] restricted to the given webhooks'
-/// deliveries, for tests that must claim their own fixture rows from a shared
-/// database whatever other tests have queued there (#5825). Among the given
-/// webhooks the claim follows the same fairness rules.
+/// This test-only form restricts the claim to the given webhooks; the worker
+/// calls [`claim_due_webhook_deliveries_of`] directly with its free lane
+/// count. Tests must never claim unrestricted: the unit tests share one
+/// database, and a claim across every webhook holds other tests' fixture rows
+/// (and their webhooks' claim locks) while it runs, so their own claims find
+/// the endpoint busy and come back empty (#5825, and the #5195 test flake).
 #[cfg(test)]
 async fn claim_due_webhook_deliveries_for_webhooks(
     db: &sqlx::PgPool,
@@ -2669,7 +2651,11 @@ pub async fn run_webhook_delivery_worker(db: sqlx::PgPool) {
     let mut backlog_gauge = WebhookBacklogGauge::default();
     let mut next_gauge = tokio::time::Instant::now();
     loop {
-        if let Err(e) = dispatch_due_webhook_lanes(&db, &client, &lanes, None).await {
+        // #5921: a draining process claims no new deliveries; the lanes it
+        // already started finish, and another replica takes the rest.
+        if crate::services::shutdown_drain::is_draining() {
+            tracing::debug!("draining for shutdown; not claiming webhook deliveries");
+        } else if let Err(e) = dispatch_due_webhook_lanes(&db, &client, &lanes, None).await {
             tracing::warn!("Webhook delivery claim failed: {}", e);
         }
         if tokio::time::Instant::now() >= next_gauge {
@@ -7548,9 +7534,17 @@ mod tests {
             assert_eq!(first.id, delivery_id);
             assert_eq!(first.claimed_by(), "replica-a");
 
-            let second = claim_due_webhook_deliveries(&pool, 50, "replica-b", 60.0)
-                .await
-                .expect("claim ok");
+            // Restricted to the fixture's webhook: an unrestricted claim would
+            // hold every other test's due rows on the shared database.
+            let second = claim_due_webhook_deliveries_for_webhooks(
+                &pool,
+                &[webhook_id],
+                50,
+                "replica-b",
+                60.0,
+            )
+            .await
+            .expect("claim ok");
             release_foreign_test_claims(&pool, &second, delivery_id).await;
             assert!(
                 second.iter().all(|d| d.id != delivery_id),

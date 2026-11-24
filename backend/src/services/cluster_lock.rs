@@ -71,6 +71,18 @@ impl ClusterLease {
             ClusterLease::InMemory(lease) => drop(lease),
         }
     }
+
+    /// Whether this lease still holds its lock: its session is alive and
+    /// `pg_locks` shows the lock granted to it. `false` once the session is
+    /// gone (terminated, a dropped connection), so a long holder can stop
+    /// work it no longer owns (#6390). The in-memory lease is always held.
+    pub async fn is_held(&mut self) -> bool {
+        match self {
+            ClusterLease::Postgres(lease) => lease.is_held().await,
+            #[cfg(test)]
+            ClusterLease::InMemory(_) => true,
+        }
+    }
 }
 
 /// Cross-replica advisory-lock seam.
@@ -382,6 +394,22 @@ pub struct PgAdvisoryLease {
 }
 
 impl PgAdvisoryLease {
+    async fn is_held(&mut self) -> bool {
+        let Some(conn) = self.conn.as_mut() else {
+            return false;
+        };
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE pid = pg_backend_pid() \
+                 AND locktype = 'advisory' AND classid::bigint = $1 \
+                 AND objid::bigint = $2 AND objsubid = 2 AND granted)",
+        )
+        .bind(i64::from(self.class as u32))
+        .bind(i64::from(self.obj as u32))
+        .fetch_one(conn)
+        .await
+        .unwrap_or(false)
+    }
+
     async fn release(mut self) {
         if let Some(mut conn) = self.conn.take() {
             // Best-effort explicit unlock; if it fails, dropping the detached

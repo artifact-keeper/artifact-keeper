@@ -464,8 +464,17 @@ impl PromotionRuleService {
 
         // 6. Health score check
         if let Some(min_score) = rule.min_health_score {
-            if let Some(score) = self.get_artifact_health_score(artifact_id).await? {
-                if let Some(v) = check_min_health_score(min_score, score) {
+            if let Some(rated) = self.get_artifact_health_score(artifact_id).await? {
+                // An unrated artifact (no component scored, #5656) does not
+                // meet a health minimum.
+                let violation = match rated {
+                    Some(score) => check_min_health_score(min_score, score),
+                    None => Some(format!(
+                        "Health is unrated (no security, license, quality or metadata score), \
+                         below minimum required score of {min_score}"
+                    )),
+                };
+                if let Some(v) = violation {
                     violations.push(v);
                 }
                 // #4994: the health score weighs in the repository security
@@ -699,8 +708,10 @@ impl PromotionRuleService {
         Ok(signed)
     }
 
-    async fn get_artifact_health_score(&self, artifact_id: Uuid) -> Result<Option<i32>> {
-        let score: Option<i32> = sqlx::query_scalar::<_, i32>(
+    /// `None`: no health row yet (the rule skips the artifact, #4156).
+    /// `Some(None)`: the row says unrated (#5656).
+    async fn get_artifact_health_score(&self, artifact_id: Uuid) -> Result<Option<Option<i32>>> {
+        let score: Option<Option<i32>> = sqlx::query_scalar::<_, Option<i32>>(
             r#"SELECT health_score FROM artifact_health_scores WHERE artifact_id = $1"#,
         )
         .bind(artifact_id)

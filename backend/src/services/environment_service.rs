@@ -153,6 +153,20 @@ pub struct LookupOutcome {
     pub truncated: bool,
 }
 
+/// The sha256 a lockfile pins for a package's file (#4184), lower-case hex,
+/// or `None` when it records none (or one that is not 64 hex digits). Only a
+/// whole-package digest counts: a per-file hash (`poetry.lock`) names one of
+/// several distributions, not the file at `url`.
+pub(crate) fn pinned_sha256(
+    pkg: &crate::services::environment_lock::LockedPackage,
+) -> Option<String> {
+    pkg.hashes
+        .iter()
+        .find(|h| h.algorithm.eq_ignore_ascii_case("sha256") && h.file.is_none())
+        .map(|h| h.value.trim().to_ascii_lowercase())
+        .filter(|v| v.len() == 64 && v.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
 /// The purl with its qualifier string removed — the identity an advisory
 /// carries. Lookup keys and stored rows are both reduced through this, so a
 /// fully-qualified conda purl and the bare purl from an OSV entry resolve to
@@ -293,7 +307,7 @@ impl EnvironmentService {
             let mut qb = sqlx::QueryBuilder::new(
                 "INSERT INTO environment_packages \
                  (environment_id, scope_environment, scope_platform, ecosystem, name, version, \
-                  purl, purl_base, package_key, is_root) ",
+                  purl, purl_base, package_key, is_root, url, sha256) ",
             );
             qb.push_values(chunk, |mut b, pkg| {
                 // The same purl the SBOM renderer emits, so an advisory that
@@ -308,7 +322,11 @@ impl EnvironmentService {
                     .push_bind(&purl)
                     .push_bind(purl.as_deref().map(purl_base))
                     .push_bind(&pkg.key)
-                    .push_bind(pkg.is_root);
+                    .push_bind(pkg.is_root)
+                    // #4184: the pinned file and its checksum, so a stored
+                    // environment can be warmed into a Remote's cache.
+                    .push_bind(&pkg.url)
+                    .push_bind(pinned_sha256(pkg));
             });
             qb.build()
                 .execute(&mut *tx)

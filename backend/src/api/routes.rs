@@ -351,6 +351,29 @@ pub fn create_router(state: SharedState) -> Router {
     // covers every surface at once.
     router = router.layer(middleware::from_fn(nul_path_guard));
 
+    // #5941: replay a bodiless GET/HEAD once when it answered 5xx after
+    // losing its database connection (a switchover or failover). Outside the
+    // setup, guest-access and auth layers, so a credential lookup that lost
+    // its connection is replayed too; inside correlation-id and client-IP, so
+    // the replay keeps the request's id and address. DATABASE_READ_RETRY=false
+    // leaves it out.
+    //
+    // It is inside the database admission gate (#4182), so a replayed request
+    // keeps its admission slot through the 250-500 ms pause and the replay.
+    // Deliberately: it bounds a request to one slot for at most one replay,
+    // and the gate's permit is held by the outer layer's future, so handing
+    // it back would mean moving the admission gate inside correlation-id and
+    // client-IP, which changes what a shed request has done. Re-acquiring
+    // after the pause would also put the replay behind the burst of new
+    // requests a failover causes, where it would most likely be shed with
+    // 503 POOL_EXHAUSTED. The slot sits idle for the pause only during a
+    // failover, when the pool itself is reconnecting.
+    if crate::api::middleware::db_read_retry::enabled_from_env() {
+        router = router.layer(middleware::from_fn(
+            crate::api::middleware::db_read_retry::db_read_retry,
+        ));
+    }
+
     // Correlation ID middleware (runs first on every request after the global
     // backstop below). Extracts or generates a correlation ID and sets the
     // X-Correlation-ID response header. A gateway's `x-request-id` becomes the
@@ -383,10 +406,19 @@ pub fn create_router(state: SharedState) -> Router {
     // instead of queueing on the pool with the whole burst. Outside every
     // middleware that reads the database (setup, guest access, visibility,
     // auth), so a shed request has done no work; probes are never gated.
+    // Fairness (#6344): a share of the slots is kept for requests presenting
+    // a credential, and a client at its share yields to a waiting one.
     if let Some(gate) = crate::api::middleware::db_admission::DbAdmission::new(
         state.db.clone(),
         state.config.database_request_wait_ms(),
         state.config.database_request_slots(),
+        crate::api::middleware::db_admission::Fairness {
+            credentialed_reserve_percent: state
+                .config
+                .database_request_credentialed_reserve_percent,
+            client_share_percent: state.config.database_request_client_share_percent,
+            trusted_proxies: state.config.rate_limit_trusted_proxy_cidrs.clone(),
+        },
     ) {
         router = router.layer(middleware::from_fn_with_state(
             gate,
@@ -1590,6 +1622,16 @@ fn api_v1_routes(
         .nest(
             "/sbom",
             handlers::sbom::router().layer(middleware::from_fn_with_state(
+                auth_service.clone(),
+                auth_middleware,
+            )),
+        )
+        // Warm a conda Remote's proxy cache from a stored environment
+        // (#4184): POST/GET /conda/{repo}/warm, GET/DELETE
+        // /conda/{repo}/warm/{id}. Repository write (or admin) on {repo}.
+        .nest(
+            "/conda",
+            handlers::conda_warm::router().layer(middleware::from_fn_with_state(
                 auth_service.clone(),
                 auth_middleware,
             )),

@@ -892,12 +892,28 @@ async fn migrate_locked(
     conn: &mut sqlx::PgConnection,
     migrator: &sqlx::migrate::Migrator,
 ) -> Result<()> {
+    if is_fresh_database(conn).await? {
+        // #5656: on an empty database the migrations' `DROP ... IF EXISTS`
+        // statements each send a `... does not exist, skipping` NOTICE and
+        // the data repairs report "0 rows", which sqlx logged at INFO: about
+        // 50 lines of every fresh install's log that say nothing. Warnings
+        // and errors still come through. Upgrades keep their notices (what a
+        // repair changed). The session is closed after migrating
+        // (`db::with_migration_session`), so the setting never reaches a
+        // pooled connection.
+        sqlx::query("SET client_min_messages = warning")
+            .execute(&mut *conn)
+            .await
+            .map_err(db_err)?;
+    }
     repair_invalid_concurrent_indexes(conn).await?;
     // The same migration set without sqlx's own (blocking) lock: this
     // session already holds it.
     let unlocked = sqlx::migrate::Migrator {
         migrations: std::borrow::Cow::Owned(migrator.migrations.to_vec()),
-        ignore_missing: migrator.ignore_missing,
+        // MIGRATIONS_IGNORE_MISSING (#5920), decided under the lock.
+        ignore_missing: migrator.ignore_missing
+            || crate::migration_compat::ignore_missing_for(conn, migrator).await?,
         locking: false,
         no_tx: migrator.no_tx,
         table_name: migrator.table_name.clone(),
@@ -905,6 +921,22 @@ async fn migrate_locked(
     };
     unlocked.run_direct(None, conn, false).await?;
     Ok(())
+}
+
+/// No migration has ever been recorded: a fresh install (#5656).
+async fn is_fresh_database(conn: &mut sqlx::PgConnection) -> Result<bool> {
+    let has_ledger: bool = sqlx::query_scalar("SELECT to_regclass('_sqlx_migrations') IS NOT NULL")
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(db_err)?;
+    if !has_ledger {
+        return Ok(true);
+    }
+    let any_applied: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM _sqlx_migrations)")
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(db_err)?;
+    Ok(!any_applied)
 }
 
 #[cfg(ak_test_shard = "services-2")]

@@ -73,6 +73,8 @@ use crate::services::scheduler_service::normalize_cron_expression;
 use crate::storage::keys::prefix_matches;
 
 mod assignments;
+mod derived_state;
+pub use derived_state::SweepDerivedState;
 
 /// SQL fragment implementing a policy's exclusion ("keep") list.
 ///
@@ -1424,6 +1426,10 @@ pub struct LifecycleService {
     /// See [`LifecycleService::with_npm_packument_cache`].
     npm_packument_cache:
         Option<std::sync::Arc<crate::services::npm_packument_cache::NpmPackumentCache>>,
+    /// The services behind the rest of a delete's derived state: peers'
+    /// delete sync, audit, events, search, Maven metadata and the Cargo
+    /// index (#6469). See [`LifecycleService::with_derived_state`].
+    derived_state: SweepDerivedState,
 }
 
 impl LifecycleService {
@@ -1433,7 +1439,18 @@ impl LifecycleService {
             proxy_service: None,
             proxy_cache_page_size: proxy_cache::EVICTION_PAGE_SIZE,
             npm_packument_cache: None,
+            derived_state: SweepDerivedState::default(),
         }
+    }
+
+    /// The services a sweep updates the rest of each format's derived state
+    /// through (#6469), as the per-artifact delete does. Without them the
+    /// sweep still fans out peer delete sync and writes audit rows (those
+    /// need only the database), and skips events, search documents, Maven
+    /// stored metadata and the Cargo index cache.
+    pub fn with_derived_state(mut self, derived_state: SweepDerivedState) -> Self {
+        self.derived_state = derived_state;
+        self
     }
 
     /// The npm packument cache a sweep invalidates (#5779). Without it a
@@ -1679,6 +1696,14 @@ impl LifecycleService {
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
         let result = Self::dispatch_execute(&mut tx, policy, false).await?;
+        if result.artifacts_removed > 0 {
+            // Step 4's work is owed from the moment the deletes commit: a
+            // restart before it finishes leaves this row for the next tick
+            // to resume (#6469).
+            derived_state::record_pending_fanout(&mut tx, repository_id, deleted_at)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
+        }
         tx.commit()
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
@@ -1706,6 +1731,16 @@ impl LifecycleService {
             self.retract_swept_versions(repository_id, deleted_at).await;
             self.invalidate_swept_packuments(repository_id, deleted_at)
                 .await;
+            // Step 4 (#6469): the rest of the per-artifact delete's
+            // derived state, batched, and resumable from the row recorded
+            // above if this process stops part-way.
+            derived_state::finish_swept_deletes(
+                &self.db,
+                &self.derived_state,
+                repository_id,
+                deleted_at,
+            )
+            .await;
         }
 
         Ok(result)
@@ -1920,6 +1955,9 @@ impl LifecycleService {
         &self,
         abort: &CancellationToken,
     ) -> Result<Vec<PolicyExecutionResult>> {
+        // Finish what an earlier cycle's sweeps left owed (a restart, or a
+        // failed page) before sweeping again (#6469).
+        derived_state::resume_pending_sweep_fanouts(&self.db, &self.derived_state).await;
         let policies = self.load_enabled_policies().await?;
         self.execute_due_from(policies, abort).await
     }

@@ -691,7 +691,6 @@ jobs:
           # fall back to the system allocator if that default is edited.
           build-args: |
             GIT_SHA=${{ github.sha }}
-            APP_VERSION=${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
             CARGO_BUILD_JOBS=${{ matrix.cargo-build-jobs }}
             CARGO_FEATURES=jemalloc
 
@@ -958,7 +957,6 @@ jobs:
           provenance: mode=max
           build-args: |
             GIT_SHA=${{ github.sha }}
-            APP_VERSION=${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
 
       - name: Export digest
         run: |
@@ -1002,6 +1000,14 @@ jobs:
         with:
           name: backend-digests-amd64
           path: /tmp/backend-digests
+
+      # The arm64 backend digest is read only for the embedded-SBOM check
+      # below; the Trivy passes scan amd64.
+      - name: Download backend arm64 digest
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: backend-digests-arm64
+          path: /tmp/backend-digests-arm64
 
       - name: Download openscap amd64 digest
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
@@ -1170,6 +1176,42 @@ jobs:
           pull_with_retry "${{ steps.refs.outputs.openscap }}"
           pull_with_retry "${{ steps.refs.outputs.scanner-adapter }}"
 
+      # The backend binary is built with `cargo auditable` (#6180), so it
+      # carries its own dependency graph, which is what lets Trivy, Syft and
+      # `cargo audit bin` list its crates. Read it back out of the image this
+      # run built, with the gate the release tarballs use: `cargo audit bin`
+      # exits 0 on a binary with NO embedded data, so the gate asserts on its
+      # output. Dropping `auditable` from Dockerfile.backend fails here.
+      # Advisories it prints do not block (see the script's header).
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
+        with:
+          # Same pin as release.yml and ci.yml (#6178).
+          tool: cargo-audit@0.23.0
+
+      # Both architectures: `docker create` never runs the arm64 image, and
+      # `cargo audit bin` reads an ELF of either.
+      - name: Verify the backend binary carries its dependency graph
+        env:
+          # The runner's own toolchain: `cargo audit` compiles nothing, so
+          # there is no need to install rust-toolchain.toml's channel here.
+          RUSTUP_TOOLCHAIN: stable
+          AMD64_REF: ${{ steps.refs.outputs.backend }}
+          ARM64_DIGEST_DIR: /tmp/backend-digests-arm64
+          IMAGE: ${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}
+        run: |
+          set -euo pipefail
+          arm64_ref="${IMAGE}@sha256:$(ls "$ARM64_DIGEST_DIR")"
+          for leg in "amd64 ${AMD64_REF}" "arm64 ${arm64_ref}"; do
+            read -r arch ref <<<"$leg"
+            bin="${RUNNER_TEMP}/artifact-keeper-${arch}"
+            docker pull -q --platform "linux/${arch}" "$ref" >/dev/null
+            cid="$(docker create --platform "linux/${arch}" "$ref")"
+            docker cp "${cid}:/usr/local/bin/artifact-keeper" "$bin"
+            docker rm "$cid" >/dev/null
+            BINARY="$bin" ./scripts/ci/assert-binary-sbom.sh
+          done
+
       # ---- Pass 1: SARIF visibility (all severities, never blocks) ----
 
       - name: Trivy SARIF - Backend
@@ -1244,6 +1286,14 @@ jobs:
       # Every image is gated with `if: always()` so one blocking image does not
       # hide another's CRITICAL/HIGH findings.
 
+      # REPORT-ONLY CRATES (#6180). Since the binary embeds its dependency
+      # graph, Trivy sees its ~700 Rust crates; before that it saw none. For
+      # one release their findings go to the Security tab through the SARIF
+      # pass above (which does scan the binary) and do not block, while they
+      # are triaged and a .trivyignore policy for crates is agreed. Rust
+      # advisories already block merges through ci.yml's `cargo audit`.
+      # Remove `skip-files` to make crate findings blocking. Only this one
+      # file is skipped: the Go binaries and the RPMs stay gated.
       - name: Trivy gate - Backend
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # 0.36.0
         if: always()
@@ -1253,6 +1303,7 @@ jobs:
           severity: 'CRITICAL,HIGH'
           ignore-unfixed: true
           trivyignores: '.trivyignore'
+          skip-files: '/usr/local/bin/artifact-keeper'
           exit-code: '1'
           skip-setup-trivy: true
           cache: 'false'

@@ -142,22 +142,44 @@ pub async fn clear_stored_maven_metadata(
     group_id: &str,
     artifact_id: &str,
 ) {
+    let storage = match state.storage_for_repo(storage_location) {
+        Ok(storage) => Some(storage),
+        Err(e) => {
+            warn!(error = %e, "clear_stored_maven_metadata: storage unavailable");
+            None
+        }
+    };
+    clear_stored_maven_metadata_in(
+        storage.as_deref(),
+        repo_id,
+        storage_backend,
+        group_id,
+        artifact_id,
+    )
+    .await;
+}
+
+/// [`clear_stored_maven_metadata`] against an already-resolved storage
+/// backend, for callers without a [`SharedState`] such as the lifecycle
+/// sweep (#6469). `None` (storage unavailable) still drops the caches.
+pub async fn clear_stored_maven_metadata_in(
+    storage: Option<&dyn crate::storage::StorageBackend>,
+    repo_id: Uuid,
+    storage_backend: &str,
+    group_id: &str,
+    artifact_id: &str,
+) {
     // Always drop the generation cache, even if there is no stored object.
     invalidate_maven_metadata_cache(repo_id, group_id, artifact_id).await;
     // A deploy/delete can add or remove a groupId, so the repo's prefixes
     // file may now be stale too (#3382 review finding 6/9).
     invalidate_maven_prefixes_cache(repo_id).await;
 
-    let storage = match state.storage_for_repo(storage_location) {
-        Ok(storage) => storage,
-        Err(e) => {
-            warn!(error = %e, "clear_stored_maven_metadata: storage unavailable");
-            return;
-        }
+    let Some(storage) = storage else {
+        return;
     };
-
     let meta_path = maven_metadata_object_path(group_id, artifact_id);
-    delete_stored_metadata_document(storage.as_ref(), repo_id, storage_backend, &meta_path).await;
+    delete_stored_metadata_document(storage, repo_id, storage_backend, &meta_path).await;
 }
 
 /// Remove one stored `maven-metadata.xml` (relative to the `maven/` prefix)
@@ -231,9 +253,9 @@ pub async fn clear_stored_snapshot_version_metadata(
     storage_location: &crate::storage::StorageLocation,
     artifact_path: &str,
 ) {
-    let Some(meta_path) = snapshot_version_metadata_path(artifact_path) else {
+    if snapshot_version_metadata_path(artifact_path).is_none() {
         return;
-    };
+    }
     let storage = match state.storage_for_repo(storage_location) {
         Ok(storage) => storage,
         Err(e) => {
@@ -241,7 +263,35 @@ pub async fn clear_stored_snapshot_version_metadata(
             return;
         }
     };
-    delete_stored_metadata_document(storage.as_ref(), repo_id, storage_backend, &meta_path).await;
+    clear_stored_snapshot_version_metadata_in(
+        storage.as_ref(),
+        repo_id,
+        storage_backend,
+        artifact_path,
+    )
+    .await;
+}
+
+/// [`clear_stored_snapshot_version_metadata`] against an already-resolved
+/// storage backend (#6469), for the lifecycle sweep.
+pub async fn clear_stored_snapshot_version_metadata_in(
+    storage: &dyn crate::storage::StorageBackend,
+    repo_id: Uuid,
+    storage_backend: &str,
+    artifact_path: &str,
+) {
+    let Some(meta_path) = snapshot_version_metadata_path(artifact_path) else {
+        return;
+    };
+    delete_stored_metadata_document(storage, repo_id, storage_backend, &meta_path).await;
+}
+
+/// The version-level `maven-metadata.xml` a deleted file's SNAPSHOT
+/// directory holds, as [`clear_stored_snapshot_version_metadata_in`] would
+/// clear it, so a sweep that removes many builds of one SNAPSHOT clears its
+/// document once (#6469).
+pub fn snapshot_version_metadata_dir_key(artifact_path: &str) -> Option<String> {
+    snapshot_version_metadata_path(artifact_path)
 }
 
 // ---------------------------------------------------------------------------

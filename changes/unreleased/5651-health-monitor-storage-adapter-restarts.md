@@ -1,0 +1,14 @@
+---
+section: Changed
+issues: [#5651]
+---
+- **The health monitor now records storage outages, scanner-adapter outages and Postgres restarts, and `/readyz` answers within about a second with the database down** (#5651). The monitor (the health log and alert state under `/api/v1/admin/monitoring`) only checked the database, the Trivy server, OpenSearch, OpenSCAP and Dependency-Track. A MinIO outage, an evicted scanner adapter and a Postgres restart between two 60-second checks all left nothing but healthy rows behind. Now:
+
+  - **Storage** is checked on every tick through the same check `/health` runs (a HEAD for object stores, a small write for the filesystem). It shares that check's 5-second cache and 2-second bound, so the monitor adds no storage traffic while `/health` is polled.
+  - **The scanner adapter** (`TRIVY_ADAPTER_URL`, and `SCAN_WORKER_TRIVY_ADAPTER_URL` when it names a different adapter) is probed at `GET /probe/healthy`, recorded as `scanner-adapter` and `scanner-adapter-worker`.
+  - **A Postgres restart** is recorded even when it falls between two checks. The database check reads `pg_postmaster_start_time()` alongside the last recorded database check in the same round trip. A start time after that check writes an `unavailable` row stamped with the restart time and a recovery after it.
+  - **Alerting.** New metrics: `ak_health_monitor_up{service}` (1 healthy, 0 not) for every checked dependency, and `ak_health_monitor_postgres_restarts_total`. A restart is recorded once, also when the scheduled check and `POST /api/v1/admin/monitoring/check` run together, and is alerted at once (`last_alert_sent_at`) rather than after three consecutive failures.
+  - **Bounded cost.** The dependency probes run at the same time, so a check with several dead dependencies costs the slowest probe (5 s for HTTP, 2 s for storage), not the sum of their timeouts.
+  - **`/readyz` with the database down** answered after 7-10 s, past the chart's 5-second probe timeout, because it ran two sequential queries (each waiting for a pool connection) before the dependency probes. It now runs one query, bounded to 1 second, alongside the dependency probes, and answers `503` in about a second. A reachable database costs one query per probe instead of two. The guest-access guard also decides `/readyz`, `/health` and its other always-allowed paths before it reads the guest-access setting. That refresh went through the request pool, so with the database hung, a probe every few seconds took 5 seconds longer.
+
+  New services appear in the health log and alerts without configuration. There is no setting to turn them off. A monitor that should not track a dependency can have its alerts suppressed with `POST /api/v1/admin/monitoring/alerts/suppress`. See `docs/operations/health-probes.md`.

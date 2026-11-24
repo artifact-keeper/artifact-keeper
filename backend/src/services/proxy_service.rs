@@ -27,6 +27,7 @@ use crate::api::middleware::request_span::record_cache_outcome;
 use crate::error::{AppError, Result};
 use crate::models::repository::{Repository, RepositoryFormat, RepositoryType};
 use crate::services::cache_classifier;
+use crate::services::log_throttle::LogEvery;
 use crate::services::metrics_service::{
     record_proxy_cache_lookup, record_proxy_stale_if_error_response, ProxyCachePublishFailure,
 };
@@ -34,7 +35,8 @@ use crate::services::proxy_cache_cap::ProxyCacheCap;
 use crate::services::proxy_cache_scope::ProxyCacheScope;
 use crate::services::proxy_catalog;
 use crate::services::proxy_hydration::{
-    Coordinator, DetachedFillLimits, HydrationCoordinator, StreamHandle, StreamHeaders,
+    Coordinator, DetachedFillInFlight, DetachedFillLimits, HydrationCoordinator, StreamHandle,
+    StreamHeaders, DETACHED_FILL_LOG_INTERVAL,
 };
 use crate::services::proxy_scan_service::{
     decide_cache_scan_gate, CacheScanGate, StoredProxyVerdict,
@@ -86,13 +88,71 @@ const HYDRATION_WAIT_TIMEOUT_MESSAGE: &str = "Timed out waiting for proxy cache 
 /// Message prefix of a detached fill abandoned at its deadline.
 const DETACHED_FILL_DEADLINE_MESSAGE: &str = "Proxy cache fill abandoned";
 
-/// Whether `err` came from waiting on a detached fill (a follower timeout, or
-/// the fill abandoned at its deadline) rather than from the fill itself, which
-/// has already applied stale-if-error to its own upstream failures.
+/// Message prefix of a follower that took the verdict of the fill it waited
+/// on, whose upstream fetch hit its deadline (#5617).
+const LEADER_FETCH_DEADLINE_MESSAGE: &str =
+    "The proxy cache fill this request waited on hit its upstream fetch deadline";
+
+/// Whether `err` came from waiting on a detached fill (a follower timeout, the
+/// fill abandoned at its deadline, or a follower taking a leader's fetch
+/// deadline) rather than from the fill itself, which has already applied
+/// stale-if-error to its own upstream failures.
 fn is_detached_fill_wait_error(err: &AppError) -> bool {
     matches!(err, AppError::BadGateway(m)
         if m.starts_with(HYDRATION_WAIT_TIMEOUT_MESSAGE)
-            || m.starts_with(DETACHED_FILL_DEADLINE_MESSAGE))
+            || m.starts_with(DETACHED_FILL_DEADLINE_MESSAGE)
+            || m.starts_with(LEADER_FETCH_DEADLINE_MESSAGE))
+}
+
+/// When a buffered fill's upstream fetch last hit
+/// `PROXY_UPSTREAM_FETCH_DEADLINE_SECS`, by cache key (#5617).
+///
+/// A request that was waiting on that fill when it hit the deadline takes the
+/// same verdict (the stale copy through stale-if-error, or the error) instead
+/// of becoming the next leader and waiting out a second deadline: the
+/// upstream that just failed to answer in time is the one it would ask. A
+/// request that arrives after the deadline fetches as before, so nothing is
+/// pinned. Only the followers in this process see the entry; a follower on
+/// another replica (`PROXY_SINGLEFLIGHT_ADVISORY_LOCKS_ENABLED`) still fetches
+/// once itself.
+///
+/// An entry only matters to a request that started waiting before it was
+/// written, and no request waits longer than the hydration wait timeout, so
+/// older entries are dropped.
+fn fetch_deadline_hits() -> &'static std::sync::Mutex<HashMap<String, std::time::Instant>> {
+    static HITS: std::sync::OnceLock<std::sync::Mutex<HashMap<String, std::time::Instant>>> =
+        std::sync::OnceLock::new();
+    HITS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// Most cache keys [`fetch_deadline_hits`] holds at once.
+const FETCH_DEADLINE_HITS_MAX: usize = 4096;
+
+/// Record that the fill of `cache_key` hit its upstream fetch deadline now.
+fn note_fetch_deadline_hit(cache_key: &str) {
+    let now = std::time::Instant::now();
+    let mut hits = fetch_deadline_hits()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if hits.len() >= FETCH_DEADLINE_HITS_MAX {
+        let keep = crate::services::proxy_hydration::DEFAULT_PROXY_HYDRATION_WAIT_TIMEOUT;
+        hits.retain(|_, at| now.saturating_duration_since(*at) <= keep);
+        if hits.len() >= FETCH_DEADLINE_HITS_MAX {
+            // Forgetting only costs a follower its own fetch, as before #5617.
+            hits.clear();
+        }
+    }
+    hits.insert(cache_key.to_owned(), now);
+}
+
+/// Whether the fill of `cache_key` hit its upstream fetch deadline after
+/// `since` (when the asking request started to wait).
+fn fetch_deadline_hit_since(cache_key: &str, since: std::time::Instant) -> bool {
+    fetch_deadline_hits()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(cache_key)
+        .is_some_and(|at| *at >= since)
 }
 
 /// Apply the proxy's upstream connection settings (#5220) to `builder`: the
@@ -150,6 +210,45 @@ async fn proxy_metadata_lru() -> &'static Cache<String, Option<CacheMetadata>> {
 
 async fn invalidate_proxy_metadata_lru(metadata_key: &str) {
     proxy_metadata_lru().await.invalidate(metadata_key).await;
+}
+
+/// Evict a proxy-cache entry whose body failed verification on a hit
+/// (#4323), if its sidecar still records `failed_digest`: a sidecar naming
+/// another digest belongs to a refill that landed after the failed read, and
+/// is left alone, and not counted. Body before sidecar, as every eviction
+/// orders them; an eviction is counted in
+/// `ak_proxy_cache_integrity_evictions_total` once it is decided; delete
+/// errors are logged and otherwise ignored, as `CacheStore::invalidate`
+/// ignores them, because a sidecar over a missing body already reads as a
+/// miss (#3147).
+async fn evict_corrupt_cache_entry(
+    storage: Arc<StorageService>,
+    repo_key: String,
+    content_key: String,
+    sidecar_key: String,
+    failed_digest: String,
+) {
+    let current = match storage.get(&sidecar_key).await {
+        Ok(bytes) => serde_json::from_slice::<CacheMetadata>(&bytes).ok(),
+        Err(_) => None,
+    };
+    if current.is_some_and(|m| m.checksum_sha256 != failed_digest) {
+        return;
+    }
+    crate::services::metrics_service::record_proxy_cache_integrity_eviction(&repo_key);
+    tracing::warn!(
+        cache_key = %content_key,
+        expected_sha256 = %failed_digest,
+        "proxy cache object failed verification on serve; evicting the entry so the next \
+         read refetches it upstream (#4323)"
+    );
+    if let Err(e) = storage.delete(&content_key).await {
+        tracing::debug!(cache_key = %content_key, error = %e, "evicting corrupt cache body");
+    }
+    if let Err(e) = storage.delete(&sidecar_key).await {
+        tracing::debug!(cache_key = %sidecar_key, error = %e, "evicting corrupt cache sidecar");
+    }
+    invalidate_proxy_metadata_lru(&sidecar_key).await;
 }
 
 /// Upper bound on how long a cache read will wait for an in-flight streaming
@@ -591,6 +690,10 @@ struct FinishFillOnDrop {
     limits: FinishFillLimits,
 }
 
+/// `kind` label of `ak_proxy_detached_fills_total` for a [`FinishFillOnDrop`]
+/// drain (#5617).
+const DETACHED_KIND_STREAM_DRAIN: &str = "stream_drain";
+
 /// How many [`FinishFillOnDrop`] drains may run at once (shared with the
 /// #5220 detached buffered fills) and for how long each may run.
 #[derive(Clone)]
@@ -674,22 +777,53 @@ impl Drop for FinishFillOnDrop {
             return;
         };
         let Ok(permit) = Arc::clone(&self.limits.permits).try_acquire_owned() else {
-            tracing::debug!(
-                "no detached-fill permit free; a streaming fill its client stopped \
-                 reading is dropped unfinished (#5509)"
+            // #5617: counted, and at WARN at most once a minute, so the cap
+            // biting is visible at the default log level.
+            crate::services::metrics_service::record_proxy_detached_fill(
+                DETACHED_KIND_STREAM_DRAIN,
+                "refused",
             );
+            static REFUSED_LOG: LogEvery = LogEvery::new(DETACHED_FILL_LOG_INTERVAL);
+            if let Some(held_back) = REFUSED_LOG.check() {
+                tracing::warn!(
+                    held_back,
+                    "no detached-fill permit free (PROXY_UPSTREAM_MAX_DETACHED_FILLS); a \
+                     streaming fill its client stopped reading is dropped unfinished and \
+                     not cached (#5509). `held_back` more since the last such line; see \
+                     ak_proxy_detached_fills_total{{kind=\"stream_drain\",outcome=\"refused\"}}"
+                );
+            } else {
+                tracing::debug!(
+                    "no detached-fill permit free; a streaming fill its client stopped \
+                     reading is dropped unfinished (#5509)"
+                );
+            }
             return;
         };
+        let in_flight = DetachedFillInFlight::start(DETACHED_KIND_STREAM_DRAIN);
         let deadline = self.limits.deadline;
         let cache_published = self.cache_published.clone();
         let drain = async move {
             let drained = tokio::time::timeout(deadline, Self::drain(body, cache_published)).await;
+            in_flight.end(drained.is_err());
             if drained.is_err() {
-                tracing::debug!(
-                    deadline_secs = deadline.as_secs(),
-                    "a streaming fill its client stopped reading did not finish within the \
-                     detached-fill deadline; abandoned unfinished (#5509)"
-                );
+                static ABANDONED_LOG: LogEvery = LogEvery::new(DETACHED_FILL_LOG_INTERVAL);
+                if let Some(held_back) = ABANDONED_LOG.check() {
+                    tracing::warn!(
+                        deadline_secs = deadline.as_secs(),
+                        held_back,
+                        "a streaming fill its client stopped reading did not finish within the \
+                         detached-fill deadline (PROXY_UPSTREAM_FETCH_DEADLINE_SECS + 60 s, \
+                         counted from the client going away); abandoned unfinished and not \
+                         cached (#5509). `held_back` more since the last such line"
+                    );
+                } else {
+                    tracing::debug!(
+                        deadline_secs = deadline.as_secs(),
+                        "a streaming fill its client stopped reading did not finish within the \
+                         detached-fill deadline; abandoned unfinished (#5509)"
+                    );
+                }
             }
         };
         let correlation = crate::api::middleware::tracing::current_correlation_id();
@@ -6635,6 +6769,9 @@ impl ProxyService {
                 .with_circuits(Arc::clone(&self.upstream_client.circuits)),
         );
         self.detached_fill_permits = Arc::new(Semaphore::new(timeouts.max_detached_fills));
+        crate::services::metrics_service::record_proxy_detached_fills_limit(
+            timeouts.max_detached_fills,
+        );
         self.upstream_timeouts = timeouts;
         self
     }
@@ -7754,6 +7891,12 @@ impl ProxyService {
         // leader's fill would queue them behind one scan after another and
         // run them into the hydration deadline.
         let waited_on_held_fill = std::sync::atomic::AtomicBool::new(false);
+        // #5617: a request waiting on a detached fill whose upstream fetch
+        // hits its deadline takes that verdict rather than fetching again.
+        // The in-request fills below (a caller check or a deferred commit)
+        // have no stale-if-error step for it, so they keep re-electing.
+        let waiting_since = std::time::Instant::now();
+        let inherit_fetch_deadline = check.is_none() && deferred.is_none();
         let check_cache = || async {
             // #4514: a fill another request holds back for the scan gate
             // (or a streaming publish in its tail) is waited for, not
@@ -7817,6 +7960,12 @@ impl ProxyService {
                         fetch_path
                     )));
                 }
+            }
+            if inherit_fetch_deadline && fetch_deadline_hit_since(&cache_key, waiting_since) {
+                crate::services::metrics_service::record_proxy_fill_follower_inherited();
+                return Err(AppError::BadGateway(format!(
+                    "{LEADER_FETCH_DEADLINE_MESSAGE}: {cache_key}"
+                )));
             }
             Ok(cached)
         };
@@ -7947,6 +8096,8 @@ impl ProxyService {
                     "Upstream fetch of {} exceeded its deadline",
                     redact_url_for_diagnostics(full_url)
                 );
+                // #5617: the requests waiting on this fill take its verdict.
+                note_fetch_deadline_hit(cache_key);
                 Err(AppError::BadGateway(format!(
                     "Upstream fetch exceeded the {}-second deadline",
                     deadline.as_secs()
@@ -8613,12 +8764,10 @@ impl ProxyService {
         let metadata_key = Self::cache_metadata_key(&self.cache_scope, &repo.key, cache_path)?;
 
         // Cache hit fast path: load metadata sidecar, stream content
-        // straight from storage. The slow-path SHA verification done by
-        // the buffered `fetch_artifact_with_cache_path` is intentionally
-        // skipped here — we cannot recompute SHA without buffering, and
-        // the storage backend's own integrity guarantees apply just as
-        // they do for presigned redirects (#1018 R-tradeoff already
-        // accepted upstream).
+        // straight from storage. The body is hashed while it streams and
+        // checked against the sidecar's SHA-256 (#4323, see
+        // `verify_cached_body`); a mismatch aborts the transfer and evicts
+        // the entry, where the buffered read answers it as a miss.
         if let Some(result) = self
             .try_streaming_cache_hit(
                 repo,
@@ -9076,7 +9225,8 @@ impl ProxyService {
         };
         match stream {
             Ok(body) => Ok(Some(StreamingFetchResult {
-                body,
+                // #4323: hashed while it streams, against the sidecar's digest.
+                body: self.verify_cached_body(cache_key, metadata_key, metadata, body),
                 content_type: metadata.content_type.clone(),
                 content_length: Some(metadata.size_bytes as u64),
                 // Proxy-cache stream: not our artifact row (#1278), unrecorded.
@@ -9098,6 +9248,62 @@ impl ProxyService {
             }
             Err(e) => Err(e),
         }
+    }
+
+    /// Verify a proxy-cache hit's body against the SHA-256 and size its
+    /// sidecar records, while it streams (#4323).
+    ///
+    /// The hit paths used to stream a cached body unchecked, while the
+    /// buffered read treated a digest mismatch as a miss. Now the body is
+    /// wrapped in [`verify::verify_sha256_stream_with_hook`]: memory stays at
+    /// one chunk, nothing is read ahead (a `HEAD`, whose body is never
+    /// polled, costs nothing), and a body that does not match is never
+    /// delivered complete, because its last chunk is withheld and the
+    /// transfer aborted. The mismatch also evicts the entry (body, sidecar,
+    /// in-process sidecar LRU), so the next read is a miss and refetches the
+    /// object upstream under every gate: a corrupt cached object heals on the
+    /// client's retry instead of failing every pull until its TTL runs out.
+    /// The eviction only removes the entry when its sidecar still records the
+    /// digest that failed, so a refill that landed meanwhile is kept.
+    ///
+    /// Unverified, exactly as before: `DOWNLOAD_VERIFY_CHECKSUMS=false`, and a
+    /// sidecar recording no SHA-256 (an empty-body entry, or one written
+    /// before digests were recorded).
+    fn verify_cached_body(
+        &self,
+        cache_key: &str,
+        metadata_key: &str,
+        metadata: &CacheMetadata,
+        body: futures::stream::BoxStream<'static, Result<Bytes>>,
+    ) -> futures::stream::BoxStream<'static, Result<Bytes>> {
+        use crate::storage::verify;
+        let Some(expected) = verify::parse_sha256_hex(&metadata.checksum_sha256)
+            .filter(|_| verify::serve_verification_enabled())
+        else {
+            return body;
+        };
+        let repo_key = Self::cache_entry_of_content_key(&self.cache_scope, cache_key)
+            .map_or("unknown", |(repo_key, _)| repo_key)
+            .to_string();
+        let storage = Arc::clone(&self.storage);
+        let failed_digest = metadata.checksum_sha256.clone();
+        let (content_key, sidecar_key) = (cache_key.to_string(), metadata_key.to_string());
+        let on_mismatch: verify::MismatchHook = Box::new(move || {
+            tokio::spawn(evict_corrupt_cache_entry(
+                storage,
+                repo_key,
+                content_key,
+                sidecar_key,
+                failed_digest,
+            ));
+        });
+        verify::verify_sha256_stream_with_hook(
+            body,
+            expected,
+            Some(metadata.size_bytes.max(0) as u64),
+            format!("proxy cache {cache_key}"),
+            Some(on_mismatch),
+        )
     }
 
     /// The streaming leader body: open upstream ONCE, tee to client + cache,
@@ -10171,8 +10377,15 @@ impl ProxyService {
         // *siblings* (Packages, etc.), not the Release itself.
         let now = Utc::now();
 
-        // Write to cache
-        if let Err(e) = self
+        // Write to cache, unless the storage volume is at its disk block
+        // threshold (#5191): then the fetched Release is served uncached, like
+        // every other fill.
+        if crate::services::quota::disk::cache_fills_blocked() {
+            tracing::debug!(
+                cache_key = %cache_key,
+                "storage volume at its disk threshold; serving dists uncached"
+            );
+        } else if let Err(e) = self
             .cache_artifact(
                 &cache_key,
                 &metadata_key,
@@ -10220,6 +10433,9 @@ impl ProxyService {
         repo_id: Uuid,
         etag: &str,
     ) -> Result<Option<UpstreamResponse>> {
+        // #5941: a request that reached the upstream (a cache fill) is never
+        // replayed after a lost database connection.
+        crate::api::middleware::db_read_retry::note_write();
         let upstream_auth = self
             .upstream_client
             .upstream_auth_for(
@@ -11068,6 +11284,15 @@ impl ProxyService {
             tracing::debug!(
                 repository = %repo.key,
                 "instance storage quota reached; serving without caching"
+            );
+            return false;
+        }
+        // At the disk block threshold (#5191) likewise: the response is
+        // still streamed to the client, never written to the volume.
+        if crate::services::quota::disk::cache_fills_blocked() {
+            tracing::debug!(
+                repository = %repo.key,
+                "storage volume at its disk threshold; serving without caching"
             );
             return false;
         }
@@ -12209,6 +12434,9 @@ impl ProxyService {
         repo_id: Uuid,
         max: usize,
     ) -> Result<UpstreamResponse> {
+        // #5941: a request that reached the upstream (a cache fill) is never
+        // replayed after a lost database connection.
+        crate::api::middleware::db_read_retry::note_write();
         self.fetch_from_upstream_with_accept(url, repo_id, None, max)
             .await
     }
@@ -12227,6 +12455,9 @@ impl ProxyService {
         accept: Option<&str>,
         max: usize,
     ) -> Result<UpstreamResponse> {
+        // #5941: a request that reached the upstream (a cache fill) is never
+        // replayed after a lost database connection.
+        crate::api::middleware::db_read_retry::note_write();
         self.fetch_from_upstream_negotiated(url, repo_id, accept, None, max)
             .await
     }
@@ -12246,6 +12477,9 @@ impl ProxyService {
         accept_encoding: Option<&str>,
         max: usize,
     ) -> Result<UpstreamResponse> {
+        // #5941: a request that reached the upstream (a cache fill) is never
+        // replayed after a lost database connection.
+        crate::api::middleware::db_read_retry::note_write();
         let mut resp = self
             .upstream_client
             .fetch_buffered_coded(
@@ -12328,6 +12562,9 @@ impl ProxyService {
         url: &str,
         repo_id: Uuid,
     ) -> Result<UpstreamStream> {
+        // #5941: a request that reached the upstream (a cache fill) is never
+        // replayed after a lost database connection.
+        crate::api::middleware::db_read_retry::note_write();
         self.upstream_client.fetch_stream(url, repo_id).await
     }
 
@@ -17304,6 +17541,7 @@ mod tests {
         let proxy = build_proxy_service_with_storage(backend.clone());
         let mut metadata = stale_positive_sidecar(18);
         metadata.expires_at = Utc::now() + chrono::Duration::hours(1);
+        metadata.checksum_sha256 = sha256_hex_of(b"real-tarball-bytes");
 
         let opened = proxy
             .open_cached_stream(content_key, &sidecar_key_of(content_key), &metadata)
@@ -17317,6 +17555,143 @@ mod tests {
             b"real-tarball-bytes".to_vec()
         );
         assert!(backend.exists(content_key).await.unwrap());
+    }
+
+    fn sha256_hex_of(bytes: &[u8]) -> String {
+        use sha2::Digest;
+        hex::encode(sha2::Sha256::digest(bytes))
+    }
+
+    /// Drain `body`, returning the bytes delivered before it ended and
+    /// whether it ended in an error.
+    async fn drain_until_error(body: BoxStream<'static, Result<Bytes>>) -> (Vec<u8>, bool) {
+        let mut body = body;
+        let mut out = Vec::new();
+        while let Some(chunk) = body.next().await {
+            match chunk {
+                Ok(chunk) => out.extend_from_slice(&chunk),
+                Err(_) => return (out, true),
+            }
+        }
+        (out, false)
+    }
+
+    /// Wait (bounded) for the spawned eviction of a corrupt entry.
+    async fn wait_until_absent(backend: &CacheObjectBackend, key: &str) -> bool {
+        for _ in 0..100 {
+            if !backend.exists(key).await.unwrap() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        false
+    }
+
+    /// #4323: a cache hit is verified against the sidecar's SHA-256 while it
+    /// streams. A body of the right size whose bytes changed in storage is
+    /// never delivered complete (the transfer ends in an error before its last
+    /// chunk), and the entry is evicted so the next read refetches upstream.
+    #[tokio::test]
+    async fn test_streaming_hit_with_corrupt_bytes_aborts_and_evicts_the_entry_4323() {
+        let backend = CacheObjectBackend::new();
+        let content_key = "proxy-cache/npm-remote/4323-corrupt/__content__";
+        let metadata_key = sidecar_key_of(content_key);
+        let good = b"real-tarball-bytes";
+        backend.put_object(content_key, b"real-tarball-BYTES").await;
+        let mut metadata = stale_positive_sidecar(good.len() as i64);
+        metadata.expires_at = Utc::now() + chrono::Duration::hours(1);
+        metadata.checksum_sha256 = sha256_hex_of(good);
+        backend.put_sidecar(&metadata_key, &metadata).await;
+        let proxy = build_proxy_service_with_storage(backend.clone());
+
+        let opened = proxy
+            .open_cached_stream(content_key, &metadata_key, &metadata)
+            .await
+            .expect("opens")
+            .expect("the size matches, so the entry opens as a hit");
+        let (delivered, errored) = drain_until_error(opened.body).await;
+
+        assert!(errored, "a corrupt cached body must end in an error");
+        assert!(
+            delivered.len() < good.len(),
+            "a corrupt cached body must never be delivered complete ({} bytes went out)",
+            delivered.len()
+        );
+        assert!(
+            wait_until_absent(&backend, content_key).await,
+            "the corrupt body is evicted"
+        );
+        assert!(
+            !backend.exists(&metadata_key).await.unwrap(),
+            "and its sidecar, so the next read is a miss that refetches upstream"
+        );
+    }
+
+    /// #4323 positive control: an intact cached body is served whole and its
+    /// entry kept; a sidecar recording no digest is served unverified as
+    /// before.
+    #[tokio::test]
+    async fn test_streaming_hit_with_intact_bytes_is_served_whole_4323() {
+        let good = b"real-tarball-bytes";
+        for (slug, digest) in [
+            ("4323-intact", sha256_hex_of(good)),
+            ("4323-no-digest", String::new()),
+        ] {
+            let backend = CacheObjectBackend::new();
+            let content_key = format!("proxy-cache/npm-remote/{slug}/__content__");
+            let metadata_key = sidecar_key_of(&content_key);
+            backend.put_object(&content_key, good).await;
+            let mut metadata = stale_positive_sidecar(good.len() as i64);
+            metadata.expires_at = Utc::now() + chrono::Duration::hours(1);
+            metadata.checksum_sha256 = digest;
+            backend.put_sidecar(&metadata_key, &metadata).await;
+            let proxy = build_proxy_service_with_storage(backend.clone());
+
+            let opened = proxy
+                .open_cached_stream(&content_key, &metadata_key, &metadata)
+                .await
+                .expect("opens")
+                .expect("hit");
+            assert_eq!(drain_body(opened.body).await, good.to_vec(), "{slug}");
+            assert!(backend.exists(&content_key).await.unwrap(), "{slug}");
+            assert!(backend.exists(&metadata_key).await.unwrap(), "{slug}");
+        }
+    }
+
+    /// #4323: the eviction removes the entry only while its sidecar still
+    /// records the digest that failed; a refill that landed meanwhile is kept.
+    #[tokio::test]
+    async fn test_corrupt_entry_eviction_keeps_a_refill_4323() {
+        let backend = CacheObjectBackend::new();
+        let content_key = "proxy-cache/npm-remote/4323-refilled/__content__";
+        let metadata_key = sidecar_key_of(content_key);
+        backend.put_object(content_key, b"fresh-refill").await;
+        let mut refilled = stale_positive_sidecar(12);
+        refilled.checksum_sha256 = sha256_hex_of(b"fresh-refill");
+        backend.put_sidecar(&metadata_key, &refilled).await;
+        let storage = Arc::new(StorageService::new(backend.clone()));
+
+        evict_corrupt_cache_entry(
+            storage.clone(),
+            "npm-remote".to_string(),
+            content_key.to_string(),
+            metadata_key.clone(),
+            sha256_hex_of(b"the bytes that failed"),
+        )
+        .await;
+        assert!(backend.exists(content_key).await.unwrap());
+        assert!(backend.exists(&metadata_key).await.unwrap());
+
+        evict_corrupt_cache_entry(
+            storage,
+            "npm-remote".to_string(),
+            content_key.to_string(),
+            metadata_key.clone(),
+            refilled.checksum_sha256.clone(),
+        )
+        .await;
+        assert!(!backend.exists(content_key).await.unwrap());
+        assert!(!backend.exists(&metadata_key).await.unwrap());
     }
 
     /// #4758 on the stale-if-error reader, which takes `Content-Length` off the
@@ -17750,9 +18125,10 @@ mod tests {
         let content_key = "proxy-cache/npm-remote/4640-stream/__content__";
         let metadata_key = sidecar_key_of(content_key);
         backend.put_object(content_key, b"KEPT-BYTES").await;
-        backend
-            .put_sidecar(&metadata_key, &stale_positive_sidecar(10))
-            .await;
+        let mut sidecar = stale_positive_sidecar(10);
+        // A hit is verified against the recorded digest (#4323).
+        sidecar.checksum_sha256 = sha256_hex_of(b"KEPT-BYTES");
+        backend.put_sidecar(&metadata_key, &sidecar).await;
         let proxy = build_proxy_service_with_storage(backend.clone());
 
         let handle = proxy
@@ -18614,6 +18990,7 @@ mod tests {
         let mut metadata = stale_positive_sidecar(18);
         metadata.expires_at = Utc::now() + chrono::Duration::hours(1);
         metadata.storage_etag = Some("\"ac0a54faa6e8c861ec913465610119f4\"".to_string());
+        metadata.checksum_sha256 = sha256_hex_of(b"real-tarball-bytes");
 
         let opened = proxy
             .open_cached_stream(content_key, &sidecar_key_of(content_key), &metadata)
@@ -24099,6 +24476,8 @@ mod tests {
         // checks an unpinned entry's size against it (#4758).
         let mut sidecar: CacheMetadata = serde_json::from_slice(&fresh_metadata_bytes()).unwrap();
         sidecar.size_bytes = wheel_body.len() as i64;
+        // ...and records its digest: a hit is verified against it (#4323).
+        sidecar.checksum_sha256 = StorageService::calculate_hash(&wheel_body);
         let mut entries = std::collections::HashMap::new();
         entries.insert(
             keys.metadata.clone(),
@@ -27291,6 +27670,82 @@ mod tests {
             other => panic!("expected the deadline error, got {other:?}"),
         }
         assert!(elapsed < Duration::from_secs(4), "{elapsed:?}");
+    }
+
+    /// #5617: a request that waits on a buffered fill whose upstream fetch
+    /// then hits the fetch deadline takes that verdict. Before, it became the
+    /// next leader, asked the same upstream again and answered after a second
+    /// deadline (about twice the deadline in all). A request that arrives
+    /// after the deadline still fetches.
+    #[tokio::test]
+    async fn test_follower_takes_the_leaders_fetch_deadline_5617() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/stalled-5617"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(b"late".as_ref())
+                    .set_delay(Duration::from_secs(4)),
+            )
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("follower-deadline-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = Arc::new(
+            Arc::unwrap_or_clone(tdh::build_proxy_service_with_fs(
+                pool,
+                tmp.to_str().unwrap(),
+            ))
+            .with_upstream_settings(crate::config::ProxyUpstreamSettings {
+                connect_secs: 5,
+                read_secs: 60,
+                fetch_deadline_secs: 1,
+                ..Default::default()
+            }),
+        );
+        let repo = wiremock_remote_repo("follower-deadline", &server.uri(), tmp.to_str().unwrap());
+
+        let leader = {
+            let (proxy, repo) = (Arc::clone(&proxy), repo.clone());
+            tokio::spawn(async move { proxy.fetch_artifact(&repo, "stalled-5617").await })
+        };
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let started = std::time::Instant::now();
+        let follower = proxy.fetch_artifact(&repo, "stalled-5617").await;
+        let follower_secs = started.elapsed();
+        let leader = leader.await.expect("leader task");
+        let hits_after_both = server.received_requests().await.unwrap_or_default().len();
+
+        // Arrives after the deadline: fetches again, as before.
+        let _late = proxy.fetch_artifact(&repo, "stalled-5617").await;
+        let hits_after_late = server.received_requests().await.unwrap_or_default().len();
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert!(leader.is_err(), "the leader hit the deadline: {leader:?}");
+        match follower {
+            Err(AppError::BadGateway(message)) => assert!(
+                message.starts_with(LEADER_FETCH_DEADLINE_MESSAGE),
+                "the follower names the inherited deadline: {message}"
+            ),
+            other => panic!("expected the inherited deadline, got {other:?}"),
+        }
+        assert_eq!(
+            hits_after_both, 1,
+            "the follower did not ask the upstream again"
+        );
+        assert!(
+            follower_secs < Duration::from_millis(1500),
+            "the follower answered with the leader, not after a second deadline: {follower_secs:?}"
+        );
+        assert_eq!(hits_after_late, 2, "a later request fetches again");
     }
 
     // -- get_cache_ttl_for_repo: DB lookup with default fallback -------------

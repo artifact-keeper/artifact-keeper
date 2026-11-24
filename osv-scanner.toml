@@ -1,0 +1,160 @@
+# osv-scanner configuration for Cargo.lock (#6180).
+#
+# ci.yml's security-audit job runs `osv-scanner scan source --lockfile
+# Cargo.lock` beside `cargo audit`, with the same blocking rule. cargo audit
+# reads only RustSec. OSV also carries GitHub advisories with crates.io ranges,
+# which is how GHSA-m665-v7pm-7grj (zip 2.4.2, no RUSTSEC id when published)
+# went unseen by cargo audit for weeks.
+#
+# Every entry has a reason and an expiry. When an entry expires the job fails
+# again: re-check the reason, then either fix the dependency or renew the date
+# with the new evidence. The reachability analysis for the vulnerabilities
+# below is in .cargo/audit.toml, which ignores the same RUSTSEC ids. Keep the
+# two files in step.
+#
+# OSV, unlike cargo audit, also reports RustSec's informational advisories
+# (unmaintained, unsound) as vulnerabilities. cargo audit prints those as
+# warnings and does not fail on them, so they are listed here with that reason.
+
+# --- Vulnerabilities, also ignored in .cargo/audit.toml -----------------------
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2023-0071"
+ignoreUntil = 2027-02-28
+reason = "rsa 0.9.10 (Marvin attack), only via sqlx-mysql, which is never compiled: the backend enables the postgres driver only. No upstream fix. See .cargo/audit.toml."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0367"
+ignoreUntil = 2027-02-28
+reason = "zip 2.4.2 is only a build-dependency of utoipa-swagger-ui 8.1.0, whose build.rs unpacks the vendored swagger-ui with by_index and never calls extract(). Nothing from it is linked. The backend's own zip is 9.x. See .cargo/audit.toml (#4705, #5162)."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0368"
+ignoreUntil = 2027-02-28
+reason = "zip 2.4.2 build-dependency of utoipa-swagger-ui only; extract() is never called. See RUSTSEC-2026-0367 above."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0369"
+ignoreUntil = 2027-02-28
+reason = "zip 2.4.2 build-dependency of utoipa-swagger-ui only; extract() is never called. See RUSTSEC-2026-0367 above."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0429"
+ignoreUntil = 2027-02-28
+reason = "zip 2.4.2 build-dependency of utoipa-swagger-ui only; extract() is never called. See RUSTSEC-2026-0367 above."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0545"
+ignoreUntil = 2027-02-28
+reason = "zip 2.4.2 build-dependency of utoipa-swagger-ui only, built without aes-crypto, and no entry is read with a password. See .cargo/audit.toml (#6156)."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0548"
+ignoreUntil = 2027-02-28
+reason = "GHSA-m665-v7pm-7grj, the advisory cargo audit missed (#6180). zip 2.4.2 build-dependency of utoipa-swagger-ui only: its build.rs uses ZipArchive::by_index, never the streaming reader. `cargo tree -i zip@2.4.2 -e normal` prints nothing. See .cargo/audit.toml (#6156, #6178)."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0387"
+ignoreUntil = 2027-02-28
+reason = "crypto-bigint 0.5.5 via elliptic-curve 0.13 (pgp, bergshamra); the 0.5 line has no fix. Backend signing keys are RSA or Ed25519, and bergshamra only verifies IdP signatures. See .cargo/audit.toml (#4940)."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0391"
+ignoreUntil = 2027-02-28
+reason = "zstd 0.13.3 only via wasmtime-internal-cache, which runs only for an Engine configured with a compilation cache; wasm_runtime.rs never configures one. See .cargo/audit.toml."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0459"
+ignoreUntil = 2027-02-28
+# Also covers its alias RUSTSEC-2026-0502 (osv-scanner groups aliases).
+reason = "libsqlite3-sys 0.30.1 is in Cargo.lock only as an unactivated optional dependency of sqlx-sqlite; `cargo tree -i libsqlite3-sys -e normal,build,dev --target all` prints nothing, so no SQLite is compiled. See .cargo/audit.toml (#5555)."
+
+# --- zstd-safe 7.2.4: the same unreachable copy as RUSTSEC-2026-0391 ------------
+# cargo audit ignores 0398 and 0403 and reports the others as unsound warnings.
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0395"
+ignoreUntil = 2027-02-28
+reason = "zstd-safe 7.2.4 only via wasmtime-internal-cache (zstd 0.13.3), never run: no compilation cache is configured. See RUSTSEC-2026-0391."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0396"
+ignoreUntil = 2027-02-28
+reason = "zstd-safe 7.2.4 via wasmtime-internal-cache only, never run. See RUSTSEC-2026-0391."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0397"
+ignoreUntil = 2027-02-28
+reason = "zstd-safe 7.2.4 via wasmtime-internal-cache only, never run. See RUSTSEC-2026-0391."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0398"
+ignoreUntil = 2027-02-28
+reason = "zstd-safe 7.2.4 via wasmtime-internal-cache only, never run. See RUSTSEC-2026-0391."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0399"
+ignoreUntil = 2027-02-28
+reason = "zstd-safe 7.2.4 via wasmtime-internal-cache only, never run. See RUSTSEC-2026-0391."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0400"
+ignoreUntil = 2027-02-28
+reason = "zstd-safe 7.2.4 via wasmtime-internal-cache only, never run. See RUSTSEC-2026-0391."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0401"
+ignoreUntil = 2027-02-28
+reason = "zstd-safe 7.2.4 via wasmtime-internal-cache only, never run. See RUSTSEC-2026-0391."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0402"
+ignoreUntil = 2027-02-28
+reason = "zstd-safe 7.2.4 via wasmtime-internal-cache only, never run. See RUSTSEC-2026-0391."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0403"
+ignoreUntil = 2027-02-28
+reason = "zstd-safe 7.2.4 via wasmtime-internal-cache only, never run. See RUSTSEC-2026-0391."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0404"
+ignoreUntil = 2027-02-28
+reason = "zstd-safe 7.2.4 via wasmtime-internal-cache only, never run. See RUSTSEC-2026-0391."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0405"
+ignoreUntil = 2027-02-28
+reason = "zstd-safe 7.2.4 via wasmtime-internal-cache only, never run. See RUSTSEC-2026-0391."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0406"
+ignoreUntil = 2027-02-28
+reason = "zstd-safe 7.2.4 via wasmtime-internal-cache only, never run. See RUSTSEC-2026-0391."
+
+# --- Informational advisories (cargo audit: warnings, not failures) -----------
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0440"
+ignoreUntil = 2027-02-28
+reason = "Unmaintained notice: astral-tokio-tar 0.6.4 via rattler_package_streaming's async modules, which the conda handler does not call (it reads through the sync tar crate). No replacement release yet."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0543"
+ignoreUntil = 2027-02-28
+reason = "Unmaintained notice for chrono, a direct dependency used across the backend and by sqlx; no vulnerability."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0542"
+ignoreUntil = 2027-02-28
+reason = "Unmaintained notice for humantime (via object_store); no vulnerability."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2024-0436"
+ignoreUntil = 2027-02-28
+reason = "Unmaintained notice for paste, a build-time proc-macro (via utoipa-axum); no vulnerability."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2024-0449"
+ignoreUntil = 2027-02-28
+reason = "Unmaintained notice for unsafe-libyaml (via serde_yaml, direct and through rattler_conda_types); no vulnerability."

@@ -92,6 +92,15 @@ The legacy migration-repair routines (`repair_legacy_073_checksum` and friends)
 run *ahead* of the `SKIP_MIGRATIONS` gate and still run. They no-op on a healthy
 database, which is what makes running them unconditionally safe.
 
+### Rolling back without skipping migrations (1.13 and later)
+
+From 1.13 an older binary can also start with `MIGRATIONS_IGNORE_MISSING=true`
+instead. It still applies its own pending migrations and checks its ledger,
+ignores newer expand migrations and newer contracts of expands it already has,
+and refuses to start on a newer contract migration
+(`NNN_contract_of_MMM_<what>.sql`) whose expand MMM is newer than it. See "Rolling deploys: expand,
+then contract" in `docs/operations/online-migrations.md`.
+
 ### Rolling forward again
 
 Remove the flag and start the newer image. The migrations the newer binary

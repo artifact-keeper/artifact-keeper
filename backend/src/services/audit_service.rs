@@ -1071,6 +1071,26 @@ impl AuditService {
 
     /// The batched multi-row INSERT behind [`AuditService::log_batch`].
     async fn insert_batch_rows(&self, entries: &[AuditEntry]) -> sqlx::Result<()> {
+        Self::insert_batch_rows_on(&self.db, entries).await
+    }
+
+    /// [`AuditService::log_batch`]'s INSERT on a caller's executor, so the
+    /// rows commit or roll back with the caller's transaction (#6469: a
+    /// lifecycle sweep writes a page's audit rows in the transaction that
+    /// records the page as done). Unlike `log_batch` it neither emits the
+    /// export records nor retries row by row: the caller emits
+    /// [`audit_export::emit_entry`] once the transaction commits, and treats
+    /// an error as "the page is not done".
+    pub(crate) async fn insert_batch_rows_on<'e, E>(
+        executor: E,
+        entries: &[AuditEntry],
+    ) -> sqlx::Result<()>
+    where
+        E: sqlx::PgExecutor<'e>,
+    {
+        if entries.is_empty() {
+            return Ok(());
+        }
         let n = entries.len();
         let mut ids: Vec<Uuid> = Vec::with_capacity(n);
         let mut user_ids: Vec<Option<Uuid>> = Vec::with_capacity(n);
@@ -1109,7 +1129,7 @@ impl AuditService {
         .bind(details)
         .bind(ip_addresses)
         .bind(correlation_ids)
-        .execute(&self.db)
+        .execute(executor)
         .await?;
         Ok(())
     }

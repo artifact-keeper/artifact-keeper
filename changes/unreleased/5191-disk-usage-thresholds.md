@@ -1,0 +1,7 @@
+---
+section: Added
+issues: [#5191]
+---
+- **Disk usage thresholds on the storage volume: warn, then refuse writes before the disk is full** (#5191). The storage quotas count stored bytes, not the disk, so with the filesystem backend the first sign of a filling volume was a write failing once it was already full. The backend now measures the volume under `STORAGE_PATH` (and `AK_UPLOAD_STAGING_DIR` when set) with `statvfs` on a background thread every `STORAGE_DISK_CHECK_INTERVAL_SECS` (default 5) and caches the reading, so requests never wait on the filesystem. At `STORAGE_DISK_WARN_PERCENT` (default 95) it logs a rate-limited warning and sets `ak_storage_disk_state` to 1. At `STORAGE_DISK_BLOCK_PERCENT` (off by default) every write that stores new bytes is refused with `403 DISK_THRESHOLD_EXCEEDED` ("server storage nearly full: free disk or add storage"), before the body is read, through the same refusal path as the storage quota, with its own reason phrase and `ak_quota_refusals_total{kind="disk"}` label. Downloads, deletes, lifecycle and GC keep working; a remote repository streams upstream content without caching it; writes resume one point below the threshold. The figures are in `GET /api/v1/system/quota` (`disk`) and the `ak_storage_disk_*` gauges. Object-store backends have no volume to measure and are skipped.
+
+  Default change: the warning is on at 95 % for filesystem storage (log line and gauge only; nothing is refused). Set `STORAGE_DISK_WARN_PERCENT=0` to turn it off. Blocking is opt-in with `STORAGE_DISK_BLOCK_PERCENT`.

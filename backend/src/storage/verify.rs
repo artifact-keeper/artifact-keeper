@@ -179,6 +179,9 @@ pub fn verify_sha256_stream_with_hook(
                                 expected_len = ?expected_len,
                                 "stored object is longer than its record; aborting response"
                             );
+                            crate::services::metrics_service::record_stored_object_integrity_failure(
+                                "streaming",
+                            );
                             if let Some(hook) = st.on_mismatch.take() {
                                 hook();
                             }
@@ -215,6 +218,9 @@ pub fn verify_sha256_stream_with_hook(
                                     expected_len = ?expected_len,
                                     actual_len,
                                     "stored object failed integrity verification on serve; aborting response"
+                                );
+                                crate::services::metrics_service::record_stored_object_integrity_failure(
+                                    "streaming",
                                 );
                                 st.pending = None;
                                 if let Some(hook) = st.on_mismatch.take() {
@@ -403,6 +409,64 @@ pub fn serve_verification_enabled() -> bool {
     *ENABLED
 }
 
+/// Serve paths whose clients always check the bytes against the digest they
+/// asked for, and on which `DOWNLOAD_VERIFY_SKIP_CLIENT_VERIFIED` may turn
+/// serve-time verification off (#6468). Only OCI blobs today: a blob is
+/// fetched by its `sha256:` digest, and `docker`, containerd, Podman and
+/// every OCI distribution client reject a body that does not hash to it.
+pub const CLIENT_VERIFIED_PATHS: &[&str] = &["oci"];
+
+/// Parse `DOWNLOAD_VERIFY_SKIP_CLIENT_VERIFIED` (a comma-separated list of
+/// [`CLIENT_VERIFIED_PATHS`] entries, case-insensitive). Unknown entries are
+/// returned separately so the caller can warn; they never skip anything.
+fn parse_client_verified_skips(raw: &str) -> (Vec<&'static str>, Vec<String>) {
+    let mut skip = Vec::new();
+    let mut unknown = Vec::new();
+    for item in raw.split(',').map(|s| s.trim().to_ascii_lowercase()) {
+        if item.is_empty() {
+            continue;
+        }
+        match CLIENT_VERIFIED_PATHS.iter().find(|p| **p == item) {
+            Some(p) if !skip.contains(p) => skip.push(*p),
+            Some(_) => {}
+            None => unknown.push(item),
+        }
+    }
+    (skip, unknown)
+}
+
+/// Whether serve-time verification runs on `path` (one of
+/// [`CLIENT_VERIFIED_PATHS`]): on unless `DOWNLOAD_VERIFY_CHECKSUMS` is off or
+/// the operator listed `path` in `DOWNLOAD_VERIFY_SKIP_CLIENT_VERIFIED`
+/// (#6468). The default (unset) verifies everything.
+///
+/// Skipping trades server-side detection for CPU: on that path a corrupted
+/// stored object is no longer aborted, counted in
+/// `ak_stored_object_integrity_failures_total` or repaired from upstream on
+/// serve (the #5169 OCI blob repair); the client still refuses it, and the
+/// storage scrub still finds it. Read once.
+pub fn serve_verification_enabled_for(path: &str) -> bool {
+    static SKIPS: std::sync::LazyLock<Vec<&'static str>> = std::sync::LazyLock::new(|| {
+        let raw = std::env::var("DOWNLOAD_VERIFY_SKIP_CLIENT_VERIFIED").unwrap_or_default();
+        let (skip, unknown) = parse_client_verified_skips(&raw);
+        if !unknown.is_empty() {
+            tracing::warn!(
+                ignored = ?unknown,
+                accepted = ?CLIENT_VERIFIED_PATHS,
+                "DOWNLOAD_VERIFY_SKIP_CLIENT_VERIFIED names paths that cannot skip serve-time verification; they stay verified"
+            );
+        }
+        if !skip.is_empty() {
+            tracing::info!(
+                paths = ?skip,
+                "serve-time SHA-256 verification is off on client-verified paths (DOWNLOAD_VERIFY_SKIP_CLIENT_VERIFIED)"
+            );
+        }
+        skip
+    });
+    serve_verification_enabled() && !SKIPS.contains(&path)
+}
+
 fn integrity_error(label: &str) -> AppError {
     AppError::CodedBadGateway {
         code: STORED_OBJECT_INTEGRITY_CODE,
@@ -432,6 +496,7 @@ fn log_mismatch(label: &str, expected: &[u8; 32], expected_len: u64, verdict: &I
             actual_len,
             "stored object failed integrity verification on serve; answering 502"
         );
+        crate::services::metrics_service::record_stored_object_integrity_failure("before_headers");
     }
 }
 
@@ -655,6 +720,27 @@ pub fn advertised_sha256(headers: &[(axum::http::HeaderName, String)]) -> Option
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #6468: only listed client-verified paths skip; the default (unset or
+    /// empty) skips nothing, unknown names never skip, case and spaces are
+    /// ignored.
+    #[test]
+    fn test_client_verified_skip_list_parse_6468() {
+        assert_eq!(parse_client_verified_skips(""), (vec![], vec![]));
+        assert_eq!(parse_client_verified_skips(" , "), (vec![], vec![]));
+        assert_eq!(parse_client_verified_skips("oci"), (vec!["oci"], vec![]));
+        assert_eq!(
+            parse_client_verified_skips(" OCI , oci,npm,generic"),
+            (vec!["oci"], vec!["npm".to_string(), "generic".to_string()])
+        );
+        // The environment of the test process sets nothing, so the
+        // default is to verify.
+        if std::env::var_os("DOWNLOAD_VERIFY_SKIP_CLIENT_VERIFIED").is_none()
+            && std::env::var_os("DOWNLOAD_VERIFY_CHECKSUMS").is_none()
+        {
+            assert!(serve_verification_enabled_for("oci"));
+        }
+    }
 
     fn sha(bytes: &[u8]) -> [u8; 32] {
         Sha256::digest(bytes).into()

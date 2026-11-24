@@ -341,12 +341,17 @@ pub async fn guest_access_guard(
     request: Request,
     next: Next,
 ) -> Response {
-    if state.policy.is_enabled().await {
+    // Allowlisted paths pass whatever the policy says, so they are decided
+    // before it is read. A policy refresh reads system_settings through the
+    // request pool; with the database hung it waited out the pool's acquire
+    // timeout, so every few seconds a /readyz or /health took 5 s longer than
+    // its own bounded checks (#5651).
+    let path = request.uri().path();
+    if is_allowlisted(path) {
         return next.run(request).await;
     }
 
-    let path = request.uri().path();
-    if is_allowlisted(path) {
+    if state.policy.is_enabled().await {
         return next.run(request).await;
     }
 

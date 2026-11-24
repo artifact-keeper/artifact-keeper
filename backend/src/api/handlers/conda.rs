@@ -7357,6 +7357,151 @@ async fn serve_scanned_conda_package(
     proxy_helpers::serve_scanned_proxy_file(state, proxy, &req, &file).await
 }
 
+/// The proxy-cache key a Remote's `<subdir>/<filename>` package is cached
+/// under: the key [`download_package`] serves and fills (#4184).
+pub(crate) fn conda_package_cache_key(subdir: &str, filename: &str) -> String {
+    conda_package_serve_key(subdir, filename).cache_key
+}
+
+/// The package name a conda file name carries, if it parses (#4184).
+pub(crate) fn conda_package_name(filename: &str) -> Option<&str> {
+    conda_name_from_filename(filename)
+}
+
+/// Whether a Virtual's conda allowlist admits `<subdir>/<filename>` (#4184):
+/// `Ok(true)` with no allowlist. A Virtual does not serve a package its
+/// allowlist refuses, so warming one into a member's cache would be wasted.
+pub(crate) async fn virtual_allowlist_admits(
+    db: &sqlx::PgPool,
+    virtual_repo_id: uuid::Uuid,
+    subdir: &str,
+    filename: &str,
+) -> Result<bool, Response> {
+    Ok(virtual_allowlist(db, virtual_repo_id)
+        .await?
+        .is_none_or(|a| a.admits_filename(subdir, filename)))
+}
+
+/// Fetch one package through a Remote exactly as a client download of
+/// `/conda/<remote>/<subdir>/<filename>` would (#4184), and drain the body so
+/// the proxy cache commits it. Nothing is served and no download is counted.
+///
+/// The fetch takes the same arm [`download_package`] takes: the inline scan
+/// gate when the Remote scans this file, the streaming tee otherwise. Every
+/// gate therefore applies as on a client's cold miss (the Package Age Policy
+/// hold, the origin policy, the scan verdict), and a warmed entry is a
+/// proxy-cache entry like any other: a later serve still passes
+/// [`proxy_helpers::proxy_cache_row_gate`] and the cache-hit gates. Returns
+/// the status the route would have answered, plus the sha256 and size of the
+/// bytes it would have served on a 2xx.
+///
+/// `via_virtual` is the Virtual the warm was asked for, when it was: the scan
+/// policy is then [`warm_scan_policy`]'s stricter of the Virtual's and the
+/// member's, the policy a download through that Virtual is served under. A
+/// warm through a scanning Virtual therefore scans (or answers `403`) instead
+/// of caching the member's bytes unscanned.
+pub(crate) async fn warm_remote_package(
+    state: &SharedState,
+    proxy: &crate::services::proxy_service::ProxyService,
+    remote: &crate::models::repository::Repository,
+    via_virtual: Option<uuid::Uuid>,
+    subdir: &str,
+    filename: &str,
+) -> (StatusCode, Option<(String, u64)>) {
+    use futures::StreamExt;
+    use sha2::{Digest, Sha256};
+
+    let Some(upstream_url) = remote.upstream_url.as_deref() else {
+        return (StatusCode::NOT_FOUND, None);
+    };
+    if !is_conda_package(filename)
+        || proxy_helpers::reject_ambiguous_client_segments(true, &[subdir, filename]).is_err()
+    {
+        return (StatusCode::BAD_REQUEST, None);
+    }
+    let serve_key = conda_package_serve_key(subdir, filename);
+    let fetched = async {
+        if serve_key.scannable {
+            if let Some((action, severity_gate)) =
+                warm_scan_policy(&state.db, remote.id, via_virtual).await?
+            {
+                let req = proxy_helpers::ScannedProxyRequest {
+                    repo_id: remote.id,
+                    repo_key: &remote.key,
+                    fetch_base: upstream_url,
+                    format: crate::models::repository::RepositoryFormat::Conda,
+                    source_path: &serve_key.cache_key,
+                    cache_path: &serve_key.cache_key,
+                    filename,
+                    action,
+                    severity_gate,
+                    // No context: a warm is not a download.
+                    ctx: None,
+                };
+                let file = CondaScannedPackage {
+                    proxy,
+                    upstream_url,
+                };
+                return proxy_helpers::serve_scanned_proxy_file(state, proxy, &req, &file).await;
+            }
+        }
+        proxy_helpers::proxy_fetch_streaming_with_disposition_and_format(
+            proxy,
+            remote.id,
+            &remote.key,
+            upstream_url,
+            &serve_key.cache_key,
+            conda_package_content_type(filename),
+            Some(filename),
+            crate::models::repository::RepositoryFormat::Conda,
+            false,
+        )
+        .await
+    }
+    .await;
+    let response = match fetched {
+        Ok(r) | Err(r) => r,
+    };
+    let status = response.status();
+    if !status.is_success() {
+        return (status, None);
+    }
+    let mut body = response.into_body().into_data_stream();
+    let mut hasher = Sha256::new();
+    let mut size = 0u64;
+    while let Some(chunk) = body.next().await {
+        match chunk {
+            Ok(bytes) => {
+                size += bytes.len() as u64;
+                hasher.update(&bytes);
+            }
+            // A body cut mid-stream is an upstream fault; the tee does not
+            // commit it, and the item is retried.
+            Err(_) => return (StatusCode::BAD_GATEWAY, None),
+        }
+    }
+    (status, Some((format!("{:x}", hasher.finalize()), size)))
+}
+
+/// The scan-on-proxy policy a warm of `remote` fills its cache under
+/// (#4184): the Remote's own for a direct warm, and for a warm through
+/// `via_virtual` the stricter of the Virtual's and the member's
+/// ([`proxy_helpers::effective_virtual_scan_policy`]), as a client download
+/// through that Virtual is. `None` when neither scans; an unreadable config
+/// fails closed with the 503 the download path answers.
+pub(crate) async fn warm_scan_policy(
+    db: &sqlx::PgPool,
+    remote_id: uuid::Uuid,
+    via_virtual: Option<uuid::Uuid>,
+) -> Result<Option<proxy_helpers::MemberScanPolicy>, Response> {
+    match via_virtual {
+        Some(virtual_id) => {
+            proxy_helpers::effective_virtual_scan_policy(db, virtual_id, remote_id).await
+        }
+        None => proxy_helpers::remote_scan_policy(db, remote_id).await,
+    }
+}
+
 /// The conda half of the generic proxy scan gate.
 struct CondaScannedPackage<'a> {
     proxy: &'a crate::services::proxy_service::ProxyService,

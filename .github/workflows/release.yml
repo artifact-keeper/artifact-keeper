@@ -928,18 +928,23 @@ jobs:
           # Keep them equal to release-cli-caches.yml's.
           tool: cargo-auditable@0.7.7,cargo-cyclonedx@0.5.10,cargo-audit@0.23.0
 
-      - name: Set version from tag
+      # The build below is `--locked` (#6180): it builds the committed
+      # Cargo.lock, the one `cargo audit` checked, or fails. This step used to
+      # rewrite Cargo.toml's version from the tag, which `--locked` refuses
+      # (Cargo.lock records the workspace version too), and which could only
+      # make the tarball differ from the certified commit. The release-prep
+      # PR sets the version, so check it instead. A prerelease tag
+      # (vX.Y.Z-rc.N) builds the X.Y.Z it was cut from, as the image does.
+      - name: Check the workspace version matches the tag
+        shell: bash
         run: |
-          VERSION=${GITHUB_REF_NAME#v}
-          echo "Setting workspace version to ${VERSION}"
-          # Portable in-place edit: GNU `sed -i` and BSD/macOS `sed -i` take
-          # incompatible arguments (BSD requires a backup suffix), which broke
-          # the macOS release builds (#1538: "sed: 1: Cargo.toml: invalid
-          # command code C"). Use a temp file so the same step works on the
-          # Linux and macOS runners alike.
-          sed "s/^version = \".*\"/version = \"${VERSION}\"/" Cargo.toml > Cargo.toml.tmp
-          mv Cargo.toml.tmp Cargo.toml
-          head -5 Cargo.toml
+          VERSION="${GITHUB_REF_NAME#v}"
+          CARGO_VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          if [ "${VERSION%%-*}" != "${CARGO_VERSION}" ]; then
+            echo "::error title=Tag does not match Cargo.toml::Tag ${GITHUB_REF_NAME} but Cargo.toml says ${CARGO_VERSION}. Land the release-prep PR that sets version = \"${VERSION%%-*}\" and tag that commit."
+            exit 1
+          fi
+          echo "Cargo.toml version ${CARGO_VERSION} matches ${GITHUB_REF_NAME}"
 
       # jemalloc fixes its page size at compile time. The aarch64 Linux leg is
       # cross-compiled on a 4 KiB-page x86_64 runner, so build it for 64 KiB
@@ -980,7 +985,7 @@ jobs:
         # GIT_SHA is the commit /health and the startup log report. build.rs
         # no longer reads git itself (#6181), so a shipped build passes it,
         # from the commit actually checked out, as git rev-parse gave before.
-        run: GIT_SHA="$(git rev-parse HEAD)" cargo auditable build --release --target ${{ matrix.target }} --features ${{ matrix.features }}
+        run: GIT_SHA="$(git rev-parse HEAD)" cargo auditable build --locked --release --target ${{ matrix.target }} --features ${{ matrix.features }}
 
       - name: Package binary (Unix)
         if: "!contains(matrix.target, 'windows')"
@@ -1581,7 +1586,7 @@ jobs:
           fi
 
       - name: Create Release
-        uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v2
+        uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4
         with:
           tag_name: ${{ steps.version.outputs.tag }}
           # Pin the release to the commit this run tested. The tag already

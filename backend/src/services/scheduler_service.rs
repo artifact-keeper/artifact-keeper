@@ -337,13 +337,14 @@ pub(crate) async fn run_storage_gc_tick_follow_on(
 pub fn spawn_all(
     db: PgPool,
     config: Config,
-    _primary_storage: Arc<dyn crate::storage::StorageBackend>,
+    primary_storage: Arc<dyn crate::storage::StorageBackend>,
     storage_registry: Arc<crate::storage::StorageRegistry>,
     smtp_service: Option<Arc<SmtpService>>,
     event_bus: Arc<EventBus>,
     advisory_client: Arc<crate::services::scanner_service::AdvisoryClient>,
     proxy_service: Option<Arc<crate::services::proxy_service::ProxyService>>,
     npm_packument_cache: Option<Arc<crate::services::npm_packument_cache::NpmPackumentCache>>,
+    lifecycle_derived_state: crate::services::lifecycle_service::SweepDerivedState,
 ) {
     // Daily metrics snapshot (runs every hour, captures once per day via UPSERT)
     {
@@ -516,6 +517,7 @@ pub fn spawn_all(
     {
         let db = db.clone();
         let config_clone = config.clone();
+        let storage = primary_storage.clone();
         tokio::spawn(async move {
             tokio::time::sleep(jittered_startup_delay(15)).await;
             let monitor = HealthMonitorService::new(db.clone(), MonitorConfig::default());
@@ -534,7 +536,10 @@ pub fn spawn_all(
                     tracing::debug!("Another replica owns the health monitor lease; skipping");
                     continue;
                 };
-                match monitor.check_all_services(&config_clone).await {
+                match monitor
+                    .check_all_services(&config_clone, Some(&storage))
+                    .await
+                {
                     Ok(results) => {
                         for entry in &results {
                             if entry.status != "healthy" {
@@ -571,7 +576,8 @@ pub fn spawn_all(
             tokio::time::sleep(jittered_startup_delay(60)).await;
             let service = LifecycleService::new(db.clone())
                 .with_proxy_service(proxy_service)
-                .with_npm_packument_cache(npm_packument_cache);
+                .with_npm_packument_cache(npm_packument_cache)
+                .with_derived_state(lifecycle_derived_state);
             let mut ticker = interval(Duration::from_secs(check_secs));
 
             loop {
@@ -1403,6 +1409,10 @@ pub fn spawn_all(
     }
 
     // Password expiry notifications (configurable interval, default: hourly)
+    //
+    // Named in the one "Background schedulers started" line below; it used
+    // to log its own copy of that line as well (#5656).
+    let password_expiry: &str;
     if config.password_expiry_days > 0 {
         if let Some(smtp) = smtp_service {
             let db = db.clone();
@@ -1435,18 +1445,12 @@ pub fn spawn_all(
                     }
                 }
             });
-            tracing::info!(
-                "Background schedulers started: metrics, health monitor, lifecycle, stuck-scan janitor, backup schedules, sync policies, webhook retries, curation sync, upload cleanup, password expiry notifications"
-            );
+            password_expiry = ", password expiry notifications";
         } else {
-            tracing::info!(
-                "Background schedulers started: metrics, health monitor, lifecycle, stuck-scan janitor, backup schedules, sync policies, webhook retries, curation sync, upload cleanup (password expiry notifications skipped: SMTP not configured)"
-            );
+            password_expiry = " (password expiry notifications skipped: SMTP not configured)";
         }
     } else {
-        tracing::info!(
-            "Background schedulers started: metrics, health monitor, lifecycle, stuck-scan janitor, backup schedules, sync policies, webhook retries, curation sync, upload cleanup"
-        );
+        password_expiry = "";
     }
     // Download-ticket cleanup (every 10 minutes).
     //
@@ -1572,7 +1576,7 @@ pub fn spawn_all(
     }
 
     tracing::info!(
-        "Background schedulers started: metrics, health monitor, lifecycle, stuck-scan janitor, backup schedules, sync policies, webhook retries, curation sync, upload cleanup, download ticket cleanup, age-gate auto-approval, environment advisory re-evaluation, audit retention"
+        "Background schedulers started: metrics, health monitor, lifecycle, stuck-scan janitor, backup schedules, sync policies, webhook retries, curation sync, upload cleanup, download ticket cleanup, age-gate auto-approval, environment advisory re-evaluation, audit retention{password_expiry}"
     );
 }
 
@@ -1959,6 +1963,14 @@ async fn execute_due_backup_schedules(
         };
 
     for due_schedule in &due_schedules {
+        // #5921: a draining process starts no new backup run; another
+        // replica claims the due run.
+        if crate::services::shutdown_drain::is_draining() {
+            tracing::info!(
+                "draining for shutdown; leaving due scheduled backups to another replica"
+            );
+            break;
+        }
         let claimed = match claim_backup_schedule_run(
             db,
             due_schedule.id,

@@ -2362,6 +2362,37 @@ pub(crate) async fn proxy_cache_fresh_redirect(
     cache_path: &str,
     ctx: &crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Option<Response>, Response> {
+    proxy_cache_fresh_redirect_gated(proxy_service, state, repo_key, cache_path, ctx, true).await
+}
+
+/// [`proxy_cache_fresh_redirect`] for a virtual member's Pass-1 probe
+/// (#5129): the same gates in the same order, from the same single sidecar
+/// read, but any refusal only declines the redirect. The walk's own cache
+/// probe then answers the entry exactly as it does with presigned downloads
+/// off (a held entry's 409 included), so turning presigning on changes how a
+/// servable entry is delivered and nothing else. A refusing verdict is not
+/// recorded here, because the declined redirect is not the serve.
+async fn member_cache_fresh_redirect(
+    state: &AppState,
+    proxy: &ProxyService,
+    member: &Repository,
+    path: &str,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
+) -> Option<Response> {
+    proxy_cache_fresh_redirect_gated(proxy, state, &member.key, path, ctx, false)
+        .await
+        .ok()
+        .flatten()
+}
+
+async fn proxy_cache_fresh_redirect_gated(
+    proxy_service: &ProxyService,
+    state: &AppState,
+    repo_key: &str,
+    cache_path: &str,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
+    record_block: bool,
+) -> Result<Option<Response>, Response> {
     if !state.config.presigned_downloads_enabled || ctx.is_head {
         return Ok(None);
     }
@@ -2391,8 +2422,15 @@ pub(crate) async fn proxy_cache_fresh_redirect(
     // #4514: the stored scan verdict of the cached body. A refusing verdict
     // is the scan gate's 403; fail-closed without a reusable clean verdict
     // is not for a redirect, and the caller serves the request itself.
-    match cache_scan_gate_for_redirect(state, proxy_service, repo_key, cache_path, &entry, true)
-        .await
+    match cache_scan_gate_for_redirect(
+        state,
+        proxy_service,
+        repo_key,
+        cache_path,
+        &entry,
+        record_block,
+    )
+    .await
     {
         Some(CacheScanGate::Serve) => {}
         Some(CacheScanGate::Block) => {
@@ -3329,6 +3367,27 @@ pub async fn proxy_fetch_uncached_decoded(
         proxy_service
             .fetch_upstream_direct_decoded(&repo, path)
             .await
+    })
+    .await
+}
+
+/// [`proxy_fetch_uncached`] under the caller's body cap `max`, for a small
+/// answer that is only parsed and never served or stored (the Composer
+/// upstream search, #6332). Same origin policy, URL gate, upstream
+/// credentials and error mapping as every other upstream read.
+pub async fn proxy_fetch_uncached_capped(
+    proxy_service: &ProxyService,
+    repo_id: Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    path: &str,
+    max: usize,
+) -> Result<Bytes, Response> {
+    with_proxy_repo(repo_id, repo_key, upstream_url, path, |repo| async move {
+        proxy_service
+            .fetch_upstream_direct_dated(&repo, path, max)
+            .await
+            .map(|(content, _)| content)
     })
     .await
 }
@@ -4419,9 +4478,10 @@ where
         ctx,
         local_fetch,
         refusals.then_some(db),
+        None,
     )
     .await
-    .map(|(result, _origin)| result)
+    .and_then(|(download, _origin)| download.into_stream())
 }
 
 /// [`resolve_virtual_download`] that reads a Remote member's credentialed
@@ -4536,9 +4596,84 @@ where
         ctx,
         local_fetch,
         None,
+        None,
     )
     .await
-    .map(|(result, _origin)| result)
+    .and_then(|(download, _origin)| download.into_stream())
+}
+
+/// A virtual download that may be answered with a presigned redirect
+/// (#5129): see [`resolve_virtual_download_or_redirect`].
+pub(crate) enum VirtualDownload {
+    /// The winning member's bytes, for the caller to shape into its response.
+    Stream(StreamingFetchResult),
+    /// A presigned redirect to a Remote member's fresh proxy-cache entry,
+    /// ready to return unchanged.
+    Redirect(Response),
+}
+
+impl VirtualDownload {
+    /// The stream, for a resolver that was not allowed to redirect. That
+    /// resolver never builds a `Redirect`; if one appeared it is passed on as
+    /// the answer rather than dropped.
+    fn into_stream(self) -> Result<StreamingFetchResult, Response> {
+        match self {
+            Self::Stream(result) => Ok(result),
+            Self::Redirect(response) => {
+                tracing::error!("virtual download redirect from a resolver that may not redirect");
+                Err(response)
+            }
+        }
+    }
+}
+
+/// [`resolve_virtual_download_from_members_with_fetch_urls`] that hands out a
+/// Remote member's FRESH proxy-cache entry as a presigned redirect instead of
+/// streaming it through the backend (#5129), as
+/// [`resolve_virtual_download_streaming`] does for the other formats (#1555).
+///
+/// The redirect is tried in Pass 1, before the member's streaming cache probe,
+/// and only after every gate a proxy-cache fast path applies has passed on
+/// one read of the entry's sidecar ([`proxy_cache_fresh_redirect`]): fresh
+/// (a stale entry is revalidated by the probe, never redirected), present in
+/// storage (#3067, #4630), outside its Package Age Policy hold (#2075),
+/// allowed by the origin policy (#4506) and by the stored scan verdict
+/// (#4514). A refusal only declines the redirect: the probe then answers the
+/// entry as it does with presigning off, so a held entry is still the `409`.
+/// Presigned downloads off, a `HEAD` (#3209), a backend that cannot presign,
+/// a hosted member and a cache miss all take the streaming walk unchanged. A
+/// redirected Remote winner is recorded like a streamed one (#2260, #3844).
+///
+/// Callers pass only members the format route serves without an inline scan
+/// (Cargo and npm send scanning members through their scan gate first).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn resolve_virtual_download_or_redirect<F, Fut>(
+    state: &AppState,
+    members: Vec<Repository>,
+    fallback: VirtualMemberFallback,
+    proxy_service: Option<&ProxyService>,
+    path: &str,
+    member_fetch_urls: &std::collections::HashMap<Uuid, String>,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
+    local_fetch: F,
+) -> Result<VirtualDownload, Response>
+where
+    F: Fn(Uuid, StorageLocation) -> Fut,
+    Fut: Future<Output = Result<StreamingFetchResult, Response>>,
+{
+    resolve_virtual_download_winner(
+        members,
+        fallback,
+        proxy_service,
+        path,
+        member_fetch_urls,
+        Some(ctx),
+        local_fetch,
+        None,
+        Some(state),
+    )
+    .await
+    .map(|(download, _origin)| download)
 }
 
 /// [`resolve_virtual_download_from_members_with_fetch_urls`] for a caller
@@ -4570,9 +4705,10 @@ where
         ctx,
         local_fetch,
         Some(db),
+        None,
     )
     .await
-    .map(|(result, _origin)| result)
+    .and_then(|(download, _origin)| download.into_stream())
 }
 
 /// [`resolve_virtual_download_from_members`], also reporting which member won
@@ -4599,14 +4735,20 @@ where
         ctx,
         local_fetch,
         None,
+        None,
     )
     .await
+    .and_then(|(download, origin)| download.into_stream().map(|result| (result, origin)))
 }
 
 /// `refusals_db`: `Some` makes a Remote member whose upstream refuses the
 /// credentials it carries ([`is_credentialed_upstream_refusal`]) count as
 /// unavailable rather than a miss (#6214, the Go `.mod`/`.zip` walks); `None`
 /// keeps the shared #5504 classification, where a permanent 4xx is a miss.
+///
+/// `redirect`: `Some` (with a `ctx`) lets a Remote member's fresh cache entry
+/// be answered as a presigned redirect ([`resolve_virtual_download_or_redirect`],
+/// #5129); `None` never redirects.
 #[allow(clippy::too_many_arguments)]
 async fn resolve_virtual_download_winner<F, Fut>(
     members: Vec<Repository>,
@@ -4617,7 +4759,8 @@ async fn resolve_virtual_download_winner<F, Fut>(
     ctx: Option<&crate::api::middleware::download_telemetry::DownloadContext>,
     local_fetch: F,
     refusals_db: Option<&PgPool>,
-) -> Result<(StreamingFetchResult, VirtualServeOrigin), Response>
+    redirect: Option<&AppState>,
+) -> Result<(VirtualDownload, VirtualServeOrigin), Response>
 where
     F: Fn(Uuid, StorageLocation) -> Fut,
     Fut: Future<Output = Result<StreamingFetchResult, Response>>,
@@ -4646,107 +4789,132 @@ where
     let local_fetch = &local_fetch;
     // Each hit carries its `VirtualServeOrigin` to winner-determination (#3844);
     // see `resolve_virtual_download_streaming` for why it is not recorded here.
-    let outcome = resolve_members_two_phase::<
-        (StreamingFetchResult, VirtualServeOrigin),
-        Response,
-        _,
-        _,
-        _,
-        _,
-    >(
-        &members,
-        |member| async move {
-            match virtual_member_fetch_strategy(
-                &member.repo_type,
-                proxy_service.is_some(),
-                member.upstream_url.is_some(),
-            ) {
-                VirtualMemberFetchStrategy::Local => {
-                    match local_fetch(member.id, member.storage_location()).await {
-                        Ok(result) => {
-                            let origin = VirtualServeOrigin::hosted(result.artifact_id);
+    let outcome =
+        resolve_members_two_phase::<(VirtualDownload, VirtualServeOrigin), Response, _, _, _, _>(
+            &members,
+            |member| async move {
+                match virtual_member_fetch_strategy(
+                    &member.repo_type,
+                    proxy_service.is_some(),
+                    member.upstream_url.is_some(),
+                ) {
+                    VirtualMemberFetchStrategy::Local => {
+                        match local_fetch(member.id, member.storage_location()).await {
+                            Ok(result) => {
+                                let origin = VirtualServeOrigin::hosted(result.artifact_id);
+                                (
+                                    MemberCacheClass::DefiniteHit,
+                                    Some(MemberResolveOutcome::Hit((
+                                        VirtualDownload::Stream(result),
+                                        origin,
+                                    ))),
+                                )
+                            }
+                            // #3220 / #5574: a policy block is the member's own
+                            // download gate refusing an artifact it HOLDS, and a
+                            // storage fault means it could not answer; both are
+                            // carried by the shared classifier instead of being
+                            // flattened into a miss.
+                            Err(resp) => classify_local_fetch_failure(resp),
+                        }
+                    }
+                    VirtualMemberFetchStrategy::Proxy => match proxy_service {
+                        // The cache-only probe contacts no upstream; its result is
+                        // classified by the pure `classify_cache_probe`.
+                        Some(proxy) => {
+                            // #5129: a fresh entry every fast-path gate passes is
+                            // handed out as a presigned redirect, never streamed.
+                            if let (Some(state), Some(ctx)) = (redirect, ctx) {
+                                if let Some(response) =
+                                    member_cache_fresh_redirect(state, proxy, member, path, ctx)
+                                        .await
+                                {
+                                    return (
+                                        MemberCacheClass::DefiniteHit,
+                                        Some(MemberResolveOutcome::Hit((
+                                            VirtualDownload::Redirect(response),
+                                            VirtualServeOrigin::remote(member),
+                                        ))),
+                                    );
+                                }
+                            }
+                            let (class, outcome) = classify_cache_probe(
+                                proxy.streaming_cached_artifact_by_path(member, path).await,
+                            );
                             (
-                                MemberCacheClass::DefiniteHit,
-                                Some(MemberResolveOutcome::Hit((result, origin))),
+                                class,
+                                outcome.map(|o| {
+                                    o.map_hit(|result| {
+                                        (
+                                            VirtualDownload::Stream(result),
+                                            VirtualServeOrigin::remote(member),
+                                        )
+                                    })
+                                }),
                             )
                         }
-                        // #3220 / #5574: a policy block is the member's own
-                        // download gate refusing an artifact it HOLDS, and a
-                        // storage fault means it could not answer; both are
-                        // carried by the shared classifier instead of being
-                        // flattened into a miss.
-                        Err(resp) => classify_local_fetch_failure(resp),
-                    }
+                        None => (MemberCacheClass::DefiniteMiss, None),
+                    },
+                    VirtualMemberFetchStrategy::Skip => (MemberCacheClass::DefiniteMiss, None),
                 }
-                VirtualMemberFetchStrategy::Proxy => match proxy_service {
-                    // The cache-only probe contacts no upstream; its result is
-                    // classified by the pure `classify_cache_probe`.
+            },
+            |member| async move {
+                // Only reached for Remote members the strategy resolved as Proxy, so
+                // a proxy service is guaranteed present.
+                match proxy_service {
+                    // #3952: a member with a resolved fetch URL (e.g. a cargo
+                    // member's `dl`-template download host) fetches upstream bytes
+                    // from that absolute URL while the cache stays keyed on `path`.
                     Some(proxy) => {
-                        let (class, outcome) = classify_cache_probe(
-                            proxy.streaming_cached_artifact_by_path(member, path).await,
-                        );
-                        (
-                            class,
-                            outcome.map(|o| {
-                                o.map_hit(|result| (result, VirtualServeOrigin::remote(member)))
-                            }),
-                        )
-                    }
-                    None => (MemberCacheClass::DefiniteMiss, None),
-                },
-                VirtualMemberFetchStrategy::Skip => (MemberCacheClass::DefiniteMiss, None),
-            }
-        },
-        |member| async move {
-            // Only reached for Remote members the strategy resolved as Proxy, so
-            // a proxy service is guaranteed present.
-            match proxy_service {
-                // #3952: a member with a resolved fetch URL (e.g. a cargo
-                // member's `dl`-template download host) fetches upstream bytes
-                // from that absolute URL while the cache stays keyed on `path`.
-                Some(proxy) => {
-                    let fetch = match member_fetch_urls.get(&member.id) {
-                        Some(absolute_url) => {
-                            proxy
-                                .fetch_artifact_streaming_with_cache_path(
-                                    member,
-                                    absolute_url,
-                                    path,
-                                )
-                                .await
-                        }
-                        None => proxy.fetch_artifact_streaming(member, path).await,
-                    };
-                    // #5810: the member's answer, for its download breaker.
-                    proxy
-                        .member_breaker()
-                        .record_fetch(member.id, &member.key, &fetch);
-                    // #6214: read a refusal of the member's own credentials
-                    // as unavailable, for a caller that asked for it.
-                    let refused = refusals_db.is_some()
-                        && fetch
-                            .as_ref()
-                            .err()
-                            .is_some_and(is_upstream_auth_refusal_error);
-                    let mut outcome = classify_stream_upstream(fetch, &member.key, path);
-                    if refused && matches!(outcome, MemberResolveOutcome::Miss) {
-                        if let (Some(db), Some(url)) = (refusals_db, member.upstream_url.as_deref())
-                        {
-                            if is_credentialed_upstream_refusal(db, member.id, url, true).await {
-                                outcome = MemberResolveOutcome::Unavailable;
+                        let fetch = match member_fetch_urls.get(&member.id) {
+                            Some(absolute_url) => {
+                                proxy
+                                    .fetch_artifact_streaming_with_cache_path(
+                                        member,
+                                        absolute_url,
+                                        path,
+                                    )
+                                    .await
+                            }
+                            None => proxy.fetch_artifact_streaming(member, path).await,
+                        };
+                        // #5810: the member's answer, for its download breaker.
+                        proxy
+                            .member_breaker()
+                            .record_fetch(member.id, &member.key, &fetch);
+                        // #6214: read a refusal of the member's own credentials
+                        // as unavailable, for a caller that asked for it.
+                        let refused = refusals_db.is_some()
+                            && fetch
+                                .as_ref()
+                                .err()
+                                .is_some_and(is_upstream_auth_refusal_error);
+                        let mut outcome = classify_stream_upstream(fetch, &member.key, path);
+                        if refused && matches!(outcome, MemberResolveOutcome::Miss) {
+                            if let (Some(db), Some(url)) =
+                                (refusals_db, member.upstream_url.as_deref())
+                            {
+                                if is_credentialed_upstream_refusal(db, member.id, url, true).await
+                                {
+                                    outcome = MemberResolveOutcome::Unavailable;
+                                }
                             }
                         }
+                        outcome.map_hit(|result| {
+                            (
+                                VirtualDownload::Stream(result),
+                                VirtualServeOrigin::remote(member),
+                            )
+                        })
                     }
-                    outcome.map_hit(|result| (result, VirtualServeOrigin::remote(member)))
+                    None => MemberResolveOutcome::Miss,
                 }
-                None => MemberResolveOutcome::Miss,
-            }
-        },
-        // #5810: a hung member is passed over after the download deadline;
-        // in strict mode an unavailable member ends the walk.
-        MemberWalk::download(proxy_service, path, fallback),
-    )
-    .await;
+            },
+            // #5810: a hung member is passed over after the download deadline;
+            // in strict mode an unavailable member ends the walk.
+            MemberWalk::download(proxy_service, path, fallback),
+        )
+        .await;
 
     match outcome {
         Some(MemberResolveOutcome::Hit((result, origin))) => {
@@ -11102,10 +11270,12 @@ impl<'a> From<&'a RepoInfo> for CurationTarget<'a> {
 /// typo-squat, homoglyph and affix comparisons against the popular list,
 /// which need no network call. The download-count threshold and
 /// `publisher_trust` rules still run only on the staging sync. A `popularity`
-/// `Block` (a homoglyph or mixed-script match under `block_typosquat`)
-/// refuses the pull like a `block` rule. Edit-distance and affix matches only
-/// flag. A `Flag` serves the pull and logs it, because the proxy path has no
-/// review queue.
+/// `Block` (a homoglyph or mixed-script match on a name with a non-ASCII
+/// character, under `block_typosquat`) refuses the pull like a `block` rule.
+/// Edit-distance and affix matches only flag, and so does an all-ASCII
+/// confusable (`c1ick`) unless the rule sets `ascii_lookalikes: "block"`
+/// (#5840). A `Flag` serves the pull and logs it, because the proxy path has
+/// no review queue.
 #[allow(clippy::result_large_err)]
 pub async fn enforce_curation<'a>(
     db: &PgPool,
@@ -11164,6 +11334,14 @@ pub async fn evaluate_curation<'a>(
 /// so the pull is served and the flag is logged with the rule and reason.
 /// A `review` default stance with no matching rule serves silently, as it
 /// always has.
+///
+/// The flag line is logged at `warn` the first time a (repository, package,
+/// rule) is flagged within [`CURATION_FLAG_LOG_WINDOW`], and at `debug` after
+/// that (#5840): a flagged package is pulled again and again (on PyPI the
+/// index and then the file, on a Virtual once per member checked), and the
+/// repeats buried the first sighting of a new name. Every flag is counted in
+/// `ak_curation_proxy_flags_total{repository, rule_id}`, so the volume stays
+/// visible.
 fn curation_verdict(
     target: &CurationTarget<'_>,
     package: &str,
@@ -11176,20 +11354,52 @@ fn curation_verdict(
             unavailable: false,
         }),
         ("review", Some(rule_id)) => {
+            crate::services::metrics_service::record_curation_proxy_flag(target.key, rule_id);
             // `warn`, like the failed-evaluation line above: a flagged download is
-            // served, so deployments that log at warn must still see it.
-            tracing::warn!(
-                repo_id = %target.id,
-                repo_key = %target.key,
-                package = %package,
-                rule_id = %rule_id,
-                reason = %eval.reason,
-                "curation flagged a proxy download; serving it (no review queue on the proxy path)"
-            );
+            // served, so deployments that log at warn must still see it. Once per
+            // window per (repository, package, rule); repeats at `debug` (#5840).
+            if curation_flag_first_sighting(target.id, package, rule_id) {
+                tracing::warn!(
+                    repo_id = %target.id,
+                    repo_key = %target.key,
+                    package = %package,
+                    rule_id = %rule_id,
+                    reason = %eval.reason,
+                    repeat_log_window_secs = CURATION_FLAG_LOG_WINDOW.as_secs(),
+                    "curation flagged a proxy download; serving it (no review queue on the proxy path)"
+                );
+            } else {
+                tracing::debug!(
+                    repo_id = %target.id,
+                    repo_key = %target.key,
+                    package = %package,
+                    rule_id = %rule_id,
+                    reason = %eval.reason,
+                    "curation flagged a proxy download again; serving it"
+                );
+            }
             Ok(())
         }
         _ => Ok(()),
     }
+}
+
+/// How long a curation flag on a proxy download is logged at `warn` only once
+/// per (repository, package, rule) (#5840).
+pub(crate) const CURATION_FLAG_LOG_WINDOW: std::time::Duration =
+    std::time::Duration::from_secs(3600);
+
+/// Most (repository, package, rule) keys the flag-log dedup remembers.
+const CURATION_FLAG_LOG_MAX_KEYS: usize = 10_000;
+
+/// Whether this is the first flag of `package` by `rule_id` on `repo_id`
+/// within [`CURATION_FLAG_LOG_WINDOW`] in this process (#5840).
+fn curation_flag_first_sighting(repo_id: Uuid, package: &str, rule_id: Uuid) -> bool {
+    use crate::services::log_throttle::FirstSighting;
+    static SEEN: std::sync::OnceLock<FirstSighting<(Uuid, String, Uuid)>> =
+        std::sync::OnceLock::new();
+    SEEN.get_or_init(|| FirstSighting::new(CURATION_FLAG_LOG_WINDOW, CURATION_FLAG_LOG_MAX_KEYS))
+        .first((repo_id, package.to_owned(), rule_id))
 }
 
 /// Curation enforcement (#2930) for handlers whose repo struct does NOT carry
@@ -20175,6 +20385,245 @@ mod tests {
         assert!(backend.exists(&meta_key).await.unwrap());
     }
 
+    /// #5129: the Cargo and npm virtual resolver hands a Remote member's
+    /// fresh cached file out as a presigned redirect, and only once the
+    /// fast-path gates pass on the probe's sidecar. A held entry is never
+    /// redirected and is still the hold's 409; a HEAD and the resolver
+    /// variants that may not redirect stream as before.
+    #[tokio::test]
+    async fn virtual_download_redirects_a_fresh_member_entry_only_past_the_gate_5129() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let pool = tdh::lazy_pool();
+        let scope = scoped_test_scope();
+        let (proxy, backend) = tdh::build_scoped_presign_proxy(pool.clone(), scope.clone());
+        let dir = tempfile::tempdir().unwrap();
+        let state = tdh::build_state_with_proxy_presigned(
+            pool,
+            dir.path().to_str().unwrap(),
+            proxy.clone(),
+        );
+        let member = build_remote_repo(Uuid::new_v4(), "npm-proxy", "https://unused.example.com");
+        let seed = |path: &str, hold: bool| {
+            let content_key = ProxyService::cache_storage_key(&scope, &member.key, path).unwrap();
+            let meta_key = ProxyService::cache_metadata_key(&scope, &member.key, path).unwrap();
+            backend.seed_fresh_entry(&content_key, &meta_key);
+            if hold {
+                let mut held: crate::services::proxy_service::CacheMetadata =
+                    serde_json::from_slice(&tdh::fresh_cache_sidecar_bytes()).unwrap();
+                held.quarantine_until = Some(chrono::Utc::now() + chrono::Duration::days(7));
+                backend
+                    .objects
+                    .lock()
+                    .unwrap()
+                    .insert(meta_key, Bytes::from(serde_json::to_vec(&held).unwrap()));
+            }
+            content_key
+        };
+        let no_local = |_: Uuid, _: StorageLocation| async {
+            Err::<StreamingFetchResult, Response>(StatusCode::NOT_FOUND.into_response())
+        };
+        let resolve =
+            |path: &'static str,
+             ctx: crate::api::middleware::download_telemetry::DownloadContext| {
+                let state = state.clone();
+                let proxy = proxy.clone();
+                let member = member.clone();
+                async move {
+                    resolve_virtual_download_or_redirect(
+                        state.as_ref(),
+                        vec![member],
+                        VirtualMemberFallback::default(),
+                        Some(proxy.as_ref()),
+                        path,
+                        &std::collections::HashMap::new(),
+                        &ctx,
+                        no_local,
+                    )
+                    .await
+                }
+            };
+
+        const FRESH: &str = "left-pad/-/left-pad-1.3.0.tgz";
+        let content_key = seed(FRESH, false);
+        match resolve(FRESH, get_ctx()).await {
+            Ok(VirtualDownload::Redirect(resp)) => {
+                assert!(resp.status().is_redirection(), "{}", resp.status());
+                let loc = resp.headers()[axum::http::header::LOCATION]
+                    .to_str()
+                    .unwrap();
+                assert!(loc.contains(&content_key), "signed another key: {loc}");
+            }
+            Ok(VirtualDownload::Stream(_)) => panic!("a fresh cached member file must redirect"),
+            Err(resp) => panic!(
+                "a fresh cached member file must redirect: {}",
+                resp.status()
+            ),
+        }
+        // A HEAD is never presigned (#3209): it streams the cached headers.
+        let head = crate::api::middleware::download_telemetry::DownloadContext {
+            is_head: true,
+            ..get_ctx()
+        };
+        assert!(matches!(
+            resolve(FRESH, head).await,
+            Ok(VirtualDownload::Stream(_))
+        ));
+        // The resolver the other formats share does not redirect.
+        let streamed = resolve_virtual_download_from_members_with_fetch_urls(
+            vec![member.clone()],
+            VirtualMemberFallback::default(),
+            Some(proxy.as_ref()),
+            FRESH,
+            &std::collections::HashMap::new(),
+            Some(&get_ctx()),
+            no_local,
+        )
+        .await;
+        assert!(
+            streamed.is_ok(),
+            "the stream variant still serves the entry"
+        );
+
+        // A held entry is not redirected: the walk answers the hold's 409.
+        const HELD: &str = "left-pad/-/left-pad-1.4.0.tgz";
+        seed(HELD, true);
+        match resolve(HELD, get_ctx()).await {
+            Err(resp) => assert_eq!(resp.status(), StatusCode::CONFLICT),
+            Ok(VirtualDownload::Redirect(_)) => panic!("a held entry must never be redirected"),
+            Ok(VirtualDownload::Stream(_)) => panic!("a held entry must not be served"),
+        }
+
+        // A stale entry is not redirected either.
+        const STALE: &str = "left-pad/-/left-pad-1.5.0.tgz";
+        seed(STALE, false);
+        let meta_key = ProxyService::cache_metadata_key(&scope, &member.key, STALE).unwrap();
+        let mut stale: crate::services::proxy_service::CacheMetadata =
+            serde_json::from_slice(&tdh::fresh_cache_sidecar_bytes()).unwrap();
+        stale.expires_at = chrono::Utc::now() - chrono::Duration::hours(1);
+        backend
+            .objects
+            .lock()
+            .unwrap()
+            .insert(meta_key, Bytes::from(serde_json::to_vec(&stale).unwrap()));
+        assert!(
+            !matches!(
+                resolve(STALE, get_ctx()).await,
+                Ok(VirtualDownload::Redirect(_))
+            ),
+            "a stale entry must never be redirected"
+        );
+    }
+
+    /// #5129 security: the Cargo/npm virtual resolver's redirect consults the
+    /// stored scan verdict of the member's cached body (#4514), as the other
+    /// fast paths do. A vulnerable verdict, or fail-closed with no reusable
+    /// clean verdict, declines the redirect: the member is answered by the
+    /// streaming probe, never handed out as a presigned URL. DB-backed.
+    #[tokio::test]
+    async fn virtual_redirect_declines_a_member_body_the_stored_verdict_refuses_5129() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::storage_service::StorageBackend;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let scope = scoped_test_scope();
+        let (proxy, backend) = tdh::build_scoped_presign_proxy(pool.clone(), scope.clone());
+        let (repo_id, repo_key, _dir) = tdh::create_repo(&pool, "remote", "npm").await;
+        let dir = tempfile::tempdir().unwrap();
+        let state = tdh::build_state_with_proxy_presigned(
+            pool.clone(),
+            dir.path().to_str().unwrap(),
+            proxy.clone(),
+        );
+        let mut member = build_remote_repo(repo_id, &repo_key, "https://unused.example.com");
+        member.format = crate::models::repository::RepositoryFormat::Npm;
+        let path = "left-pad/-/left-pad-1.3.0.tgz";
+        let digest = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+        let content_key = ProxyService::cache_storage_key(&scope, &repo_key, path).unwrap();
+        let meta_key = ProxyService::cache_metadata_key(&scope, &repo_key, path).unwrap();
+        backend.seed_fresh_entry(&content_key, &meta_key);
+        let mut sidecar: crate::services::proxy_service::CacheMetadata =
+            serde_json::from_slice(&tdh::fresh_cache_sidecar_bytes()).unwrap();
+        sidecar.checksum_sha256 = digest.clone();
+        backend
+            .put(
+                &meta_key,
+                Bytes::from(serde_json::to_vec(&sidecar).unwrap()),
+            )
+            .await
+            .unwrap();
+        let ctx = get_ctx();
+        let redirected = || async {
+            matches!(
+                resolve_virtual_download_or_redirect(
+                    state.as_ref(),
+                    vec![member.clone()],
+                    VirtualMemberFallback::default(),
+                    Some(proxy.as_ref()),
+                    path,
+                    &std::collections::HashMap::new(),
+                    &ctx,
+                    |_: Uuid, _: StorageLocation| async {
+                        Err::<StreamingFetchResult, Response>(StatusCode::NOT_FOUND.into_response())
+                    },
+                )
+                .await,
+                Ok(VirtualDownload::Redirect(_))
+            )
+        };
+        let set_action = |action: &'static str| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query(
+                    "UPDATE scan_configs SET proxy_scan_action = $2 WHERE repository_id = $1",
+                )
+                .bind(repo_id)
+                .bind(action)
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+        };
+
+        // Control: the member does not scan, so its fresh entry is redirected.
+        assert!(
+            redirected().await,
+            "an unscanned fresh member entry redirects"
+        );
+
+        // Fail-closed with no verdict: nothing vouches for the body.
+        tdh::enable_proxy_scan(&pool, repo_id, "fail_closed").await;
+        assert!(
+            !redirected().await,
+            "fail-closed without a verdict must not redirect"
+        );
+
+        // A stored vulnerable verdict declines it under either enforcing action.
+        crate::services::proxy_scan_service::ProxyScanService::new(pool.clone())
+            .record_verdict(
+                &digest,
+                PROXY_SCAN_TYPE,
+                crate::services::proxy_scan_service::VERDICT_VULNERABLE,
+                1,
+                1,
+                0,
+                0,
+                0,
+                Some("critical"),
+                Some("grype-test"),
+                Some(repo_id),
+            )
+            .await
+            .unwrap();
+        for action in ["fail_closed", "fail_open"] {
+            set_action(action).await;
+            assert!(
+                !redirected().await,
+                "{action}: a body with a vulnerable verdict must never be redirected"
+            );
+        }
+    }
+
     /// #4514: the package-file redirect fast paths of a Remote that scans on
     /// proxy consult the verdict stored for the cached body's digest. A
     /// refusing verdict is the scan gate's 403 (the PyPI helper declines);
@@ -23122,6 +23571,8 @@ mod tests {
                 database_request_acquire_wait_ms: None,
                 database_probe_connections: 1,
                 database_request_concurrency: None,
+                database_request_credentialed_reserve_percent: 25,
+                database_request_client_share_percent: 25,
                 database_idle_timeout_secs: 600,
                 database_max_lifetime_secs: 1800,
                 database_tcp_keepalives: true,
@@ -25410,7 +25861,9 @@ mod tests {
 
         for fn_name in [
             "pub async fn proxy_fetch_or_redirect(",
-            "pub(crate) async fn proxy_cache_fresh_redirect(",
+            // `proxy_cache_fresh_redirect` and the #5129 member fast path
+            // both sign here.
+            "async fn proxy_cache_fresh_redirect_gated(",
             // The Virtual streaming resolver's presign moved into this helper
             // (#2069 two-phase refactor); it is where the no-prefix handle is used.
             "async fn try_member_cache_redirect(",
@@ -30095,6 +30548,177 @@ mod tests {
 
         assert!(flagged.is_ok(), "a Flag must serve the download");
         assert!(other_format.is_ok(), "popularity applies to npm/PyPI only");
+    }
+
+    /// #5840: an all-ASCII confusable (`c1ick` for `click`) is served and
+    /// flagged on a download, while a Unicode lookalike of the same name is
+    /// still refused. `ascii_lookalikes: "block"` restores the block.
+    #[tokio::test]
+    async fn test_curation_ascii_confusable_serves_and_unicode_still_blocks_5840() {
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let (user_id, repo_id, key) = seed_curated_repo(&pool, "remote", true, None).await;
+        let rule_id = insert_popularity_rule(
+            &pool,
+            repo_id,
+            user_id,
+            serde_json::json!({
+                "block_typosquat": true,
+                "download_name_checks": true,
+                "popular_packages": ["lodash"],
+            }),
+        )
+        .await;
+        let repo = repo_info_for(repo_id, &key, "remote", true);
+        let ascii = evaluate_curation(&pool, &repo, "1odash", None).await;
+        let unicode = evaluate_curation(&pool, &repo, LODASH_HOMOGLYPH, None).await;
+        sqlx::query("UPDATE curation_rules SET config = config || $2 WHERE id = $1")
+            .bind(rule_id)
+            .bind(serde_json::json!({"ascii_lookalikes": "block"}))
+            .execute(&pool)
+            .await
+            .expect("opt into ASCII blocks");
+        let strict = evaluate_curation(&pool, &repo, "1odash", None).await;
+        curation_cleanup(&pool, repo_id, user_id).await;
+
+        assert!(ascii.is_ok(), "an ASCII confusable is served: {ascii:?}");
+        let block = unicode.expect_err("a Unicode lookalike is still refused");
+        assert!(block.reason.contains("Unicode"), "{}", block.reason);
+        let block = strict.expect_err("ascii_lookalikes: block refuses the ASCII one");
+        assert!(block.reason.contains("ASCII lookalike"), "{}", block.reason);
+    }
+
+    /// #5840 upgrade safety: migration 421 stamps `ascii_lookalikes: "block"`
+    /// on every `popularity` rule that had `block_typosquat: true`, so such a
+    /// rule keeps refusing `paypa1` after the upgrade, while a rule written
+    /// after it (no key) flags it. Rules without `block_typosquat`, and rules
+    /// that already say "flag", are left alone, and a second run changes
+    /// nothing.
+    #[tokio::test]
+    async fn test_migration_421_keeps_existing_ascii_lookalike_blocks_5840() {
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let (user_id, repo_id, key) = seed_curated_repo(&pool, "remote", true, None).await;
+        let base =
+            serde_json::json!({"download_name_checks": true, "popular_packages": ["paypal"]});
+        let with = |extra: serde_json::Value| {
+            let mut c = base.clone();
+            c.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            c
+        };
+        let existing = insert_popularity_rule(
+            &pool,
+            repo_id,
+            user_id,
+            with(serde_json::json!({"block_typosquat": true})),
+        )
+        .await;
+        let said_flag = insert_popularity_rule(
+            &pool,
+            repo_id,
+            user_id,
+            with(serde_json::json!({"block_typosquat": true, "ascii_lookalikes": "flag"})),
+        )
+        .await;
+        let no_block = insert_popularity_rule(&pool, repo_id, user_id, base.clone()).await;
+        let repo = repo_info_for(repo_id, &key, "remote", true);
+        // Only the existing rule active: before the migration it flags (the
+        // 1.13 default), after it blocks as it did in 1.12.
+        let only = |id: uuid::Uuid| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query(
+                    "UPDATE curation_rules SET enabled = (id = $2) WHERE staging_repo_id = $1",
+                )
+                .bind(repo_id)
+                .bind(id)
+                .execute(&pool)
+                .await
+                .expect("select the active rule");
+            }
+        };
+        only(existing).await;
+        let before = evaluate_curation(&pool, &repo, "paypa1", None).await;
+
+        let migration =
+            include_str!("../../../migrations/421_curation_popularity_ascii_lookalikes_block.sql");
+        for _ in 0..2 {
+            let mut tx = pool.begin().await.expect("tx");
+            sqlx::raw_sql(migration)
+                .execute(&mut *tx)
+                .await
+                .expect("migration 421");
+            tx.commit().await.expect("commit");
+        }
+        let after = evaluate_curation(&pool, &repo, "paypa1", None).await;
+        let config_of = |id: uuid::Uuid| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, serde_json::Value>(
+                    "SELECT config FROM curation_rules WHERE id = $1",
+                )
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .expect("config")
+            }
+        };
+        let (c_existing, c_flag, c_none) = (
+            config_of(existing).await,
+            config_of(said_flag).await,
+            config_of(no_block).await,
+        );
+        only(said_flag).await;
+        let new_rule = evaluate_curation(&pool, &repo, "paypa1", None).await;
+        curation_cleanup(&pool, repo_id, user_id).await;
+
+        assert!(
+            before.is_ok(),
+            "without the stamp the 1.13 default flags: {before:?}"
+        );
+        let block = after.expect_err("the stamped existing rule still refuses paypa1");
+        assert!(block.reason.contains("ASCII lookalike"), "{}", block.reason);
+        assert_eq!(c_existing["ascii_lookalikes"], "block", "{c_existing}");
+        assert_eq!(
+            c_flag["ascii_lookalikes"], "flag",
+            "an explicit flag is kept: {c_flag}"
+        );
+        assert!(
+            c_none.get("ascii_lookalikes").is_none(),
+            "no block_typosquat, no stamp: {c_none}"
+        );
+        assert!(
+            new_rule.is_ok(),
+            "a rule that says flag serves paypa1: {new_rule:?}"
+        );
+    }
+
+    /// #5840: the flag line is a first sighting per (repository, package,
+    /// rule) within the window; the repeats are not.
+    #[test]
+    fn test_curation_flag_log_is_once_per_repository_package_and_rule_5840() {
+        let (repo, other_repo) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let (rule, other_rule) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        assert!(curation_flag_first_sighting(repo, "preact", rule));
+        for _ in 0..5 {
+            assert!(!curation_flag_first_sighting(repo, "preact", rule));
+        }
+        assert!(
+            curation_flag_first_sighting(repo, "vite", rule),
+            "another package"
+        );
+        assert!(
+            curation_flag_first_sighting(other_repo, "preact", rule),
+            "another repository"
+        );
+        assert!(
+            curation_flag_first_sighting(repo, "preact", other_rule),
+            "another rule"
+        );
     }
 
     fn proxy_eval(

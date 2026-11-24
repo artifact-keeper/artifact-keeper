@@ -5898,13 +5898,17 @@ async fn serve_tarball(
         let member_fetch_urls =
             npm_virtual_member_fetch_urls(proxy_for_virtual, &members, package_name, filename)
                 .await;
-        let result = proxy_helpers::resolve_virtual_download_from_members_with_fetch_urls(
+        // #5129: these members serve without the inline scan, so a Remote
+        // member's fresh cached tarball may be answered with a presigned
+        // redirect once every fast-path gate passes.
+        let download = proxy_helpers::resolve_virtual_download_or_redirect(
+            state,
             members,
             fallback,
             proxy_for_virtual,
             &upstream_path,
             &member_fetch_urls,
-            Some(ctx),
+            ctx,
             |member_id, location| {
                 let db = db.clone();
                 let state = state.clone();
@@ -5924,6 +5928,10 @@ async fn serve_tarball(
             }
             _ => resp,
         })?;
+        let result = match download {
+            proxy_helpers::VirtualDownload::Redirect(redirect) => return Ok(redirect),
+            proxy_helpers::VirtualDownload::Stream(result) => result,
+        };
 
         // Always serve npm virtual-repo tarballs as `application/gzip`,
         // overriding whatever content type the proxy-cache sidecar recorded
@@ -9515,6 +9523,100 @@ mod tests {
         assert!(
             tarball.contains(&format!("/npm/{}/", fx.repo_key)),
             "proxied tarball must be rewritten to the virtual repo: {tarball}"
+        );
+    }
+
+    /// #5129 security: a virtual that scans on proxy over a Remote member
+    /// that does not still sends that member through the inline scan gate
+    /// (#3023, stricter of the two policies), so the member's fresh cached
+    /// tarball is never handed out as a presigned redirect. Control: with no
+    /// scan policy on either, the same request redirects. DB-backed.
+    #[tokio::test]
+    async fn test_virtual_tarball_never_redirects_when_the_virtual_scans_5129_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "npm").await else {
+            return;
+        };
+        let package = format!("redir5129-{}", uuid::Uuid::new_v4().simple());
+        let file = format!("{package}-1.0.0.tgz");
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/{package}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": package, "dist-tags": {"latest": "1.0.0"},
+                "versions": {"1.0.0": {"name": package, "version": "1.0.0",
+                    "dist": {"tarball": format!("{}/{package}/-/{file}", upstream.uri())}}}
+            })))
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/{package}/-/{file}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"cached-body".to_vec()))
+            .mount(&upstream)
+            .await;
+
+        let (remote_id, remote_key, _remote_dir) =
+            tdh::create_repo(&fx.pool, "remote", "npm").await;
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(upstream.uri())
+            .bind(remote_id)
+            .execute(&fx.pool)
+            .await
+            .expect("configure remote member");
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 1)",
+        )
+        .bind(fx.repo_id)
+        .bind(remote_id)
+        .execute(&fx.pool)
+        .await
+        .expect("attach member");
+        tdh::publish_repo(&fx.pool, remote_id).await;
+
+        // The member's fresh cache entry, on a backend that can presign.
+        let scope = crate::services::proxy_cache_scope::ProxyCacheScope::unscoped();
+        let (proxy, backend) = tdh::build_scoped_presign_proxy(fx.pool.clone(), scope.clone());
+        let cache_path = format!("{package}/-/{file}");
+        backend.seed_fresh_entry(
+            &crate::services::proxy_service::ProxyService::cache_storage_key(
+                &scope,
+                &remote_key,
+                &cache_path,
+            )
+            .unwrap(),
+            &crate::services::proxy_service::ProxyService::cache_metadata_key(
+                &scope,
+                &remote_key,
+                &cache_path,
+            )
+            .unwrap(),
+        );
+        let state = tdh::build_state_with_proxy_presigned(
+            fx.pool.clone(),
+            fx.storage_dir.to_str().unwrap(),
+            proxy,
+        );
+        let app = tdh::router_anon(super::router(), state);
+        let uri = format!("/{}/{package}/-/{file}", fx.repo_key);
+
+        let (status, body) = tdh::send(app.clone(), tdh::get(uri.clone())).await;
+        assert!(
+            status.is_redirection(),
+            "control: an unscanned member's fresh cached tarball redirects, got {status}: {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        // The virtual scans; the member does not.
+        tdh::enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
+        let (status, _) = tdh::send(app, tdh::get(uri)).await;
+        assert!(
+            !status.is_redirection(),
+            "a member the virtual scans must go through the scan gate, never a redirect \
+             (got {status})"
         );
     }
 

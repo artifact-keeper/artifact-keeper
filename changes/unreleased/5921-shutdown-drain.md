@@ -1,0 +1,9 @@
+---
+section: Added
+issues: [#5921]
+---
+- **`SHUTDOWN_DRAIN_SECS` keeps a stopping backend serving, with readiness failing, before it closes its listeners, so rolling updates and scale-downs behind a load balancer no longer answer 502** (#5921). On SIGTERM the HTTP listener closes at once. A load balancer or ingress learns that an endpoint is gone a second or two later, so it kept sending requests to the terminating replica, which refused them, and the proxy answered 502; with one ready replica left its retries had nowhere else to go.
+
+  From the stop signal (SIGTERM, Ctrl+C or a Windows service stop) `/readyz` answers `503` at once with `failing: ["shutting_down"]`, without probing anything, while `/livez` and `/health` are unchanged. Background workers stop claiming new work: no scheduler lease is acquired, and the webhook delivery, peer sync and scheduled-backup workers claim nothing new, while work already running finishes. With `SHUTDOWN_DRAIN_SECS` set, requests, new and in flight, are then served normally for that many seconds before the HTTP, gRPC and metrics listeners close and in-flight requests finish. A second signal exits at once. A job running under a scheduler lease is told to stop at the signal. At exit the process waits for those jobs until the end of the drain and releases the scheduler leases it holds, so another replica takes those jobs over at once instead of after the lease TTL; the lease of a job still running then is left to lapse, so the job never runs on two replicas at once. Each phase is logged, and `ak_shutdown_draining` is `1` from the signal on.
+
+  The default is `0`, which closes the listeners at once as before. Behind a Kubernetes Service or ingress, set 5-10 s and keep `terminationGracePeriodSeconds` above any preStop hook plus the drain plus the longest request; a `preStop: sleep` hook added for this is then no longer needed. See `docs/operations/graceful-shutdown.md`.

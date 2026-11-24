@@ -400,6 +400,9 @@ pub async fn get_system_config(
     components(schemas(
         crate::services::quota::QuotaOverview,
         crate::services::quota::StorageQuotaStatus,
+        crate::services::quota::disk::DiskStatus,
+        crate::services::quota::disk::DiskState,
+        crate::services::quota::disk::DiskReading,
         crate::services::quota::TransferQuotaStatus,
         crate::services::quota::storage::StorageState,
         crate::services::quota::transfer::TransferState,

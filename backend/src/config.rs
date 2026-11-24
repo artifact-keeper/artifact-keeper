@@ -626,7 +626,9 @@ pub struct ProxyUpstreamSettings {
     /// Most fills allowed to run detached from their request at once: buffered
     /// fills, and streamed fills whose client stopped reading after the first
     /// bytes (#5509), each within the fetch deadline plus a 60-second commit
-    /// allowance. Env: `PROXY_UPSTREAM_MAX_DETACHED_FILLS`, clamped to
+    /// allowance (for a streamed fill, counted from when its client went
+    /// away). Refusals are counted in `ak_proxy_detached_fills_total`
+    /// (#5617). Env: `PROXY_UPSTREAM_MAX_DETACHED_FILLS`, clamped to
     /// 0..=1024. Default 16. Zero keeps every fill in its request.
     pub max_detached_fills: usize,
 }
@@ -700,6 +702,14 @@ impl ProxyUpstreamSettings {
 /// * `QUOTA_PRECHECK_BUDGET_MS` (default 500): how long the check before an
 ///   upload body is read may wait on the database before it admits the
 ///   request unchecked (#6316).
+/// * `STORAGE_DISK_WARN_PERCENT` (default 95) and
+///   `STORAGE_DISK_BLOCK_PERCENT` (default 0, off): thresholds on how full
+///   the filesystem under `STORAGE_PATH` (and `AK_UPLOAD_STAGING_DIR`) is
+///   (#5191). At the warning threshold the backend logs and sets
+///   `ak_storage_disk_state`; at the block threshold writes are refused with
+///   `403 DISK_THRESHOLD_EXCEEDED` while reads keep working. Measured every
+///   `STORAGE_DISK_CHECK_INTERVAL_SECS` (default 5); see
+///   [`crate::services::quota::disk`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct QuotaSettings {
     /// `STORAGE_QUOTA_BYTES`; `0` = off.
@@ -716,6 +726,12 @@ pub struct QuotaSettings {
     pub help_url: Option<String>,
     /// `QUOTA_PRECHECK_BUDGET_MS`. Default 500.
     pub precheck_budget_ms: u64,
+    /// `STORAGE_DISK_WARN_PERCENT`, 0..=100; `0` = off. Default 95.
+    pub disk_warn_percent: u8,
+    /// `STORAGE_DISK_BLOCK_PERCENT`, 0..=100; `0` = off. Default 0.
+    pub disk_block_percent: u8,
+    /// `STORAGE_DISK_CHECK_INTERVAL_SECS`, at least 1. Default 5.
+    pub disk_check_interval_secs: u64,
 }
 
 impl Default for QuotaSettings {
@@ -728,6 +744,9 @@ impl Default for QuotaSettings {
             transfer_grace_percent: 0,
             help_url: None,
             precheck_budget_ms: 500,
+            disk_warn_percent: 95,
+            disk_block_percent: 0,
+            disk_check_interval_secs: 5,
         }
     }
 }
@@ -752,6 +771,14 @@ impl QuotaSettings {
             .min(1000),
             help_url: Self::parse_help_url(env::var("QUOTA_HELP_URL").ok().as_deref()),
             precheck_budget_ms: env_parse("QUOTA_PRECHECK_BUDGET_MS", d.precheck_budget_ms),
+            disk_warn_percent: env_parse("STORAGE_DISK_WARN_PERCENT", d.disk_warn_percent).min(100),
+            disk_block_percent: env_parse("STORAGE_DISK_BLOCK_PERCENT", d.disk_block_percent)
+                .min(100),
+            disk_check_interval_secs: env_parse(
+                "STORAGE_DISK_CHECK_INTERVAL_SECS",
+                d.disk_check_interval_secs,
+            )
+            .max(1),
         }
     }
 
@@ -1403,6 +1430,22 @@ pub struct Config {
     /// [`Config::database_request_slots`]). `0` turns the gate off.
     pub database_request_concurrency: Option<usize>,
 
+    /// Share of the admission slots (percent) that only requests presenting
+    /// a credential (`Authorization`, `X-API-Key`, the session cookie, a
+    /// `/t/<token>/` path) may take while the pool is busy (#6344), so an
+    /// anonymous flood cannot shed authenticated clients. Env var:
+    /// `DATABASE_REQUEST_CREDENTIALED_RESERVE_PERCENT`. Default 25; `0`
+    /// turns the reserve off.
+    pub database_request_credentialed_reserve_percent: u8,
+
+    /// Share of the admission slots (percent) one client (best-effort client
+    /// IP) may hold or wait for while another client is waiting (#6344);
+    /// past it the client's next request is shed at once. A client alone on
+    /// a busy pool is not limited. Env var:
+    /// `DATABASE_REQUEST_CLIENT_SHARE_PERCENT`. Default 25; `0` turns the
+    /// share off.
+    pub database_request_client_share_percent: u8,
+
     /// Maximum number of bcrypt-bound auth operations (login,
     /// password verification, API-token verification) allowed to run
     /// concurrently across the process. Acts as a fast-fail load shed:
@@ -2019,6 +2062,8 @@ redacted_debug!(Config {
     show database_request_acquire_wait_ms,
     show database_probe_connections,
     show database_request_concurrency,
+    show database_request_credentialed_reserve_percent,
+    show database_request_client_share_percent,
     show database_idle_timeout_secs,
     show database_max_lifetime_secs,
     show database_tcp_keepalives,
@@ -2195,6 +2240,8 @@ impl Default for Config {
             database_request_acquire_wait_ms: None,
             database_probe_connections: 1,
             database_request_concurrency: None,
+            database_request_credentialed_reserve_percent: 25,
+            database_request_client_share_percent: 25,
             database_idle_timeout_secs: 600,
             database_max_lifetime_secs: 1800,
             database_tcp_keepalives: true,
@@ -2628,6 +2675,16 @@ impl Config {
             database_request_concurrency: env::var("DATABASE_REQUEST_CONCURRENCY")
                 .ok()
                 .and_then(|v| v.trim().parse().ok()),
+            database_request_credentialed_reserve_percent: env_parse::<u8>(
+                "DATABASE_REQUEST_CREDENTIALED_RESERVE_PERCENT",
+                25,
+            )
+            .min(100),
+            database_request_client_share_percent: env_parse::<u8>(
+                "DATABASE_REQUEST_CLIENT_SHARE_PERCENT",
+                25,
+            )
+            .min(100),
             database_idle_timeout_secs: env_parse("DATABASE_IDLE_TIMEOUT_SECS", 600),
             database_max_lifetime_secs: env_parse("DATABASE_MAX_LIFETIME_SECS", 1800),
             database_tcp_keepalives: !matches!(

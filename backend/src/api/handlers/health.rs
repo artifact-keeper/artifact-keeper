@@ -485,7 +485,7 @@ pub async fn health_check(State(state): State<SharedState>) -> impl IntoResponse
         },
     };
 
-    let storage_check = check_storage_health(&state.config, &state.storage).await;
+    let storage_check = storage_health(&state.config, &state.storage).await;
 
     // Every dependency sub-check below runs behind a short-TTL, single-flight
     // cache (#3127). `/health` is unauthenticated and, by design, not
@@ -538,7 +538,7 @@ pub async fn health_check(State(state): State<SharedState>) -> impl IntoResponse
         size: state.db.size(),
     };
 
-    let git_sha = env!("GIT_SHA");
+    let git_sha = crate::build_info::GIT_SHA;
     let is_prerelease = env!("CARGO_PKG_VERSION").contains('-');
     let (commit, dirty) = if git_sha != "unknown" {
         (Some(git_sha.to_string()), Some(is_prerelease))
@@ -609,41 +609,28 @@ pub async fn health_check(State(state): State<SharedState>) -> impl IntoResponse
     )
 )]
 pub async fn readiness_check(State(state): State<SharedState>) -> impl IntoResponse {
-    let db_check = match sqlx::query("SELECT 1").fetch_one(state.probe_db()).await {
-        Ok(_) => CheckStatus {
-            status: STATUS_HEALTHY.to_string(),
-            message: None,
-        },
-        Err(e) => CheckStatus {
-            status: STATUS_UNHEALTHY.to_string(),
-            message: Some(format!("Database unreachable: {}", e)),
-        },
-    };
-
-    let migrations_check = match sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS(SELECT 1 FROM _sqlx_migrations WHERE success = true)",
-    )
-    .fetch_one(state.probe_db())
-    .await
-    {
-        Ok(true) => CheckStatus {
-            status: STATUS_HEALTHY.to_string(),
-            message: None,
-        },
-        Ok(false) => CheckStatus {
-            status: STATUS_UNHEALTHY.to_string(),
-            message: Some("No successful migrations found".to_string()),
-        },
-        Err(e) => CheckStatus {
-            status: STATUS_UNHEALTHY.to_string(),
-            message: Some(format!("Migration check failed: {}", e)),
-        },
-    };
+    // #5921: a replica draining for shutdown is not ready, whatever its
+    // dependencies say; answer at once without probing them.
+    if crate::services::shutdown_drain::is_draining() {
+        let setup_required = state
+            .setup_required
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let (status_code, response) = draining_response(setup_required);
+        return (status_code, Json(response));
+    }
+    // The database probe and the dependency probes run concurrently, each
+    // under its own deadline, so a dead database answers within
+    // READYZ_DATABASE_TIMEOUT instead of after two sequential pool acquires
+    // plus the dependency probes (7-10 s before #5651, past the chart's 5 s
+    // probe timeout).
+    let ((db_check, migrations_check), dependencies) = tokio::join!(
+        probe_readyz_database(state.probe_db()),
+        probe_readyz_dependencies(&state)
+    );
 
     let setup_required = state
         .setup_required
         .load(std::sync::atomic::Ordering::Relaxed);
-    let dependencies = probe_readyz_dependencies(&state).await;
     let (status_code, response) =
         build_readyz_response(db_check, migrations_check, setup_required, dependencies);
     if !response.failing.is_empty() {
@@ -655,6 +642,56 @@ pub async fn readiness_check(State(state): State<SharedState>) -> impl IntoRespo
     }
 
     (status_code, Json(response))
+}
+
+/// How long `/readyz` waits for the database (#5651): a pool acquire plus one
+/// query. A reachable database answers in milliseconds; past a second it is
+/// not serving this replica's requests either.
+const READYZ_DATABASE_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// The `/readyz` database and migrations checks in one round trip, bounded by
+/// [`READYZ_DATABASE_TIMEOUT`] (#5651).
+///
+/// The migrations query answering at all proves the database reachable, so
+/// the separate `SELECT 1` (a second pool acquire, each up to the probe
+/// pool's 2 s acquire timeout while the database is down) is gone. A missing
+/// `_sqlx_migrations` table (`42P01`) is a reachable database with no
+/// migrations.
+async fn probe_readyz_database(db: &sqlx::PgPool) -> (CheckStatus, CheckStatus) {
+    let query = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM _sqlx_migrations WHERE success = true)",
+    )
+    .fetch_one(db);
+    let healthy = || CheckStatus {
+        status: STATUS_HEALTHY.to_string(),
+        message: None,
+    };
+    let unhealthy = |message: String| CheckStatus {
+        status: STATUS_UNHEALTHY.to_string(),
+        message: Some(message),
+    };
+    match tokio::time::timeout(READYZ_DATABASE_TIMEOUT, query).await {
+        Ok(Ok(true)) => (healthy(), healthy()),
+        Ok(Ok(false)) => (
+            healthy(),
+            unhealthy("No successful migrations found".to_string()),
+        ),
+        Ok(Err(sqlx::Error::Database(e))) if e.code().as_deref() == Some("42P01") => (
+            healthy(),
+            unhealthy(format!("Migration check failed: {}", e)),
+        ),
+        Ok(Err(e)) => (
+            unhealthy(format!("Database unreachable: {}", e)),
+            unhealthy("Migration check skipped: database unreachable".to_string()),
+        ),
+        Err(_) => (
+            unhealthy(format!(
+                "Database check timed out ({}s)",
+                READYZ_DATABASE_TIMEOUT.as_secs()
+            )),
+            unhealthy("Migration check skipped: database unreachable".to_string()),
+        ),
+    }
 }
 
 /// Pure response-builder for the readiness probe.
@@ -737,6 +774,59 @@ fn build_readyz_response(
     };
 
     (status_code, response)
+}
+
+/// Name of the `failing` entry a replica draining for shutdown reports.
+const SHUTTING_DOWN: &str = "shutting_down";
+
+/// Status of a check or dependency `/readyz` skipped because the process is
+/// draining for shutdown.
+const STATUS_NOT_CHECKED: &str = "not_checked";
+
+/// The `/readyz` answer while the process drains for shutdown (#5921): a
+/// stop was requested, so load balancers and the kubelet should take this
+/// replica out of rotation while it keeps serving what still reaches it.
+/// Nothing is probed: `failing` is exactly `["shutting_down"]` and every
+/// check and dependency reads `not_checked`. `/livez` and `/health` are not
+/// affected, so nothing restarts the process meanwhile.
+fn draining_response(setup_required: bool) -> (StatusCode, ReadyzResponse) {
+    let not_checked = || CheckStatus {
+        status: STATUS_NOT_CHECKED.to_string(),
+        message: None,
+    };
+    let dependency = || DependencyStatus {
+        status: STATUS_NOT_CHECKED.to_string(),
+        required: false,
+        message: None,
+    };
+    let setup_complete = CheckStatus {
+        status: if setup_required {
+            SETUP_INCOMPLETE
+        } else {
+            SETUP_COMPLETE
+        }
+        .to_string(),
+        message: None,
+    };
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        ReadyzResponse {
+            status: "not_ready".to_string(),
+            checks: ReadyzChecks {
+                database: not_checked(),
+                migrations: not_checked(),
+                setup_complete,
+            },
+            dependencies: ReadyzDependencies {
+                opensearch: dependency(),
+                storage: dependency(),
+                scanner: dependency(),
+                ldap: dependency(),
+            },
+            failing: vec![SHUTTING_DOWN.to_string()],
+            degraded: Vec::new(),
+        },
+    )
 }
 
 /// Compute whether the service should be reported as ready.
@@ -918,7 +1008,11 @@ fn skipped_storage_backends(skipped: &HashMap<String, String>) -> Vec<SkippedSto
 /// so the endpoint does not hammer the disk (filesystem) or the remote API
 /// (object stores) on every request. A genuinely-broken backend is still
 /// surfaced within the TTL once the cached entry expires.
-async fn check_storage_health(
+///
+/// The periodic health monitor records this same check (#5651), so it shares
+/// the cache with `/health` and adds no storage traffic while `/health` is
+/// polled.
+pub(crate) async fn storage_health(
     config: &crate::config::Config,
     storage: &Arc<dyn StorageBackend>,
 ) -> CheckStatus {
@@ -1794,6 +1888,30 @@ mod tests {
         assert!(json.contains("No successful migrations found"));
     }
 
+    /// #5921: a replica draining for shutdown answers 503 naming only the
+    /// reason, with nothing probed, and keeps reporting the setup state.
+    #[test]
+    fn draining_fails_readiness_and_names_only_the_reason() {
+        for setup_required in [false, true] {
+            let (code, response) = draining_response(setup_required);
+            assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(response.status, "not_ready");
+            assert_eq!(response.failing, vec![SHUTTING_DOWN.to_string()]);
+            assert!(response.degraded.is_empty());
+            assert_eq!(response.checks.database.status, STATUS_NOT_CHECKED);
+            assert_eq!(response.checks.migrations.status, STATUS_NOT_CHECKED);
+            assert_eq!(response.dependencies.storage.status, STATUS_NOT_CHECKED);
+            assert_eq!(
+                response.checks.setup_complete.status,
+                if setup_required {
+                    SETUP_INCOMPLETE
+                } else {
+                    SETUP_COMPLETE
+                }
+            );
+        }
+    }
+
     /// Regression for #889: when only `setup_required` is true, the readiness
     /// decision must remain "ready" so Kubernetes does not restart the pod
     /// and kick the operator out of `kubectl exec` while they change the
@@ -2082,7 +2200,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_check_storage_health_gcs_healthy() {
+    async fn test_storage_health_gcs_healthy() {
         let config = test_config("gcs");
         let storage: Arc<dyn crate::storage::StorageBackend> = Arc::new(HealthyMockBackend);
         let status = probe_storage_health(&config, &storage).await;
@@ -2090,7 +2208,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_check_storage_health_gcs_unhealthy() {
+    async fn test_storage_health_gcs_unhealthy() {
         let config = test_config("gcs");
         let storage: Arc<dyn crate::storage::StorageBackend> = Arc::new(UnhealthyMockBackend);
         let status = probe_storage_health(&config, &storage).await;
@@ -2102,7 +2220,7 @@ mod tests {
     /// transport. The unauthenticated health JSON must not name the endpoint
     /// host, the bucket or the probe object key.
     #[tokio::test]
-    async fn test_check_storage_health_gcs_transport_failure_omits_the_request_url() {
+    async fn test_storage_health_gcs_transport_failure_omits_the_request_url() {
         let bucket = "health-redaction-probe-bucket";
         let config = crate::config::Config {
             storage_backend: "gcs".to_string(),
@@ -2137,7 +2255,7 @@ mod tests {
 
     /// Whatever a backend's error says, the health message drops any URL.
     #[tokio::test]
-    async fn test_check_storage_health_strips_a_url_from_the_backend_error() {
+    async fn test_storage_health_strips_a_url_from_the_backend_error() {
         struct UrlEchoingBackend;
         #[async_trait]
         impl crate::storage::StorageBackend for UrlEchoingBackend {
@@ -2200,7 +2318,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_check_storage_health_s3_healthy() {
+    async fn test_storage_health_s3_healthy() {
         let config = test_config("s3");
         let storage: Arc<dyn crate::storage::StorageBackend> = Arc::new(HealthyMockBackend);
         let status = probe_storage_health(&config, &storage).await;
@@ -2208,7 +2326,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_check_storage_health_s3_unhealthy() {
+    async fn test_storage_health_s3_unhealthy() {
         let config = test_config("s3");
         let storage: Arc<dyn crate::storage::StorageBackend> = Arc::new(UnhealthyMockBackend);
         let status = probe_storage_health(&config, &storage).await;
@@ -2217,7 +2335,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_check_storage_health_azure_healthy() {
+    async fn test_storage_health_azure_healthy() {
         let config = test_config("azure");
         let storage: Arc<dyn crate::storage::StorageBackend> = Arc::new(HealthyMockBackend);
         let status = probe_storage_health(&config, &storage).await;
@@ -2225,7 +2343,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_check_storage_health_unknown_backend() {
+    async fn test_storage_health_unknown_backend() {
         let config = test_config("ftp");
         let storage: Arc<dyn crate::storage::StorageBackend> = Arc::new(HealthyMockBackend);
         let status = probe_storage_health(&config, &storage).await;
@@ -2371,7 +2489,7 @@ mod tests {
     //
     // These exercise `probe_storage_health` (the uncached inner probe) so they
     // are deterministic regardless of execution order; the process-wide TTL
-    // cache is covered separately in `test_check_storage_health_ttl_cache`.
+    // cache is covered separately in `test_storage_health_ttl_cache`.
     // -----------------------------------------------------------------------
 
     fn fs_config(dir: &std::path::Path) -> crate::config::Config {
@@ -2506,14 +2624,14 @@ mod tests {
 
     /// The process-wide TTL cache returns a previously-cached result without
     /// re-probing, then refreshes after the entry expires. We seed the cache
-    /// with a known value via `check_storage_health`, then mutate the cache's
+    /// with a known value via `storage_health`, then mutate the cache's
     /// timestamp to simulate expiry and confirm a fresh probe runs.
     ///
     /// This test is `#[serial]`-free by construction: it owns the cache for the
     /// duration by clearing it first; other tests use `probe_storage_health`
     /// (uncached) so they cannot race this one through the shared cache.
     #[tokio::test]
-    async fn test_check_storage_health_ttl_cache() {
+    async fn test_storage_health_ttl_cache() {
         let dir = tempfile::tempdir().unwrap();
         let config = fs_config(dir.path());
         let storage: Arc<dyn crate::storage::StorageBackend> = Arc::new(HealthyMockBackend);
@@ -2522,7 +2640,7 @@ mod tests {
         *STORAGE_HEALTH_CACHE.lock().await = None;
 
         // First call populates the cache.
-        let first = check_storage_health(&config, &storage).await;
+        let first = storage_health(&config, &storage).await;
         assert_eq!(first.status, STATUS_HEALTHY);
         {
             let cache = STORAGE_HEALTH_CACHE.lock().await;
@@ -2544,7 +2662,7 @@ mod tests {
                 },
             ));
         }
-        let cached = check_storage_health(&config, &storage).await;
+        let cached = storage_health(&config, &storage).await;
         assert_eq!(
             cached.status, STATUS_UNHEALTHY,
             "fresh cache entry must be served without re-probing"
@@ -2562,7 +2680,7 @@ mod tests {
                 *at = stale_at;
             }
         }
-        let refreshed = check_storage_health(&config, &storage).await;
+        let refreshed = storage_health(&config, &storage).await;
         assert_eq!(
             refreshed.status, STATUS_HEALTHY,
             "expired cache entry must trigger a fresh probe"
@@ -3586,5 +3704,38 @@ mod tests {
             assert!(failing.contains(&serde_json::json!("database")), "{body}");
             assert!(body["dependencies"].is_object(), "always present: {body}");
         }
+    }
+
+    /// #5651: a database that accepts the connection but never answers costs
+    /// `/readyz` READYZ_DATABASE_TIMEOUT, once, not two sequential pool
+    /// acquires; both checks report it.
+    #[tokio::test]
+    async fn readyz_database_probe_is_bounded_5651() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // Accept and hold every connection without a byte of the protocol.
+        let hold = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                held.push(sock);
+            }
+        });
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(Duration::from_secs(30))
+            .connect_lazy(&format!("postgres://u:p@127.0.0.1:{port}/db"))
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        let (db, migrations) = probe_readyz_database(&pool).await;
+        let took = started.elapsed();
+
+        assert!(
+            took < READYZ_DATABASE_TIMEOUT + Duration::from_millis(500),
+            "took {took:?}"
+        );
+        assert_eq!(db.status, STATUS_UNHEALTHY);
+        assert_eq!(db.message.as_deref(), Some("Database check timed out (1s)"));
+        assert_eq!(migrations.status, STATUS_UNHEALTHY);
+        hold.abort();
     }
 }

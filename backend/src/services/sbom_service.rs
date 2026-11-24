@@ -2418,6 +2418,11 @@ mod tests {
                 vec!["mit", "Custom Commercial"],
                 "MIT AND LicenseRef-Custom-Commercial",
             ),
+            // #6379: a conjunctive element joined with another term.
+            (
+                vec!["MIT AND PSF-2.0", "ISC"],
+                "MIT AND LicenseRef-PSF-2.0 AND ISC",
+            ),
         ] {
             let raw: Vec<String> = raw.into_iter().map(str::to_string).collect();
             let license = sanitize_trivy_licenses(&raw).expect("non-empty list");

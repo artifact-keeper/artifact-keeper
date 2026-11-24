@@ -18,10 +18,18 @@
 #   git worktree add --detach /tmp/ak-perf origin/main && cd /tmp/ak-perf
 # or set EMPTY_COMMIT_REBUILD_ALLOW_BRANCH=1 in a clone you will throw away.
 #
+# MODE=git-sha times the other case instead: a build that sets GIT_SHA (as a
+# shipped build, or a local `GIT_SHA=$(git rev-parse HEAD) cargo build`, does)
+# and sees a new value on each commit. The backend must recompile then, since
+# it embeds the value; what the step shows is how much else reruns with it.
+# Since ak-build-info (#6181) only that crate's tiny build script does, not
+# the backend's proto codegen. This mode makes no commits.
+#
 # Usage (from that work tree):
 #   scripts/perf/empty-commit-rebuild.sh [label]
 # Env:
-#   RUNS          empty commits to time (default 3)
+#   MODE          empty-commit (default) or git-sha
+#   RUNS          empty commits (or GIT_SHA values) to time (default 3)
 #   CARGO_ARGS    what to build (default "build -p artifact-keeper-backend")
 #   GIT_SHA       must be unset: it is what a shipped build sets, and it hides
 #                 the dev-build behaviour this measures. The script refuses it.
@@ -35,6 +43,11 @@ set -euo pipefail
 
 LABEL="${1:-run}"
 RUNS="${RUNS:-3}"
+MODE="${MODE:-empty-commit}"
+case "$MODE" in
+  empty-commit | git-sha) ;;
+  *) echo "empty-commit-rebuild: MODE must be empty-commit or git-sha" >&2; exit 2 ;;
+esac
 read -r -a CARGO_CMD <<<"${CARGO_ARGS:-build -p artifact-keeper-backend}"
 
 if [[ -n "${GIT_SHA:-}" ]]; then
@@ -46,7 +59,7 @@ if [[ -z "${EPOCHREALTIME:-}" ]]; then
   exit 2
 fi
 git rev-parse --is-inside-work-tree >/dev/null
-if branch="$(git symbolic-ref -q --short HEAD)" && [[ "${EMPTY_COMMIT_REBUILD_ALLOW_BRANCH:-0}" != 1 ]]; then
+if [[ "$MODE" == empty-commit ]] && branch="$(git symbolic-ref -q --short HEAD)" && [[ "${EMPTY_COMMIT_REBUILD_ALLOW_BRANCH:-0}" != 1 ]]; then
   echo "empty-commit-rebuild: HEAD is branch '${branch}', and this script commits to HEAD." >&2
   echo "  Run it in a throwaway worktree on a detached HEAD (git worktree add --detach <dir> origin/main)," >&2
   echo "  or set EMPTY_COMMIT_REBUILD_ALLOW_BRANCH=1 in a clone you will throw away." >&2
@@ -74,11 +87,24 @@ measure() {
   printf '%-10s %-8s %8ss  recompiled %-3s %s\n' "$LABEL" "$step" "$secs" "$units" "${reason:--}"
 }
 
-echo "== ${LABEL}: warming the target dir (cargo ${CARGO_CMD[*]})"
-measure warm
-measure noop
-for i in $(seq 1 "$RUNS"); do
-  git commit --quiet --allow-empty --no-verify -m "perf: empty commit ${i} (#6181)"
-  measure "commit-${i}"
-done
+echo "== ${LABEL} (${MODE}): warming the target dir (cargo ${CARGO_CMD[*]})"
+if [[ "$MODE" == git-sha ]]; then
+  # A distinct 40-hex value per step, as consecutive commits would give.
+  GIT_SHA="$(printf '%040d' 0)"
+  export GIT_SHA
+  measure warm
+  measure noop
+  for i in $(seq 1 "$RUNS"); do
+    GIT_SHA="$(printf '%040d' "$i")"
+    measure "sha-${i}"
+  done
+  unset GIT_SHA
+else
+  measure warm
+  measure noop
+  for i in $(seq 1 "$RUNS"); do
+    git commit --quiet --allow-empty --no-verify -m "perf: empty commit ${i} (#6181)"
+    measure "commit-${i}"
+  done
+fi
 echo "wrote ${out}"

@@ -4866,6 +4866,10 @@ async fn cache_manifest_reference_locally(
     if crate::services::quota::storage::at_quota(&state.db).await {
         return Err("instance storage quota reached; not caching".to_string());
     }
+    // Likewise at the disk block threshold (#5191).
+    if crate::services::quota::disk::cache_fills_blocked() {
+        return Err("storage volume at its disk threshold; not caching".to_string());
+    }
     let digest = compute_sha256(content);
     let storage = state
         .storage_for_repo(&repo.location)
@@ -7358,7 +7362,9 @@ async fn handle_head_blob(
 /// STORED_OBJECT_INTEGRITY` with no body, a larger one is cut short before
 /// its last chunk, so a client never receives a complete-looking corrupt
 /// layer. A range pull is served unverified (only the whole object can be
-/// checked). `DOWNLOAD_VERIFY_CHECKSUMS=false` turns the check off.
+/// checked). `DOWNLOAD_VERIFY_CHECKSUMS=false` turns the check off, and so
+/// does `DOWNLOAD_VERIFY_SKIP_CLIENT_VERIFIED=oci` for this route only (#6468):
+/// every OCI client checks a blob against the digest it pulled.
 ///
 /// The `502` carries [`crate::storage::verify::IntegrityFailure`];
 /// `on_stream_mismatch` runs when a larger blob is the one found corrupt, after
@@ -7378,7 +7384,7 @@ async fn serve_stored_blob(
         ),
         (CONTENT_TYPE, "application/octet-stream".to_string()),
     ];
-    let verify = crate::storage::verify::serve_verification_enabled()
+    let verify = crate::storage::verify::serve_verification_enabled_for("oci")
         .then(|| crate::storage::verify::advertised_sha256(&base_headers))
         .flatten()
         .map(
@@ -13427,6 +13433,14 @@ fn mount_quota_refusal(
 ) -> Result<(), Option<Response>> {
     match decision {
         Ok(None) => Ok(()),
+        // A mount writes no bytes, so the disk threshold (#5191) does not
+        // refuse it. The disk check runs after every quota, so a disk denial
+        // means the mount fits them all.
+        Ok(Some(denial))
+            if denial.scope == crate::services::repository_service::QuotaScope::Disk =>
+        {
+            Ok(())
+        }
         Ok(Some(denial)) => Err(oci_quota_refusal(Ok(Some(denial)))),
         Err(e) => {
             tracing::warn!("blob mount quota check failed; falling back to an upload: {e}");

@@ -175,6 +175,10 @@ pub(crate) fn module_docs() -> Vec<(&'static str, utoipa::openapi::OpenApi)> {
             handlers::environments::EnvironmentsApiDoc::openapi(),
         ),
         (
+            "conda_warm",
+            handlers::conda_warm::CondaWarmApiDoc::openapi(),
+        ),
+        (
             "artifact_presence",
             handlers::artifact_presence::ArtifactPresenceApiDoc::openapi(),
         ),

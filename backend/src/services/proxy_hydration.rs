@@ -13,6 +13,8 @@ use tokio::sync::{broadcast, watch, Notify};
 use crate::services::cluster_lock::{
     lease_object_id, ClusterLease, ClusterLock, PgAdvisoryLock, PROXY_HYDRATION_LOCK_CLASS,
 };
+use crate::services::log_throttle::LogEvery;
+use crate::services::metrics_service;
 
 pub const DEFAULT_PROXY_HYDRATION_WAIT_TIMEOUT: Duration = Duration::from_secs(65);
 
@@ -339,6 +341,50 @@ where
     .await
 }
 
+/// `kind` label of `ak_proxy_detached_fills_total` for a buffered fill (#5617).
+pub const DETACHED_KIND_BUFFERED: &str = "buffered";
+
+/// Least time between two WARN lines about the detached-fill cap (#5617).
+pub const DETACHED_FILL_LOG_INTERVAL: Duration = Duration::from_secs(60);
+
+/// One detached fill for the #5617 metrics: counts it `started` and in
+/// flight when made, and `finished` or `abandoned` (and no longer in flight)
+/// when it ends. A fill dropped without [`Self::end`] (a panic, a runtime
+/// shutdown) counts as `abandoned` and still leaves the in-flight gauge.
+pub(crate) struct DetachedFillInFlight {
+    kind: &'static str,
+    ended: bool,
+}
+
+impl DetachedFillInFlight {
+    pub(crate) fn start(kind: &'static str) -> Self {
+        metrics_service::record_proxy_detached_fill(kind, "started");
+        metrics_service::record_proxy_detached_fills_in_flight(kind, 1.0);
+        Self { kind, ended: false }
+    }
+
+    pub(crate) fn end(mut self, abandoned: bool) {
+        self.finish(abandoned);
+    }
+
+    fn finish(&mut self, abandoned: bool) {
+        if std::mem::replace(&mut self.ended, true) {
+            return;
+        }
+        metrics_service::record_proxy_detached_fill(
+            self.kind,
+            if abandoned { "abandoned" } else { "finished" },
+        );
+        metrics_service::record_proxy_detached_fills_in_flight(self.kind, -1.0);
+    }
+}
+
+impl Drop for DetachedFillInFlight {
+    fn drop(&mut self) {
+        self.finish(true);
+    }
+}
+
 /// Bounds and admission of a fill run by [`Coordinator::coordinate_detached`].
 pub struct DetachedFillLimits<DeadlineErr> {
     /// Hard bound on the whole fill (fetch, cache write and bookkeeping).
@@ -396,34 +442,51 @@ where
             // Boxed: a fill is a large future, and keeping it inline would
             // make every caller's future (and stack frame) that large too.
             let fill = Box::pin(produce());
+            // The outcome, and whether the fill was abandoned at its deadline.
             let bounded = async move {
                 // #5013: the fill deadline is our own: an upstream request
                 // still waiting inside counts against its circuit.
                 match crate::services::upstream_circuit::within_own_deadline(deadline, fill).await {
-                    Ok(outcome) => outcome,
+                    Ok(outcome) => (outcome, false),
                     Err(_) => {
                         tracing::warn!(
                             deadline_secs = deadline.as_secs(),
                             "proxy cache fill exceeded its deadline; abandoning it and \
                              releasing its single-flight slot"
                         );
-                        Err(on_deadline())
+                        (Err(on_deadline()), true)
                     }
                 }
             };
             let Ok(permit) = permits.try_acquire_owned() else {
                 // Too many fills are already detached: run this one in the
                 // caller's task, so it ends if its client goes away.
-                tracing::debug!(
-                    lease_key,
-                    "detached proxy fill limit reached; filling in the request"
-                );
+                // #5617: counted, and logged at WARN at most once a minute,
+                // so an operator at the default level can tell the cap bites.
+                metrics_service::record_proxy_detached_fill(DETACHED_KIND_BUFFERED, "refused");
+                static REFUSED_LOG: LogEvery = LogEvery::new(DETACHED_FILL_LOG_INTERVAL);
+                if let Some(held_back) = REFUSED_LOG.check() {
+                    tracing::warn!(
+                        lease_key,
+                        held_back,
+                        "no detached proxy fill permit free (PROXY_UPSTREAM_MAX_DETACHED_FILLS); \
+                         the fill runs in its request and ends if the client goes away. \
+                         `held_back` more since the last such line; see \
+                         ak_proxy_detached_fills_total{{kind=\"buffered\",outcome=\"refused\"}}"
+                    );
+                } else {
+                    tracing::debug!(
+                        lease_key,
+                        "detached proxy fill limit reached; filling in the request"
+                    );
+                }
                 return Either::Left(async move {
-                    let outcome = bounded.await;
+                    let (outcome, _abandoned) = bounded.await;
                     drop(lease);
                     outcome
                 });
             };
+            let in_flight = DetachedFillInFlight::start(DETACHED_KIND_BUFFERED);
             // A span of its own that only follows from the request, so the
             // request's span (and its duration) ends when the request does.
             let span = tracing::info_span!(
@@ -440,11 +503,12 @@ where
             // caller is dropped right after the election.
             let task = tokio::spawn(
                 async move {
-                    let outcome = bounded.await;
+                    let (outcome, abandoned) = bounded.await;
                     // Followers wake only once the fill has committed (or
                     // was abandoned at its deadline).
                     drop(lease);
                     drop(permit);
+                    in_flight.end(abandoned);
                     outcome
                 }
                 .instrument(span),
@@ -2337,6 +2401,81 @@ mod tests {
         let lock: Arc<dyn ClusterLock> = Arc::new(InMemoryClusterLock::default());
         let coordinator = HydrationCoordinator::Advisory(advisory_over(&lock));
         assert_detached_fill_survives_a_dropped_leader(&coordinator, Some(&lock)).await;
+    }
+
+    /// #5617: every detached fill is counted by outcome, and the in-flight
+    /// gauge returns to zero. A fill that finds no permit is `refused` (it
+    /// runs in the request), one that runs is `started` and then `finished`,
+    /// and one past its deadline is `abandoned`.
+    #[tokio::test]
+    async fn detached_fills_are_counted_by_outcome_5617() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let run = |permits: usize, deadline: Duration, fill_for: Duration| async move {
+            let key = format!("proxy-cache:detached-metrics-{}", uuid::Uuid::new_v4());
+            coordinate_proxy_hydration_detached(
+                &key,
+                || async { Ok::<Option<u32>, &str>(None) },
+                move || async move {
+                    tokio::time::sleep(fill_for).await;
+                    Ok(7)
+                },
+                DetachedFillLimits {
+                    deadline,
+                    on_deadline: || "deadline",
+                    permits: Arc::new(tokio::sync::Semaphore::new(permits)),
+                },
+                || "timeout",
+            )
+            .await
+        };
+        let short = Duration::from_millis(5);
+        assert_eq!(
+            run(0, Duration::from_secs(5), short).await,
+            Ok(7),
+            "refused, in request"
+        );
+        assert_eq!(
+            run(1, Duration::from_secs(5), short).await,
+            Ok(7),
+            "detached"
+        );
+        assert_eq!(
+            run(1, Duration::from_millis(20), Duration::from_secs(5)).await,
+            Err("deadline"),
+            "abandoned"
+        );
+
+        // One snapshot: a `DebuggingRecorder` read resets counters.
+        let mut counts = std::collections::HashMap::new();
+        let mut in_flight = None;
+        for (key, _, _, value) in snapshotter.snapshot().into_vec() {
+            let key = key.key();
+            let label = |name: &str| {
+                key.labels()
+                    .find(|l| l.key() == name)
+                    .map(|l| l.value().to_string())
+            };
+            match (key.name(), value) {
+                ("ak_proxy_detached_fills_total", DebugValue::Counter(n)) => {
+                    assert_eq!(label("kind").as_deref(), Some(DETACHED_KIND_BUFFERED));
+                    counts.insert(label("outcome").unwrap_or_default(), n);
+                }
+                ("ak_proxy_detached_fills_in_flight", DebugValue::Gauge(g)) => {
+                    in_flight = Some(g.into_inner())
+                }
+                _ => {}
+            }
+        }
+        let count = |o: &str| counts.get(o).copied().unwrap_or(0);
+        assert_eq!(count("refused"), 1, "{counts:?}");
+        assert_eq!(count("started"), 2, "{counts:?}");
+        assert_eq!(count("finished"), 1, "{counts:?}");
+        assert_eq!(count("abandoned"), 1, "{counts:?}");
+        assert_eq!(in_flight, Some(0.0), "every detached fill ended");
     }
 
     /// A panic in a detached fill reaches the caller, as it would in place,

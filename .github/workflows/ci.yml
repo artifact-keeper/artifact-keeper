@@ -348,6 +348,14 @@ jobs:
                 manifest=true
                 rust=true
                 ;;
+              # The two advisory ignore lists (#6180) decide the Security
+              # Audit verdict as much as the lockfile does, so a change to
+              # either is held to it. Otherwise as the default arm.
+              .cargo/audit.toml|osv-scanner.toml)
+                code=true
+                manifest=true
+                rust=true
+                ;;
               backend/*|Cargo.toml|Cargo.lock|.sqlx/*|\
               .config/nextest.toml|\
               scripts/ci/run-measured-build.sh)
@@ -747,6 +755,22 @@ jobs:
       - name: Start the memory sampler
         run: ./scripts/ci/memory-watch.sh start "$RUNNER_TEMP/memory-watch.tsv" 5
 
+      # Every shipped build (Dockerfile.backend, release.yml) runs with
+      # `--locked` (#6180), so a Cargo.toml change whose Cargo.lock update
+      # was not committed could merge here and then fail the release. Fail
+      # it here, first, with the fix in the message. `--locked` only refuses
+      # a lock that would have to CHANGE: a PR that commits its updated
+      # Cargo.lock passes.
+      - name: Check Cargo.lock is up to date
+        run: |
+          if ! out="$(cargo metadata --locked --format-version 1 2>&1 >/dev/null)"; then
+            printf '%s\n' "$out" >&2
+            if grep -q -- "--locked" <<<"$out"; then
+              echo "::error title=Cargo.lock is out of date::Cargo.toml needs a Cargo.lock change that is not committed. Run \`cargo update -w\` (or the cargo command that changed Cargo.toml) and commit Cargo.lock."
+            fi
+            exit 1
+          fi
+
       - name: Run Clippy
         # CARGO_BUILD_JOBS is the hosted runner's core count. It was capped
         # at 2 and then 4 on the self-hosted pool after lib-test compiles
@@ -793,10 +817,10 @@ jobs:
           ./scripts/ci/memory-cap.sh -- timeout --signal=TERM --kill-after=60s 30m bash -c '
             set -e
             echo "::group::clippy pass 1: lib, bins, example, integration tests"
-            cargo clippy --workspace --lib --bins --examples --test "*" -- -D warnings
+            cargo clippy --locked --workspace --lib --bins --examples --test "*" -- -D warnings
             echo "::endgroup::"
             echo "clippy pass 2: the unit-test targets (all targets; the rest is fresh)"
-            cargo clippy --workspace --all-targets -- -D warnings
+            cargo clippy --locked --workspace --all-targets -- -D warnings
           ' || rc=$?
           if [ "$rc" = 124 ] || [ "$rc" = 137 ]; then
             echo "::error title=Clippy stopped after 30 minutes::cargo clippy ran past 30 minutes (5-8 normally) and was stopped so this job keeps its log. The memory numbers below say whether the VM was swapping (#6242)."
@@ -1047,7 +1071,7 @@ jobs:
         run: ./scripts/ci/check-toolchain-pin.sh --active
 
       # #5273 drives npm through a pending scan and its eventual verdict.
-      - uses: actions/setup-node@v7.1.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         if: matrix.shard == 'handlers-1'
         with:
           node-version: '22'
@@ -1056,10 +1080,16 @@ jobs:
         if: matrix.shard == 'handlers-1'
         run: npm install --global npm@10.9.9
 
+      # Exact versions (#6178): an unversioned `tool:` installs whatever
+      # was released last, so a new upstream release could change every leg
+      # at once with no commit here. These are the versions the floating
+      # entries resolved to on main on 2026-11-23. Bump them together with
+      # the other install-action steps; check-action-pins.sh refuses an
+      # unversioned entry.
       - name: Install cargo-llvm-cov, cargo-nextest and sqlx-cli
         uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
         with:
-          tool: cargo-llvm-cov,cargo-nextest,sqlx-cli
+          tool: cargo-llvm-cov@0.9.1,cargo-nextest@0.9.152,sqlx-cli@0.9.1
 
       # The self-hosted runner image ships protoc; ubuntu-24.04 does not,
       # and build scripts in the dependency tree need it. services-1 also
@@ -1091,7 +1121,7 @@ jobs:
         run: |
           set -euo pipefail
           for attempt in 1 2 3; do
-            if cargo fetch; then
+            if cargo fetch --locked; then
               exit 0
             fi
             echo "cargo fetch failed (attempt ${attempt}/3) — retrying" >&2
@@ -1390,7 +1420,7 @@ jobs:
       - name: Install cargo-nextest and sqlx-cli
         uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
         with:
-          tool: cargo-nextest,sqlx-cli
+          tool: cargo-nextest@0.9.152,sqlx-cli@0.9.1
 
       # The self-hosted image shipped protoc; ubuntu-24.04 does not, and
       # build scripts in the dependency tree need it.
@@ -1416,14 +1446,14 @@ jobs:
       # Resolve and fetch in a step of its own with a retry, after a
       # stale/truncated crates.io index failed `main` before any test ran
       # (run 31176621357, 2026-08-07). This retries resolution and download
-      # ONLY; no test step is ever retried. No `--locked`: the build steps do
-      # not use it either, so adding it here would newly fail PRs with a
-      # legitimately-updated Cargo.lock.
+      # ONLY; no test step is ever retried. `--locked` (#6180) fails only a
+      # Cargo.lock that would have to change, never a PR that commits its
+      # updated lock, and nothing later in the job can rewrite the lock.
       - name: Fetch dependencies
         run: |
           set -euo pipefail
           for attempt in 1 2 3; do
-            if cargo fetch; then
+            if cargo fetch --locked; then
               exit 0
             fi
             echo "cargo fetch failed (attempt ${attempt}/3) — retrying" >&2
@@ -1898,7 +1928,7 @@ jobs:
       - name: Install cargo-nextest
         uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
         with:
-          tool: cargo-nextest
+          tool: cargo-nextest@0.9.152
 
       # Bounded (#6272): scripts/ci/apt-install-bounded.sh caps each download
       # attempt at 3 minutes and retries on azure.archive.ubuntu.com, so a
@@ -1919,7 +1949,7 @@ jobs:
         run: |
           set -euo pipefail
           for attempt in 1 2 3; do
-            if cargo fetch; then
+            if cargo fetch --locked; then
               exit 0
             fi
             echo "cargo fetch failed (attempt ${attempt}/3) — retrying" >&2
@@ -2497,6 +2527,15 @@ jobs:
 
       - name: Check the toolchain-pin gate catches what it must
         run: bash scripts/ci/test-check-toolchain-pin.sh
+
+      # Every `uses:` is a full commit sha and every install-action tool has
+      # an exact version (#6178), so no action or tool can change under this
+      # repo without a commit. Pure file inspection, no network, ~1s.
+      - name: Check every action and installed tool is pinned
+        run: bash scripts/ci/check-action-pins.sh
+
+      - name: Check the action-pin gate catches what it must
+        run: bash scripts/ci/test-check-action-pins.sh
 
       # The daily curl advisory watch (scheduled-curl-advisory-watch.yml,
       # #6003) is the only control over the curl / libcurl the backend and
@@ -3110,7 +3149,7 @@ jobs:
       - name: Setup Node.js for jscpd
         if: ${{ !cancelled() && steps.mb.outcome == 'success' }}
         continue-on-error: true
-        uses: actions/setup-node@v7.1.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '20'
 
@@ -3862,10 +3901,34 @@ jobs:
       - name: Install cargo-audit
         uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
         with:
-          tool: cargo-audit
+          # Exact version (#6180), the one release.yml pins (#6178).
+          tool: cargo-audit@0.23.0
 
       - name: Audit Rust dependencies
         run: cargo audit
+
+      # osv-scanner beside cargo audit (#6180), under the same blocking rule
+      # (see ci-complete). cargo audit reads only RustSec; OSV also carries
+      # GitHub advisories with crates.io ranges. GHSA-m665-v7pm-7grj (zip
+      # 2.4.2) was published with no RUSTSEC id and cargo audit never saw
+      # it. The ignores, each with a reason and an expiry, are in
+      # osv-scanner.toml. Pinned by version and sha256.
+      - name: Install osv-scanner
+        env:
+          OSV_SCANNER_VERSION: 2.7.0
+          OSV_SCANNER_SHA256: 160c6253e2922e9e0a6a9771c5c4c40a4b3c6090b34a3cdd5e80c96cc2e4218b
+        run: |
+          set -euo pipefail
+          bin="$RUNNER_TEMP/osv-scanner"
+          curl --proto '=https' --tlsv1.2 -sSfL --retry 3 -o "$bin" \
+            "https://github.com/google/osv-scanner/releases/download/v${OSV_SCANNER_VERSION}/osv-scanner_linux_amd64"
+          echo "${OSV_SCANNER_SHA256}  ${bin}" | sha256sum -c -
+          chmod +x "$bin"
+          "$bin" --version
+
+      - name: Scan Cargo.lock with osv-scanner
+        run: |
+          "$RUNNER_TEMP/osv-scanner" scan source --config osv-scanner.toml --lockfile Cargo.lock
 
   # ════════════════════════════════════════════════════════════════════════════
   # FINAL STATUS

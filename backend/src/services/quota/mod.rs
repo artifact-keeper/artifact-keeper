@@ -27,11 +27,18 @@
 //!   is refused with `413 PAYLOAD_TOO_LARGE`, on its `Content-Length` before
 //!   the body is read, and by counting for a body without one.
 //!
+//! * **Disk usage** ([`disk`], `STORAGE_DISK_WARN_PERCENT`,
+//!   `STORAGE_DISK_BLOCK_PERCENT`): not a quota but how full the storage
+//!   volume is. At the block threshold writes are refused with
+//!   `403 DISK_THRESHOLD_EXCEEDED` before their body is read, from a reading
+//!   cached for a few seconds; reads keep working.
+//!
 //! Every refusal is a 4xx with a JSON body ([`QuotaRefusal`]); none is a 5xx,
 //! which clients would retry and monitoring would read as a server fault.
 //! A per-repository or per-project quota refusal answers `403 QUOTA_EXCEEDED`
 //! with the same extra fields.
 
+pub mod disk;
 pub mod http;
 #[cfg(ak_test_shard = "router")]
 #[cfg(test)]
@@ -60,6 +67,8 @@ pub struct QuotaOverview {
     pub max_upload_bytes: u64,
     /// `QUOTA_HELP_URL`, when configured.
     pub quota_help_url: Option<String>,
+    /// The disk usage thresholds and the storage volume's last reading.
+    pub disk: disk::DiskStatus,
 }
 
 impl QuotaOverview {
@@ -70,6 +79,7 @@ impl QuotaOverview {
             transfer_quota: state.transfer_meter.status().await,
             max_upload_bytes: state.config.max_upload_size_bytes,
             quota_help_url: state.config.quotas.help_url.clone(),
+            disk: disk::status(&state.config.quotas),
         })
     }
 }

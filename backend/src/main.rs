@@ -116,11 +116,18 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         .install_default()
         .expect("Failed to install rustls CryptoProvider");
 
-    // Resolve the shutdown token early so background workers spawned during
-    // startup (email dispatcher, webhook producer) share the same
-    // cancellation source as the HTTP/gRPC servers spawned later. If the
-    // caller did not pass one (console mode) we create our own and bind it
-    // to the OS signal listener.
+    // Resolve the stop token early so background workers spawned during
+    // startup share one cancellation source. If the caller did not pass one
+    // (console mode) we create our own and bind it to the OS signal listener.
+    //
+    // #5921: shutdown is two-phase. `runtime_shutdown_token` is cancelled
+    // the moment a stop is requested: readiness fails and the workers that
+    // claim background work stop claiming. `serve_token` is cancelled only
+    // after the SHUTDOWN_DRAIN_SECS drain (see `services::shutdown_drain`):
+    // it closes the listeners and stops the services requests still feed
+    // during the drain (download events, the webhook producer, cache
+    // invalidation, score refresh).
+    let signal_driven = shutdown_token.is_none();
     let runtime_shutdown_token = match shutdown_token {
         Some(token) => token,
         None => {
@@ -133,6 +140,7 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
             token
         }
     };
+    let serve_token = CancellationToken::new();
 
     // Load environment variables
     if let Ok(env_file) = std::env::var("AK_ENV_FILE") {
@@ -166,6 +174,27 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         "audit event stream configured"
     );
 
+    // #5921: the drain between a stop request and closing the listeners,
+    // read once the env file is loaded.
+    tokio::spawn(
+        artifact_keeper_backend::services::shutdown_drain::drain_then_close(
+            runtime_shutdown_token.clone(),
+            serve_token.clone(),
+            artifact_keeper_backend::services::shutdown_drain::drain_from_env(),
+        ),
+    );
+    // A second SIGTERM or Ctrl+C, during the drain or the close, exits at
+    // once: the operator has asked twice.
+    if signal_driven {
+        let first = runtime_shutdown_token.clone();
+        tokio::spawn(async move {
+            first.cancelled().await;
+            shutdown_signal().await;
+            tracing::warn!("shutdown: second signal, exiting now without waiting for requests");
+            std::process::exit(1);
+        });
+    }
+
     // Load configuration
     let config = Config::from_env()?;
     artifact_keeper_backend::api::middleware::tracing::warn_if_trace_context_untrusted(&config);
@@ -197,11 +226,19 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     // needs nothing from the database or the rest of startup.
     let metrics_handle = metrics_service::init_metrics();
     tracing::info!("Prometheus metrics recorder initialized");
+    metrics_service::publish_build_info();
     artifact_keeper_backend::services::proxy_scan_service::publish_db_grace_window_gauges();
 
     // Connect to database
     let db_pool = db::create_pool(&config).await?;
     tracing::info!("Connected to database");
+
+    // #5941: the read retry replays only once a write statement has been
+    // seen through this process's real subscriber; otherwise it stays off.
+    if artifact_keeper_backend::api::middleware::db_read_retry::enabled_from_env() {
+        artifact_keeper_backend::api::middleware::db_read_retry::prove_write_detection(&db_pool)
+            .await;
+    }
 
     // Reconcile stale/diverged `_sqlx_migrations` ledgers BEFORE the
     // SKIP_MIGRATIONS gate. These repairs each no-op on fresh and healthy
@@ -954,7 +991,10 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         ),
     };
     app_state.set_scanner_service(scanner_service);
-    app_state.shutdown_token = runtime_shutdown_token.clone();
+    // Migrations started through the API run until the listeners close and
+    // are paused at shutdown (#6253), so a migration started during the drain
+    // is not handed an already-cancelled token (#5921).
+    app_state.shutdown_token = serve_token.clone();
     // Health and readiness probes read the database through their own small
     // pool, so a burst that fills the request pool cannot fail them (#4182).
     app_state.probe_pool = db::create_probe_pool(&config)?;
@@ -1144,7 +1184,7 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     artifact_keeper_backend::services::scan_result_service::spawn_score_refresher(
         app_state.event_bus.clone(),
         app_state.db.clone(),
-        runtime_shutdown_token.clone(),
+        serve_token.clone(),
     );
 
     // Start webhooks v2 producer: subscribes to EventBus and enqueues rows
@@ -1161,7 +1201,7 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         artifact_keeper_backend::services::webhook_producer::start_webhook_producer(
             app_state.event_bus.clone(),
             app_state.db.clone(),
-            runtime_shutdown_token.clone(),
+            serve_token.clone(),
         );
         tracing::info!("Webhook producer started (WEBHOOKS_V2_PRODUCER_ENABLED=true)");
     } else {
@@ -1180,7 +1220,7 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     // dispatcher. Sizing: DOWNLOAD_EVENT_QUEUE_DEPTH / DOWNLOAD_EVENT_FLUSH_WORKERS.
     artifact_keeper_backend::services::download_event_dispatch::start_download_event_dispatch(
         app_state.db.clone(),
-        runtime_shutdown_token.clone(),
+        serve_token.clone(),
     );
 
     app_state
@@ -1230,7 +1270,9 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
             permission_service: state.permission_service.clone(),
             npm_packument_cache: state.npm_packument_cache.clone(),
         },
-        runtime_shutdown_token.clone(),
+        // Served requests read the caches it invalidates, so it runs until
+        // the listeners close (#5921).
+        serve_token.clone(),
     )
     .await;
 
@@ -1244,6 +1286,13 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
             tracing::warn!(event = "upstream_jobs_paused", "{message}");
         }
     }
+
+    // #4184: resume the conda warm jobs a previous process left running.
+    // Detached deliberately: lifecycle is governed by the shutdown token.
+    let _conda_warm_resume = artifact_keeper_backend::api::handlers::conda_warm::spawn_resume(
+        state.clone(),
+        runtime_shutdown_token.clone(),
+    );
 
     // #2249: proactive packument invalidation from npm's replication feed.
     // Opt-in (NPM_UPSTREAM_FEED_ENABLED); one replica consumes cluster-wide
@@ -1270,6 +1319,11 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     // Instance quotas: add this replica's download transfer count to the
     // shared monthly counter, and keep the quota gauges current.
     let _transfer_quota_flusher = state.transfer_meter.spawn_flusher();
+    // #5191: read how full the storage volume is, for the disk thresholds.
+    let _disk_monitor = artifact_keeper_backend::services::quota::disk::spawn_monitor(
+        &state.config,
+        runtime_shutdown_token.clone(),
+    );
     if state.config.quotas.storage_quota_bytes > 0 || state.config.quotas.transfer_quota_bytes > 0 {
         tracing::info!(
             storage_quota_bytes = state.config.quotas.storage_quota_bytes,
@@ -1329,6 +1383,7 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         advisory_client.clone(),
         state.proxy_service.clone(),
         state.npm_packument_cache.clone(),
+        artifact_keeper_backend::services::lifecycle_service::SweepDerivedState::from_state(&state),
     );
 
     // Drains the durable scan queue (migration 362) when SCAN_QUEUE_ENABLED and
@@ -1342,6 +1397,13 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
             }
             None => state.clone(),
         },
+        runtime_shutdown_token.clone(),
+    );
+
+    // #5177: keep each scanner's vulnerability-database age (API + gauges)
+    // current and warn when it passes SCAN_VULN_DB_MAX_AGE_HOURS.
+    artifact_keeper_backend::services::vuln_db_status::spawn_refresher(
+        state.clone(),
         runtime_shutdown_token.clone(),
     );
 
@@ -1517,11 +1579,9 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         ),
     );
 
-    // The concrete shutdown token used by all servers and background tasks
-    // is resolved earlier in run_server (see `runtime_shutdown_token`) so
-    // that long-lived workers (email dispatcher, webhook producer)
-    // share the same cancellation source as the HTTP/gRPC servers.
-    let shutdown_token = runtime_shutdown_token.clone();
+    // The listeners close on `serve_token`, after the shutdown drain
+    // (#5921); see where it is created in run_server.
+    let shutdown_token = serve_token.clone();
 
     // Start HTTP server
     let addr: SocketAddr = config.bind_address.parse()?;
@@ -1742,10 +1802,35 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     // #6253: a migration worker may be mid-transfer and never reach its next
     // status check before the process exits
     artifact_keeper_backend::services::migration_service::pause_jobs_on_shutdown(
-        migration_db_pool,
+        migration_db_pool.clone(),
         artifact_keeper_backend::services::cluster_work::WorkerIdentity::for_process().as_str(),
     )
     .await;
+
+    // #5921: hand the singleton jobs this process holds to the next replica
+    // now rather than at their lease TTL. The jobs were told to stop when
+    // the drain began; wait for them until the drain's end, and leave the
+    // lease of any still running to lapse, so no other replica starts one
+    // while it may still run here.
+    let still_running = artifact_keeper_backend::services::cluster_work::wait_for_scheduler_jobs(
+        artifact_keeper_backend::services::shutdown_drain::drain_deadline()
+            .unwrap_or_else(tokio::time::Instant::now),
+    )
+    .await;
+    if !still_running.is_empty() {
+        tracing::warn!(
+            running_scheduler_jobs = still_running.len(),
+            "shutdown: scheduler jobs still running at the end of the drain; their leases lapse at their TTL"
+        );
+    }
+    let released =
+        artifact_keeper_backend::services::cluster_work::release_scheduler_leases_held_by(
+            &migration_db_pool,
+            artifact_keeper_backend::services::cluster_work::WorkerIdentity::for_process().as_str(),
+            &still_running,
+        )
+        .await;
+    tracing::info!(released_scheduler_leases = released, "shutdown complete");
 
     Ok(())
 }

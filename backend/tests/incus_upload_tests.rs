@@ -124,6 +124,8 @@ fn test_config(storage_path: &str) -> Config {
         database_request_acquire_wait_ms: None,
         database_probe_connections: 1,
         database_request_concurrency: None,
+        database_request_credentialed_reserve_percent: 25,
+        database_request_client_share_percent: 25,
         database_idle_timeout_secs: 600,
         database_max_lifetime_secs: 1800,
         database_tcp_keepalives: true,
