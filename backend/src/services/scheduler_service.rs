@@ -344,6 +344,7 @@ pub fn spawn_all(
     advisory_client: Arc<crate::services::scanner_service::AdvisoryClient>,
     proxy_service: Option<Arc<crate::services::proxy_service::ProxyService>>,
     npm_packument_cache: Option<Arc<crate::services::npm_packument_cache::NpmPackumentCache>>,
+    lifecycle_derived_state: crate::services::lifecycle_service::SweepDerivedState,
 ) {
     // Daily metrics snapshot (runs every hour, captures once per day via UPSERT)
     {
@@ -575,7 +576,8 @@ pub fn spawn_all(
             tokio::time::sleep(jittered_startup_delay(60)).await;
             let service = LifecycleService::new(db.clone())
                 .with_proxy_service(proxy_service)
-                .with_npm_packument_cache(npm_packument_cache);
+                .with_npm_packument_cache(npm_packument_cache)
+                .with_derived_state(lifecycle_derived_state);
             let mut ticker = interval(Duration::from_secs(check_secs));
 
             loop {

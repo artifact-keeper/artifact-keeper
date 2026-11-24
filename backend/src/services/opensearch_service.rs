@@ -357,6 +357,51 @@ impl OpenSearchService {
         Ok(())
     }
 
+    /// Remove many artifacts from the search index, one `_bulk` request per
+    /// [`BATCH_SIZE`] ids (#6469): a lifecycle sweep removes every document
+    /// it soft-deleted this way instead of one DELETE per artifact.
+    ///
+    /// An id that has no document is `not_found` in the bulk reply, which is
+    /// success, as in [`Self::remove_artifact`]. Any other per-item failure
+    /// fails the call after every chunk has been sent.
+    pub async fn remove_artifacts(&self, artifact_ids: &[Uuid]) -> Result<()> {
+        let mut failed = 0usize;
+        for chunk in artifact_ids.chunks(BATCH_SIZE) {
+            let body: Vec<JsonBody<Value>> = chunk
+                .iter()
+                .map(|id| {
+                    json!({ "delete": { "_index": self.artifacts_index, "_id": id.to_string() } })
+                        .into()
+                })
+                .collect();
+            let response = self
+                .client
+                .bulk(BulkParts::Index(&self.artifacts_index))
+                .body(body)
+                .send()
+                .await
+                .map_err(|e| AppError::Internal(format!("Bulk delete request failed: {}", e)))?;
+            let status = response.status_code();
+            if !status.is_success() {
+                let text = response.text().await.unwrap_or_default();
+                return Err(AppError::Internal(format!(
+                    "Bulk delete failed (HTTP {}): {}",
+                    status, text
+                )));
+            }
+            let reply: Value = response.json().await.unwrap_or(Value::Null);
+            failed += bulk_delete_failures(&reply);
+        }
+        if failed > 0 {
+            return Err(AppError::Internal(format!(
+                "Bulk delete had {} failed items out of {}",
+                failed,
+                artifact_ids.len()
+            )));
+        }
+        Ok(())
+    }
+
     /// Remove a repository from the search index.
     ///
     /// A 404 response is treated as success (the document was already gone).
@@ -1215,6 +1260,27 @@ struct ArtifactDownloadCountRow {
 ///
 /// Artifacts with no entry in `download_counts` default to 0,
 /// matching the previous `COALESCE(ds.download_count, 0)` behavior.
+/// Items of a `_bulk` delete reply that failed (#6469). `not_found` (404)
+/// is not a failure: the document was already gone.
+fn bulk_delete_failures(reply: &Value) -> usize {
+    if reply["errors"].as_bool() != Some(true) {
+        return 0;
+    }
+    reply["items"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter(|item| {
+                    item["delete"]["status"]
+                        .as_u64()
+                        .is_none_or(|s| s >= 400 && s != 404)
+                })
+                .count()
+        })
+        .unwrap_or(0)
+}
+
 fn build_artifact_batch(
     rows: Vec<ArtifactRow>,
     download_counts: &HashMap<Uuid, i64>,
@@ -1691,6 +1757,56 @@ mod tests {
         );
         // And the scope itself grants nothing.
         assert!(!scope.grants(Uuid::new_v4()));
+    }
+
+    /// #6469: `remove_artifacts` sends one `_bulk` of delete actions per
+    /// BATCH_SIZE ids against the artifacts index, and a `not_found` item is
+    /// success while any other per-item failure is not.
+    #[tokio::test]
+    async fn test_remove_artifacts_sends_bulk_deletes_per_batch_6469() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/artifacts/_bulk"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "errors": true,
+                "items": [{ "delete": { "status": 404, "result": "not_found" } }]
+            })))
+            .mount(&server)
+            .await;
+        let svc = OpenSearchService::new(&server.uri(), None, None, false).expect("service");
+        let ids: Vec<Uuid> = (0..BATCH_SIZE + 1).map(|_| Uuid::new_v4()).collect();
+        svc.remove_artifacts(&ids)
+            .await
+            .expect("not_found items are success");
+
+        let requests = server.received_requests().await.unwrap_or_default();
+        assert_eq!(requests.len(), 2, "one _bulk per BATCH_SIZE ids");
+        let mut sent = Vec::new();
+        for r in &requests {
+            for line in std::str::from_utf8(&r.body).unwrap().lines() {
+                let action: Value = serde_json::from_str(line).unwrap();
+                assert_eq!(action["delete"]["_index"], "artifacts");
+                sent.push(action["delete"]["_id"].as_str().unwrap().to_string());
+            }
+        }
+        let want: Vec<String> = ids.iter().map(|i| i.to_string()).collect();
+        assert_eq!(sent, want, "every id is deleted exactly once, in order");
+
+        svc.remove_artifacts(&[]).await.expect("empty is a no-op");
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+
+        assert_eq!(
+            bulk_delete_failures(&json!({"errors": true, "items": [
+                {"delete": {"status": 200}}, {"delete": {"status": 404}},
+                {"delete": {"status": 429}}, {"delete": {}}
+            ]})),
+            2
+        );
+        assert_eq!(bulk_delete_failures(&json!({"errors": false})), 0);
+        assert_eq!(bulk_delete_failures(&json!({})), 0);
     }
 
     /// Canned OpenSearch `_search` response carrying one artifact hit.

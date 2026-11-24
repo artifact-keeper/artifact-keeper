@@ -73,6 +73,63 @@ const ENQUEUE_DELETE_SYNC_TASKS_SQL: &str = r#"
                 WHERE sync_tasks.status <> 'in_progress'
                 "#;
 
+/// [`CANCEL_SUPERSEDED_PUSH_TASKS_SQL`] for a batch of soft-deleted artifacts
+/// (`$1` UUID[]), for the lifecycle sweep (#6469).
+pub(crate) const CANCEL_SUPERSEDED_PUSH_TASKS_BATCH_SQL: &str = r#"
+            UPDATE sync_tasks
+            SET status = 'cancelled',
+                completed_at = NOW(),
+                error_message = 'superseded by artifact delete'
+            WHERE artifact_id = ANY($1::uuid[])
+              AND task_type = 'push'
+              AND status IN ('pending', 'failed')
+            "#;
+
+/// [`ENQUEUE_DELETE_SYNC_TASKS_SQL`] for a batch of artifacts (`$1` UUID[])
+/// a lifecycle sweep soft-deleted (#6469): the same peers, the same task and
+/// the same conflict handling, one statement per batch.
+///
+/// One guard the single-row statement leaves to its caller: a row that is no
+/// longer soft-deleted is skipped. A restore, and a re-upload of the same
+/// path (which revives the row: `UNIQUE (repository_id, path)`), both clear
+/// `is_deleted`, and the peer applies a delete by repository key and path,
+/// so without the guard it would drop what is live again. `DISTINCT ON` keeps
+/// one source row per conflict key, which a multi-row `ON CONFLICT DO UPDATE`
+/// requires.
+pub(crate) const ENQUEUE_DELETE_SYNC_TASKS_BATCH_SQL: &str = r#"
+                INSERT INTO sync_tasks (
+                    id, peer_instance_id, artifact_id, task_type, status, priority,
+                    target_repository_id, target_repository_key, target_path
+                )
+                SELECT DISTINCT ON (pi.id, a.id)
+                       gen_random_uuid(), pi.id, a.id, 'delete', 'pending', 0,
+                       r.id, r.key, a.path
+                FROM artifacts a
+                JOIN peer_repo_subscriptions prs ON prs.repository_id = a.repository_id
+                JOIN peer_instances pi ON pi.id = prs.peer_instance_id
+                JOIN repositories r ON r.id = a.repository_id
+                WHERE a.id = ANY($1::uuid[])
+                  AND a.is_deleted = true
+                  AND pi.is_local = false
+                  AND prs.replication_mode::text IN ('push', 'mirror')
+                  AND prs.sync_enabled = true
+                ORDER BY pi.id, a.id
+                ON CONFLICT (peer_instance_id, artifact_id, task_type) DO UPDATE SET
+                    status = 'pending',
+                    retry_count = 0,
+                    unreachable_since = NULL,
+                    error_message = NULL,
+                    started_at = NULL,
+                    completed_at = NULL,
+                    claimed_by = NULL,
+                    claim_token = NULL,
+                    claim_expires_at = NULL,
+                    target_repository_id = EXCLUDED.target_repository_id,
+                    target_repository_key = EXCLUDED.target_repository_key,
+                    target_path = EXCLUDED.target_path
+                WHERE sync_tasks.status <> 'in_progress'
+                "#;
+
 /// The three content digests persisted on every artifact row.
 ///
 /// Registry clients look artifacts up by any of SHA-256, SHA-1, or MD5 (Maven
@@ -5898,6 +5955,37 @@ mod tests {
         // Gating on peer status here is what dropped every delete made while a
         // peer was offline; the worker already gates delivery.
         assert!(!sql.contains("pi.status"));
+    }
+
+    /// #6469: the sweep's batched fan-out keeps every clause of the
+    /// single-row statement and adds the still-deleted guard.
+    #[test]
+    fn test_batched_delete_sync_sql_matches_the_single_row_clauses_6469() {
+        let one = ENQUEUE_DELETE_SYNC_TASKS_SQL;
+        let many = ENQUEUE_DELETE_SYNC_TASKS_BATCH_SQL;
+        for clause in [
+            "INSERT INTO sync_tasks",
+            "'delete', 'pending', 0",
+            "pi.is_local = false",
+            "prs.replication_mode::text IN ('push', 'mirror')",
+            "prs.sync_enabled = true",
+            "ON CONFLICT (peer_instance_id, artifact_id, task_type) DO UPDATE SET",
+            "WHERE sync_tasks.status <> 'in_progress'",
+        ] {
+            assert!(one.contains(clause), "single-row SQL lost {clause}");
+            assert!(many.contains(clause), "batched SQL lacks {clause}");
+        }
+        let tail = |sql: &'static str| sql.split("ON CONFLICT").nth(1).unwrap().trim().to_string();
+        assert_eq!(tail(one), tail(many), "same conflict handling");
+        assert!(many.contains("a.id = ANY($1::uuid[])"));
+        assert!(many.contains("AND a.is_deleted = true"));
+        assert!(many.contains("DISTINCT ON (pi.id, a.id)"));
+        assert!(!many.contains("pi.status"));
+        assert!(CANCEL_SUPERSEDED_PUSH_TASKS_BATCH_SQL.contains("artifact_id = ANY($1::uuid[])"));
+        assert_eq!(
+            CANCEL_SUPERSEDED_PUSH_TASKS_SQL.replace("artifact_id = $1", ""),
+            CANCEL_SUPERSEDED_PUSH_TASKS_BATCH_SQL.replace("artifact_id = ANY($1::uuid[])", ""),
+        );
     }
 
     #[tokio::test]
