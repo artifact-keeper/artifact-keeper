@@ -1,5 +1,5 @@
 //! Package-exception queue reads and auto-filing for the non-age gates
-//! (migration 420).
+//! (migration 432).
 //!
 //! The age gate owns its own rows through `age_gate_service`, because its
 //! decisions are bound to an age-specific policy identity (mode + upstream

@@ -1,6 +1,6 @@
 -- The age_gate_reviews key gains gate, so one version can hold an age, a scan and a curation row (#5152)
 -- Contract: the previous release upserts ON CONFLICT (repository_id, package_name, package_version), the key this drops,
--- so an upgrade to the release with 420 and 429 can't roll (docs/operations/online-migrations.md)
+-- so an upgrade to the release with 432 and 433 can't roll (docs/operations/online-migrations.md)
 
 -- The old UNIQUE (repository_id, package_name, package_version) forbids an age row and a scan row for one version
 -- Its generated name sits at the 63-char identifier limit, so it is looked up rather than hardcoded

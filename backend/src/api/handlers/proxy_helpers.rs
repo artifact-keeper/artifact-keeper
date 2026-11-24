@@ -11341,7 +11341,7 @@ pub async fn evaluate_curation<'a>(
         return Ok(());
     };
     // A rule said no; the exception queue is where a human can say
-    // otherwise (migration 420). Unlike the scan gate there is no
+    // otherwise (migration 432). Unlike the scan gate there is no
     // digest at this seam, so the exception is keyed on the coordinate
     // alone. npm and OCI pass no version here at all (a tarball
     // filename cannot be split unambiguously, and a manifest is
@@ -30783,7 +30783,7 @@ mod tests {
     }
 
     /// A curation block is auto-filed on the exception queue, and an approved,
-    /// unexpired exception releases it (migration 420).
+    /// unexpired exception releases it (migration 432).
     #[tokio::test]
     async fn test_curation_block_files_and_honours_an_exception() {
         use crate::services::age_gate_service::GATE_CURATION;
