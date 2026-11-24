@@ -6,14 +6,31 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
-use std::io::Read;
 
 use crate::error::{AppError, Result};
 use crate::formats::FormatHandler;
 use crate::models::repository::RepositoryFormat;
+use crate::util::bounded_archive;
 
 /// Go module proxy format handler
 pub struct GoHandler;
+
+/// A go.mod is a few kilobytes in practice; 1 MiB still leaves ample room
+/// while keeping an inflated entry from being read without bound.
+const MAX_GO_MOD_BYTES: u64 = 1024 * 1024;
+
+/// Matches the entry ceiling of the proxy-side Go zip identity probe, so a
+/// large legitimate module is not refused for its file count.
+const MAX_GO_MOD_ARCHIVE_ENTRIES: u64 = 1_000_000;
+
+fn read_go_mod_entry(content: &[u8], matches: impl Fn(&str) -> bool) -> Result<Option<Vec<u8>>> {
+    bounded_archive::read_metadata_from_zip_limited(
+        std::io::Cursor::new(content),
+        matches,
+        MAX_GO_MOD_ARCHIVE_ENTRIES,
+        MAX_GO_MOD_BYTES,
+    )
+}
 
 impl GoHandler {
     pub fn new() -> Self {
@@ -271,34 +288,29 @@ impl GoHandler {
         })
     }
 
-    /// Extract go.mod from module zip
-    pub fn extract_go_mod_from_zip(content: &[u8]) -> Result<GoMod> {
-        let cursor = std::io::Cursor::new(content);
-        let mut archive = zip::ZipArchive::new(cursor)
-            .map_err(|e| AppError::Validation(format!("Invalid module zip: {}", e)))?;
+    /// Extract go.mod from a module zip, preferring the entry for the
+    /// requested module version over a nested module's go.mod.
+    pub fn extract_go_mod_from_zip(content: &[u8], info: &GoModuleInfo) -> Result<GoMod> {
+        let preferred_entry = info
+            .version
+            .as_deref()
+            .map(|version| format!("{}@{}/go.mod", info.module, version));
 
-        for i in 0..archive.len() {
-            let mut file = archive
-                .by_index(i)
-                .map_err(|e| AppError::Validation(format!("Failed to read zip entry: {}", e)))?;
+        let canonical = match &preferred_entry {
+            Some(entry) => read_go_mod_entry(content, |name| name == entry)?,
+            None => None,
+        };
+        let body = match canonical {
+            Some(body) => body,
+            None => read_go_mod_entry(content, |name| {
+                name == "go.mod" || name.ends_with("/go.mod")
+            })?
+            .ok_or_else(|| AppError::Validation("go.mod not found in module zip".to_string()))?,
+        };
 
-            let name = file
-                .name()
-                .map_err(|e| AppError::Validation(format!("Failed to read zip entry name: {}", e)))?
-                .into_owned();
-
-            if name.ends_with("/go.mod") || name == "go.mod" {
-                let mut content = String::new();
-                file.read_to_string(&mut content)
-                    .map_err(|e| AppError::Validation(format!("Failed to read go.mod: {}", e)))?;
-
-                return Self::parse_go_mod(&content);
-            }
-        }
-
-        Err(AppError::Validation(
-            "go.mod not found in module zip".to_string(),
-        ))
+        let text = std::str::from_utf8(&body)
+            .map_err(|e| AppError::Validation(format!("Invalid UTF-8 in go.mod: {}", e)))?;
+        Self::parse_go_mod(text)
     }
 }
 
@@ -345,7 +357,7 @@ impl FormatHandler for GoHandler {
                 }
                 GoOperation::Zip => {
                     // Extract go.mod from zip
-                    if let Ok(go_mod) = Self::extract_go_mod_from_zip(content) {
+                    if let Ok(go_mod) = Self::extract_go_mod_from_zip(content, &info) {
                         metadata["goMod"] = serde_json::to_value(&go_mod)?;
                     }
                 }
@@ -382,7 +394,7 @@ impl FormatHandler for GoHandler {
                     }
                 }
                 GoOperation::Zip => {
-                    let go_mod = Self::extract_go_mod_from_zip(content)?;
+                    let go_mod = Self::extract_go_mod_from_zip(content, &info)?;
 
                     // Verify module path matches
                     if go_mod.module != info.module {
@@ -489,6 +501,7 @@ pub fn generate_version_info(version: &str, time: Option<&str>) -> VersionInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     // ---- GoHandler::new / Default ----
 
@@ -1029,18 +1042,114 @@ require github.com/pkg/errors v0.9.1
         assert!(result.is_none());
     }
 
-    // ---- extract_go_mod_from_zip: error cases ----
+    // ---- extract_go_mod_from_zip ----
+
+    fn zip_info() -> GoModuleInfo {
+        GoModuleInfo {
+            module: "github.com/user/repo".to_string(),
+            version: Some("v1.0.0".to_string()),
+            operation: GoOperation::Zip,
+        }
+    }
+
+    fn module_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        {
+            let mut writer = zip::ZipWriter::new(&mut cursor);
+            let options: zip::write::FileOptions<'_, '_, ()> = zip::write::FileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            for (name, data) in entries {
+                writer.start_file(*name, options).unwrap();
+                writer.write_all(data).unwrap();
+            }
+            writer.finish().unwrap();
+        }
+        cursor.into_inner()
+    }
+
+    fn oversized_go_mod() -> String {
+        let mut body = String::from("module github.com/user/repo\n");
+        while body.len() <= MAX_GO_MOD_BYTES as usize {
+            body.push_str("// padding to exceed the go.mod cap\n");
+        }
+        body.truncate(MAX_GO_MOD_BYTES as usize + 1);
+        body
+    }
 
     #[test]
     fn test_extract_go_mod_from_zip_invalid() {
-        let result = GoHandler::extract_go_mod_from_zip(b"not a zip");
+        let result = GoHandler::extract_go_mod_from_zip(b"not a zip", &zip_info());
         assert!(result.is_err());
     }
 
     #[test]
     fn test_extract_go_mod_from_zip_empty() {
-        let result = GoHandler::extract_go_mod_from_zip(b"");
+        let result = GoHandler::extract_go_mod_from_zip(b"", &zip_info());
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_extract_go_mod_from_zip_prefers_canonical_entry() {
+        let zip = module_zip(&[
+            (
+                "github.com/user/repo@v1.0.0/vendor/nested/go.mod",
+                b"module example.com/nested\n",
+            ),
+            (
+                "github.com/user/repo@v1.0.0/go.mod",
+                b"module github.com/user/repo\n",
+            ),
+        ]);
+
+        let go_mod = GoHandler::extract_go_mod_from_zip(&zip, &zip_info()).unwrap();
+        assert_eq!(go_mod.module, "github.com/user/repo");
+    }
+
+    #[test]
+    fn test_extract_go_mod_from_zip_accepts_root_entry() {
+        let zip = module_zip(&[("go.mod", b"module github.com/user/repo\n")]);
+
+        let go_mod = GoHandler::extract_go_mod_from_zip(&zip, &zip_info()).unwrap();
+        assert_eq!(go_mod.module, "github.com/user/repo");
+    }
+
+    #[test]
+    fn test_extract_go_mod_from_zip_without_version_uses_root_entry() {
+        let zip = module_zip(&[("go.mod", b"module github.com/user/repo\n")]);
+        let mut info = zip_info();
+        info.version = None;
+
+        let go_mod = GoHandler::extract_go_mod_from_zip(&zip, &info).unwrap();
+        assert_eq!(go_mod.module, "github.com/user/repo");
+    }
+
+    #[test]
+    fn test_extract_go_mod_from_zip_rejects_oversized_entry() {
+        let body = oversized_go_mod();
+        let zip = module_zip(&[("github.com/user/repo@v1.0.0/go.mod", body.as_bytes())]);
+
+        let err = GoHandler::extract_go_mod_from_zip(&zip, &zip_info()).unwrap_err();
+        assert!(matches!(err, AppError::Validation(_)), "{err:?}");
+        assert!(err.to_string().contains("maximum allowed size"), "{err}");
+    }
+
+    #[test]
+    fn test_extract_go_mod_from_zip_rejects_invalid_utf8() {
+        let zip = module_zip(&[(
+            "github.com/user/repo@v1.0.0/go.mod",
+            &b"module github.com/user/repo\n\xff"[..],
+        )]);
+
+        let err = GoHandler::extract_go_mod_from_zip(&zip, &zip_info()).unwrap_err();
+        assert!(err.to_string().contains("Invalid UTF-8"), "{err}");
+    }
+
+    #[test]
+    fn test_extract_go_mod_from_zip_missing_entry() {
+        let zip = module_zip(&[("github.com/user/repo@v1.0.0/README.md", b"not a go.mod")]);
+
+        let err = GoHandler::extract_go_mod_from_zip(&zip, &zip_info()).unwrap_err();
+        assert!(err.to_string().contains("go.mod not found"), "{err}");
     }
 
     // ---- parse_go_mod: require block with opening paren on separate line ----
