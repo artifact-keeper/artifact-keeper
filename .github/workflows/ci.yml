@@ -2141,6 +2141,13 @@ jobs:
       - name: Check Trivy gate severity filter
         run: ./scripts/ci/check-trivy-gate-severity.sh
 
+      # #4799: the weekly scan's classifier decides which findings open an
+      # issue, so a wrong verdict is invisible until the next Monday scan.
+      # The self-test pins the stale-:latest and still-live cases offline with
+      # Node; no Docker or network needed.
+      - name: Check Trivy finding classification
+        run: bash scripts/ci/test-trivy-findings.sh
+
       # Stock compose image names (#4479): a short name like
       # `postgres:18-alpine` resolves per host under podman's enforcing
       # short-name mode, so the same file could run different images.
