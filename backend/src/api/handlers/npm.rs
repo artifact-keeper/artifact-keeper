@@ -5686,8 +5686,10 @@ async fn serve_tarball(
         // #3178: authorize the member set against the CALLER before any
         // format-specific filtering, so a member this caller could not read
         // directly can never reach the byte resolver.
-        let members =
-            proxy_helpers::try_authorize_virtual_members(&state.db, auth, repo.id, members).await?;
+        let members = proxy_helpers::try_authorize_virtual_members_or_challenge(
+            &state.db, auth, repo.id, members,
+        )
+        .await?;
         let (ownership, members) = npm_virtual_eligible_members(
             &state.db,
             repo.id,

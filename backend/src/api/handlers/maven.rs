@@ -3076,7 +3076,7 @@ async fn download(
                 }
                 Err(_) => false,
             };
-            let members = proxy_helpers::try_authorize_virtual_members(
+            let members = proxy_helpers::try_authorize_virtual_members_or_challenge(
                 &state.db,
                 auth.as_ref(),
                 repo.id,
@@ -4633,7 +4633,7 @@ async fn serve_artifact(
                 //
                 // The fallible form, as sbt uses: a failed visibility query is
                 // a retryable server error, not a definitive 404 (#3321).
-                let members = proxy_helpers::try_authorize_virtual_members(
+                let members = proxy_helpers::try_authorize_virtual_members_or_challenge(
                     &state.db,
                     auth,
                     repo.id,
@@ -10606,6 +10606,103 @@ mod tests {
         assert_eq!(after_get, 1, "the virtual GET must record one download");
         assert_eq!(head_status, StatusCode::OK);
         assert_eq!(after_head, 1, "a HEAD through the virtual must not record");
+    }
+
+    /// #6494: a public virtual whose members are all private answered an
+    /// anonymous request 404, so Maven never retried with its credentials.
+    /// The anonymous request now gets the 401 challenge a private repository
+    /// answers, a signed-in caller without a grant still gets 404
+    #[tokio::test]
+    async fn public_virtual_over_private_members_challenges_anonymous_6494() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (outsider_id, outsider_name) = tdh::create_user(&pool).await;
+        let (hosted_id, hosted_key, hosted_dir) = tdh::create_repo(&pool, "local", "maven").await;
+        let (virtual_id, virtual_key, virtual_dir) =
+            tdh::create_repo(&pool, "virtual", "maven").await;
+        tdh::link_virtual_member(&pool, virtual_id, hosted_id, 1).await;
+        tdh::publish_repo(&pool, virtual_id).await;
+        tdh::grant_repo_access(&pool, hosted_id, user_id).await;
+        tdh::grant_repo_access(&pool, virtual_id, user_id).await;
+
+        let state = tdh::build_state(pool.clone(), hosted_dir.to_str().unwrap());
+        let hosted = tdh::make_repo_info(hosted_id, &hosted_key, &hosted_dir, "local", None);
+        let path = "com/example/anon6494/lib/1.0/lib-1.0.jar";
+        tdh::seed_artifact(
+            &state,
+            &pool,
+            &hosted,
+            &format!("maven/{path}"),
+            path,
+            "anon6494",
+            "1.0",
+            "application/java-archive",
+            Bytes::from_static(b"jar6494"),
+            user_id,
+        )
+        .await;
+        let uri = format!("/{virtual_key}/{path}");
+
+        let (anon_status, _, anon_headers) = tdh::send_with_headers(
+            tdh::router_anon(super::router(), state.clone()),
+            tdh::get(uri.clone()),
+        )
+        .await;
+        let anon_challenges: Vec<&str> = anon_headers
+            .get_all("www-authenticate")
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .collect();
+        let granted = tdh::send(
+            tdh::router_with_auth(
+                super::router(),
+                state.clone(),
+                tdh::make_auth(user_id, &username),
+            ),
+            tdh::get(uri.clone()),
+        )
+        .await;
+        let outsider = tdh::send(
+            tdh::router_with_auth(
+                super::router(),
+                state,
+                tdh::make_auth(outsider_id, &outsider_name),
+            ),
+            tdh::get(uri),
+        )
+        .await;
+
+        tdh::cleanup_member_repo(&pool, hosted_id, &hosted_dir).await;
+        tdh::cleanup(&pool, virtual_id, user_id).await;
+        tdh::cleanup_user(&pool, outsider_id).await;
+        let _ = std::fs::remove_dir_all(&virtual_dir);
+
+        assert_eq!(
+            anon_status,
+            StatusCode::UNAUTHORIZED,
+            "anonymous gets the challenge"
+        );
+        assert!(
+            anon_challenges
+                .iter()
+                .any(|c| *c == "Basic realm=\"artifact-keeper\""),
+            "the challenge Maven answers with credentials: {anon_challenges:?}"
+        );
+        assert_eq!(
+            granted.0,
+            StatusCode::OK,
+            "control: a granted user is served"
+        );
+        assert_eq!(&granted.1[..], b"jar6494");
+        assert_eq!(
+            outsider.0,
+            StatusCode::NOT_FOUND,
+            "a signed-in caller without a grant keeps the 404"
+        );
     }
 
     /// #4286: every read of a hosted Maven artifact, direct or through a
