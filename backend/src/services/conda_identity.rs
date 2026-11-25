@@ -85,6 +85,7 @@ use std::time::{Duration as StdDuration, Instant};
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use url::Url;
 use utoipa::ToSchema;
 
 // ---------------------------------------------------------------------------
@@ -1777,7 +1778,7 @@ impl AliasLoad {
 
 /// Process-wide map plus the last load attempt. One lock keeps a lookup from
 /// ever pairing a new map with an old error, or the reverse.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct AliasMapRuntime {
     map: Arc<AliasMap>,
     last_error: Option<String>,
@@ -1911,6 +1912,28 @@ fn configured_url() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// Operator URLs are allowed to carry internal credentials, so neither the
+/// status response nor a log line may show them verbatim. Every query value is
+/// redacted rather than guessed by name: a token can hide behind any key.
+fn redact_configured_url(raw: &str) -> String {
+    let Ok(mut url) = Url::parse(raw) else {
+        return "<unparseable URL>".to_string();
+    };
+    if !url.username().is_empty() {
+        let _ = url.set_username("REDACTED");
+        let _ = url.set_password(None);
+    }
+    let keys: Vec<String> = url.query_pairs().map(|(key, _)| key.into_owned()).collect();
+    if !keys.is_empty() {
+        let mut pairs = url.query_pairs_mut();
+        pairs.clear();
+        for key in keys {
+            pairs.append_pair(&key, "REDACTED");
+        }
+    }
+    url.to_string()
+}
+
 fn build_status(
     runtime: &AliasMapRuntime,
     now: DateTime<Utc>,
@@ -1919,6 +1942,7 @@ fn build_status(
 ) -> AliasMapStatus {
     let map = &runtime.map;
     let provenance = map.provenance();
+    let refresh_url = refresh_url.map(|url| redact_configured_url(&url));
     let age_seconds = provenance.map(|p| {
         let age = (now - p.fetched_at).max(Duration::zero());
         age.num_seconds()
@@ -1995,22 +2019,28 @@ pub fn status() -> AliasMapStatus {
 async fn fetch_alias_map_url(url: &str) -> Result<AliasMap, String> {
     crate::api::validation::validate_outbound_internal_url(url, ALIAS_MAP_URL_ENV)
         .map_err(|e| e.to_string())?;
+    let safe_url = redact_configured_url(url);
     let client = crate::services::http_client::internal_service_client_builder()
         .timeout(FETCH_TIMEOUT)
         .build()
         .map_err(|e| format!("HTTP client could not be built: {e}"))?;
-    let response = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| format!("request failed: {e}"))?;
+    let response = client.get(url).send().await.map_err(|e| {
+        let detail = if e.is_timeout() {
+            "request timed out"
+        } else if e.is_connect() {
+            "connection failed"
+        } else {
+            "request failed"
+        };
+        format!("{detail} for {safe_url}")
+    })?;
     let http_status = response.status();
     if !http_status.is_success() {
         return Err(format!("HTTP {http_status}"));
     }
     let bytes = crate::services::http_client::read_body_capped(response, MAX_MAPPING_BYTES).await?;
     let provenance = MappingProvenance {
-        source: truncate(url, 200),
+        source: truncate(&safe_url, 200),
         fetched_at: Utc::now(),
         channel: None,
     };
@@ -2033,17 +2063,20 @@ pub async fn refresh() -> AliasMapStatus {
 async fn refresh_from(url: Option<String>, path: Option<String>) -> AliasMapStatus {
     let _guard = refresh_lock().lock().await;
     let load = match url {
-        Some(url) => match fetch_alias_map_url(&url).await {
-            Ok(map) => {
-                tracing::info!(url = %url, entries = map.loaded_entries(), "refreshed conda->PyPI alias mapping");
-                AliasLoad::success(map)
+        Some(url) => {
+            let safe_url = redact_configured_url(&url);
+            match fetch_alias_map_url(&url).await {
+                Ok(map) => {
+                    tracing::info!(url = %safe_url, entries = map.loaded_entries(), "refreshed conda->PyPI alias mapping");
+                    AliasLoad::success(map)
+                }
+                Err(e) => {
+                    let error = format!("{safe_url}: {e}");
+                    tracing::warn!(url = %safe_url, error = %e, "conda->PyPI alias map refresh failed; keeping the last good mapping");
+                    AliasLoad::failure(error)
+                }
             }
-            Err(e) => {
-                let error = format!("{url}: {e}");
-                tracing::warn!(url = %url, error = %e, "conda->PyPI alias map refresh failed; keeping the last good mapping");
-                AliasLoad::failure(error)
-            }
-        },
+        }
         None => load_from_setting(path),
     };
     apply_load(&mut write_runtime(), load);
@@ -2107,6 +2140,22 @@ mod tests {
             source: "parselmouth conda-forge index @ 2026-09-18".to_string(),
             fetched_at: fetched(2026, 9, 19),
             channel: Some("conda-forge".to_string()),
+        }
+    }
+
+    struct RuntimeSnapshot {
+        original: AliasMapRuntime,
+    }
+
+    impl Drop for RuntimeSnapshot {
+        fn drop(&mut self) {
+            *write_runtime() = self.original.clone();
+        }
+    }
+
+    fn snapshot_runtime() -> RuntimeSnapshot {
+        RuntimeSnapshot {
+            original: write_runtime().clone(),
         }
     }
 
@@ -2929,9 +2978,47 @@ mod tests {
         assert_eq!(report.fetched_at, Some(now - Duration::hours(48)));
     }
 
+    #[test]
+    fn configured_urls_redact_userinfo_and_every_query_value() {
+        let raw = "https://operator:secret@mirror.example.test/aliases.json?token=abc&page=1";
+        let redacted = redact_configured_url(raw);
+        assert!(!redacted.contains("operator"));
+        assert!(!redacted.contains("secret"));
+        assert!(!redacted.contains("abc"));
+        assert!(redacted.contains("mirror.example.test/aliases.json"));
+        assert_eq!(
+            redacted,
+            "https://REDACTED@mirror.example.test/aliases.json?token=REDACTED&page=REDACTED"
+        );
+    }
+
+    #[test]
+    fn status_returns_the_redacted_refresh_url() {
+        let runtime = AliasMapRuntime::new();
+        let raw = "https://operator:secret@mirror.example.test/aliases.json?token=abc";
+        let report = build_status(&runtime, Utc::now(), None, Some(raw.to_string()));
+        let shown = report.refresh_url.expect("redacted URL");
+        assert!(!shown.contains("secret"));
+        assert!(!shown.contains("abc"));
+    }
+
+    #[tokio::test]
+    async fn refresh_errors_redact_the_configured_url() {
+        let _guard = runtime_test_lock().lock().await;
+        let _snapshot = snapshot_runtime();
+        let raw = "https://operator:secret@127.0.0.1/aliases.json?token=abc";
+        let report = refresh_from(Some(raw.to_string()), None).await;
+        let error = report.last_error.expect("refresh error");
+        assert!(!error.contains("operator"));
+        assert!(!error.contains("secret"));
+        assert!(!error.contains("abc"));
+        assert!(error.contains("REDACTED"));
+    }
+
     #[tokio::test]
     async fn reloading_a_changed_file_replaces_the_map_without_a_restart() {
         let _guard = runtime_test_lock().lock().await;
+        let _snapshot = snapshot_runtime();
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir
             .path()
@@ -2978,6 +3065,7 @@ mod tests {
     #[tokio::test]
     async fn refresh_without_a_configured_source_keeps_the_last_good_map() {
         let _guard = runtime_test_lock().lock().await;
+        let _snapshot = snapshot_runtime();
         let mut state = AliasMapRuntime::new();
         apply_load(
             &mut state,
@@ -3023,6 +3111,7 @@ mod tests {
     #[test]
     fn process_wide_state_exposes_the_current_map_and_last_error() {
         let _guard = runtime_test_lock().blocking_lock();
+        let _snapshot = snapshot_runtime();
         let mut state = AliasMapRuntime::new();
         apply_load(
             &mut state,
