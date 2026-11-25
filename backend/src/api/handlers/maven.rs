@@ -3344,12 +3344,17 @@ fn virtual_metadata_not_found(member_unavailable: bool) -> Response {
 /// marked, uncacheable partial merge; a virtual that explicitly sets
 /// `virtual_member_fallback = strict` gets the retryable 503 instead, as it
 /// does for artifact downloads (#5810).
-fn serve_maven_virtual_merge(
+async fn serve_maven_virtual_merge(
+    state: &SharedState,
+    repo_id: uuid::Uuid,
     xml: Bytes,
     marks: MetadataMarks,
-    fallback: proxy_helpers::VirtualMemberFallback,
 ) -> Result<(Bytes, MetadataMarks), Response> {
-    if fallback.is_strict() && marks.is_partial() {
+    if marks.is_partial()
+        && proxy_helpers::virtual_member_fallback(&state.db, repo_id)
+            .await
+            .is_strict()
+    {
         return Err(proxy_helpers::member_unavailable_response());
     }
     Ok((xml, marks))
@@ -3563,10 +3568,6 @@ async fn fetch_maven_metadata_bytes(
     // Virtual repos: merge metadata from all members.
     if repo.repo_type == RepositoryType::Virtual {
         let members = proxy_helpers::authorized_virtual_members(&state.db, auth, repo.id).await?;
-        // #5777: an unavailable member leaves the merge partial. An
-        // explicitly strict `virtual_member_fallback` (#5810) turns it into
-        // the retryable 503; the default keeps #5809's partial merge.
-        let fallback = proxy_helpers::virtual_member_fallback(&state.db, repo.id).await;
 
         // Whether the GA-level merge may be shared through the process-wide
         // cache (#3323). The merge is built from the members THIS caller may
@@ -3709,7 +3710,7 @@ async fn fetch_maven_metadata_bytes(
             };
 
             if let Some(xml) = ga_merge {
-                return serve_maven_virtual_merge(xml, marks, fallback);
+                return serve_maven_virtual_merge(state, repo.id, xml, marks).await;
             }
 
             // Group-level plugin-prefix metadata (#1595). A path like
@@ -3747,7 +3748,7 @@ async fn fetch_maven_metadata_bytes(
             }
 
             if let Some(xml) = crate::formats::maven::merge_plugin_prefix_metadata(&member_docs) {
-                return serve_maven_virtual_merge(Bytes::from(xml), marks, fallback);
+                return serve_maven_virtual_merge(state, repo.id, Bytes::from(xml), marks).await;
             }
         }
 
@@ -3806,7 +3807,8 @@ async fn fetch_maven_metadata_bytes(
                 if let Some(xml) =
                     generate_snapshot_metadata_xml(&group_id, &artifact_id, &version, &all_entries)
                 {
-                    return serve_maven_virtual_merge(Bytes::from(xml), marks, fallback);
+                    return serve_maven_virtual_merge(state, repo.id, Bytes::from(xml), marks)
+                        .await;
                 }
             }
         }
