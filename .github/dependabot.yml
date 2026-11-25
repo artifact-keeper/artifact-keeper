@@ -48,9 +48,10 @@ updates:
       prefix: "chore"
     # The release-gate pin (#6170) arrives as its own PR, never inside the
     # weekly group: it changes what certifies a release, and Mergify does not
-    # auto-merge it. CODEOWNERS marks the callers' ownership; release/*
-    # requires a second reviewer (#6216), while code-owner review remains
-    # #4071. Dependabot does not update the callers'
+    # auto-merge it. CODEOWNERS marks the callers' ownership; no code-owner
+    # review is enforced yet (#4071), and ruleset 20038606 still requires zero
+    # approvals on release/* (#6216). Changing that ruleset is a maintainer
+    # decision. Dependabot does not update the callers'
     # `# ... as of DATE` comment. A dependency goes to the
     # first group it matches. (artifact-keeper-test has no release tags;
     # whether Dependabot moves a tagless sha pin to main's head is not

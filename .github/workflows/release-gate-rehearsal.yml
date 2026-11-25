@@ -264,8 +264,9 @@ jobs:
     # Pinned to an artifact-keeper-test commit, not @main (#6170): a gate
     # change reaches a candidate only through a bump PR in this repo, which
     # Mergify does not auto-merge. CODEOWNERS lists this file to mark
-    # ownership; release/* requires a second reviewer (#6216), while
-    # code-owner review remains #4071. The pin does not wait on
+    # ownership only; no code-owner review is enforced yet (#4071), and
+    # ruleset 20038606 still requires zero approvals on release/* (#6216).
+    # Changing that ruleset is a maintainer decision. The pin does not wait on
     # protection for artifact-keeper-test (#6178). All five callers carry ONE
     # sha, and
     # scripts/ci/check-gate-workflow-pins.sh enforces both that and that the

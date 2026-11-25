@@ -37,8 +37,9 @@
 #   and date the trailing comment (Dependabot, if it ever opens the bump,
 #   does not update that `# ... as of DATE` comment: fix it by hand). It is an
 #   ordinary pipeline change, and Mergify does not auto-merge it. CODEOWNERS
-#   lists the callers to mark ownership only; release/* requires a second
-#   reviewer (#6216), while code-owner review remains #4071.
+#   lists the callers to mark ownership only; no code-owner review is enforced
+#   (#4071), and ruleset 20038606 still requires zero approvals on release/*
+#   (#6216). Changing that ruleset is a maintainer decision.
 #
 #   The pin covers only the workflow YAML. The gate's jobs still check out
 #   artifact-keeper-test's default branch and run its scripts, and tests_sha
