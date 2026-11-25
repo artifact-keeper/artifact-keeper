@@ -40,8 +40,8 @@ fn validate_event_version(v: &str) -> std::result::Result<(), AppError> {
 }
 
 /// How many receiver response bytes the three delivery paths keep for
-/// troubleshooting (#6403). The 30 s client timeout bounds time, not size, so
-/// the body needs its own cap. `WEBHOOK_RESPONSE_BODY_MAX_BYTES` overrides it.
+/// troubleshooting (#6403). Request timeouts bound time, not size, so the body
+/// needs its own cap. `WEBHOOK_RESPONSE_BODY_MAX_BYTES` overrides it.
 const WEBHOOK_RESPONSE_BODY_MAX_BYTES_DEFAULT: usize = 4 * 1024;
 
 fn webhook_response_body_max_bytes() -> usize {
@@ -77,20 +77,25 @@ async fn read_bounded_response_body(response: reqwest::Response, limit: usize) -
     let declared_len = response.content_length();
     let mut stream = response.bytes_stream();
     let mut kept = Vec::new();
+    let mut overflow = false;
 
-    while kept.len() < limit {
+    loop {
         let Some(chunk) = stream.next().await else {
             break;
         };
         let chunk = chunk.ok()?;
+        if kept.len() == limit {
+            // One chunk past the cap tells an exact-cap body from a truncated
+            // one when the receiver omits Content-Length.
+            overflow = !chunk.is_empty();
+            break;
+        }
         let remaining = limit - kept.len();
         kept.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
     }
 
-    let truncated = kept.len() == limit
-        && declared_len
-            .map(|total| total > limit as u64)
-            .unwrap_or(true);
+    let truncated =
+        overflow || (kept.len() == limit && declared_len.is_some_and(|total| total > limit as u64));
     let mut body = String::from_utf8_lossy(&kept).into_owned();
     if truncated {
         body.push_str(&truncated_response_body_marker(limit, declared_len));
@@ -3384,6 +3389,37 @@ pub struct WebhooksApiDoc;
 mod tests {
     use super::*;
 
+    async fn chunked_response(parts: Vec<String>) -> reqwest::Response {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener");
+        let addr = listener.local_addr().expect("test address");
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("test connection");
+            let mut request = vec![0u8; 4096];
+            let _ = socket.read(&mut request).await;
+            let mut response = b"HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\n\
+                                 transfer-encoding: chunked\r\n\r\n"
+                .to_vec();
+            for part in parts {
+                response.extend_from_slice(format!("{:x}\r\n{part}\r\n", part.len()).as_bytes());
+            }
+            response.extend_from_slice(b"0\r\n\r\n");
+            socket
+                .write_all(&response)
+                .await
+                .expect("write chunked response");
+        });
+        reqwest::Client::new()
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .expect("chunked receiver")
+    }
+
     // -----------------------------------------------------------------------
     // webhook_access_allowed — object-level authorization invariant
     // -----------------------------------------------------------------------
@@ -3604,6 +3640,39 @@ mod tests {
             .await
             .expect("response body");
         assert_eq!(body, full, "a body at the cap is not truncated");
+    }
+
+    #[tokio::test]
+    async fn test_read_bounded_response_body_keeps_exact_chunked_cap_without_marker() {
+        let limit = 8;
+        let full = "z".repeat(limit);
+        let response = chunked_response(vec![full.clone()]).await;
+        assert_eq!(
+            response.content_length(),
+            None,
+            "no declared length to rely on"
+        );
+
+        let body = read_bounded_response_body(response, limit)
+            .await
+            .expect("response body");
+        assert_eq!(body, full, "a chunked body at the cap is not truncated");
+    }
+
+    #[tokio::test]
+    async fn test_read_bounded_response_body_marks_chunked_overflow_without_content_length() {
+        let limit = 8;
+        let response = chunked_response(vec!["y".repeat(limit), "z".to_string()]).await;
+        assert_eq!(
+            response.content_length(),
+            None,
+            "no declared length to rely on"
+        );
+
+        let body = read_bounded_response_body(response, limit)
+            .await
+            .expect("response body");
+        assert!(body.contains("[truncated, 8+ bytes]"));
     }
 
     #[tokio::test]
