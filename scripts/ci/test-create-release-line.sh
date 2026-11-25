@@ -176,10 +176,12 @@ jq -nc '{id:20038606,name:"Release branch protection",enforcement:"active",
 # <label> <expected-exit> <expected-substring> [args...]; the log is left in
 # $LOG for the caller to inspect.
 LOG=""
+OUT=""
 run_case() {
   local label="$1" want="$2" needle="$3" got=0 out
   shift 3
   LOG="$WORK/log.$$"
+  OUT="$WORK/out.$$"
   : > "$LOG"
   cp "$RULESET_JSON" "$WORK/live.json"
   rm -f "$REPO"/release-line-*.json
@@ -187,6 +189,7 @@ run_case() {
     RELEASE_LINE_REPO=artifact-keeper/artifact-keeper RELEASE_LINE_RULESET=20038606 \
     RELEASE_LINE_TESTS_REPO=artifact-keeper/artifact-keeper-test \
     bash "$SCRIPT" "$@" 2>&1)" || got=$?
+  printf '%s\n' "$out" > "$OUT"
   if [ "$got" != "$want" ]; then
     fail "$label: expected exit $want, got $got"
     printf '%s\n' "$out" | sed 's/^/        /' >&2
@@ -258,9 +261,25 @@ W_TESTS_COMPARE=diverged refusal_no_mutation "tests sha not on the suite's main 
 W_TESTS_PUSH=false refusal_no_mutation "no push access to the suite repo -> refused" \
   "must be able to push to" --tests-sha "$TESTS_OTHER" 1.9
 
-# ── #6216: do not relax a ruleset that does not require a second person ─────
-W_APPROVALS=0 refusal_no_mutation "zero required approvals -> refused" \
-  "requires 0 approving review(s)" --tests-from-run 42 1.9
+# ── #6216: a ruleset without a second reviewer warns but does not block ─────
+if run_case "review requirement present -> no warning" 0 "every precondition passed" \
+  --dry-run --tests-from-run 42 1.9; then
+  if grep -qF -- "approving review(s)" "$OUT"; then
+    fail "a compliant ruleset produced a review warning"
+    sed 's/^/        /' "$OUT" >&2
+  else
+    pass "a compliant ruleset produced no review warning"
+  fi
+fi
+if W_APPROVALS=0 run_case "zero required approvals -> warning only" 0 \
+  "requires 0 approving review(s)" --dry-run --tests-from-run 42 1.9; then
+  if grep -qE '^(PUT|POST) ' "$LOG"; then
+    fail "zero-approval warning case issued a mutating call"
+    sed 's/^/        /' "$LOG" >&2
+  else
+    pass "zero-approval warning case issued no PUT/POST"
+  fi
+fi
 
 # ── --dry-run changes nothing ───────────────────────────────────────────────
 if run_case "--dry-run -> plan only" 0 "every precondition passed" --dry-run --tests-from-run 42 1.9; then
