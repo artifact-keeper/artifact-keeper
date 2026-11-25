@@ -206,6 +206,62 @@ async fn depth_archive_roundtrip_preserves_content_and_refuses_conflicts_4216() 
     f.teardown().await;
 }
 
+#[tokio::test]
+async fn depth_restore_waits_for_an_in_flight_layout_writer_6391() {
+    let Some(f) = tdh::Fixture::setup("local", "rpm").await else {
+        return;
+    };
+    let storage = Arc::new(StorageService::new(Arc::new(
+        crate::services::storage_service::FilesystemBackend::new(f.storage_dir.clone()),
+    )));
+    let service = BackupService::new(f.pool.clone(), storage);
+    let mut conn = f.pool.acquire().await.unwrap();
+    let exported = BackupService::export_table(&mut conn, "repositories")
+        .await
+        .unwrap();
+    let mut repositories = serde_json::json!([exported
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == f.repo_id.to_string())
+        .unwrap()
+        .clone()]);
+    repositories[0]["repodata_depth"] = serde_json::json!(1);
+    rpm_layout::set_depth(&mut conn, f.repo_id, 1)
+        .await
+        .unwrap();
+    drop(conn);
+    let backup = archive(&service, &repositories, &serde_json::json!([]), &[]).await;
+    sqlx::query("DELETE FROM repositories WHERE id=$1")
+        .bind(f.repo_id)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+
+    // An artifact writer holds the repository's shared layout lock while its
+    // transaction commits. The restore must wait for it, not report a conflict.
+    let writer = hold_shared_layout_lock(&f.pool, f.repo_id).await;
+    let restore = service.restore(backup, options());
+    tokio::pin!(restore);
+    tokio::select! {
+        result = &mut restore => panic!("restore must wait for the layout writer: {result:?}"),
+        _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {}
+    }
+    writer.rollback().await.unwrap();
+    let restored = tokio::time::timeout(std::time::Duration::from_secs(10), restore)
+        .await
+        .expect("restore must finish once the writer commits")
+        .unwrap();
+    assert!(restored.errors.is_empty(), "{:?}", restored.errors);
+    assert_eq!(rpm_layout::depth(&f.pool, f.repo_id).await.unwrap(), 1);
+    sqlx::query("DELETE FROM backups WHERE id=$1")
+        .bind(backup)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    f.teardown().await;
+}
+
 #[test]
 fn archived_depth_values_are_strict_and_legacy_absence_means_zero_4216() {
     let id = Uuid::new_v4();
