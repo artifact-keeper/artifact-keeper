@@ -90,6 +90,14 @@ eq(r.summaryLine('Backend (latest)', p, s, true),
   '- **Backend (latest)**: 3 finding(s) — 3 MEDIUM — `x:latest` (version `main`, built 2026-10-18T04:25:12Z)\n  - Located in: `usr/local/bin/buildctl` (3)');
 eq(r.summaryLine('Backend (dev)', {}, r.summarizeSarif(report()), true), '- **Backend (dev)**: 0 findings');
 eq(r.summaryLine('OpenSCAP', {}, r.summarizeSarif(report()), false), '- **OpenSCAP**: Scan skipped or failed');
+
+// The workflow only closes its own weekly scan issues, with an explanation.
+eq(r.isScanIssue({ title: 'Container scan findings detected (2026-10-19)' }), true);
+eq(r.isScanIssue({ title: 'Unrelated security issue' }), false);
+const stale = r.classify(report('CVE-A'), report(), report(), newerDev);
+const comment = r.staleIssueComment(stale);
+assert.ok(comment.includes('Closing this scan issue'));
+assert.ok(comment.includes('1 of 1 finding(s) were classified as stale'));
 NODE
 then pass "pure classification and summary logic"; else fail "pure classification and summary logic"; fi
 

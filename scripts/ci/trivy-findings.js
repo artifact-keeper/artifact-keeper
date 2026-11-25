@@ -104,6 +104,18 @@ function summaryLine(name, provenance, summary, present) {
   return `- **${name}**: ${summary.count} finding(s) — ${severityText(summary)}${meta}\n  - Located in: ${locationText(summary)}`;
 }
 
+function isScanIssue(issue) {
+  return issue.title.includes('Container scan findings');
+}
+
+function staleIssueComment(data) {
+  return [
+    'Closing this scan issue: all current findings are present only in the frozen `:latest` image',
+    'and absent from a `:dev` image built at least as recently, so they are already fixed on `main`',
+    `and clear on the next stable publish (#4799). ${data.staleFindings.length} of ${data.totalFindings} finding(s) were classified as stale.`,
+  ].join('\n');
+}
+
 // The decision the workflow acts on. A latest finding whose rule id also
 // appears on dev is live on main; one that does not is already fixed only
 // when the dev report comes from an image built at least as recently.
@@ -171,4 +183,15 @@ function main() {
 
 if (require.main === module) main();
 
-module.exports = { readSarif, summarizeSarif, readProvenance, classify, summaryLine, collect, run, TARGETS };
+module.exports = {
+  readSarif,
+  summarizeSarif,
+  readProvenance,
+  classify,
+  summaryLine,
+  isScanIssue,
+  staleIssueComment,
+  collect,
+  run,
+  TARGETS,
+};

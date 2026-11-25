@@ -158,7 +158,7 @@ jobs:
             scanned-images.txt
           retention-days: 90
 
-      - name: Check for new findings and create issue
+      - name: Check for findings and create or close scan issue
         if: always()
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
@@ -174,21 +174,17 @@ jobs:
             console.log(`Actionable findings: ${data.actionableFindings}`);
             console.log(data.summaries.join('\n'));
 
+            const existing = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'type:security',
+              per_page: 100
+            });
+            const scanIssues = existing.data.filter(findings.isScanIssue);
+
             if (data.actionableFindings > 0) {
-              // Check if there's already an open issue for container findings
-              const existing = await github.rest.issues.listForRepo({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                state: 'open',
-                labels: 'type:security',
-                per_page: 100
-              });
-
-              const hasExisting = existing.data.some(i =>
-                i.title.includes('Container scan findings')
-              );
-
-              if (!hasExisting) {
+              if (scanIssues.length === 0) {
                 await github.rest.issues.create({
                   owner: context.repo.owner,
                   repo: context.repo.repo,
@@ -227,6 +223,22 @@ jobs:
                   ].join('\n'),
                   labels: ['type:security']
                 });
+              }
+            } else if (data.staleFindings.length > 0) {
+              for (const issue of scanIssues) {
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: issue.number,
+                  body: findings.staleIssueComment(data)
+                });
+                await github.rest.issues.update({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: issue.number,
+                  state: 'closed'
+                });
+                console.log(`Closed resolved scan issue #${issue.number}`);
               }
             }
 
