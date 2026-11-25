@@ -11444,14 +11444,16 @@ mod not_found_3887 {
                 "entitled reader must see {uri}"
             );
             assert_eq!(reader_absent[i].0, StatusCode::NOT_FOUND, "{uri}");
-            for (who, hidden) in [
-                ("outsider", &outsider_hidden[i]),
-                ("anonymous", &anon_hidden[i]),
-            ] {
-                assert_eq!(hidden.0, reader_absent[i].0, "{who} status for {uri}");
-                assert_eq!(hidden.1, reader_absent[i].1, "{who} headers for {uri}");
-                assert_eq!(hidden.2, reader_absent[i].2, "{who} body for {uri}");
-            }
+            let hidden = &outsider_hidden[i];
+            assert_eq!(hidden.0, reader_absent[i].0, "outsider status for {uri}");
+            assert_eq!(hidden.1, reader_absent[i].1, "outsider headers for {uri}");
+            assert_eq!(hidden.2, reader_absent[i].2, "outsider body for {uri}");
+            // #6494: anonymous is challenged, so a client sends credentials
+            assert_eq!(
+                anon_hidden[i].0,
+                StatusCode::UNAUTHORIZED,
+                "anonymous status for {uri}"
+            );
         }
     }
 }

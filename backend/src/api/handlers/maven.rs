@@ -10687,9 +10687,7 @@ mod tests {
             "anonymous gets the challenge"
         );
         assert!(
-            anon_challenges
-                .iter()
-                .any(|c| *c == "Basic realm=\"artifact-keeper\""),
+            anon_challenges.contains(&"Basic realm=\"artifact-keeper\""),
             "the challenge Maven answers with credentials: {anon_challenges:?}"
         );
         assert_eq!(

@@ -7093,12 +7093,14 @@ pub async fn authorized_virtual_members(
 }
 
 /// [`try_authorize_virtual_members`] for a path that answers a package client:
-/// an anonymous caller who may read none of the members gets the 401 challenge
-/// a private repository answers, not the empty set (#6494). Maven and Gradle
-/// send configured credentials only after a challenge, so the 404 the empty
-/// set led to made a public virtual over private members unusable for them.
-/// Aggregating callers that read any `Err` as a database failure keep the
-/// plain form
+/// an anonymous caller who may read none of the members gets the 401
+/// challenge a private repository answers, not the empty set (#6494). Maven
+/// and Gradle send configured credentials only after a challenge, so the 404
+/// the empty set led to made a public virtual over private members unusable
+/// for them. It tells an anonymous caller that the virtual has members it may
+/// not read, which the shared 404 of #3452 hid. A virtual with no members
+/// keeps that 404. Aggregating callers that read any `Err` as a database
+/// failure keep the plain form
 pub async fn try_authorize_virtual_members_or_challenge(
     db: &PgPool,
     auth: Option<&crate::api::middleware::auth::AuthExtension>,
@@ -29446,7 +29448,11 @@ mod tests {
             ids(authorized_virtual_members(&pool, Some(&member_auth), root_id).await);
         let virtual_only_visible =
             ids(authorized_virtual_members(&pool, Some(&virtual_only_auth), root_id).await);
-        let anonymous_visible = ids(authorized_virtual_members(&pool, None, root_id).await);
+        // #6494: no member readable, so anonymous gets the challenge, not a list
+        let anonymous_status = authorized_virtual_members(&pool, None, root_id)
+            .await
+            .err()
+            .map(|r| r.status());
         let member_target = resolve_virtual_deploy_target(&pool, &svc, &member_auth, root_id)
             .await
             .map(|r| r.id);
@@ -29481,8 +29487,9 @@ mod tests {
             virtual_only_visible.is_empty(),
             "a grant on the virtual's project must not leak other projects' members"
         );
-        assert!(
-            anonymous_visible.is_empty(),
+        assert_eq!(
+            anonymous_status,
+            Some(StatusCode::UNAUTHORIZED),
             "private members never reach anonymous"
         );
         assert_eq!(
@@ -31120,7 +31127,11 @@ mod virtual_read_authz_tests {
     /// see this repository exists" — where content resolution additionally
     /// requires the `read` ACTION (#3326). Both are caller-narrowing; only the
     /// second half differs.
-    const AUTHZ_CALLS: &[&str] = &["authorize_virtual_members(", "filter_visible_repo_ids("];
+    const AUTHZ_CALLS: &[&str] = &[
+        "authorize_virtual_members(",
+        "authorize_virtual_members_or_challenge(",
+        "filter_visible_repo_ids(",
+    ];
 
     /// Byte window BEFORE the call in which an explicit opt-out marker must
     /// appear for a site that is deliberately unfiltered.
@@ -32043,7 +32054,8 @@ mod proxy_download_recording_tests {
                 .find(|(n, _)| *n == file)
                 .unwrap_or_else(|| panic!("{file} is scanned"));
             assert!(
-                src.contains("try_authorize_virtual_members("),
+                src.contains("try_authorize_virtual_members(")
+                    || src.contains("try_authorize_virtual_members_or_challenge("),
                 "#4308: {file} has a virtual download path and must authorize its \
                  members through the fallible helper"
             );

@@ -22865,7 +22865,7 @@ mod virtual_packument_member_authz_tests {
     }
 
     /// A caller who may read no member is answered before the cache is
-    /// touched, with the merge's own indistinguishable not-found body (#3452).
+    /// touched. Anonymous, it gets the 401 challenge (#6494).
     #[tokio::test]
     async fn a_caller_with_no_readable_member_is_refused_before_the_cache_db() {
         let Some(fx) = tdh::Fixture::setup("virtual", "npm").await else {
@@ -22876,7 +22876,7 @@ mod virtual_packument_member_authz_tests {
         seed_version(&fx, private_id, "authz-no-member-pkg", "1.0.0").await;
 
         let (status, _) = cached_body(&fx, None, "authz-no-member-pkg").await;
-        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
 
         tdh::cleanup_member_repo(&fx.pool, private_id, &private_dir).await;
         fx.teardown().await;
