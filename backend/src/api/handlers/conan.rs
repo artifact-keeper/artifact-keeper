@@ -528,6 +528,10 @@ struct SearchQuery {
 /// for both the non-virtual fast path and for virtual fan-out across hosted
 /// member repositories. Returns the list of recipe references
 /// (`name/version@user/channel`) for one repository matching `like_pattern`.
+///
+/// The pattern matches the name, `name/version` or the full reference, as on
+/// a Remote and on conan_server, so `conan list "name/*"` and
+/// `conan list name/version` find a hosted recipe (#6501)
 async fn search_recipes_for_repo(
     db: &PgPool,
     repository_id: uuid::Uuid,
@@ -556,7 +560,13 @@ async fn search_recipes_for_repo(
           AND a.is_deleted = false
           AND am.format = 'conan'
           AND am.metadata->>'pending' IS NULL
-          AND a.name LIKE $2
+          AND (
+            a.name LIKE $2
+            OR a.name || '/' || COALESCE(am.metadata->>'version', a.version, '0.0.0') LIKE $2
+            OR a.name || '/' || COALESCE(am.metadata->>'version', a.version, '0.0.0')
+               || '@' || COALESCE(am.metadata->>'user', '_')
+               || '/' || COALESCE(am.metadata->>'channel', '_') LIKE $2
+          )
         ORDER BY a.name, a.version
         "#,
     )
@@ -7036,6 +7046,53 @@ mod tests {
             );
 
             f.teardown().await;
+        }
+
+        /// #6501: `conan list "name/*"` and `conan list name/version` send the
+        /// reference, not the bare name, and found nothing on a hosted repo
+        #[tokio::test]
+        async fn search_matches_the_reference_pattern_6501() {
+            let Some(f) = TestFixture::setup("local").await else {
+                return;
+            };
+
+            let _ = seed_recipe_row(
+                &f.pool,
+                f.repo_id,
+                "t17lib",
+                "0.1.0",
+                "_",
+                "_",
+                "rev1",
+                "conanfile.py",
+            )
+            .await;
+
+            let mut found = Vec::new();
+            for q in [
+                "t17lib/*",
+                "t17lib/0.1.0",
+                "t17lib/0.1.0@_/_",
+                "t17lib*",
+                "other/*",
+            ] {
+                let (status, body) = f
+                    .get(format!(
+                        "/{}/v2/conans/search?q={}",
+                        f.repo_key,
+                        q.replace('*', "%2A")
+                    ))
+                    .await;
+                assert_eq!(status, StatusCode::OK, "q={q}");
+                found.push((q, parse_search_results(&body).await));
+            }
+            f.teardown().await;
+
+            let hit = vec!["t17lib/0.1.0@_/_".to_string()];
+            for (q, results) in &found[..4] {
+                assert_eq!(results, &hit, "q={q} must find the hosted recipe");
+            }
+            assert!(found[4].1.is_empty(), "control: another name finds nothing");
         }
     }
 
