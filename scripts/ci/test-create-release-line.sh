@@ -73,7 +73,8 @@ git fetch -q origin
 # the PUT rewrites) and $GH_LOG (one line per call, which is how the no-call
 # and restore-on-failure cases are asserted). W_CREATE_FAIL makes the ref
 # creation fail; W_ADMIN answers .permissions.admin; W_RESTORE_FAIL makes the
-# restoring PUT fail, which must be shouted about rather than logged.
+# restoring PUT fail, which must be shouted about rather than logged;
+# W_APPROVALS makes the ruleset GET report a different review count (#6216).
 STUB="$WORK/bin"
 mkdir -p "$STUB"
 cat > "$STUB/gh" <<'STUBGH'
@@ -108,7 +109,14 @@ case "${method} ${path}" in
     jq --arg e "$want" '.enforcement = $e | .updated_at = "2026-09-20T12:00:00.000Z"' \
       "$GH_RULESET" > "$GH_RULESET.tmp" && mv "$GH_RULESET.tmp" "$GH_RULESET"
     emit "$(cat "$GH_RULESET")" ;;
-  "GET "*/rulesets/*) emit "$(cat "$GH_RULESET")" ;;
+  "GET "*/rulesets/*)
+    ruleset="$(cat "$GH_RULESET")"
+    if [ -n "${W_APPROVALS:-}" ]; then
+      ruleset="$(jq --argjson n "$W_APPROVALS" \
+        '(.rules[] | select(.type == "pull_request") | .parameters.required_approving_review_count) = $n' \
+        <<< "$ruleset")"
+    fi
+    emit "$ruleset" ;;
   # ── the test-suite repository (#4372) ──
   "GET repos/artifact-keeper/artifact-keeper-test")
     emit "$(jq -nc --argjson p "${W_TESTS_PUSH:-true}" '{permissions:{push:$p}}')" ;;
@@ -152,16 +160,28 @@ TESTS_OTHER="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 RULESET_JSON="$WORK/ruleset.json"
 jq -nc '{id:20038606,name:"Release branch protection",enforcement:"active",
          conditions:{ref_name:{include:["refs/heads/release/[0-9]*.[0-9]*.x"],exclude:[]}},
-         rules:[{type:"pull_request"},{type:"required_status_checks"},{type:"non_fast_forward"},{type:"deletion"}],
+         rules:[
+           {type:"pull_request",parameters:{
+             required_approving_review_count:1,
+             dismiss_stale_reviews_on_push:true,
+             require_last_push_approval:true,
+             require_code_owner_review:false,
+             required_review_thread_resolution:false,
+             dismissal_restriction:{enabled:false,allowed_actors:[]},
+             required_reviewers:[],
+             allowed_merge_methods:["merge","squash","rebase"]}},
+           {type:"required_status_checks"},{type:"non_fast_forward"},{type:"deletion"}],
          bypass_actors:[],updated_at:"2026-09-20T00:43:13.203Z"}' > "$RULESET_JSON"
 
 # <label> <expected-exit> <expected-substring> [args...]; the log is left in
 # $LOG for the caller to inspect.
 LOG=""
+OUT=""
 run_case() {
   local label="$1" want="$2" needle="$3" got=0 out
   shift 3
   LOG="$WORK/log.$$"
+  OUT="$WORK/out.$$"
   : > "$LOG"
   cp "$RULESET_JSON" "$WORK/live.json"
   rm -f "$REPO"/release-line-*.json
@@ -169,6 +189,7 @@ run_case() {
     RELEASE_LINE_REPO=artifact-keeper/artifact-keeper RELEASE_LINE_RULESET=20038606 \
     RELEASE_LINE_TESTS_REPO=artifact-keeper/artifact-keeper-test \
     bash "$SCRIPT" "$@" 2>&1)" || got=$?
+  printf '%s\n' "$out" > "$OUT"
   if [ "$got" != "$want" ]; then
     fail "$label: expected exit $want, got $got"
     printf '%s\n' "$out" | sed 's/^/        /' >&2
@@ -239,6 +260,26 @@ W_TESTS_COMPARE=diverged refusal_no_mutation "tests sha not on the suite's main 
   "is not on artifact-keeper/artifact-keeper-test main" --tests-sha "$TESTS_OTHER" 1.9
 W_TESTS_PUSH=false refusal_no_mutation "no push access to the suite repo -> refused" \
   "must be able to push to" --tests-sha "$TESTS_OTHER" 1.9
+
+# ── #6216: a ruleset without a second reviewer warns but does not block ─────
+if run_case "review requirement present -> no warning" 0 "every precondition passed" \
+  --dry-run --tests-from-run 42 1.9; then
+  if grep -qF -- "approving review(s)" "$OUT"; then
+    fail "a compliant ruleset produced a review warning"
+    sed 's/^/        /' "$OUT" >&2
+  else
+    pass "a compliant ruleset produced no review warning"
+  fi
+fi
+if W_APPROVALS=0 run_case "zero required approvals -> warning only" 0 \
+  "requires 0 approving review(s)" --dry-run --tests-from-run 42 1.9; then
+  if grep -qE '^(PUT|POST) ' "$LOG"; then
+    fail "zero-approval warning case issued a mutating call"
+    sed 's/^/        /' "$LOG" >&2
+  else
+    pass "zero-approval warning case issued no PUT/POST"
+  fi
+fi
 
 # ── --dry-run changes nothing ───────────────────────────────────────────────
 if run_case "--dry-run -> plan only" 0 "every precondition passed" --dry-run --tests-from-run 42 1.9; then
