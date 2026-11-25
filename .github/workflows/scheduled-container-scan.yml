@@ -166,8 +166,8 @@ jobs:
             // Classified by scripts/ci/trivy-findings.js: severity comes from
             // the SARIF rule, not from the step config (this scan is
             // visibility-only and sets no severity filter, #3262), and a
-            // :latest finding absent from :dev is already fixed on main, so
-            // it must not open an issue (#4799).
+            // :latest finding absent from a :dev scan of an image built at
+            // least as recently is already fixed on main (#4799).
             const findings = require('./scripts/ci/trivy-findings.js');
             const data = findings.collect('.');
             console.log(`Total findings: ${data.totalFindings}`);
@@ -208,10 +208,11 @@ jobs:
                     '',
                     '- **Backend (dev)** tracks `main`. A finding here is actionable by a PR.',
                     '- **Backend (latest)** is the last *stable release*, which can lag `main` by weeks.',
-                    '  A finding that appears only against `:latest` is already fixed on `main` if the',
-                    '  version label above predates the fix — it clears on the next stable publish, and',
-                    '  must **not** be given a `.trivyignore` suppression (that would suppress a finding',
-                    '  in a build we no longer produce). Such findings do not open this issue (#4799).',
+                    '  A finding that appears only against `:latest` is already fixed on `main` only when',
+                    '  the `:dev` image above was built at least as recently and the finding is absent',
+                    '  there. It then clears on the next stable publish and must **not** be given a',
+                    '  `.trivyignore` suppression (that would suppress a finding in a build we no longer',
+                    '  produce). Such findings do not open this issue (#4799).',
                     '- Findings located in `usr/local/bin/grype` come from the bundled scanner CLI,',
                     '  which since #3352 is BUILT FROM SOURCE on a go1.26.6-floored toolchain rather',
                     '  than copied from `ghcr.io/anchore/grype`. A Go **stdlib** finding here is',

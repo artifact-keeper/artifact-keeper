@@ -4,15 +4,18 @@
 // `:dev` tracks main, so every finding there is live on main and actionable.
 // `:latest` is the frozen last stable release: a finding there that is absent
 // from `:dev` was already fixed on main and clears on the next stable publish.
-// It must not open a scan issue (#4799), and it must never be suppressed in
-// .trivyignore -- that would record an exception for a build we no longer
-// produce. OpenSCAP has no :dev scan, so its findings stay actionable.
+// Right after a release `:dev` can still be older, so its clean scan proves
+// nothing until it was built at least as recently as `:latest` (#4799). Such
+// findings must never be suppressed in .trivyignore -- that would record an
+// exception for a build we no longer produce. OpenSCAP has no :dev scan, so
+// its findings stay actionable.
 //
 // INPUT (--dir, default '.'): scanned-images.txt (name|ref|version|created),
 // backend-trivy.sarif, backend-dev-trivy.sarif, openscap-trivy.sarif. A
 // missing SARIF file means the scan was skipped or failed: when the dev file
-// is missing the classification is unknown, so every latest finding is kept
-// actionable rather than silently dismissed.
+// is missing, or either image's build time is unknown, the classification is
+// unknown and every latest finding stays actionable rather than being silently
+// dismissed.
 //
 // OUTPUT (--out, default ./findings.json): JSON with `summaries` (the issue
 // body lines), `totalFindings`, `actionableFindings` and `staleFindings`.
@@ -71,6 +74,20 @@ function readProvenance(dir) {
   return provenance;
 }
 
+function imageBuiltAt(provenance, name) {
+  const image = provenance[name];
+  const timestamp = Date.parse((image && image.created) || '');
+  return Number.isFinite(timestamp) ? timestamp : null;
+}
+
+// A clean `:dev` report only rules out a `:latest` finding when it comes from
+// an image that is not older than the release image (#4799).
+function devIsAtLeastAsNewAsLatest(provenance) {
+  const dev = imageBuiltAt(provenance, 'Backend (dev)');
+  const latest = imageBuiltAt(provenance, 'Backend (latest)');
+  return dev !== null && latest !== null && dev >= latest;
+}
+
 function severityText(summary) {
   return Object.entries(summary.bySeverity).map(([s, n]) => `${n} ${s}`).join(', ');
 }
@@ -88,16 +105,16 @@ function summaryLine(name, provenance, summary, present) {
 }
 
 // The decision the workflow acts on. A latest finding whose rule id also
-// appears on dev is live on main; one that does not is an already-fixed
-// finding in the frozen release image.
-function classify(latestSarif, devSarif, openscapSarif) {
+// appears on dev is live on main; one that does not is already fixed only
+// when the dev report comes from an image built at least as recently.
+function classify(latestSarif, devSarif, openscapSarif, provenance = {}) {
   const latest = summarizeSarif(latestSarif);
   const dev = summarizeSarif(devSarif);
   const openscap = summarizeSarif(openscapSarif);
   const devRuleIds = new Set(dev.entries.map((e) => e.ruleId));
-  const devAvailable = devSarif !== null;
-  const liveLatest = devAvailable ? latest.entries.filter((e) => devRuleIds.has(e.ruleId)) : latest.entries;
-  const staleFindings = devAvailable
+  const devCanRuleOutLatest = devSarif !== null && devIsAtLeastAsNewAsLatest(provenance);
+  const liveLatest = devCanRuleOutLatest ? latest.entries.filter((e) => devRuleIds.has(e.ruleId)) : latest.entries;
+  const staleFindings = devCanRuleOutLatest
     ? latest.entries.filter((e) => !devRuleIds.has(e.ruleId)).map((e) => ({ name: 'Backend (latest)', ...e }))
     : [];
   return {
@@ -115,9 +132,14 @@ function classify(latestSarif, devSarif, openscapSarif) {
 // `collect` is what the workflow's github-script calls; `run` is the CLI form
 // used by the self-test. Both share the same classification.
 function collect(dir) {
-  const reports = Object.fromEntries(TARGETS.map(([name, file]) => [name, readSarif(dir, file)]));
-  const result = classify(reports['Backend (latest)'], reports['Backend (dev)'], reports.OpenSCAP);
   const provenance = readProvenance(dir);
+  const reports = Object.fromEntries(TARGETS.map(([name, file]) => [name, readSarif(dir, file)]));
+  const result = classify(
+    reports['Backend (latest)'],
+    reports['Backend (dev)'],
+    reports.OpenSCAP,
+    provenance,
+  );
   return {
     totalFindings: result.totalFindings,
     actionableFindings: result.actionableFindings,
