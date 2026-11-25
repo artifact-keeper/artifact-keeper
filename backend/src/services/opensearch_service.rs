@@ -26,6 +26,22 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::error::{AppError, Result};
+use crate::services::cluster_work::{try_acquire_scheduler_lease_quiet, SchedulerLease};
+
+/// The one cluster-wide lease every full reindex runs under, the startup
+/// reindex and both admin endpoints alike, so they never overlap (#3502,
+/// #6404). Overlapping runs raced each other's refresh-interval changes and
+/// multiplied the load. The name predates the endpoints sharing it
+const REINDEX_LEASE: &str = "opensearch_bootstrap_reindex";
+
+/// Bounds a crashed holder, the renewal keeps a live reindex from becoming
+/// reclaimable mid-stream
+const REINDEX_LEASE_TTL_SECS: f64 = 6.0 * 3600.0;
+
+/// The reindex lease, `None` while another replica or call holds it
+pub async fn try_acquire_reindex_lease(db: &PgPool) -> Option<SchedulerLease> {
+    try_acquire_scheduler_lease_quiet(db, REINDEX_LEASE, REINDEX_LEASE_TTL_SECS).await
+}
 use crate::models::access_scope::AccessScope;
 
 /// Base name of the artifacts index, before any configured prefix is applied.
@@ -840,6 +856,21 @@ impl OpenSearchService {
 
         tracing::info!("Repository reindex complete: {} documents indexed", total);
         Ok(total)
+    }
+
+    /// [`Self::full_reindex`] under the reindex lease, stopped between batches
+    /// if another replica reclaims it, released at the end
+    pub async fn full_reindex_leased(
+        &self,
+        db: &PgPool,
+        lease: SchedulerLease,
+    ) -> Result<(usize, usize)> {
+        let (renewal, lost) =
+            lease.spawn_renewal_with_cancellation(db.clone(), REINDEX_LEASE_TTL_SECS);
+        let result = self.full_reindex(db, Some(&lost)).await;
+        drop(renewal);
+        lease.release(db).await;
+        result
     }
 
     /// Run a full reindex of both artifacts and repositories.

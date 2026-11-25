@@ -2617,6 +2617,7 @@ pub struct ReindexResponse {
     responses(
         (status = 200, description = "Reindex completed", body = ReindexResponse),
         (status = 401, description = "Admin privileges required"),
+        (status = 409, description = "A full reindex is already running"),
         (status = 500, description = "Internal server error")
     ),
     security(("bearer_auth" = []))
@@ -2636,9 +2637,10 @@ pub async fn trigger_reindex(
         .as_ref()
         .ok_or_else(|| AppError::Internal("Search engine is not configured".to_string()))?;
 
-    // `abort: None` — this operator-invoked reindex is not guarded by the
-    // bootstrap scheduler lease, so there is no lease-loss token (#3502).
-    let (artifacts, repositories) = search.full_reindex(&state.db, None).await?;
+    let lease = crate::services::opensearch_service::try_acquire_reindex_lease(&state.db)
+        .await
+        .ok_or_else(super::search::reindex_running)?;
+    let (artifacts, repositories) = search.full_reindex_leased(&state.db, lease).await?;
 
     Ok(Json(ReindexResponse {
         message: "Full reindex completed successfully".to_string(),
