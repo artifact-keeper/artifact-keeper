@@ -4816,8 +4816,10 @@ fn versioning_noop_warning(format_key: &str, versioning_requested: bool) -> Opti
 }
 
 /// Wraps a create/update result with the [`versioning_noop_warning`] header
-/// and log line. The body and status are unchanged.
+/// and log line. The status, headers and body are unchanged.
 fn respond_with_versioning_warning(
+    status: StatusCode,
+    headers: HeaderMap,
     repo: RepositoryResponse,
     versioning_requested: bool,
 ) -> Response {
@@ -4830,7 +4832,7 @@ fn respond_with_versioning_warning(
              only generic and mlmodel uploads are versioned (#6063)"
         );
     }
-    let mut response = Json(repo).into_response();
+    let mut response = (status, headers, Json(repo)).into_response();
     if let Some(value) = warning.and_then(|v| header::HeaderValue::from_str(&v).ok()) {
         response.headers_mut().append(header::WARNING, value);
     }
@@ -4846,11 +4848,13 @@ async fn create_repository_route(
     auth: Extension<Option<AuthExtension>>,
     body: Bytes,
 ) -> Result<Response> {
-    let Json(repo) = create_repository(state, auth, body).await?;
+    let (status, headers, Json(repo)) = create_repository(state, auth, body).await?;
     // Create stores exactly what was sent (default false), so the echoed
     // value is the requested one.
     let requested = repo.versioning_enabled;
-    Ok(respond_with_versioning_warning(repo, requested))
+    Ok(respond_with_versioning_warning(
+        status, headers, repo, requested,
+    ))
 }
 
 /// HTTP route for [`update_repository`]; see [`create_repository_route`]. Only
@@ -4864,7 +4868,12 @@ async fn update_repository_route(
 ) -> Result<Response> {
     let requested = payload.versioning_enabled == Some(true);
     let Json(repo) = update_repository(state, auth, key, Json(payload)).await?;
-    Ok(respond_with_versioning_warning(repo, requested))
+    Ok(respond_with_versioning_warning(
+        StatusCode::OK,
+        HeaderMap::new(),
+        repo,
+        requested,
+    ))
 }
 
 /// Create a new repository
@@ -29290,7 +29299,12 @@ mod tests {
     fn versioning_warning_response_keeps_status_and_body() {
         let mut repo = make_repo(false);
         repo.versioning_enabled = true;
-        let warned = respond_with_versioning_warning(repo_to_response(repo.clone(), 0), true);
+        let warned = respond_with_versioning_warning(
+            StatusCode::OK,
+            HeaderMap::new(),
+            repo_to_response(repo.clone(), 0),
+            true,
+        );
         assert_eq!(warned.status(), StatusCode::OK);
         assert_eq!(
             warned.headers().get(header::WARNING).unwrap(),
@@ -29298,13 +29312,48 @@ mod tests {
         );
 
         repo.format = RepositoryFormat::Generic;
-        let control = respond_with_versioning_warning(repo_to_response(repo.clone(), 0), true);
+        let control = respond_with_versioning_warning(
+            StatusCode::OK,
+            HeaderMap::new(),
+            repo_to_response(repo.clone(), 0),
+            true,
+        );
         assert_eq!(control.status(), StatusCode::OK);
         assert!(control.headers().get(header::WARNING).is_none());
 
         repo.format = RepositoryFormat::Pypi;
-        let not_requested = respond_with_versioning_warning(repo_to_response(repo, 0), false);
+        let not_requested = respond_with_versioning_warning(
+            StatusCode::OK,
+            HeaderMap::new(),
+            repo_to_response(repo, 0),
+            false,
+        );
         assert!(not_requested.headers().get(header::WARNING).is_none());
+    }
+
+    #[test]
+    fn versioning_warning_response_keeps_create_status_and_location() {
+        let mut repo = make_repo(false);
+        repo.versioning_enabled = true;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::LOCATION,
+            header::HeaderValue::from_static("/api/v1/repositories/warned"),
+        );
+
+        let response = respond_with_versioning_warning(
+            StatusCode::CREATED,
+            headers,
+            repo_to_response(repo, 0),
+            true,
+        );
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(
+            response.headers().get(header::LOCATION).unwrap(),
+            "/api/v1/repositories/warned"
+        );
+        assert!(response.headers().contains_key(header::WARNING));
     }
 
     // -----------------------------------------------------------------------
@@ -37386,7 +37435,7 @@ mod tests {
 
         // Created strict.
         let strict_key = format!("v5810-{}", Uuid::new_v4().simple());
-        let Json(created) = create_repository(
+        let (_, _, Json(created)) = create_repository(
             State(state.clone()),
             admin(),
             make_create_request(
