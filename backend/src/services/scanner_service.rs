@@ -3361,6 +3361,22 @@ fn is_iso_excluded_package_file(filename: &str) -> bool {
         .any(|suffix| lower.ends_with(suffix))
 }
 
+/// Whether reusing `source` would hand an upload that expects a catalog
+/// another artifact's zero-findings verdict, which may have been graded
+/// without one (#4324). A verdict with findings had a catalog to find them
+/// in, and the artifact's own verdict is its own
+fn takes_over_a_verdict_without_catalog(
+    expects_catalog: bool,
+    cve_authoritative: bool,
+    source: &crate::models::security::ScanResult,
+    artifact_id: Uuid,
+) -> bool {
+    expects_catalog
+        && cve_authoritative
+        && source.findings_count == 0
+        && source.artifact_id != artifact_id
+}
+
 /// Whether this upload expects a catalog: [`format_expects_catalog`] for its
 /// format and file name, or an ISO9660 image the scan workspace stages as
 /// a rootfs package database (#1966, [`ScanWorkspace::stages_iso_rootfs`]),
@@ -10486,6 +10502,35 @@ impl ScannerService {
             let reusable = match fresh_since {
                 Some(since) => reusable.filter(|r| r.completed_at.is_some_and(|c| c >= since)),
                 None => reusable,
+            };
+            // #4324: another artifact's zero-findings verdict may come from an
+            // upload of these bytes whose format expects no catalog, where an
+            // empty catalog still counts as complete. An upload that expects a
+            // catalog does not take it over: it keeps its own verdict if it has
+            // one (so it never gains a second completed row) and scans otherwise
+            let reusable = match reusable {
+                Some(r)
+                    if takes_over_a_verdict_without_catalog(
+                        expects_catalog,
+                        scanner.is_cve_authoritative(),
+                        &r,
+                        artifact_id,
+                    ) =>
+                {
+                    self.scan_result_service
+                        .find_own_reusable_scan(
+                            artifact_id,
+                            checksum,
+                            scanner.scan_type(),
+                            DEDUP_TTL_DAYS,
+                            ZERO_FINDINGS_DEDUP_TTL_DAYS,
+                            pin_identity.as_deref(),
+                        )
+                        .await
+                        .ok()
+                        .flatten()
+                }
+                other => other,
             };
             if let Some(mut source_scan) = reusable {
                 // #4425: `find_reusable_scan` only returns ORIGINAL scans, so
@@ -33134,6 +33179,99 @@ tonic-build = "0.12"
     /// key in the `find_reusable_scan` cross-artifact index). Built from two
     /// UUIDs because `format!("{:0<64}", uuid.simple())` doesn't actually
     /// pad: the `uuid::fmt::Simple` Display impl ignores fill/width.
+    /// #4324: the same bytes scanned first as a plain file (no catalog
+    /// expected, an empty catalog is a complete clean) and then as an archive
+    /// in a generic repository (a catalog expected). The archive must get its
+    /// own verdict, not the plain file's clean one
+    #[tokio::test]
+    async fn test_catalog_expecting_upload_does_not_reuse_a_clean_without_catalog_4324() {
+        struct EmptyCatalogCve;
+        #[async_trait::async_trait]
+        impl Scanner for EmptyCatalogCve {
+            fn name(&self) -> &str {
+                "empty-catalog-cve-4324"
+            }
+            fn scan_type(&self) -> &str {
+                "grype"
+            }
+            fn is_cve_authoritative(&self) -> bool {
+                true
+            }
+            async fn scan(
+                &self,
+                _: &Artifact,
+                _: Option<&ArtifactMetadata>,
+                _: &Bytes,
+            ) -> Result<ScanOutput> {
+                Ok(ScanOutput {
+                    findings: Vec::new(),
+                    packages: Vec::new(),
+                    scan_completeness: ScanCompleteness::Complete,
+                    cataloged: Some(Vec::new()),
+                    vuln_db: None,
+                })
+            }
+        }
+
+        let _serial = crate::api::handlers::test_db_helpers::scan_dedup_serial_lock().await;
+        let Some(fx) =
+            crate::api::handlers::test_db_helpers::Fixture::setup("local", "generic").await
+        else {
+            return;
+        };
+        let service = scanner_service_with(&fx, Arc::new(EmptyCatalogCve));
+        let bytes = npm_tarball_bytes("shared4324", "1.0.0");
+        let checksum = fresh_checksum();
+
+        let plain = insert_artifact_named(
+            &fx,
+            "shared4324",
+            Some("1.0.0"),
+            "plain",
+            "shared4324.bin",
+            &checksum,
+            bytes.clone(),
+        )
+        .await;
+        service
+            .scan_artifact_with_options(plain, true, false)
+            .await
+            .expect("scan orchestration must succeed");
+        let archive = insert_artifact_named(
+            &fx,
+            "shared4324",
+            Some("1.0.0"),
+            "archive",
+            "shared4324.tar.gz",
+            &checksum,
+            bytes,
+        )
+        .await;
+        service
+            .scan_artifact_with_options(archive, true, false)
+            .await
+            .expect("scan orchestration must succeed");
+
+        let (_, _, plain_reused, _, plain_complete) = read_reuse_row(&fx.pool, plain).await;
+        let (_, _, archive_reused, _, archive_complete) = read_reuse_row(&fx.pool, archive).await;
+        fx.teardown().await;
+
+        assert_eq!(
+            (plain_reused, plain_complete.as_deref()),
+            (false, Some("complete")),
+            "a plain file expects no catalog, its empty one is a complete clean"
+        );
+        assert!(
+            !archive_reused,
+            "the archive expects a catalog and must not be handed the plain file's clean"
+        );
+        assert_eq!(
+            archive_complete.as_deref(),
+            Some("not_cataloged"),
+            "its own scan found nothing to catalog"
+        );
+    }
+
     fn fresh_checksum() -> String {
         let mut s = String::with_capacity(64);
         s.push_str(&Uuid::new_v4().simple().to_string());
