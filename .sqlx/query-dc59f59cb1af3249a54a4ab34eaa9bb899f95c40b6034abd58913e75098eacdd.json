@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            INSERT INTO repositories (\n                key, name, description, format, repo_type,\n                storage_backend, storage_path, upstream_url,\n                visibility, quota_bytes, promotion_only, versioning_enabled,\n                project_id\n            )\n            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::repository_visibility, $10, $11, $12, $13)\n            RETURNING\n                id, key, name, description,\n                format as \"format: RepositoryFormat\",\n                repo_type as \"repo_type: RepositoryType\",\n                storage_backend, storage_path, upstream_url,\n                visibility as \"visibility: RepositoryVisibility\",\n                is_public, quota_bytes, promotion_only,\n                replication_priority as \"replication_priority: ReplicationPriority\",\n                curation_enabled, curation_source_repo_id, curation_target_repo_id,\n                curation_default_action, curation_sync_interval_secs, curation_auto_fetch,\n                age_gate_enabled, age_gate_min_age_days, versioning_enabled,\n                project_id, created_at, updated_at\n            ",
+  "query": "\n            SELECT\n                id, key, name, description,\n                format as \"format: RepositoryFormat\",\n                repo_type as \"repo_type: RepositoryType\",\n                storage_backend, storage_path, upstream_url,\n                visibility as \"visibility: RepositoryVisibility\",\n                is_public, quota_bytes, promotion_only,\n                replication_priority as \"replication_priority: ReplicationPriority\",\n                curation_enabled, curation_source_repo_id, curation_target_repo_id,\n                curation_default_action, curation_sync_interval_secs, curation_auto_fetch,\n                age_gate_enabled, age_gate_min_age_days, versioning_enabled, immutability as \"immutability: RepositoryImmutability\",\n                project_id, created_at, updated_at\n            FROM repositories\n            WHERE key = $1\n            ",
   "describe": {
     "columns": [
       {
@@ -111,7 +111,9 @@
                 "github",
                 "mise",
                 "aqua",
-                "pacman"
+                "pacman",
+                "agentplugins",
+                "mcp"
               ]
             }
           }
@@ -358,6 +360,27 @@
       },
       {
         "ordinal": 23,
+        "name": "immutability: RepositoryImmutability",
+        "type_info": {
+          "Custom": {
+            "name": "repository_immutability",
+            "kind": {
+              "Enum": [
+                "write_once",
+                "mutable"
+              ]
+            }
+          }
+        },
+        "origin": {
+          "Table": {
+            "table": "repositories",
+            "name": "immutability"
+          }
+        }
+      },
+      {
+        "ordinal": 24,
         "name": "project_id",
         "type_info": "Uuid",
         "origin": {
@@ -368,7 +391,7 @@
         }
       },
       {
-        "ordinal": 24,
+        "ordinal": 25,
         "name": "created_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -379,7 +402,7 @@
         }
       },
       {
-        "ordinal": 25,
+        "ordinal": 26,
         "name": "updated_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -392,107 +415,7 @@
     ],
     "parameters": {
       "Left": [
-        "Varchar",
-        "Varchar",
-        "Text",
-        {
-          "Custom": {
-            "name": "repository_format",
-            "kind": {
-              "Enum": [
-                "maven",
-                "gradle",
-                "npm",
-                "pypi",
-                "nuget",
-                "go",
-                "rubygems",
-                "docker",
-                "helm",
-                "rpm",
-                "debian",
-                "conan",
-                "cargo",
-                "generic",
-                "podman",
-                "buildx",
-                "oras",
-                "wasm_oci",
-                "helm_oci",
-                "poetry",
-                "conda",
-                "yarn",
-                "bower",
-                "pnpm",
-                "chocolatey",
-                "powershell",
-                "terraform",
-                "opentofu",
-                "alpine",
-                "conda_native",
-                "composer",
-                "hex",
-                "cocoapods",
-                "swift",
-                "pub",
-                "sbt",
-                "chef",
-                "puppet",
-                "ansible",
-                "gitlfs",
-                "vscode",
-                "jetbrains",
-                "huggingface",
-                "mlmodel",
-                "cran",
-                "vagrant",
-                "opkg",
-                "p2",
-                "bazel",
-                "protobuf",
-                "incus",
-                "lxc",
-                "jupyter",
-                "github",
-                "mise",
-                "aqua",
-                "pacman"
-              ]
-            }
-          }
-        },
-        {
-          "Custom": {
-            "name": "repository_type",
-            "kind": {
-              "Enum": [
-                "local",
-                "remote",
-                "virtual",
-                "staging"
-              ]
-            }
-          }
-        },
-        "Varchar",
-        "Varchar",
-        "Varchar",
-        {
-          "Custom": {
-            "name": "repository_visibility",
-            "kind": {
-              "Enum": [
-                "public",
-                "internal",
-                "private"
-              ]
-            }
-          }
-        },
-        "Int8",
-        "Bool",
-        "Bool",
-        "Uuid"
+        "Text"
       ]
     },
     "nullable": [
@@ -519,10 +442,11 @@
       false,
       false,
       false,
+      false,
       true,
       false,
       false
     ]
   },
-  "hash": "26c7077119286dc5e5d71e5eac6d8d5c1f3923a142514ac8f769b5067aaf0d5b"
+  "hash": "dc59f59cb1af3249a54a4ab34eaa9bb899f95c40b6034abd58913e75098eacdd"
 }

@@ -422,6 +422,23 @@ impl RepositoryVisibility {
     }
 }
 
+/// Per-repository immutability mode (#5188): whether a re-upload to an
+/// occupied path is refused or replaces the content there. Only formats and
+/// repository types that `artifact_service::overwrite_supported` accepts can
+/// be `Mutable`.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, sqlx::Type, utoipa::ToSchema,
+)]
+#[sqlx(type_name = "repository_immutability", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
+pub enum RepositoryImmutability {
+    /// A re-upload of an existing path answers 409.
+    #[default]
+    WriteOnce,
+    /// A re-upload replaces the content at the path.
+    Mutable,
+}
+
 /// Replication priority for Borg replication policies.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
 #[sqlx(type_name = "replication_priority", rename_all = "snake_case")]
@@ -479,6 +496,9 @@ pub struct Repository {
     /// the prior content at the same path (#2367). Defaults to false: no
     /// behavior change for existing repositories.
     pub versioning_enabled: bool,
+    /// Whether re-uploading an existing path replaces its content or answers
+    /// 409 (#5188). Defaults to write-once, as before.
+    pub immutability: RepositoryImmutability,
     /// Optional project this repository belongs to (#2472). `None` means the
     /// repository is unassigned and behaves exactly as before projects
     /// existed. Grants on the owning project (permissions rows with

@@ -5182,6 +5182,7 @@ mod tests {
         use crate::models::repository::{ReplicationPriority, Repository, RepositoryFormat};
         Repository {
             versioning_enabled: false,
+            immutability: crate::models::repository::RepositoryImmutability::WriteOnce,
             id: uuid::Uuid::new_v4(),
             key: key.to_string(),
             name: key.to_string(),

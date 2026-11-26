@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT\n                id, key, name, description,\n                format as \"format: RepositoryFormat\",\n                repo_type as \"repo_type: RepositoryType\",\n                storage_backend, storage_path, upstream_url,\n                visibility as \"visibility: RepositoryVisibility\",\n                is_public, quota_bytes, promotion_only,\n                replication_priority as \"replication_priority: ReplicationPriority\",\n                curation_enabled, curation_source_repo_id, curation_target_repo_id,\n                curation_default_action, curation_sync_interval_secs, curation_auto_fetch,\n                age_gate_enabled, age_gate_min_age_days, versioning_enabled,\n                project_id, created_at, updated_at\n            FROM repositories\n            WHERE id = $1\n            ",
+  "query": "\n            SELECT\n                r.id, r.key, r.name, r.description,\n                r.format as \"format: RepositoryFormat\",\n                r.repo_type as \"repo_type: RepositoryType\",\n                r.storage_backend, r.storage_path, r.upstream_url,\n                r.visibility as \"visibility: RepositoryVisibility\",\n                r.is_public, r.quota_bytes, r.promotion_only,\n                r.replication_priority as \"replication_priority: ReplicationPriority\",\n                r.curation_enabled, r.curation_source_repo_id, r.curation_target_repo_id,\n                r.curation_default_action, r.curation_sync_interval_secs, r.curation_auto_fetch,\n                r.age_gate_enabled, r.age_gate_min_age_days, r.versioning_enabled, r.immutability as \"immutability: RepositoryImmutability\",\n                r.project_id, r.created_at, r.updated_at\n            FROM repositories r\n            INNER JOIN virtual_repo_members vrm ON r.id = vrm.member_repo_id\n            WHERE vrm.virtual_repo_id = $1\n            ORDER BY vrm.priority\n            ",
   "describe": {
     "columns": [
       {
@@ -111,7 +111,9 @@
                 "github",
                 "mise",
                 "aqua",
-                "pacman"
+                "pacman",
+                "agentplugins",
+                "mcp"
               ]
             }
           }
@@ -358,6 +360,27 @@
       },
       {
         "ordinal": 23,
+        "name": "immutability: RepositoryImmutability",
+        "type_info": {
+          "Custom": {
+            "name": "repository_immutability",
+            "kind": {
+              "Enum": [
+                "write_once",
+                "mutable"
+              ]
+            }
+          }
+        },
+        "origin": {
+          "Table": {
+            "table": "repositories",
+            "name": "immutability"
+          }
+        }
+      },
+      {
+        "ordinal": 24,
         "name": "project_id",
         "type_info": "Uuid",
         "origin": {
@@ -368,7 +391,7 @@
         }
       },
       {
-        "ordinal": 24,
+        "ordinal": 25,
         "name": "created_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -379,7 +402,7 @@
         }
       },
       {
-        "ordinal": 25,
+        "ordinal": 26,
         "name": "updated_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -419,10 +442,11 @@
       false,
       false,
       false,
+      false,
       true,
       false,
       false
     ]
   },
-  "hash": "0826c3867ba03716c5783d97209f8f734219d7c4a1ca43575c7c1d1d126dd344"
+  "hash": "7b1e38ab3f14654b0173f1fb10541a7ff161362ea3c8d4d9c50ed37452cb94ca"
 }

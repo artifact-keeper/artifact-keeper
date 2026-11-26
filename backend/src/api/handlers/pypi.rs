@@ -4172,17 +4172,21 @@ async fn serve_file(
     // the artifact is not ours.
     crate::services::artifact_service::record_download(&state.db, artifact.id, ctx).await;
 
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, pypi_content_type(filename))
-        .header(
-            "Content-Disposition",
-            format!("attachment; filename=\"{}\"", filename),
-        )
-        .header(CONTENT_LENGTH, served_size.to_string())
-        .header("X-PyPI-File-SHA256", &served_sha)
-        .body(Body::from_stream(stream))
-        .unwrap())
+    Ok(proxy_helpers::revalidate_if_mutable(
+        repo,
+        &served_sha,
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, pypi_content_type(filename))
+            .header(
+                "Content-Disposition",
+                format!("attachment; filename=\"{}\"", filename),
+            )
+            .header(CONTENT_LENGTH, served_size.to_string())
+            .header("X-PyPI-File-SHA256", &served_sha)
+            .body(Body::from_stream(stream))
+            .unwrap(),
+    ))
 }
 
 /// The answer of a virtual distribution walk no member served (#6417): the
@@ -7645,9 +7649,14 @@ async fn upload(
         }
     }
 
-    // Check for duplicate
+    // Check for duplicate. `Some(mutable)` when the file exists; a
+    // mutable PyPI repository (#5188) lets the upload below replace a
+    // `.devN` / `+local` file, a Poetry, Conda or Jupyter repository on this
+    // route never does.
     let existing = sqlx::query_scalar!(
-        "SELECT id FROM artifacts WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
+        "SELECT r.immutability = 'mutable' AS \"mutable!\" FROM repositories r \
+         WHERE r.id = $1 AND EXISTS (SELECT 1 FROM artifacts a \
+             WHERE a.repository_id = $1 AND a.path = $2 AND a.is_deleted = false)",
         repo.id,
         format!("{}/{}/{}", normalized, pkg_version, filename)
     )
@@ -7655,7 +7664,11 @@ async fn upload(
     .await
     .map_err(map_db_err)?;
 
-    if existing.is_some() {
+    if existing.is_some_and(|mutable| {
+        !(mutable
+            && repo.overwrite_allowed()
+            && crate::formats::pypi::PypiHandler::overwritable_filename(&filename))
+    }) {
         return Err(AppError::Conflict("File already exists".to_string()).into_response());
     }
 
@@ -12477,6 +12490,7 @@ mod tests {
             artifact_id: None,
             etag: None,
             stale_since: None,
+            revalidate: false,
         }
     }
 
@@ -12595,6 +12609,7 @@ mod tests {
             artifact_id: None,
             etag: None,
             stale_since: None,
+            revalidate: false,
         }
     }
 
@@ -13161,6 +13176,7 @@ mod tests {
             artifact_id: None,
             etag: None,
             stale_since: None,
+            revalidate: false,
         }
     }
 
@@ -14389,6 +14405,145 @@ mod tests {
             StatusCode::OK,
             "upload to a normal repo must still succeed; body: {}",
             String::from_utf8_lossy(&allowed_body)
+        );
+    }
+
+    /// #5188: a virtual over a mutable member serves the replacement (it reads
+    /// the member's row on every request, with no cache of its own), and both
+    /// the member and the virtual serve the file as `no-cache` with the
+    /// SHA-256 as `ETag`, so a Remote or HTTP cache in front revalidates.
+    #[tokio::test]
+    async fn virtual_over_mutable_member_serves_the_replacement_5188() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::artifact_service::ArtifactService;
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "pypi").await else {
+            return;
+        };
+        let (member_id, member_key, member_dir) = tdh::create_repo(&fx.pool, "local", "pypi").await;
+        sqlx::query("UPDATE repositories SET immutability = 'mutable' WHERE id = $1")
+            .bind(member_id)
+            .execute(&fx.pool)
+            .await
+            .unwrap();
+        tdh::link_virtual_member(&fx.pool, fx.repo_id, member_id, 1).await;
+        tdh::grant_repo_access(&fx.pool, member_id, fx.user_id).await;
+        let (project, version) = ("ak-virt-ovr", "1.0.dev1");
+        let filename = "ak_virt_ovr-1.0.dev1-py3-none-any.whl";
+        let upload = |bytes: &'static [u8]| {
+            let (content_type, body) =
+                pypi_upload_multipart(project, version, filename, bytes, "virt", ">=3.8");
+            tdh::send(
+                fx.router_with_auth(super::router()),
+                tdh::post(format!("/{member_key}/"), &content_type, body),
+            )
+        };
+        let get = |key: String| {
+            tdh::send_with_headers(
+                fx.router_with_auth(super::router()),
+                tdh::get(format!("/{key}/simple/{project}/{filename}")),
+            )
+        };
+
+        let (first, _) = upload(b"build-1").await;
+        let (_, via_virtual_1, _) = get(fx.repo_key.clone()).await;
+        let (second, _) = upload(b"build-2").await;
+        let (status, via_virtual_2, virtual_headers) = get(fx.repo_key.clone()).await;
+        let (_, _, member_headers) = get(member_key.clone()).await;
+
+        tdh::cleanup_member_repo(&fx.pool, member_id, &member_dir).await;
+        fx.teardown().await;
+
+        assert_eq!((first, second), (StatusCode::OK, StatusCode::OK));
+        assert_eq!(&via_virtual_1[..], b"build-1");
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            &via_virtual_2[..],
+            b"build-2",
+            "the virtual serves the replacement"
+        );
+        let etag = format!("\"{}\"", ArtifactService::calculate_sha256(b"build-2"));
+        for (label, headers) in [("member", &member_headers), ("virtual", &virtual_headers)] {
+            assert_eq!(
+                headers.get("cache-control").and_then(|v| v.to_str().ok()),
+                Some("no-cache"),
+                "{label}"
+            );
+            assert_eq!(
+                headers.get("etag").and_then(|v| v.to_str().ok()),
+                Some(etag.as_str()),
+                "{label}"
+            );
+        }
+    }
+
+    /// #5188: re-uploading an existing filename (what `twine upload` does on
+    /// every snapshot build) is a 409 by default and replaces a `.devN` file
+    /// once the repository is mutable. A final release stays write-once.
+    #[tokio::test]
+    async fn test_reupload_conflicts_unless_repo_allows_overwrite() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "pypi").await else {
+            return;
+        };
+        let project = "ak-pypi-overwrite";
+        let (version, filename) = (
+            "0.1.0.dev1",
+            "ak_pypi_overwrite-0.1.0.dev1-py3-none-any.whl",
+        );
+        let send = |version: &'static str, filename: &'static str, bytes: &'static [u8]| {
+            let (content_type, body) =
+                pypi_upload_multipart(project, version, filename, bytes, "overwrite", ">=3.8");
+            let app = fx.router_with_auth(super::router());
+            tdh::send(
+                app,
+                tdh::post(format!("/{}/", fx.repo_key), &content_type, body),
+            )
+        };
+        let upload = |bytes: &'static [u8]| send(version, filename, bytes);
+        let release =
+            |bytes: &'static [u8]| send("0.1.0", "ak_pypi_overwrite-0.1.0-py3-none-any.whl", bytes);
+
+        let (first, _) = upload(b"build-1").await;
+        let (immutable, _) = upload(b"build-2").await;
+        sqlx::query("UPDATE repositories SET immutability = 'mutable' WHERE id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("set immutability");
+        let (released, _) = release(b"release-1").await;
+        let (release_mutable, _) = release(b"release-2").await;
+        let (mutable, mutable_body) = upload(b"build-2").await;
+        let stored: String = sqlx::query_scalar(
+            "SELECT checksum_sha256 FROM artifacts WHERE repository_id = $1 AND path = $2",
+        )
+        .bind(fx.repo_id)
+        .bind(format!("{project}/{version}/{filename}"))
+        .fetch_one(&fx.pool)
+        .await
+        .expect("artifact row");
+
+        fx.teardown().await;
+
+        assert_eq!(first, StatusCode::OK);
+        assert_eq!(immutable, StatusCode::CONFLICT, "default stays write-once");
+        assert_eq!(released, StatusCode::OK);
+        assert_eq!(
+            release_mutable,
+            StatusCode::CONFLICT,
+            "a final release stays write-once on a mutable repo (until #4812)"
+        );
+        assert_eq!(
+            mutable,
+            StatusCode::OK,
+            "mutable repo must accept the re-upload; body: {}",
+            String::from_utf8_lossy(&mutable_body)
+        );
+        assert_eq!(
+            stored.trim(),
+            crate::services::artifact_service::ArtifactService::calculate_sha256(b"build-2"),
+            "the stored file must be the replacement"
         );
     }
 
@@ -16486,6 +16641,7 @@ mod tests {
             upstream_commit_sha: None,
             size_bytes: 18,
             checksum_sha256: "c".repeat(64),
+            revalidate: false,
         }
     }
 
@@ -19443,6 +19599,7 @@ mod tests {
             artifact_id: None,
             etag: None,
             stale_since: None,
+            revalidate: false,
         };
 
         let response = build_streaming_file_response("numpy-1.0-py3-none-any.whl", result);
@@ -23642,6 +23799,7 @@ mod tests {
         let now = chrono::Utc::now();
         let sidecar = |body: &Bytes, sha: &str, held: bool| {
             let meta = crate::services::proxy_service::CacheMetadata {
+                revalidate: false,
                 cached_at: now,
                 upstream_etag: None,
                 storage_etag: None,
@@ -24014,6 +24172,7 @@ mod tests {
             .expect("index sidecar key");
             let now = chrono::Utc::now();
             let meta = crate::services::proxy_service::CacheMetadata {
+                revalidate: false,
                 cached_at: now,
                 upstream_etag: None,
                 storage_etag: None,
@@ -24404,6 +24563,7 @@ mod content_encoding_forwarding_tests {
             content_encoding: encoding.map(str::to_owned),
             commit_sha: None,
             stale_since: None,
+            revalidate: false,
         }
     }
 

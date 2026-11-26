@@ -1033,6 +1033,7 @@ mod tests {
     fn repo(format: RepositoryFormat, repo_type: RepositoryType) -> Repository {
         Repository {
             versioning_enabled: false,
+            immutability: crate::models::repository::RepositoryImmutability::WriteOnce,
             id: Uuid::new_v4(),
             key: "images".to_string(),
             name: "Container images".to_string(),

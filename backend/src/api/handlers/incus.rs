@@ -872,6 +872,7 @@ async fn resolve_incus_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Res
         age_gate_mode: "upstream_publish_time".to_string(),
         curation_enabled: false,
         curation_default_action: "allow".to_string(),
+        allow_overwrite: false,
     })
 }
 
@@ -3772,6 +3773,7 @@ mod tests {
             age_gate_mode: "upstream_publish_time".to_string(),
             curation_enabled: false,
             curation_default_action: "allow".to_string(),
+            allow_overwrite: false,
         };
         assert_eq!(info.repo_type, "hosted");
         assert_eq!(info.storage_path, "/data/incus");
@@ -3794,6 +3796,7 @@ mod tests {
             age_gate_mode: "upstream_publish_time".to_string(),
             curation_enabled: false,
             curation_default_action: "allow".to_string(),
+            allow_overwrite: false,
         };
         assert_eq!(info.repo_type, "remote");
         assert_eq!(
@@ -5448,6 +5451,7 @@ mod streaming_pipeline_regression_tests {
             age_gate_mode: "upstream_publish_time".to_string(),
             curation_enabled: false,
             curation_default_action: "allow".to_string(),
+            allow_overwrite: false,
         }
     }
 
@@ -5739,6 +5743,7 @@ mod streaming_pipeline_regression_tests {
             age_gate_mode: "upstream_publish_time".to_string(),
             curation_enabled: false,
             curation_default_action: "allow".to_string(),
+            allow_overwrite: false,
         };
         let artifact_path = build_artifact_path("ubuntu", "1", "incus.tar.xz");
         finalize_upload(

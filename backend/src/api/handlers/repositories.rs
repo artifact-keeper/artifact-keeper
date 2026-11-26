@@ -34,7 +34,7 @@ use crate::error::{AppError, Result};
 use crate::formats::debian::{DebianConfigPatch, DebianRepositoryConfig, DEBIAN_CONFIG_KEY};
 use crate::formats::maven::MavenHandler;
 use crate::models::access_scope::AccessScope;
-use crate::models::repository::{RepositoryFormat, RepositoryType};
+use crate::models::repository::{RepositoryFormat, RepositoryImmutability, RepositoryType};
 use crate::services::artifact_service::ArtifactService;
 use crate::services::audit_export::details as audit_details;
 use crate::services::audit_service::{
@@ -1100,6 +1100,11 @@ pub struct CreateRepositoryRequest {
     /// uploads to Generic/Mlmodel repos append immutable revisions instead
     /// of overwriting. Defaults to false (current behavior preserved).
     pub versioning_enabled: Option<bool>,
+    /// Immutability mode (#5188). `write_once` (the default): re-uploading
+    /// an existing filename answers 409. `mutable`: the re-upload replaces
+    /// it. `mutable` is rejected (422) unless the repository is a local or
+    /// staging PyPI, Debian, RPM, Alpine, Pacman or Generic one.
+    pub immutability: Option<RepositoryImmutability>,
     /// Override the default storage backend for this repository.
     /// When omitted, the server's configured default is used.
     /// Non-admin users may only use the default backend.
@@ -1485,6 +1490,11 @@ pub struct UpdateRepositoryRequest {
     /// When provided, enables/disables first-class artifact versioning for
     /// this Generic/Mlmodel repository (#2367). When omitted, unchanged.
     pub versioning_enabled: Option<bool>,
+    /// When provided, sets the immutability mode, `write_once` or `mutable`
+    /// (#5188). When omitted, unchanged. `mutable` is rejected (422) unless
+    /// the repository is a local or staging PyPI, Debian, RPM, Alpine, Pacman
+    /// or Generic one.
+    pub immutability: Option<RepositoryImmutability>,
     /// Update the Cargo index upstream URL (stored in `repository_config`).
     /// When provided, upserts the `index_upstream_url` key for this repository.
     pub index_upstream_url: Option<String>,
@@ -1735,6 +1745,9 @@ pub struct RepositoryResponse {
     /// When true, uploads to this Generic/Mlmodel repository append immutable
     /// revisions instead of overwriting the prior content (#2367).
     pub versioning_enabled: bool,
+    /// `write_once`: re-uploading an existing filename answers 409.
+    /// `mutable`: the re-upload replaces it (#5188).
+    pub immutability: RepositoryImmutability,
     /// Which storage backend holds this repository's content: `filesystem`,
     /// `s3`, `azure`, `gcs`. Accepted on create and immutable afterwards, so
     /// before #3917 it was write-only — no read path echoed it back and
@@ -2327,6 +2340,7 @@ fn repo_to_response(
         is_public: repo.is_public,
         promotion_only: repo.promotion_only,
         versioning_enabled: repo.versioning_enabled,
+        immutability: repo.immutability,
         storage_backend: repo.storage_backend,
         storage_used_bytes,
         member_storage_used_bytes: None,
@@ -4881,7 +4895,7 @@ async fn update_repository_route(
         (status = 401, description = "Authentication required"),
         (status = 403, description = "Insufficient permissions: needs global admin, system repository admin, or project admin of the requested project_id"),
         (status = 409, description = "Repository key already exists or concurrent layout change; retry"),
-        (status = 422, description = "Positive repodata_depth requires an eligible local RPM repository; repodata_mode requires a local RPM repository; a bare namespace in mcp_server_deny or mcp_auto_approve_namespaces (write `com.acme/*`)"),
+        (status = 422, description = "Positive repodata_depth requires an eligible local RPM repository; repodata_mode requires a local RPM repository; a bare namespace in mcp_server_deny or mcp_auto_approve_namespaces (write `com.acme/*`); mutable on a repository other than a local or staging PyPI, Debian, RPM, Alpine, Pacman or Generic one"),
     )
 )]
 pub async fn create_repository(
@@ -5213,6 +5227,7 @@ pub async fn create_repository(
                 quota_bytes: payload.quota_bytes,
                 promotion_only: payload.promotion_only.unwrap_or(false),
                 versioning_enabled: payload.versioning_enabled.unwrap_or(false),
+                immutability: payload.immutability.unwrap_or_default(),
                 // Plugin format key takes precedence over any explicit format_key
                 // in the payload: when a WASM plugin format was resolved above,
                 // `plugin_format_key` carries the canonical handler name.
@@ -5471,6 +5486,7 @@ pub async fn create_repository(
                 upstream_auth_change: None,
                 age_gate_change: None,
                 upstream_mode_change: born_remote.upstream_mode_audit(),
+                immutability_change: None,
             }),
     )
     .await;
@@ -6559,7 +6575,7 @@ async fn may_rename_repository(
         (status = 403, description = "Insufficient permissions: needs repository admin, plus project admin of the destination project when changing project_id, or of the current project when clearing it with null, and admin (or project admin of the project the repository ends up in) to change the key"),
         (status = 404, description = "Repository not found"),
         (status = 409, description = "Repository key conflict, nonempty repository depth change, concurrent layout change, or an upstream_url origin change while upstream-auth credentials are configured"),
-        (status = 422, description = "Positive repodata_depth requires an eligible local RPM repository; repodata_mode requires a local RPM repository; a bare namespace in mcp_server_deny or mcp_auto_approve_namespaces (write `com.acme/*`)"),
+        (status = 422, description = "Positive repodata_depth requires an eligible local RPM repository; repodata_mode requires a local RPM repository; a bare namespace in mcp_server_deny or mcp_auto_approve_namespaces (write `com.acme/*`); mutable on a repository other than a local or staging PyPI, Debian, RPM, Alpine, Pacman or Generic one"),
     )
 )]
 pub async fn update_repository(
@@ -6851,6 +6867,7 @@ pub async fn update_repository(
                 upstream_url: payload.upstream_url.clone(),
                 promotion_only: payload.promotion_only,
                 versioning_enabled: payload.versioning_enabled,
+                immutability: payload.immutability,
                 // Three-way (#2472, #4026): omit = unchanged, Some(None) =
                 // clear, Some(Some(id)) = assign (authorized above).
                 project_id: payload.project_id,
@@ -7043,6 +7060,12 @@ pub async fn update_repository(
                 upstream_auth_change: None,
                 age_gate_change: None,
                 upstream_mode_change: None,
+                immutability_change: (existing.immutability != repo.immutability).then_some(
+                    audit_details::ImmutabilityChangeAudit {
+                        previous_immutability: existing.immutability,
+                        immutability: repo.immutability,
+                    },
+                ),
             }),
     )
     .await;
@@ -7807,6 +7830,7 @@ pub async fn delete_repository(
                     upstream_auth_change: None,
                     age_gate_change: None,
                     upstream_mode_change: None,
+                    immutability_change: None,
                 }),
         )
         .await;
@@ -11765,6 +11789,9 @@ fn virtual_member_serve_head(
     if let Some(value) = etag.and_then(|e| header::HeaderValue::from_str(&e).ok()) {
         builder = builder.header(header::ETAG, value);
     }
+    if result.revalidate {
+        builder = builder.header(header::CACHE_CONTROL, "no-cache");
+    }
     proxy_helpers::apply_stale_markers(builder, result.stale_since)
 }
 
@@ -14241,7 +14268,7 @@ pub async fn download_artifact(
             // Shared range-aware streaming (#1847): one primitive serves the
             // 200 / 206 / 416 cases for both this generic path and the format
             // handlers (e.g. incus image download).
-            let base_headers = vec![
+            let mut base_headers = vec![
                 (header::CONTENT_TYPE, artifact.content_type),
                 (
                     header::CONTENT_DISPOSITION,
@@ -14258,6 +14285,11 @@ pub async fn download_artifact(
                     "proxy".to_string(),
                 ),
             ];
+            // #5188: content at a mutable repository's path can change, so
+            // caches revalidate the ETag above before reusing it.
+            if crate::services::artifact_service::overwrite_applies(&repo, &path) {
+                base_headers.push((header::CACHE_CONTROL, "no-cache".to_string()));
+            }
             let verify = serve_verification(
                 state.config.download_verify_checksums
                     && crate::storage::verify::checksum_is_content_digest(
@@ -15418,6 +15450,7 @@ async fn audit_remote_setting_change(
         upstream_auth_change: None,
         age_gate_change: None,
         upstream_mode_change: None,
+        immutability_change: None,
     };
     fill(&mut details);
     audit_fire_and_forget(
@@ -19876,6 +19909,7 @@ mod tests {
         let now = chrono::Utc::now();
         Repository {
             versioning_enabled: false,
+            immutability: crate::models::repository::RepositoryImmutability::WriteOnce,
             id: Uuid::new_v4(),
             key: "rpm-curation".to_string(),
             name: "RPM Curation".to_string(),
@@ -20352,6 +20386,7 @@ mod tests {
             repodata_depth_editable: false,
             repodata_mode: None,
             versioning_enabled: false,
+            immutability: RepositoryImmutability::Mutable,
             has_trusted_gpg_key: false,
             id: Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap(),
             key: "my-repo".to_string(),
@@ -20409,6 +20444,25 @@ mod tests {
         assert!(json.contains("\"quota_bytes\":1048576"));
         assert!(json.contains("\"allow_anonymous_access\":true"));
         assert!(json.contains("\"promotion_only\":false"));
+        // #5188: the mode serializes as its snake_case name.
+        assert!(json.contains("\"immutability\":\"mutable\""), "got {json}");
+    }
+
+    #[test]
+    fn test_immutability_json_field_5188() {
+        let req: CreateRepositoryRequest = serde_json::from_str(
+            r#"{"key":"k","name":"n","format":"pypi","repo_type":"local","immutability":"mutable"}"#,
+        )
+        .unwrap();
+        assert_eq!(req.immutability, Some(RepositoryImmutability::Mutable));
+        let upd: UpdateRepositoryRequest =
+            serde_json::from_str(r#"{"immutability":"write_once"}"#).unwrap();
+        assert_eq!(upd.immutability, Some(RepositoryImmutability::WriteOnce));
+        // A mode #4812 has not added yet is a 4xx, not silently ignored.
+        assert!(
+            serde_json::from_str::<UpdateRepositoryRequest>(r#"{"immutability":"strict"}"#)
+                .is_err()
+        );
     }
 
     #[test]
@@ -20418,6 +20472,7 @@ mod tests {
             repodata_depth_editable: false,
             repodata_mode: None,
             versioning_enabled: false,
+            immutability: crate::models::repository::RepositoryImmutability::WriteOnce,
             has_trusted_gpg_key: false,
             id: Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap(),
             key: "my-repo".to_string(),
@@ -21816,6 +21871,7 @@ mod tests {
         let now = chrono::Utc::now();
         let repo = Repository {
             versioning_enabled: false,
+            immutability: crate::models::repository::RepositoryImmutability::WriteOnce,
             id: Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap(),
             key: "maven-central".to_string(),
             name: "Maven Central".to_string(),
@@ -21871,6 +21927,7 @@ mod tests {
             repodata_depth_editable: false,
             repodata_mode: None,
             versioning_enabled: false,
+            immutability: crate::models::repository::RepositoryImmutability::WriteOnce,
             has_trusted_gpg_key: false,
             id: Uuid::new_v4(),
             key: "npm-age".to_string(),
@@ -21934,6 +21991,7 @@ mod tests {
         let now = chrono::Utc::now();
         let repo = Repository {
             versioning_enabled: false,
+            immutability: crate::models::repository::RepositoryImmutability::WriteOnce,
             id: Uuid::new_v4(),
             key: "npm-hosted".to_string(),
             name: "NPM Local".to_string(),
@@ -21981,6 +22039,7 @@ mod tests {
         let now = chrono::Utc::now();
         let repo = Repository {
             versioning_enabled: false,
+            immutability: crate::models::repository::RepositoryImmutability::WriteOnce,
             id: Uuid::new_v4(),
             key: "docker-all".to_string(),
             name: "Docker Virtual".to_string(),
@@ -22021,6 +22080,7 @@ mod tests {
         let now = chrono::Utc::now();
         let repo = Repository {
             versioning_enabled: false,
+            immutability: crate::models::repository::RepositoryImmutability::WriteOnce,
             id: Uuid::new_v4(),
             key: "cargo-staging".to_string(),
             name: "Cargo Staging".to_string(),
@@ -22139,6 +22199,7 @@ mod tests {
         let now = chrono::Utc::now();
         Repository {
             versioning_enabled: false,
+            immutability: crate::models::repository::RepositoryImmutability::WriteOnce,
             id,
             key: key.to_string(),
             name: key.to_string(),
@@ -27350,6 +27411,7 @@ mod tests {
         let now = chrono::Utc::now();
         Repository {
             versioning_enabled: false,
+            immutability: crate::models::repository::RepositoryImmutability::WriteOnce,
             id: Uuid::new_v4(),
             key: "test-repo".to_string(),
             name: "Test Repo".to_string(),
@@ -38183,6 +38245,7 @@ mod tests {
             allow_anonymous_access: false,
             promotion_only: false,
             versioning_enabled: false,
+            immutability: crate::models::repository::RepositoryImmutability::WriteOnce,
             storage_backend: "filesystem".to_string(),
             storage_used_bytes: 0,
             member_storage_used_bytes: None,
@@ -39319,6 +39382,38 @@ mod tests {
             Some(Some("203.0.113.61".to_string())),
             "the REPOSITORY_CREATED row must carry the request peer IP (#4762)"
         );
+    }
+
+    /// #5188: `immutability = mutable` set on a hash-pinned format (as a row written
+    /// before the create/update check existed could be) does not make the
+    /// generic PUT replace a released file: different bytes still get 409.
+    #[tokio::test]
+    async fn generic_put_on_mutable_npm_repo_still_conflicts_5188() {
+        let Some(f) = tdh::Fixture::setup("local", "npm").await else {
+            return;
+        };
+        sqlx::query("UPDATE repositories SET immutability = 'mutable' WHERE id = $1")
+            .bind(f.repo_id)
+            .execute(&f.pool)
+            .await
+            .unwrap();
+        let app = f.router_with_auth(super::router());
+        let uri = format!("/{}/artifacts/notes/build-1.0.0.txt", f.repo_key);
+        let (first, b1) = tdh::send(
+            app.clone(),
+            tdh::put(uri.clone(), Bytes::from_static(b"one")),
+        )
+        .await;
+        let (second, _) = tdh::send(app, tdh::put(uri, Bytes::from_static(b"two"))).await;
+        f.teardown().await;
+
+        assert_eq!(
+            first,
+            StatusCode::CREATED,
+            "{}",
+            String::from_utf8_lossy(&b1)
+        );
+        assert_eq!(second, StatusCode::CONFLICT);
     }
 
     /// #5458: a generic upload (`PUT /{key}/artifacts/{path}`) by an owner

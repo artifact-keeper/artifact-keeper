@@ -11,8 +11,8 @@ use crate::api::validation::validate_outbound_url;
 use crate::error::{AppError, Result};
 #[allow(unused_imports)] // Used by sqlx query macros
 use crate::models::repository::{
-    is_deleting_key, ReplicationPriority, Repository, RepositoryFormat, RepositoryType,
-    RepositoryVisibility,
+    is_deleting_key, ReplicationPriority, Repository, RepositoryFormat, RepositoryImmutability,
+    RepositoryType, RepositoryVisibility,
 };
 use crate::services::opensearch_service::{OpenSearchService, RepositoryDocument};
 
@@ -277,6 +277,9 @@ pub struct CreateRepositoryRequest {
     /// When true, uploads to Generic/Mlmodel repos append immutable revisions
     /// to `artifact_versions` instead of overwriting (#2367). Defaults to false.
     pub versioning_enabled: bool,
+    /// Whether re-uploading an existing path replaces its content or answers
+    /// 409 (#5188). Defaults to write-once.
+    pub immutability: RepositoryImmutability,
     /// Custom format key for WASM plugin handlers (e.g. "rpm-custom").
     pub format_key: Option<String>,
     /// Optional project to assign the repository to at creation (#2472).
@@ -326,6 +329,9 @@ pub struct UpdateRepositoryRequest {
     /// When `Some`, sets the `versioning_enabled` flag (#2367); `None` leaves
     /// it unchanged.
     pub versioning_enabled: Option<bool>,
+    /// When `Some`, sets the immutability mode (#5188); `None` leaves it
+    /// unchanged.
+    pub immutability: Option<RepositoryImmutability>,
     /// When `Some`, sets the repository's project assignment (#2472);
     /// `None` leaves it unchanged. The outer `Option` is the "field present"
     /// marker and the inner value is what is stored: `Some(Some(id))` assigns,
@@ -442,6 +448,23 @@ pub enum MemberVisibility {
 // ---------------------------------------------------------------------------
 // Pure helper functions (no DB, testable in isolation)
 // ---------------------------------------------------------------------------
+
+/// Reject `immutability: mutable` (#5188) on a repository that could not
+/// honour it: see [`crate::services::artifact_service::overwrite_supported`].
+pub(crate) fn validate_immutability(
+    immutability: RepositoryImmutability,
+    format: &RepositoryFormat,
+    repo_type: &RepositoryType,
+) -> Result<()> {
+    if immutability == RepositoryImmutability::Mutable
+        && !crate::services::artifact_service::overwrite_supported(format, repo_type)
+    {
+        return Err(AppError::UnprocessableEntity(
+            crate::services::artifact_service::OVERWRITE_UNSUPPORTED.into(),
+        ));
+    }
+    Ok(())
+}
 
 /// Validate that a remote repository has an upstream URL and that the URL is
 /// safe to contact (anti-SSRF). Returns an error if validation fails.
@@ -1354,6 +1377,7 @@ impl RepositoryService {
                 crate::services::rpm_layout::UNSUPPORTED.into(),
             ));
         }
+        validate_immutability(req.immutability, &req.format, &req.repo_type)?;
         // Validate remote repository has upstream URL and it is safe to contact
         validate_remote_upstream(&req.repo_type, &req.upstream_url, &req.format)?;
 
@@ -1413,9 +1437,9 @@ impl RepositoryService {
                 key, name, description, format, repo_type,
                 storage_backend, storage_path, upstream_url,
                 visibility, quota_bytes, promotion_only, versioning_enabled,
-                project_id
+                project_id, immutability
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::repository_visibility, $10, $11, $12, $13)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::repository_visibility, $10, $11, $12, $13, $14)
             RETURNING
                 id, key, name, description,
                 format as "format: RepositoryFormat",
@@ -1426,7 +1450,7 @@ impl RepositoryService {
                 replication_priority as "replication_priority: ReplicationPriority",
                 curation_enabled, curation_source_repo_id, curation_target_repo_id,
                 curation_default_action, curation_sync_interval_secs, curation_auto_fetch,
-                age_gate_enabled, age_gate_min_age_days, versioning_enabled,
+                age_gate_enabled, age_gate_min_age_days, versioning_enabled, immutability as "immutability: RepositoryImmutability",
                 project_id, created_at, updated_at
             "#,
             req.key,
@@ -1442,6 +1466,7 @@ impl RepositoryService {
             req.promotion_only,
             req.versioning_enabled,
             req.project_id,
+            req.immutability as RepositoryImmutability,
         )
         .fetch_one(&mut *tx)
         .await;
@@ -1718,7 +1743,7 @@ impl RepositoryService {
                 replication_priority as "replication_priority: ReplicationPriority",
                 curation_enabled, curation_source_repo_id, curation_target_repo_id,
                 curation_default_action, curation_sync_interval_secs, curation_auto_fetch,
-                age_gate_enabled, age_gate_min_age_days, versioning_enabled,
+                age_gate_enabled, age_gate_min_age_days, versioning_enabled, immutability as "immutability: RepositoryImmutability",
                 project_id, created_at, updated_at
             FROM repositories
             WHERE id = $1
@@ -1756,7 +1781,7 @@ impl RepositoryService {
                 replication_priority as "replication_priority: ReplicationPriority",
                 curation_enabled, curation_source_repo_id, curation_target_repo_id,
                 curation_default_action, curation_sync_interval_secs, curation_auto_fetch,
-                age_gate_enabled, age_gate_min_age_days, versioning_enabled,
+                age_gate_enabled, age_gate_min_age_days, versioning_enabled, immutability as "immutability: RepositoryImmutability",
                 project_id, created_at, updated_at
             FROM repositories
             WHERE key = $1
@@ -1817,7 +1842,7 @@ impl RepositoryService {
                 replication_priority,
                 curation_enabled, curation_source_repo_id, curation_target_repo_id,
                 curation_default_action, curation_sync_interval_secs, curation_auto_fetch,
-                age_gate_enabled, age_gate_min_age_days, versioning_enabled,
+                age_gate_enabled, age_gate_min_age_days, versioning_enabled, immutability,
                 project_id, created_at, updated_at
             FROM repositories
             WHERE ($1::repository_format IS NULL OR format = $1)
@@ -1916,6 +1941,10 @@ impl RepositoryService {
             let existing = self.get_by_id(id).await?;
             validate_remote_upstream(&existing.repo_type, &req.upstream_url, &existing.format)?;
         }
+        if let Some(immutability) = req.immutability {
+            let existing = self.get_by_id(id).await?;
+            validate_immutability(immutability, &existing.format, &existing.repo_type)?;
+        }
 
         let mut tx = self.db.begin().await?;
         if let Some(ref new_url) = req.upstream_url {
@@ -2005,6 +2034,7 @@ impl RepositoryService {
                 -- which derives from whichever column actually changed and so
                 -- leaves an `internal` repository alone.
                 visibility = COALESCE($13::repository_visibility, visibility),
+                immutability = COALESCE($14, immutability),
                 updated_at = NOW()
             WHERE id = $1
             RETURNING
@@ -2017,7 +2047,7 @@ impl RepositoryService {
                 replication_priority as "replication_priority: ReplicationPriority",
                 curation_enabled, curation_source_repo_id, curation_target_repo_id,
                 curation_default_action, curation_sync_interval_secs, curation_auto_fetch,
-                age_gate_enabled, age_gate_min_age_days, versioning_enabled,
+                age_gate_enabled, age_gate_min_age_days, versioning_enabled, immutability as "immutability: RepositoryImmutability",
                 project_id, created_at, updated_at
             "#,
             id,
@@ -2033,6 +2063,7 @@ impl RepositoryService {
             req.curation_enabled,
             req.curation_default_action,
             req.visibility as _,
+            req.immutability as Option<RepositoryImmutability>,
         )
         .fetch_optional(&mut *tx)
         .await
@@ -2456,7 +2487,7 @@ impl RepositoryService {
                 r.replication_priority as "replication_priority: ReplicationPriority",
                 r.curation_enabled, r.curation_source_repo_id, r.curation_target_repo_id,
                 r.curation_default_action, r.curation_sync_interval_secs, r.curation_auto_fetch,
-                r.age_gate_enabled, r.age_gate_min_age_days, r.versioning_enabled,
+                r.age_gate_enabled, r.age_gate_min_age_days, r.versioning_enabled, r.immutability as "immutability: RepositoryImmutability",
                 r.project_id, r.created_at, r.updated_at
             FROM repositories r
             INNER JOIN virtual_repo_members vrm ON r.id = vrm.member_repo_id
@@ -3877,6 +3908,7 @@ mod tests {
         let now = chrono::Utc::now();
         Repository {
             versioning_enabled: false,
+            immutability: RepositoryImmutability::WriteOnce,
             id: Uuid::new_v4(),
             key: "test-repo".to_string(),
             name: "Test Repository".to_string(),
@@ -3949,6 +3981,7 @@ mod tests {
         let now = chrono::Utc::now();
         let repo = Repository {
             versioning_enabled: false,
+            immutability: RepositoryImmutability::WriteOnce,
             id: Uuid::new_v4(),
             key: "no-desc".to_string(),
             name: "No Description".to_string(),
@@ -4020,6 +4053,7 @@ mod tests {
     fn test_create_repository_request_construction() {
         let req = CreateRepositoryRequest {
             versioning_enabled: false,
+            immutability: RepositoryImmutability::WriteOnce,
             key: "my-repo".to_string(),
             name: "My Repository".to_string(),
             description: Some("Test repo".to_string()),
@@ -4048,6 +4082,7 @@ mod tests {
     fn test_create_repository_request_remote_with_upstream() {
         let req = CreateRepositoryRequest {
             versioning_enabled: false,
+            immutability: RepositoryImmutability::WriteOnce,
             key: "npm-remote".to_string(),
             name: "NPM Remote".to_string(),
             description: None,
@@ -4115,6 +4150,7 @@ mod tests {
                         upstream_url: None,
                         promotion_only: None,
                         versioning_enabled: None,
+                        immutability: None,
                         project_id: None,
                         trusted_gpg_key: None,
                         curation_allow_unverified: None,
@@ -4232,6 +4268,7 @@ mod tests {
         let req = UpdateRepositoryRequest {
             visibility: None,
             versioning_enabled: None,
+            immutability: None,
             key: None,
             name: None,
             description: None,
@@ -4258,6 +4295,7 @@ mod tests {
         let req = UpdateRepositoryRequest {
             visibility: None,
             versioning_enabled: None,
+            immutability: None,
             key: None,
             name: Some("Updated Name".to_string()),
             description: Some(Some("Updated Description".to_string())),
@@ -4282,6 +4320,7 @@ mod tests {
         let req = UpdateRepositoryRequest {
             visibility: None,
             versioning_enabled: None,
+            immutability: None,
             key: None,
             name: None,
             description: None,
@@ -4301,6 +4340,32 @@ mod tests {
     // -----------------------------------------------------------------------
     // validate_remote_upstream (extracted pure function)
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_validate_immutability_rejects_unsupported_format_and_type() {
+        use RepositoryFormat::*;
+        let local = RepositoryType::Local;
+        for format in [Pypi, Debian, Rpm, Alpine, Pacman, Generic] {
+            assert!(
+                validate_immutability(RepositoryImmutability::Mutable, &format, &local).is_ok(),
+                "{format:?}"
+            );
+        }
+        for format in [Npm, Cargo, Go, Maven] {
+            assert!(matches!(
+                validate_immutability(RepositoryImmutability::Mutable, &format, &local),
+                Err(AppError::UnprocessableEntity(_))
+            ));
+            assert!(
+                validate_immutability(RepositoryImmutability::WriteOnce, &format, &local).is_ok()
+            );
+        }
+        for repo_type in [RepositoryType::Remote, RepositoryType::Virtual] {
+            assert!(
+                validate_immutability(RepositoryImmutability::Mutable, &Pypi, &repo_type).is_err()
+            );
+        }
+    }
 
     #[test]
     fn test_validate_remote_upstream_remote_without_url_fails() {
@@ -5692,6 +5757,7 @@ mod tests {
         fn make_create_req(suffix: &str, format: RepositoryFormat) -> CreateRepositoryRequest {
             CreateRepositoryRequest {
                 versioning_enabled: false,
+                immutability: RepositoryImmutability::WriteOnce,
                 key: format!("acs-repo-{suffix}"),
                 name: format!("acs repo {suffix}"),
                 description: None,
@@ -5716,6 +5782,70 @@ mod tests {
                 .bind(id)
                 .execute(pool)
                 .await;
+        }
+
+        /// #5188: the immutability mode is stored and returned by create and
+        /// update, and `mutable` is refused (422, nothing written) on a
+        /// format the allowlist rejects, on create and on update.
+        #[tokio::test]
+        async fn test_immutability_mode_create_update_and_refusal_5188() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let service = RepositoryService::new(pool.clone());
+            let set = |immutability| UpdateRepositoryRequest {
+                visibility: None,
+                key: None,
+                name: None,
+                description: None,
+                is_public: None,
+                quota_bytes: None,
+                upstream_url: None,
+                promotion_only: None,
+                versioning_enabled: None,
+                immutability: Some(immutability),
+                project_id: None,
+                trusted_gpg_key: None,
+                curation_allow_unverified: None,
+                curation_enabled: None,
+                curation_default_action: None,
+            };
+            let suffix = uuid::Uuid::new_v4().simple().to_string();
+            let mut req = make_create_req(&format!("{suffix}-pypi"), RepositoryFormat::Pypi);
+            req.immutability = RepositoryImmutability::Mutable;
+            let pypi = service.create(req).await.expect("create mutable pypi");
+            let back = service
+                .update(pypi.id, set(RepositoryImmutability::WriteOnce))
+                .await
+                .expect("set write_once");
+            let npm = service
+                .create(make_create_req(
+                    &format!("{suffix}-npm"),
+                    RepositoryFormat::Npm,
+                ))
+                .await
+                .expect("create npm");
+            let refused_update = service
+                .update(npm.id, set(RepositoryImmutability::Mutable))
+                .await;
+            let stored = service.get_by_id(npm.id).await.expect("npm").immutability;
+            let mut req = make_create_req(&format!("{suffix}-npm2"), RepositoryFormat::Npm);
+            req.immutability = RepositoryImmutability::Mutable;
+            let refused_create = service.create(req).await;
+            cleanup_repo(&pool, pypi.id).await;
+            cleanup_repo(&pool, npm.id).await;
+
+            assert_eq!(pypi.immutability, RepositoryImmutability::Mutable);
+            assert_eq!(back.immutability, RepositoryImmutability::WriteOnce);
+            assert!(matches!(
+                refused_update,
+                Err(AppError::UnprocessableEntity(_))
+            ));
+            assert_eq!(stored, RepositoryImmutability::WriteOnce);
+            assert!(matches!(
+                refused_create,
+                Err(AppError::UnprocessableEntity(_))
+            ));
         }
 
         /// Happy-path: create commits the INSERT inside a transaction and
@@ -5815,6 +5945,7 @@ mod tests {
                 upstream_url: None,
                 promotion_only: None,
                 versioning_enabled: None,
+                immutability: None,
                 project_id: None,
                 trusted_gpg_key: Some(None),
                 curation_allow_unverified: None,
@@ -5838,6 +5969,7 @@ mod tests {
                 upstream_url: None,
                 promotion_only: None,
                 versioning_enabled: None,
+                immutability: None,
                 project_id: None,
                 trusted_gpg_key: Some(Some(TEST_TRUSTED_PUB_KEY.to_string())),
                 curation_allow_unverified: None,
@@ -5862,6 +5994,7 @@ mod tests {
                 upstream_url: None,
                 promotion_only: None,
                 versioning_enabled: None,
+                immutability: None,
                 project_id: None,
                 trusted_gpg_key: None,
                 curation_allow_unverified: None,
@@ -5923,6 +6056,7 @@ mod tests {
                 upstream_url: None,
                 promotion_only: None,
                 versioning_enabled: None,
+                immutability: None,
                 project_id: None,
                 trusted_gpg_key: None,
                 curation_allow_unverified: flag,
@@ -8621,6 +8755,7 @@ mod tests {
                         upstream_url: None,
                         promotion_only: None,
                         versioning_enabled: None,
+                        immutability: None,
                         project_id: None,
                         trusted_gpg_key: None,
                         curation_allow_unverified: None,
