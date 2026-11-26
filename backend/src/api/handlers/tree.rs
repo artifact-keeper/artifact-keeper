@@ -1500,9 +1500,10 @@ mod content_streaming_tests_6465 {
             .expect("download");
         let download_status = download.status();
         let streamed = download.body().size_hint().exact().is_none();
-        let download_bytes = axum::body::to_bytes(download.into_body(), usize::MAX)
+        let download_bytes = http_body_util::BodyExt::collect(download.into_body())
             .await
-            .expect("download body");
+            .expect("download body")
+            .to_bytes();
         let (preview_status, preview, headers) = tdh::send_with_headers(
             tdh::router_anon(router(), state),
             tdh::get(format!(
