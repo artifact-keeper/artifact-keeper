@@ -431,6 +431,20 @@ pub trait StorageBackend: Send + Sync {
         Ok(None)
     }
 
+    /// [`Self::get_presigned_url`] for a download a browser saves: the signed
+    /// URL makes the object store answer `Content-Disposition` with
+    /// `content_disposition`, so the file keeps its name instead of the storage
+    /// key's (#6495). A backend that cannot sign it serves the plain URL
+    async fn get_presigned_download_url(
+        &self,
+        key: &str,
+        expires_in: Duration,
+        content_disposition: &str,
+    ) -> Result<Option<PresignedUrl>> {
+        let _ = content_disposition;
+        self.get_presigned_url(key, expires_in).await
+    }
+
     /// Store content from a file.
     ///
     /// Default implementation opens the file and delegates to `put_stream`,

@@ -14068,9 +14068,14 @@ pub async fn download_artifact(
         .map_err(|e| AppError::Database(e.to_string()))?
         {
             let expiry = Duration::from_secs(state.config.presigned_download_expiry_secs);
-            // Try to get presigned URL from the shared storage backend
+            // Try to get presigned URL from the shared storage backend. The
+            // key is a digest, so the URL carries the artifact's file name for
+            // the object store to answer with (#6495)
+            let file_name = path.rsplit('/').next().unwrap_or(&path);
+            let disposition =
+                crate::api::download_response::content_disposition_attachment(file_name);
             if let Some(presigned) = storage
-                .get_presigned_url(&artifact.storage_key, expiry)
+                .get_presigned_download_url(&artifact.storage_key, expiry, &disposition)
                 .await?
             {
                 // Record download analytics (best-effort; must not block the

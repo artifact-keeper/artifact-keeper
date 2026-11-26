@@ -1262,6 +1262,47 @@ impl GcsBackend {
     ///
     /// Reference: <https://cloud.google.com/storage/docs/access-control/signing-urls-manually>
     pub fn generate_signed_url(&self, key: &str, expires_in: Duration) -> Result<String> {
+        self.signed_get_url(key, expires_in, None)
+    }
+
+    /// A signed GET for a client redirect, `None` when this backend does not
+    /// redirect
+    fn presigned(
+        &self,
+        key: &str,
+        expires_in: Duration,
+        content_disposition: Option<&str>,
+    ) -> Result<Option<PresignedUrl>> {
+        if !matches!(self.auth, GcsAuthMode::ServiceAccountKey { .. }) {
+            return Ok(None);
+        }
+
+        if !self.config.redirect_downloads {
+            return Ok(None);
+        }
+
+        let url = self.signed_get_url(key, expires_in, content_disposition)?;
+
+        tracing::debug!(
+            key = %key,
+            expires_in = ?expires_in,
+            "Generated GCS signed URL"
+        );
+
+        Ok(Some(PresignedUrl {
+            url,
+            expires_in,
+            source: PresignedUrlSource::Gcs,
+        }))
+    }
+
+    /// [`Self::generate_signed_url`], answering `content_disposition` when set
+    fn signed_get_url(
+        &self,
+        key: &str,
+        expires_in: Duration,
+        content_disposition: Option<&str>,
+    ) -> Result<String> {
         let signing_key = match &self.auth {
             GcsAuthMode::ServiceAccountKey { signing_key, .. } => signing_key,
             GcsAuthMode::Adc { .. } => {
@@ -1298,13 +1339,18 @@ impl GcsBackend {
         let signed_headers = "host";
 
         // Build canonical query string (alphabetically sorted)
-        let query_params = [
+        // Sorted by name as the canonical query requires, `response-...`
+        // sorts after every `X-Goog-...`
+        let mut query_params = vec![
             ("X-Goog-Algorithm", "GOOG4-RSA-SHA256".to_string()),
             ("X-Goog-Credential", credential.clone()),
             ("X-Goog-Date", request_timestamp.clone()),
             ("X-Goog-Expires", expiry_seconds.to_string()),
             ("X-Goog-SignedHeaders", signed_headers.to_string()),
         ];
+        if let Some(value) = content_disposition {
+            query_params.push(("response-content-disposition", value.to_string()));
+        }
 
         let canonical_query_string: String = query_params
             .iter()
@@ -2030,27 +2076,17 @@ impl StorageBackend for GcsBackend {
         key: &str,
         expires_in: Duration,
     ) -> Result<Option<PresignedUrl>> {
-        if !matches!(self.auth, GcsAuthMode::ServiceAccountKey { .. }) {
-            return Ok(None);
-        }
+        self.presigned(key, expires_in, None)
+    }
 
-        if !self.config.redirect_downloads {
-            return Ok(None);
-        }
-
-        let url = self.generate_signed_url(key, expires_in)?;
-
-        tracing::debug!(
-            key = %key,
-            expires_in = ?expires_in,
-            "Generated GCS signed URL"
-        );
-
-        Ok(Some(PresignedUrl {
-            url,
-            expires_in,
-            source: PresignedUrlSource::Gcs,
-        }))
+    #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "client", storage.system = "gcs", storage.operation = "get_presigned_download_url"))]
+    async fn get_presigned_download_url(
+        &self,
+        key: &str,
+        expires_in: Duration,
+        content_disposition: &str,
+    ) -> Result<Option<PresignedUrl>> {
+        self.presigned(key, expires_in, Some(content_disposition))
     }
 
     async fn list_keys(&self, prefix: &str) -> Result<Option<Vec<super::ListedKey>>> {
@@ -2429,6 +2465,69 @@ mod tests {
     }
 
     // ---- V4 signed URL generation ----
+
+    /// #6495: the disposition override sits in the canonical query in sorted
+    /// order, so the V4 signature covers it
+    #[tokio::test]
+    async fn test_presigned_download_url_signs_the_content_disposition_6495() {
+        use rsa::signature::Verifier;
+        let backend = create_test_backend().await;
+        let disposition = "attachment; filename=\"example.tar.gz\"";
+        let presigned = backend
+            .get_presigned_download_url("generic/ab/abcd", Duration::from_secs(300), disposition)
+            .await
+            .unwrap()
+            .expect("redirects enabled");
+        let url = url::Url::parse(&presigned.url).unwrap();
+        let param = |name: &str| {
+            url.query_pairs()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.into_owned())
+                .unwrap_or_default()
+        };
+        assert_eq!(param("response-content-disposition"), disposition);
+
+        let mut pairs: Vec<(String, String)> = url
+            .query_pairs()
+            .filter(|(k, _)| k != "X-Goog-Signature")
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+        pairs.sort();
+        let query = pairs
+            .iter()
+            .map(|(k, v)| format!("{}={}", urlencoding::encode(k), urlencoding::encode(v)))
+            .collect::<Vec<_>>()
+            .join("&");
+        let canonical_request = format!(
+            "GET\n{}\n{}\nhost:storage.googleapis.com\n\nhost\nUNSIGNED-PAYLOAD",
+            url.path(),
+            query
+        );
+        let scope = param("X-Goog-Credential")
+            .split_once('/')
+            .map(|(_, s)| s.to_string())
+            .unwrap_or_default();
+        let string_to_sign = format!(
+            "GOOG4-RSA-SHA256\n{}\n{}\n{}",
+            param("X-Goog-Date"),
+            scope,
+            hex::encode(Sha256::digest(canonical_request.as_bytes()))
+        );
+        let GcsAuthMode::ServiceAccountKey { signing_key, .. } = &backend.auth else {
+            panic!("the test config signs with a service account key");
+        };
+        let verifying = rsa::pkcs1v15::VerifyingKey::<Sha256>::new(signing_key.to_public_key());
+        let signature = rsa::pkcs1v15::Signature::try_from(
+            hex::decode(param("X-Goog-Signature")).unwrap().as_slice(),
+        )
+        .unwrap();
+        assert!(
+            verifying
+                .verify(string_to_sign.as_bytes(), &signature)
+                .is_ok(),
+            "the override is part of the signature"
+        );
+    }
 
     #[tokio::test]
     async fn test_signed_url_generation() {

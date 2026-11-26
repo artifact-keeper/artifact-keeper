@@ -2604,54 +2604,18 @@ impl super::StorageBackend for S3Backend {
         key: &str,
         expires_in: Duration,
     ) -> Result<Option<PresignedUrl>> {
-        if !self.redirect_downloads {
-            return Ok(None);
-        }
+        self.presign_get(key, expires_in, None).await
+    }
 
-        let full_key = self.full_key(key);
-
-        if let Some(cf) = &self.cloudfront {
-            let url = self.generate_cloudfront_signed_url(cf, &full_key, expires_in)?;
-            tracing::debug!(
-                key = %key, expires_in_secs = expires_in.as_secs(), source = "cloudfront",
-                "Generated CloudFront signed URL"
-            );
-            return Ok(Some(PresignedUrl {
-                url,
-                expires_in,
-                source: PresignedUrlSource::CloudFront,
-            }));
-        }
-
-        use object_store::signer::Signer;
-
-        let path: ObjectPath = full_key.into();
-        let signer = self.signing_store.as_ref().unwrap_or(&self.store);
-
-        // S3 enforces a maximum presigned URL expiry of 7 days
-        let clamped_expiry = Duration::from_secs(expires_in.as_secs().min(604800));
-
-        let presigned_url = signer
-            .signed_url(http::Method::GET, &path, clamped_expiry)
+    #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "client", storage.system = "s3", storage.operation = "get_presigned_download_url"))]
+    async fn get_presigned_download_url(
+        &self,
+        key: &str,
+        expires_in: Duration,
+        content_disposition: &str,
+    ) -> Result<Option<PresignedUrl>> {
+        self.presign_get(key, expires_in, Some(content_disposition))
             .await
-            .map_err(|e| {
-                s3_storage_error(
-                    format!("Failed to generate presigned URL for '{}'", key),
-                    &e,
-                )
-            })?;
-
-        tracing::debug!(
-            key = %key, expires_in_secs = clamped_expiry.as_secs(), source = "s3",
-            dedicated_signer = self.signing_store.is_some(),
-            "Generated S3 presigned URL"
-        );
-
-        Ok(Some(PresignedUrl {
-            url: presigned_url.to_string(),
-            expires_in: clamped_expiry,
-            source: PresignedUrlSource::S3,
-        }))
     }
 
     async fn list_keys(&self, prefix: &str) -> Result<Option<Vec<super::ListedKey>>> {
@@ -2953,6 +2917,71 @@ impl super::StorageBackend for S3Backend {
 
 /// Extended S3 backend operations (for StorageService compatibility)
 impl S3Backend {
+    /// A presigned GET for `key`, answering `content_disposition` when set.
+    /// CloudFront URLs leave it out: the distribution decides which query
+    /// parameters reach the bucket
+    async fn presign_get(
+        &self,
+        key: &str,
+        expires_in: Duration,
+        content_disposition: Option<&str>,
+    ) -> Result<Option<PresignedUrl>> {
+        if !self.redirect_downloads {
+            return Ok(None);
+        }
+
+        let full_key = self.full_key(key);
+
+        if let Some(cf) = &self.cloudfront {
+            let url = self.generate_cloudfront_signed_url(cf, &full_key, expires_in)?;
+            tracing::debug!(
+                key = %key, expires_in_secs = expires_in.as_secs(), source = "cloudfront",
+                "Generated CloudFront signed URL"
+            );
+            return Ok(Some(PresignedUrl {
+                url,
+                expires_in,
+                source: PresignedUrlSource::CloudFront,
+            }));
+        }
+
+        use object_store::signer::Signer;
+
+        let path: ObjectPath = full_key.into();
+        let signer = self.signing_store.as_ref().unwrap_or(&self.store);
+
+        // S3 enforces a maximum presigned URL expiry of 7 days
+        let clamped_expiry = Duration::from_secs(expires_in.as_secs().min(604800));
+
+        // CloudFront answered above, so only the S3 signer carries the override
+        let options = match content_disposition {
+            Some(value) => object_store::signer::SignedUrlOptions::new()
+                .with_query([("response-content-disposition", value)]),
+            None => object_store::signer::SignedUrlOptions::new(),
+        };
+        let presigned_url = signer
+            .signed_url_opts(http::Method::GET, &path, clamped_expiry, &options)
+            .await
+            .map_err(|e| {
+                s3_storage_error(
+                    format!("Failed to generate presigned URL for '{}'", key),
+                    &e,
+                )
+            })?;
+
+        tracing::debug!(
+            key = %key, expires_in_secs = clamped_expiry.as_secs(), source = "s3",
+            dedicated_signer = self.signing_store.is_some(),
+            "Generated S3 presigned URL"
+        );
+
+        Ok(Some(PresignedUrl {
+            url: presigned_url.to_string(),
+            expires_in: clamped_expiry,
+            source: PresignedUrlSource::S3,
+        }))
+    }
+
     /// List keys with optional prefix
     pub async fn list(&self, prefix: Option<&str>) -> Result<Vec<String>> {
         Ok(self
@@ -5078,6 +5107,44 @@ mod tests {
                 .starts_with("https://d1234.cloudfront.net/a.bin?"),
             "{}",
             presigned.url
+        );
+    }
+
+    /// #6495: a browser download signs `response-content-disposition`, so the
+    /// bucket answers with the file name instead of the digest key
+    #[tokio::test]
+    async fn test_presigned_download_url_signs_the_content_disposition_6495() {
+        use crate::storage::StorageBackend as StorageBackendTrait;
+        let _env = AnonymousS3TestEnv::enter();
+        let mut config = S3Config::new(
+            "artifacts".into(),
+            "us-east-1".into(),
+            Some("http://storage-minio:9000".into()),
+            None,
+        );
+        config.redirect_downloads = true;
+        config.presign_access_key = Some(PUBLIC_TEST_AK.to_string());
+        config.presign_secret_key = Some(PUBLIC_TEST_SK.to_string());
+        let backend = S3Backend::new(config).await.expect("backend builds");
+        let disposition = "attachment; filename=\"example.tar.gz\"";
+        let presigned = StorageBackendTrait::get_presigned_download_url(
+            &backend,
+            "generic/ab/abcd",
+            Duration::from_secs(300),
+            disposition,
+        )
+        .await
+        .expect("presign ok")
+        .expect("redirects enabled");
+        let url = url::Url::parse(&presigned.url).expect("presigned URL parses");
+        let signed = url
+            .query_pairs()
+            .find(|(k, _)| k == "response-content-disposition")
+            .map(|(_, v)| v.into_owned());
+        assert_eq!(signed.as_deref(), Some(disposition));
+        assert!(
+            presigned_signature_valid_for_host(&url, "storage-minio:9000", PUBLIC_TEST_SK),
+            "the override is part of the signature, S3 refuses an unsigned one"
         );
     }
 
