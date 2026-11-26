@@ -29,7 +29,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Log in to Container Registry
-        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -126,21 +126,21 @@ jobs:
       # comes back online.
 
       - name: Upload Backend Trivy SARIF
-        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4
         if: always()
         with:
           sarif_file: 'backend-trivy.sarif'
           category: 'trivy-backend-scheduled'
 
       - name: Upload Backend (dev) Trivy SARIF
-        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4
         if: always()
         with:
           sarif_file: 'backend-dev-trivy.sarif'
           category: 'trivy-backend-dev-scheduled'
 
       - name: Upload OpenSCAP Trivy SARIF
-        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4
         if: always()
         with:
           sarif_file: 'openscap-trivy.sarif'
@@ -158,95 +158,33 @@ jobs:
             scanned-images.txt
           retention-days: 90
 
-      - name: Check for new findings and create issue
+      - name: Check for findings and create or close scan issue
         if: always()
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           script: |
-            const fs = require('fs');
+            // Classified by scripts/ci/trivy-findings.js: severity comes from
+            // the SARIF rule, not from the step config (this scan is
+            // visibility-only and sets no severity filter, #3262), and a
+            // :latest finding absent from a :dev scan of an image built at
+            // least as recently is already fixed on main (#4799).
+            const findings = require('./scripts/ci/trivy-findings.js');
+            const data = findings.collect('.');
+            console.log(`Total findings: ${data.totalFindings}`);
+            console.log(`Actionable findings: ${data.actionableFindings}`);
+            console.log(data.summaries.join('\n'));
 
-            // Provenance recorded before the scans: name|ref|version|created.
-            const provenance = {};
-            if (fs.existsSync('scanned-images.txt')) {
-              for (const line of fs.readFileSync('scanned-images.txt', 'utf8').split('\n')) {
-                if (!line.trim()) continue;
-                const [name, ref, version, created] = line.split('|');
-                provenance[name] = { ref, version, created };
-              }
-            }
+            const existing = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'type:security',
+              per_page: 100
+            });
+            const scanIssues = existing.data.filter(findings.isScanIssue);
 
-            // Severity comes from the SARIF rule, not from the step config:
-            // this scan sets no `severity:` filter at all (it is visibility
-            // only, exit-code 0), so calling every result CRITICAL/HIGH — as
-            // this script used to — overstates the result. #3262 was filed as
-            // "2 CRITICAL/HIGH" when it was 1 HIGH + 1 MEDIUM.
-            function summarize(file) {
-              const sarif = JSON.parse(fs.readFileSync(file, 'utf8'));
-              const run = sarif.runs?.[0] || {};
-              const results = run.results || [];
-              const rules = {};
-              for (const rule of run.tool?.driver?.rules || []) rules[rule.id] = rule;
-              const bySeverity = {};
-              const locations = {};
-              for (const r of results) {
-                const tags = rules[r.ruleId]?.properties?.tags || [];
-                const sev = ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW'].find(s => tags.includes(s)) || 'UNKNOWN';
-                bySeverity[sev] = (bySeverity[sev] || 0) + 1;
-                const loc = r.locations?.[0]?.physicalLocation?.artifactLocation?.uri || 'unknown';
-                locations[loc] = (locations[loc] || 0) + 1;
-              }
-              return { count: results.length, bySeverity, locations };
-            }
-
-            let totalFindings = 0;
-            const summaries = [];
-
-            const targets = [
-              ['Backend (latest)', 'backend-trivy.sarif'],
-              ['Backend (dev)', 'backend-dev-trivy.sarif'],
-              ['OpenSCAP', 'openscap-trivy.sarif'],
-            ];
-
-            for (const [name, file] of targets) {
-              const p = provenance[name];
-              const meta = p ? ` — \`${p.ref}\` (version \`${p.version}\`, built ${p.created})` : '';
-              if (!fs.existsSync(file)) {
-                summaries.push(`- **${name}**: Scan skipped or failed${meta}`);
-                continue;
-              }
-              const { count, bySeverity, locations } = summarize(file);
-              totalFindings += count;
-              if (count === 0) {
-                summaries.push(`- **${name}**: 0 findings${meta}`);
-                continue;
-              }
-              const sevText = Object.entries(bySeverity)
-                .map(([s, n]) => `${n} ${s}`)
-                .join(', ');
-              const locText = Object.entries(locations)
-                .map(([l, n]) => `\`${l}\` (${n})`)
-                .join(', ');
-              summaries.push(`- **${name}**: ${count} finding(s) — ${sevText}${meta}\n  - Located in: ${locText}`);
-            }
-
-            console.log(`Total findings: ${totalFindings}`);
-            console.log(summaries.join('\n'));
-
-            if (totalFindings > 0) {
-              // Check if there's already an open issue for container findings
-              const existing = await github.rest.issues.listForRepo({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                state: 'open',
-                labels: 'type:security',
-                per_page: 100
-              });
-
-              const hasExisting = existing.data.some(i =>
-                i.title.includes('Container scan findings')
-              );
-
-              if (!hasExisting) {
+            if (data.actionableFindings > 0) {
+              if (scanIssues.length === 0) {
                 await github.rest.issues.create({
                   owner: context.repo.owner,
                   repo: context.repo.repo,
@@ -254,19 +192,23 @@ jobs:
                   body: [
                     '## Weekly Container Scan Results',
                     '',
-                    `Trivy found **${totalFindings}** finding(s) with an available fix, at all severities`,
+                    `Trivy found **${data.totalFindings}** finding(s) with an available fix, at all severities`,
                     '(this scan sets no severity filter and gates nothing — `exit-code: 0`):',
                     '',
-                    ...summaries,
+                    ...data.summaries,
                     '',
+                    ...(data.staleFindings.length
+                      ? [`**${data.actionableFindings}** of those are still on \`:dev\`; the other ${data.staleFindings.length} are already fixed on \`main\` and clear on the next stable publish (#4799).`, '']
+                      : []),
                     '### How to read this',
                     '',
                     '- **Backend (dev)** tracks `main`. A finding here is actionable by a PR.',
                     '- **Backend (latest)** is the last *stable release*, which can lag `main` by weeks.',
-                    '  A finding that appears only against `:latest` is already fixed on `main` if the',
-                    '  version label above predates the fix — it clears on the next stable publish, and',
-                    '  must **not** be given a `.trivyignore` suppression (that would suppress a finding',
-                    '  in a build we no longer produce).',
+                    '  A finding that appears only against `:latest` is already fixed on `main` only when',
+                    '  the `:dev` image above was built at least as recently and the finding is absent',
+                    '  there. It then clears on the next stable publish and must **not** be given a',
+                    '  `.trivyignore` suppression (that would suppress a finding in a build we no longer',
+                    '  produce). Such findings do not open this issue (#4799).',
                     '- Findings located in `usr/local/bin/grype` come from the bundled scanner CLI,',
                     '  which since #3352 is BUILT FROM SOURCE on a go1.26.6-floored toolchain rather',
                     '  than copied from `ghcr.io/anchore/grype`. A Go **stdlib** finding here is',
@@ -281,6 +223,22 @@ jobs:
                   ].join('\n'),
                   labels: ['type:security']
                 });
+              }
+            } else if (data.staleFindings.length > 0) {
+              for (const issue of scanIssues) {
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: issue.number,
+                  body: findings.staleIssueComment(data)
+                });
+                await github.rest.issues.update({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: issue.number,
+                  state: 'closed'
+                });
+                console.log(`Closed resolved scan issue #${issue.number}`);
               }
             }
 

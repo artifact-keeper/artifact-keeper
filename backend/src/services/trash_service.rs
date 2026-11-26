@@ -830,6 +830,8 @@ pub(crate) mod tests {
     /// because that peer may have applied the delete in between.
     #[tokio::test]
     async fn restore_cancels_queued_deletes_and_rearms_pushes() {
+        // Its unclaimed `in_progress` row must survive a claim-recovery sweep.
+        let _serial = tdh::sync_claim_recovery_serial_lock().await;
         let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
             return;
         };

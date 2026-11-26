@@ -63,7 +63,9 @@
 //   REPORT_DRY_RUN         true: print the planned writes, make none
 //   REPORT_WORKFLOW        workflow file for the history walk
 //                          (default nightly-release-gate.yml)
-//   REPORT_HISTORY_RUNS    how many earlier runs the walk may read (default 20)
+//   REPORT_HISTORY_RUNS    how many earlier runs the walk may read (default 60:
+//                          up to three scheduled runs a night since #6155,
+//                          and a backstop that skipped carries no record)
 //   REPORT_OUT             where verdict.json goes (default ./verdict.json)
 //   REPORT_SERVER_URL      default https://github.com
 //   REPORT_LANE            a nightly LANE outside the gate (#6121: s3),
@@ -448,7 +450,7 @@ function main() {
   } else if (truthy(env.REPORT_TRACK) || selfTest) {
     const open = listOpenIssues(repo, trackingLabel(lane));
     const history = historyReader(repo, env.REPORT_WORKFLOW || 'nightly-release-gate.yml', runId,
-      Number(env.REPORT_HISTORY_RUNS || '20'), artifactName(lane));
+      Number(env.REPORT_HISTORY_RUNS || '60'), artifactName(lane));
     summary.push('', '### Tracking issues', '');
     for (const l of lines) {
       if (l.verdict !== 'green' && l.verdict !== 'red') continue;

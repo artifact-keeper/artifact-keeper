@@ -267,11 +267,26 @@ pub fn validate_promotion_target_and_format(
 /// matching the storage NotFound contract (#1016). Returns the
 /// [`PutStreamResult`](crate::storage::PutStreamResult) so callers can verify
 /// the streamed digest/byte count if desired.
+/// The per-item error of a bulk promotion whose copy failed. A disk-threshold
+/// refusal (#5191) names its code, so the item reads as refused for disk
+/// rather than as an internal error, and the rest of the batch goes on.
+fn bulk_copy_failure_message(e: &AppError) -> String {
+    match e {
+        AppError::QuotaRefused(refusal) => format!("{} ({})", refusal.message, refusal.code()),
+        e => crate::api::handlers::internal_err_message("Failed to copy artifact", e).to_string(),
+    }
+}
+
 pub async fn stream_copy_artifact(
     source: &dyn crate::storage::StorageBackend,
     target: &dyn crate::storage::StorageBackend,
     storage_key: &str,
 ) -> Result<crate::storage::PutStreamResult> {
+    // A promotion writes the bytes again: refused at the disk block
+    // threshold (#5191), as an OCI promotion's copy is.
+    if let Some(refusal) = crate::services::quota::disk::refusal(None) {
+        return Err(AppError::QuotaRefused(Box::new(refusal)));
+    }
     let stream = source.get_stream(storage_key).await?;
     target.put_stream(storage_key, stream).await
 }
@@ -440,8 +455,9 @@ pub fn gate_block_message(eval: &QualityGateEvaluation) -> String {
     format!(
         "Promotion blocked by quality gate '{}' (health score: {}, grade: {}, violations: {})",
         eval.gate_name,
-        eval.health_score,
-        eval.health_grade,
+        eval.health_score
+            .map_or_else(|| "unrated".to_string(), |s| s.to_string()),
+        eval.health_grade.as_deref().unwrap_or("unrated"),
         eval.violations.len(),
     )
 }
@@ -1478,7 +1494,11 @@ pub async fn promote_artifact(
     // same tee helper as the bulk path.
     stream_copy_artifact(&*source_storage, &*target_storage, &artifact.storage_key)
         .await
-        .map_err(|e| AppError::Internal(format!("Failed to copy artifact: {}", e)))?;
+        .map_err(|e| match e {
+            // The disk threshold's 403 (#5191) keeps its code.
+            e @ AppError::QuotaRefused(_) => e,
+            e => AppError::Internal(format!("Failed to copy artifact: {}", e)),
+        })?;
 
     // A Docker/OCI manifest needs its child manifests and blobs in the target
     // too, and the rows a pull resolves through (#4578). `None` for every
@@ -1941,8 +1961,7 @@ pub async fn promote_artifacts_bulk(
             results.push(failed_response(
                 source_display,
                 target_display,
-                crate::api::handlers::internal_err_message("Failed to copy artifact", &e)
-                    .to_string(),
+                bulk_copy_failure_message(&e),
             ));
             continue;
         }
@@ -3443,8 +3462,8 @@ mod tests {
             passed,
             action: action.to_string(),
             gate_name: "test-gate".to_string(),
-            health_score: 42,
-            health_grade: "D".to_string(),
+            health_score: Some(42),
+            health_grade: Some("D".to_string()),
             violations,
             component_scores: ComponentScores {
                 security: Some(50),
@@ -4698,6 +4717,40 @@ mod tests {
             format!("{:x}", h.finalize())
         };
         assert_eq!(result.checksum_sha256, expected_digest);
+    }
+
+    #[tokio::test]
+    async fn test_stream_copy_artifact_is_refused_at_the_disk_block_threshold_5191() {
+        let source = ChunkedSource {
+            payload: Bytes::from_static(b"bytes"),
+            missing: false,
+        };
+        let target = CapturingTarget::default();
+        crate::services::quota::disk::block_for_tests(true);
+        let err = stream_copy_artifact(&source, &target, "rpm/repo/pkg.rpm")
+            .await
+            .expect_err("blocked: no copy");
+        crate::services::quota::disk::block_for_tests(false);
+        let AppError::QuotaRefused(ref refusal) = err else {
+            panic!("want the disk refusal, got {err:?}");
+        };
+        assert_eq!(refusal.code(), "DISK_THRESHOLD_EXCEEDED");
+        assert!(
+            target.received.lock().unwrap().is_empty(),
+            "nothing written"
+        );
+        // The bulk path reports the item as refused for disk, by code.
+        let msg = bulk_copy_failure_message(&err);
+        assert!(msg.starts_with("server storage nearly full"), "{msg}");
+        assert!(msg.ends_with("(DISK_THRESHOLD_EXCEEDED)"), "{msg}");
+        // Any other copy error keeps the generic message.
+        assert!(
+            !bulk_copy_failure_message(&AppError::Internal("x".into())).contains("DISK_THRESHOLD")
+        );
+        // Unblocked, the copy goes through.
+        stream_copy_artifact(&source, &target, "rpm/repo/pkg.rpm")
+            .await
+            .expect("copies once freed");
     }
 
     #[tokio::test]

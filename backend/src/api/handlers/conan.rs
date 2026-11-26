@@ -2050,7 +2050,14 @@ async fn recipe_file_download(
     )
     .fetch_optional(&state.db)
     .await
-    .map_err(crate::api::handlers::db_err)?
+    .map_err(crate::api::handlers::db_err)?;
+    // #6433: a proxy-cache row is served only after its cache sidecar is
+    // checked: one nothing vouches for is no row (a Remote resolves it through
+    // its proxy path below), a held or refused one is the gate's answer.
+    let artifact = proxy_helpers::vouched_row(&state, repo.id, artifact, |a| {
+        proxy_helpers::ServedRowRef::new(&a.storage_key, Some(a.size_bytes))
+    })
+    .await?
     .ok_or_else(|| (StatusCode::NOT_FOUND, "File not found").into_response());
 
     let artifact = match artifact {
@@ -3538,7 +3545,14 @@ async fn package_file_download(
     )
     .fetch_optional(&state.db)
     .await
-    .map_err(crate::api::handlers::db_err)?
+    .map_err(crate::api::handlers::db_err)?;
+    // #6433: a proxy-cache row is served only after its cache sidecar is
+    // checked: one nothing vouches for is no row (a Remote resolves it through
+    // its proxy path below), a held or refused one is the gate's answer.
+    let artifact = proxy_helpers::vouched_row(&state, repo.id, artifact, |a| {
+        proxy_helpers::ServedRowRef::new(&a.storage_key, Some(a.size_bytes))
+    })
+    .await?
     .ok_or_else(|| (StatusCode::NOT_FOUND, "File not found").into_response());
 
     let artifact = match artifact {
@@ -5470,6 +5484,7 @@ mod tests {
                 trivy_url: None,
                 trivy_adapter_url: None,
                 incus_scanner_enabled: true,
+                trivy_ignore_embedded_pom_declarations: false,
                 openscap_url: None,
                 openscap_profile: "standard".into(),
                 opensearch_url: None,
@@ -5527,6 +5542,11 @@ mod tests {
                 database_max_connections: 20,
                 database_min_connections: 5,
                 database_acquire_timeout_secs: 30,
+                database_request_acquire_wait_ms: None,
+                database_probe_connections: 1,
+                database_request_concurrency: None,
+                database_request_credentialed_reserve_percent: 25,
+                database_request_client_share_percent: 25,
                 database_idle_timeout_secs: 600,
                 database_max_lifetime_secs: 1800,
                 database_tcp_keepalives: true,

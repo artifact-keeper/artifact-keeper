@@ -643,7 +643,9 @@ pub struct SyncStatusResponse {
     /// A pass of this repository (manual or scheduled, on any replica) holds
     /// its sync lock right now (#5404). Once it is `false` again,
     /// `lastFinishedAt`, `lastError` and `lastSummary` describe the pass that
-    /// ended last.
+    /// ended last. A pass that ended without recording an outcome (its
+    /// process exited, or it panicked or was cancelled) is reported as
+    /// finished with `lastError` saying so (#6390).
     pub running: bool,
 }
 
@@ -663,12 +665,36 @@ pub async fn sync_status(
 ) -> Result<Json<SyncStatusResponse>> {
     let auth = require_auth(auth)?;
     let repo = readable_repo(&state, &auth, &key).await?;
-    let stored = mcp_remote::load_state(&state.db, repo.id)
+    // The lock first, then the state. A pass commits its outcome before it
+    // releases the lock, so a `running: false` read here is followed by a
+    // state read that already holds that outcome. Read the other way round,
+    // a pass could record and release between the two reads, and the poll
+    // would pair the previous pass's state with `running: false` (#6249).
+    let mut running = mcp_remote::sync_running(&state.db, repo.id)
         .await
         .map_err(AppError::Database)?;
-    let running = mcp_remote::sync_running(&state.db, repo.id)
+    let mut stored = mcp_remote::load_state(&state.db, repo.id)
         .await
         .map_err(AppError::Database)?;
+    // #6390: no lock, but the last pass that started recorded no outcome.
+    // It was killed (panic, cancellation, process loss) and its lock went
+    // with its connection: record that it ended, so the poll does not pair
+    // `running: false` with the previous pass's outcome. The record is
+    // conditional on the lock still being free and on no newer start, so a
+    // pass that began between the two reads above is reported running.
+    if !running {
+        if let Some(started) = mcp_remote::pass_unfinished(&stored) {
+            mcp_remote::record_interrupted_pass(&state.db, repo.id, started)
+                .await
+                .map_err(AppError::Database)?;
+            running = mcp_remote::sync_running(&state.db, repo.id)
+                .await
+                .map_err(AppError::Database)?;
+            stored = mcp_remote::load_state(&state.db, repo.id)
+                .await
+                .map_err(AppError::Database)?;
+        }
+    }
     Ok(Json(SyncStatusResponse {
         state: stored,
         running,
@@ -767,7 +793,7 @@ pub fn sync_error(e: SyncError) -> AppError {
         SyncError::Busy | SyncError::Paused => AppError::Conflict(e.to_string()),
         SyncError::NotRemote => AppError::Validation(e.to_string()),
         SyncError::NoProxy | SyncError::Upstream(_) => AppError::BadGateway(e.to_string()),
-        SyncError::Database(_) => AppError::Database(e.to_string()),
+        SyncError::Database(_) | SyncError::LeaseLost => AppError::Database(e.to_string()),
     }
 }
 
@@ -1922,6 +1948,379 @@ mod tests {
             "no upstream request while paused"
         );
         env.teardown().await;
+    }
+
+    /// #6249: a background pass that fails on a database error records the
+    /// failure before it releases the sync lock, so no poll sees
+    /// `running: false` beside the previous pass's state. A trigger makes the
+    /// pass's own start write fail (a database error) and holds the failure
+    /// record for three seconds, which is where the old order showed the lock
+    /// free with nothing recorded.
+    #[tokio::test]
+    async fn manual_sync_failure_is_recorded_before_the_lock_is_released_6249() {
+        let Some(env) = Env::new().await else { return };
+        let func = format!("ak_test_6249_{}", Uuid::new_v4().simple());
+        let pool = env.fx.pool.clone();
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "CREATE FUNCTION {func}() RETURNS trigger LANGUAGE plpgsql AS $f$ \
+             BEGIN \
+               IF NEW.repository_id = '{repo}'::uuid THEN \
+                 IF position('ak-test-6249' IN coalesce(NEW.last_error, '')) = 0 THEN \
+                   RAISE EXCEPTION 'ak-test-6249 injected failure'; \
+                 END IF; \
+                 PERFORM pg_sleep(3); \
+               END IF; \
+               RETURN NEW; \
+             END $f$",
+            repo = env.fx.repo_id
+        )))
+        .execute(&pool)
+        .await
+        .expect("create trigger function");
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "CREATE TRIGGER {func} BEFORE INSERT OR UPDATE ON mcp_remote_sync_state \
+             FOR EACH ROW EXECUTE FUNCTION {func}()"
+        )))
+        .execute(&pool)
+        .await
+        .expect("create trigger");
+
+        let (s, b) = env.admin("POST", "/sync", None).await;
+        let mut ended = None;
+        if s == StatusCode::ACCEPTED {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while std::time::Instant::now() < deadline {
+                let (_, st) = env.admin("GET", "/sync", None).await;
+                if st["running"] == false {
+                    ended = Some(st);
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+        crate::api::handlers::test_db_helpers::drop_test_trigger(
+            &pool,
+            "mcp_remote_sync_state",
+            &func,
+            &func,
+        )
+        .await;
+        let _ = sqlx::query("DELETE FROM mcp_remote_sync_state WHERE repository_id = $1")
+            .bind(env.fx.repo_id)
+            .execute(&pool)
+            .await;
+
+        assert_eq!(s, StatusCode::ACCEPTED, "{b}");
+        let st = ended.expect("the failed pass never released its lock");
+        assert!(
+            st["lastFinishedAt"].is_string(),
+            "the lock was free before the failed pass was recorded: {st}"
+        );
+        assert!(
+            st["lastError"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("ak-test-6249"),
+            "the lock was free before the failed pass was recorded: {st}"
+        );
+        env.teardown().await;
+    }
+
+    #[test]
+    fn pass_unfinished_compares_start_and_finish_6390() {
+        use crate::services::mcp_remote::{pass_unfinished, SyncState};
+        let t = |s: i64| chrono::DateTime::from_timestamp(1_700_000_000 + s, 0).unwrap();
+        let st = |started, finished| SyncState {
+            last_started_at: started,
+            last_finished_at: finished,
+            ..Default::default()
+        };
+        assert_eq!(pass_unfinished(&st(None, None)), None);
+        assert_eq!(pass_unfinished(&st(None, Some(t(0)))), None);
+        assert_eq!(pass_unfinished(&st(Some(t(5)), None)), Some(t(5)));
+        assert_eq!(pass_unfinished(&st(Some(t(5)), Some(t(1)))), Some(t(5)));
+        assert_eq!(pass_unfinished(&st(Some(t(5)), Some(t(5)))), None);
+        assert_eq!(pass_unfinished(&st(Some(t(5)), Some(t(9)))), None);
+    }
+
+    /// #6390 case 1: a pass that loses its process mid-run releases its sync
+    /// lock with its connection and records nothing. The poll must report it
+    /// ended, not `running: false` beside the previous pass's state. The
+    /// first page never answers during the test, so the pass is in flight;
+    /// terminating the session that holds its lock is what the loss of the
+    /// pod does to it. While the lock is held, nothing is recorded.
+    #[tokio::test]
+    async fn pass_that_lost_its_lock_is_reported_ended_6390() {
+        let Some(env) = Env::new().await else { return };
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(page(vec![]))
+                    .set_delay(std::time::Duration::from_secs(120)),
+            )
+            .mount(&env.upstream)
+            .await;
+        let pool = env.fx.pool.clone();
+        let lock = (
+            i64::from(crate::services::mcp_remote::SYNC_LOCK_CLASS),
+            i64::from(crate::services::mcp_remote::lock_object_id(env.fx.repo_id) as u32),
+        );
+
+        let (s, b) = env.admin("POST", "/sync", None).await;
+        assert_eq!(s, StatusCode::ACCEPTED, "{b}");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let running = loop {
+            let (_, st) = env.admin("GET", "/sync", None).await;
+            if st["running"] == true && st["lastStartedAt"].is_string() {
+                break st;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the pass never started: {st}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
+        assert!(running["lastFinishedAt"].is_null(), "{running}");
+        let started =
+            chrono::DateTime::parse_from_rfc3339(running["lastStartedAt"].as_str().unwrap())
+                .unwrap()
+                .with_timezone(&chrono::Utc);
+        let recorded_while_held =
+            crate::services::mcp_remote::record_interrupted_pass(&pool, env.fx.repo_id, started)
+                .await
+                .unwrap();
+
+        let killed: i64 = sqlx::query_scalar(
+            "SELECT COUNT(pg_terminate_backend(pid)) FROM pg_locks \
+             WHERE locktype = 'advisory' AND classid::bigint = $1 AND objid::bigint = $2 \
+               AND objsubid = 2 AND granted",
+        )
+        .bind(lock.0)
+        .bind(lock.1)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let ended = loop {
+            let (_, st) = env.admin("GET", "/sync", None).await;
+            if st["running"] == false || std::time::Instant::now() > deadline {
+                break st;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
+        let (_, again) = env.admin("GET", "/sync", None).await;
+        // The pass itself is still running (its process was not lost): it
+        // finds its lease gone at its next check and stops, recording that it
+        // lost its lock, on its own start only.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let stopped = loop {
+            let (_, st) = env.admin("GET", "/sync", None).await;
+            let lost = st["lastError"]
+                .as_str()
+                .is_some_and(|e| e.contains("lost its repository sync lock"));
+            if lost || std::time::Instant::now() > deadline {
+                break st;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        };
+        let _ = sqlx::query("DELETE FROM mcp_remote_sync_state WHERE repository_id = $1")
+            .bind(env.fx.repo_id)
+            .execute(&pool)
+            .await;
+        env.teardown().await;
+
+        assert!(
+            stopped["lastError"]
+                .as_str()
+                .is_some_and(|e| e.contains("lost its repository sync lock")),
+            "the pass that lost its lock did not stop and say so: {stopped}"
+        );
+        assert_eq!(
+            stopped["lastStartedAt"], running["lastStartedAt"],
+            "{stopped}"
+        );
+        assert!(
+            !recorded_while_held,
+            "a pass holding its lock was recorded as ended"
+        );
+        assert_eq!(killed, 1, "the pass's lock session");
+        assert_eq!(ended["running"], false, "{ended}");
+        assert_eq!(
+            ended["lastError"],
+            crate::services::mcp_remote::INTERRUPTED_PASS_ERROR,
+            "the pass that lost its lock is reported with the previous pass's state: {ended}"
+        );
+        assert_eq!(ended["lastStartedAt"], running["lastStartedAt"], "{ended}");
+        assert!(ended["lastFinishedAt"].is_string(), "{ended}");
+        assert_eq!(
+            again["lastFinishedAt"], ended["lastFinishedAt"],
+            "recorded once: {again}"
+        );
+    }
+
+    /// #6390 review: a pass A that lost its lock but keeps running must not
+    /// overwrite the state of a pass B that started and finished after it.
+    /// A's first page answers after 2 s; its lock session is terminated at
+    /// once, B (the scheduled path) runs and completes on a fast page, then
+    /// A's page arrives and A finishes. The lease check is slowed to 60 s so
+    /// A is not stopped first: what is tested is that A's own writes match
+    /// only its own start.
+    #[tokio::test]
+    async fn stale_pass_does_not_overwrite_a_newer_pass_6390() {
+        let Some(env) = Env::new().await else { return };
+        crate::services::mcp_remote::set_lease_check_interval_for_tests(60);
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(page(vec![]))
+                    .set_delay(std::time::Duration::from_secs(2)),
+            )
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&env.upstream)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(page(vec![])))
+            .with_priority(2)
+            .mount(&env.upstream)
+            .await;
+        let pool = env.fx.pool.clone();
+        let lock = (
+            i64::from(crate::services::mcp_remote::SYNC_LOCK_CLASS),
+            i64::from(crate::services::mcp_remote::lock_object_id(env.fx.repo_id) as u32),
+        );
+
+        let (s, b) = env.admin("POST", "/sync", None).await;
+        assert_eq!(s, StatusCode::ACCEPTED, "{b}");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let a = loop {
+            let (_, st) = env.admin("GET", "/sync", None).await;
+            if st["running"] == true && st["lastStartedAt"].is_string() {
+                break st;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "A never started: {st}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        };
+        let killed: i64 = sqlx::query_scalar(
+            "SELECT COUNT(pg_terminate_backend(pid)) FROM pg_locks \
+             WHERE locktype = 'advisory' AND classid::bigint = $1 AND objid::bigint = $2 \
+               AND objsubid = 2 AND granted",
+        )
+        .bind(lock.0)
+        .bind(lock.1)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        // Wait for the lock to be gone, then B runs to the end.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while crate::services::mcp_remote::sync_running(&pool, env.fx.repo_id)
+            .await
+            .unwrap()
+            && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let repo =
+            proxy_helpers::resolve_repo_by_key(&env.fx.pool, &env.fx.repo_key, &["mcp"], "x")
+                .await
+                .ok()
+                .unwrap();
+        let b_result = crate::services::mcp_remote::sync_repo(&env.state, &repo).await;
+        let (_, after_b) = env.admin("GET", "/sync", None).await;
+        // A's delayed page arrives 2 s after A asked; give A time to finish.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while env.upstream_requests().await < 2 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+        let (_, after_a) = env.admin("GET", "/sync", None).await;
+        let _ = sqlx::query("DELETE FROM mcp_remote_sync_state WHERE repository_id = $1")
+            .bind(env.fx.repo_id)
+            .execute(&pool)
+            .await;
+        env.teardown().await;
+
+        assert_eq!(killed, 1, "A's lock session");
+        assert!(b_result.is_ok(), "{b_result:?}");
+        assert_ne!(
+            after_b["lastStartedAt"], a["lastStartedAt"],
+            "B started: {after_b}"
+        );
+        assert!(after_b["lastError"].is_null(), "{after_b}");
+        assert!(after_b["lastFinishedAt"].is_string(), "{after_b}");
+        assert_eq!(
+            after_a, after_b,
+            "the stale pass A overwrote the newer pass B's state when it finished"
+        );
+    }
+
+    /// #6390 case 2: a scheduled pass (`sync_repo`) that fails on a database
+    /// error records the failure, as the manual trigger does (#6249), so a
+    /// poll does not see `running: false` with the previous pass's state.
+    /// A trigger makes the pass's own start write fail.
+    #[tokio::test]
+    async fn scheduled_pass_database_failure_is_recorded_6390() {
+        let Some(env) = Env::new().await else { return };
+        let func = format!("ak_test_6390_{}", Uuid::new_v4().simple());
+        let pool = env.fx.pool.clone();
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "CREATE FUNCTION {func}() RETURNS trigger LANGUAGE plpgsql AS $f$ \
+             BEGIN \
+               IF NEW.repository_id = '{repo}'::uuid \
+                  AND position('ak-test-6390' IN coalesce(NEW.last_error, '')) = 0 THEN \
+                 RAISE EXCEPTION 'ak-test-6390 injected failure'; \
+               END IF; \
+               RETURN NEW; \
+             END $f$",
+            repo = env.fx.repo_id
+        )))
+        .execute(&pool)
+        .await
+        .expect("create trigger function");
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "CREATE TRIGGER {func} BEFORE INSERT OR UPDATE ON mcp_remote_sync_state \
+             FOR EACH ROW EXECUTE FUNCTION {func}()"
+        )))
+        .execute(&pool)
+        .await
+        .expect("create trigger");
+
+        let repo =
+            proxy_helpers::resolve_repo_by_key(&env.fx.pool, &env.fx.repo_key, &["mcp"], "x")
+                .await
+                .ok()
+                .unwrap();
+        let result = crate::services::mcp_remote::sync_repo(&env.state, &repo).await;
+        let (_, st) = env.admin("GET", "/sync", None).await;
+        crate::api::handlers::test_db_helpers::drop_test_trigger(
+            &pool,
+            "mcp_remote_sync_state",
+            &func,
+            &func,
+        )
+        .await;
+        let _ = sqlx::query("DELETE FROM mcp_remote_sync_state WHERE repository_id = $1")
+            .bind(env.fx.repo_id)
+            .execute(&pool)
+            .await;
+        env.teardown().await;
+
+        assert!(
+            matches!(&result, Err(SyncError::Database(m)) if m.contains("ak-test-6390")),
+            "{result:?}"
+        );
+        assert_eq!(st["running"], false, "{st}");
+        assert!(
+            st["lastError"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("ak-test-6390"),
+            "the scheduled pass's failure was not recorded: {st}"
+        );
+        assert!(st["lastFinishedAt"].is_string(), "{st}");
     }
 
     impl Env {

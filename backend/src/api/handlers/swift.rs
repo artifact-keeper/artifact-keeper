@@ -707,6 +707,13 @@ async fn download_archive(
             crate::api::handlers::db_err_message(&e),
         )
     })?;
+    // #6433: a proxy-cache row is served only after its cache sidecar is
+    // checked: one nothing vouches for is no row (a Remote resolves it through
+    // its proxy path below), a held or refused one is the gate's answer.
+    let artifact = proxy_helpers::vouched_row(&state, repo.id, artifact, |a| {
+        proxy_helpers::ServedRowRef::new(&a.storage_key, Some(a.size_bytes))
+    })
+    .await?;
 
     let artifact = match artifact {
         Some(a) => a,
@@ -987,16 +994,26 @@ async fn fetch_manifest(
                     crate::api::handlers::db_err_message(&e),
                 )
             })?;
+            // #6433: the archive of a proxy-cache row is read only after its
+            // cache sidecar is checked.
+            let storage_key =
+                proxy_helpers::vouched_row(&state, owner_id, Some(storage_key), |k| {
+                    proxy_helpers::ServedRowRef::new(k, None)
+                })
+                .await?
+                .ok_or_else(|| swift_error_response(StatusCode::NOT_FOUND, "Package not found"))?;
             let storage = state
                 .storage_for_repo(&owner_location)
                 .map_err(|e| e.into_response())?;
             let zip_bytes = storage.get(&storage_key).await.map_err(|e| {
                 crate::api::handlers::storage_err_response(&e, swift_error_response)
             })?;
-            // #2561: permit-scoped decode, fast-fail 503 on saturation.
-            crate::util::bounded_archive::with_ingest_extraction(|| {
+            // #2561: permit-scoped decode; on saturation it waits briefly
+            // for a slot, then sheds 503 (#6230).
+            crate::util::bounded_archive::with_ingest_extraction_waiting(|| {
                 extract_manifest_from_zip(&zip_bytes)
             })
+            .await
             .map_err(|e| e.into_response())?
             .ok_or_else(|| {
                 swift_error_response(StatusCode::NOT_FOUND, "Manifest not found for this release")
@@ -1292,7 +1309,8 @@ async fn publish_release(
         .map(|s| s.to_string())
     {
         Some(m) => Some(m),
-        // #2561: permit-scoped decode, fast-fail 503 on saturation. Only taken
+        // #2561: permit-scoped decode; on saturation it waits briefly
+        // for a slot, then sheds 503 (#6221). Only taken
         // when the header fallback actually needs to decode the uploaded zip.
         None => {
             let local =

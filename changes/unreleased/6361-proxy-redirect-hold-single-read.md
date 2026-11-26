@@ -1,0 +1,5 @@
+---
+section: Security
+issues: [#6361]
+---
+- **A presigned redirect to a proxy-cache entry is refused for an entry inside its Package Age Policy hold even when its sidecar is gone by the time the hold is checked** (#6361). The redirect fast paths (a virtual member's cached file, the Terraform mirror archive, PyPI distribution files, a Remote's OCI blob) read the cache sidecar once to decide freshness and again for the hold and the stored scan verdict. When the second read came back empty, the hold check passed and the held object was signed and handed out: after another replica or a lifecycle rule evicted the entry between the two reads, or, for up to 30 s, when this replica had memoised a miss for the sidecar before another replica cached the entry. Every check before signing now uses the copy of the sidecar the freshness probe read, so a missing or unreadable sidecar is never redirected to, and each redirect costs one sidecar read instead of two. The PyPI distribution fast path also checks the hold now; it did not before.

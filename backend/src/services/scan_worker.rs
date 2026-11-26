@@ -23,13 +23,35 @@ use crate::services::scan_queue::{
 /// feels this. An enqueue in this process wakes us sooner.
 const DEFAULT_TICK: Duration = Duration::from_millis(1000);
 
-/// Jobs in flight per pod, matching the extraction semaphore so a default install
-/// cannot claim more than it can decompress.
-const DEFAULT_CONCURRENCY: usize = 4;
+/// Unset `SCAN_WORKER_CONCURRENCY` keeps the pre-1.12.2 default of 4.
+const DEFAULT_WORKER_CONCURRENCY: usize = 4;
+
+/// Jobs in flight per pod: `SCAN_WORKER_CONCURRENCY` when set, otherwise the
+/// default of 4 capped at the extraction semaphore's size
+/// (`MAX_CONCURRENT_SCAN_EXTRACTIONS`), so a worker does not claim more jobs
+/// than it can extract at once (#6033). Capped, not equal: a pod that raised the
+/// permits for in-process scans must not also get more queued jobs by default,
+/// a memory jump in a patch release. A claimed job waiting on an extraction
+/// permit holds its lease and shows as `running`.
+fn resolve_concurrency(configured: Option<usize>, extraction_permits: usize) -> usize {
+    configured
+        .unwrap_or_else(|| DEFAULT_WORKER_CONCURRENCY.min(extraction_permits))
+        .max(1)
+}
 
 /// Ceiling for one queued scan: well above the inline budgets it replaces, since
 /// nobody holds a socket, but bounded so a wedged grype releases its permit.
 const DEFAULT_JOB_BUDGET: Duration = Duration::from_secs(600);
+
+/// Time after [`DEFAULT_JOB_BUDGET`] for a job to record what its scanners
+/// did (#5942). Each scanner stops at the budget's deadline
+/// ([`crate::services::scan_queue::within_job_deadline`]) and its row is
+/// recorded `failed`; this is the backstop past which the whole job is dropped,
+/// as it was at the budget itself before.
+const JOB_FINALIZE_GRACE: Duration = Duration::from_secs(60);
+
+// A backstop for recording, not a second budget for scanners.
+const _: () = assert!(JOB_FINALIZE_GRACE.as_secs() * 5 < DEFAULT_JOB_BUDGET.as_secs());
 
 /// Backoff before a failed job becomes due again.
 const RETRY_BACKOFF: Duration = Duration::from_secs(30);
@@ -91,20 +113,24 @@ pub fn spawn_scan_worker(state: SharedState, shutdown: CancellationToken) {
         return;
     }
 
-    let concurrency = state
-        .config
-        .scan_worker_concurrency
-        .unwrap_or(DEFAULT_CONCURRENCY)
-        .max(1);
-    let queue = ScanQueue::new(state.db.clone());
+    let concurrency = resolve_concurrency(
+        state.config.scan_worker_concurrency,
+        crate::services::scanner_service::max_concurrent_scan_extractions(),
+    );
+    // #6032: how long a fail-open proxy scan waits before it competes with
+    // hosted scans on age alone. Read once, like the extraction limit.
+    let backfill_aging = crate::services::scan_queue::backfill_aging();
+    let queue = ScanQueue::new(state.db.clone()).with_backfill_aging(backfill_aging);
     let permits = Arc::new(Semaphore::new(concurrency));
     // #5947: rescans take at most half the slots (one on a single-slot
-    // worker), so a hosted or waiting job always finds one free.
+    // worker), so on two or more slots a hosted or waiting job always finds
+    // one free. A single-slot worker can be busy with a rescan.
     let rescan_permits = Arc::new(Semaphore::new(rescan_slots(concurrency)));
     let identity = WorkerIdentity::for_process().as_str().to_string();
 
     tracing::info!(
         concurrency,
+        backfill_aging_secs = backfill_aging.as_secs(),
         worker = %identity,
         "Scan worker started (SCAN_WORKER_ENABLED)"
     );
@@ -162,6 +188,39 @@ pub fn spawn_scan_worker(state: SharedState, shutdown: CancellationToken) {
                         }
                     }
                     Err(e) => tracing::warn!(error = %e, "failed to publish scan queue depth"),
+                }
+
+                // #6300: how far behind the re-grades after a DB update are,
+                // against the grace window they have to finish in.
+                match queue.oldest_pending_regrade_secs().await {
+                    Ok(secs) => {
+                        crate::services::metrics_service::record_proxy_scan_regrade_backlog_oldest(
+                            "queue", secs,
+                        );
+                        let windows = crate::services::proxy_scan_service::db_grace_windows();
+                        let window = windows.serving.max(windows.fail_closed).num_seconds() as f64;
+                        static LAST_WARN: std::sync::Mutex<Option<tokio::time::Instant>> =
+                            std::sync::Mutex::new(None);
+                        let behind = window > 0.0 && secs > window / 2.0;
+                        let due = behind
+                            && LAST_WARN.lock().is_ok_and(|mut last| {
+                                let due =
+                                    last.is_none_or(|at| at.elapsed() > Duration::from_secs(300));
+                                if due {
+                                    *last = Some(tokio::time::Instant::now());
+                                }
+                                due
+                            });
+                        if due {
+                            tracing::warn!(
+                                oldest_secs = secs,
+                                window_secs = window,
+                                "proxy re-grades after a vulnerability-DB update are not keeping \
+                                 up with the grace window; add scan workers (#6300)"
+                            );
+                        }
+                    }
+                    Err(e) => tracing::warn!(error = %e, "failed to read the re-grade backlog"),
                 }
 
                 // Live consumers (cluster-wide) and this pod's own slot
@@ -239,7 +298,7 @@ pub fn spawn_scan_worker(state: SharedState, shutdown: CancellationToken) {
                 // A rescan beyond the free rescan slots (more claimed in one
                 // batch than are free) goes straight back, before its wait is
                 // recorded: it has not stopped waiting.
-                let rescan_permit = if job.job_kind() == Some(ScanJobKind::Rescan) {
+                let rescan_permit = if job.in_rescan_band() {
                     match Arc::clone(&rescan_permits).try_acquire_owned() {
                         Ok(p) => Some(p),
                         Err(_) => {
@@ -323,15 +382,31 @@ async fn run_claimed_job(state: SharedState, queue: ScanQueue, job: Claimed<Scan
         _ = lost_ownership.cancelled() => {
             tracing::warn!(
                 job_id = %job_id, kind = %kind,
-                "abandoning scan job: claim was lost to another replica mid-scan"
+                "abandoning scan job: its claim lapsed and was recovered; the requeued job \
+                 reruns the scan"
             );
             return;
         }
-        result = tokio::time::timeout(DEFAULT_JOB_BUDGET, execute(&state, &job)) => match result {
+        // #6232: rows the scan creates carry this claim, so recovery can close
+        // them if the claim lapses, and a late finish cannot overwrite them.
+        result = tokio::time::timeout(
+            DEFAULT_JOB_BUDGET + JOB_FINALIZE_GRACE,
+            // Boxed: the scan future is large, and these wrappers would
+            // otherwise each carry it on the polling thread's stack.
+            retry_when_scanner_timed_out(
+                started + DEFAULT_JOB_BUDGET,
+                Box::pin(crate::services::scan_queue::under_claim(
+                    job_id,
+                    claim_token,
+                    execute(&state, &job),
+                )),
+            ),
+        ) => match result {
             Ok(r) => r,
             Err(_) => Err(JobFailure::Retryable(format!(
-                "scan exceeded the {}s queued-job budget",
-                DEFAULT_JOB_BUDGET.as_secs()
+                "scan exceeded the {}s queued-job budget and its {}s grace",
+                DEFAULT_JOB_BUDGET.as_secs(),
+                JOB_FINALIZE_GRACE.as_secs()
             ))),
         }
     };
@@ -393,9 +468,33 @@ async fn retry_when_engine_unavailable(
     }
 }
 
+/// Run a job whose scanners stop at `deadline` (#5942), and turn a scan that
+/// finished with a scanner stopped by a time limit (the deadline, or
+/// `SCANNER_PROCESS_TIMEOUT_SECS` on a local grype or trivy) into a retry. The
+/// stopped scanner's `failed` row stays as the record of that attempt, like an
+/// unavailable engine's (#5994); when attempts run out the job ends `failed`.
+async fn retry_when_scanner_timed_out(
+    deadline: tokio::time::Instant,
+    scan: impl std::future::Future<Output = Result<(), JobFailure>>,
+) -> Result<(), JobFailure> {
+    let (result, timed_out) =
+        crate::services::scan_queue::with_job_deadline(deadline, DEFAULT_JOB_BUDGET, scan).await;
+    match result {
+        Ok(()) if timed_out => Err(JobFailure::Retryable(
+            "a scanner was stopped by its time limit; retrying the scan".to_string(),
+        )),
+        other => other,
+    }
+}
+
 /// Dispatch to the branch for this job's kind.
 async fn execute(state: &SharedState, job: &ScanJob) -> Result<(), JobFailure> {
     match job.job_kind() {
+        // #6300: a re-grade nobody waits on asks the adapter for the
+        // background band, as a rescan does.
+        Some(ScanJobKind::ProxyFile) if job.in_rescan_band() => {
+            crate::services::scan_queue::in_background(scan_proxy_file(state, job)).await
+        }
         Some(ScanJobKind::ProxyFile) => scan_proxy_file(state, job).await,
         Some(ScanJobKind::HostedArtifact) => scan_hosted_artifact(state, job).await,
         Some(ScanJobKind::HostedUpload) => {
@@ -417,6 +516,22 @@ async fn execute(state: &SharedState, job: &ScanJob) -> Result<(), JobFailure> {
             job.kind
         ))),
     }
+}
+
+/// [`scan_proxy_file`] for a job held in memory rather than claimed from the
+/// queue: the in-process re-grade after a vulnerability-DB update when the
+/// queue is off (#6300). The error is the reason no verdict was recorded.
+pub(crate) async fn scan_proxy_file_in_process(
+    state: &SharedState,
+    job: &ScanJob,
+) -> std::result::Result<(), String> {
+    scan_proxy_file(state, job)
+        .await
+        .map_err(|failure| match failure {
+            JobFailure::Retryable(m)
+            | JobFailure::Terminal(m)
+            | JobFailure::EngineUnavailable(m) => m,
+        })
 }
 
 /// Scan a proxy-cached file by reference: the body the rescan endpoint already
@@ -768,6 +883,45 @@ mod tests {
         assert!(oldest.iter().all(|(_, age)| *age == 0.0), "{oldest:?}");
     }
 
+    /// #5942: a scan that finished with a scanner stopped by a time limit is
+    /// a retry, not a completed job; a scan with no timeout keeps its own
+    /// outcome, and an unavailable engine keeps its own backoff.
+    #[tokio::test(start_paused = true)]
+    async fn a_timed_out_scanner_makes_the_job_retryable() {
+        let deadline = tokio::time::Instant::now() + DEFAULT_JOB_BUDGET;
+        let hung = retry_when_scanner_timed_out(deadline, async {
+            let _ = crate::services::scan_queue::within_job_deadline(
+                "grype",
+                std::future::pending::<crate::error::Result<()>>(),
+            )
+            .await;
+            Ok(())
+        })
+        .await;
+        assert!(
+            matches!(&hung, Err(JobFailure::Retryable(m)) if m.contains("time limit")),
+            "a scan whose scanner was stopped must be retried"
+        );
+
+        let process_limit = retry_when_scanner_timed_out(deadline, async {
+            crate::services::scan_queue::note_scanner_timed_out();
+            Ok(())
+        })
+        .await;
+        assert!(matches!(process_limit, Err(JobFailure::Retryable(_))));
+
+        let deadline = tokio::time::Instant::now() + DEFAULT_JOB_BUDGET;
+        assert!(retry_when_scanner_timed_out(deadline, async { Ok(()) })
+            .await
+            .is_ok());
+        let engine = retry_when_scanner_timed_out(deadline, async {
+            crate::services::scan_queue::note_scanner_timed_out();
+            Err(JobFailure::EngineUnavailable("down".to_string()))
+        })
+        .await;
+        assert!(matches!(engine, Err(JobFailure::EngineUnavailable(_))));
+    }
+
     /// #5947 review: rescans never hold more than half the slots, so a hosted
     /// or waiting job can always start; a single-slot worker still drains them.
     #[test]
@@ -1056,12 +1210,30 @@ mod tests {
     /// Never claim more than we hold permits for.
     #[test]
     fn claim_batch_is_bounded_by_available_permits() {
-        let permits = Semaphore::new(DEFAULT_CONCURRENCY);
-        assert_eq!(permits.available_permits(), DEFAULT_CONCURRENCY);
+        let concurrency = resolve_concurrency(None, 4);
+        let permits = Semaphore::new(concurrency);
+        assert_eq!(permits.available_permits(), concurrency);
         let held = permits.try_acquire().expect("permit");
-        assert_eq!(permits.available_permits(), DEFAULT_CONCURRENCY - 1);
+        assert_eq!(permits.available_permits(), concurrency - 1);
         drop(held);
-        assert_eq!(permits.available_permits(), DEFAULT_CONCURRENCY);
+        assert_eq!(permits.available_permits(), concurrency);
+    }
+
+    /// #6033: unset, the worker runs at most as many jobs as the extraction
+    /// semaphore has permits, so lowering `MAX_CONCURRENT_SCAN_EXTRACTIONS`
+    /// lowers the claims too; raising it does not raise them past the default
+    /// of 4. A set value wins either way.
+    #[test]
+    fn unset_concurrency_follows_the_extraction_permits() {
+        assert_eq!(resolve_concurrency(None, 1), 1);
+        assert_eq!(resolve_concurrency(None, 4), 4);
+        assert_eq!(resolve_concurrency(None, 9), 4);
+        assert_eq!(resolve_concurrency(None, 16), 4);
+        assert_eq!(resolve_concurrency(Some(2), 1), 2);
+        assert_eq!(resolve_concurrency(Some(8), 4), 8);
+        // Never zero slots, whatever the inputs.
+        assert_eq!(resolve_concurrency(None, 0), 1);
+        assert_eq!(resolve_concurrency(Some(0), 4), 1);
     }
 
     /// Above the inline budgets, or the queue reproduces the timeout it

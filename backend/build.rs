@@ -1,9 +1,10 @@
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let out_dir = std::env::var("OUT_DIR").unwrap();
 
-    // Declaring any rerun-if-changed at all (the git SHA below does) turns off
-    // cargo's default of rerunning on every change in the package, so the
-    // schemas have to name themselves or an edited .proto regenerates nothing
+    // Declaring any rerun-if-changed at all turns off cargo's default of
+    // rerunning on every change in the package. That default must stay off:
+    // a rerun regenerates the protos and recompiles the whole crate (#6181).
+    // So the schemas name themselves, or an edited .proto regenerates nothing
     // and the build fails against the previous generation -- or, worse, keeps
     // compiling against it.
     for entry in std::fs::read_dir("proto")? {
@@ -53,105 +54,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &["proto"],
         )?;
 
-    let env_sha = std::env::var("GIT_SHA").ok().filter(|s| !s.is_empty());
-    let git_sha = env_sha
-        .clone()
-        .or_else(|| git(&["rev-parse", "HEAD"]))
-        .unwrap_or_else(|| "unknown".to_string());
-    println!("cargo:rustc-env=GIT_SHA={git_sha}");
-    println!("cargo:rerun-if-env-changed=GIT_SHA");
-    if env_sha.is_none() {
-        emit_git_head_rerun();
-    }
-
-    // Compile-time floor for the Debian `Release` `Date:` field, in seconds
-    // since the Unix epoch (see `release_date_floor` in
-    // src/api/handlers/debian.rs for why it must exist and why it must be a
-    // build-time constant rather than a process-start or per-request value).
-    // `SOURCE_DATE_EPOCH` wins when set — the reproducible-builds convention —
-    // otherwise the build machine's clock at compile time. Validated here so
-    // the baked string is always a parseable integer.
-    let release_date_floor = std::env::var("SOURCE_DATE_EPOCH")
-        .ok()
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .unwrap_or_else(|| {
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0)
-        });
-    println!("cargo:rustc-env=RELEASE_DATE_FLOOR_EPOCH={release_date_floor}");
-    println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
+    // The commit, version and Debian `Release` `Date:` floor are not baked
+    // here: crates/ak-build-info's build script owns them, so this script
+    // reads no build environment and reruns only for a .proto (#6181).
 
     emit_test_shard_cfg();
 
     Ok(())
-}
-
-/// Run `git` in the package directory and return its trimmed stdout, or
-/// `None` when git is missing, this is not a work tree (a source tarball, a
-/// Docker build context without `.git`), or the command fails.
-fn git(args: &[&str]) -> Option<String> {
-    let dir = std::env::var_os("CARGO_MANIFEST_DIR")?;
-    let out = std::process::Command::new("git")
-        .args(args)
-        .current_dir(&dir)
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let text = String::from_utf8(out.stdout).ok()?.trim().to_string();
-    (!text.is_empty()).then_some(text)
-}
-
-/// The path `git rev-parse --git-path <name>` reports, made absolute, when it
-/// exists. In a linked worktree `.git` is a file, and HEAD lives under
-/// `<common dir>/worktrees/<name>/` while branch refs live in the common dir;
-/// `--git-path` resolves both.
-fn git_path(name: &str) -> Option<std::path::PathBuf> {
-    let reported = std::path::PathBuf::from(git(&["rev-parse", "--git-path", name])?);
-    let path = if reported.is_absolute() {
-        reported
-    } else {
-        std::path::PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR")?).join(reported)
-    };
-    path.exists().then_some(path)
-}
-
-/// Re-run this script (and so refresh `GIT_SHA`) when HEAD moves: a checkout
-/// rewrites HEAD, a commit rewrites the branch ref it points at (a loose ref,
-/// or `packed-refs` after `git pack-refs`). Only paths that exist are
-/// watched: cargo re-runs a build script on every build when a watched path
-/// is missing, which recompiled the whole crate each time in a worktree
-/// while this watched `../.git/HEAD` (#5826). Without git nothing is
-/// emitted.
-fn emit_git_head_rerun() {
-    let Some(head) = git_path("HEAD") else {
-        return;
-    };
-    println!("cargo:rerun-if-changed={}", head.display());
-    let Some(branch_ref) = git(&["symbolic-ref", "-q", "HEAD"]) else {
-        // Detached HEAD: the commit id is in HEAD itself.
-        return;
-    };
-    match git_path(&branch_ref) {
-        Some(loose) => println!("cargo:rerun-if-changed={}", loose.display()),
-        // A packed ref is rewritten loose on the next commit, inside its
-        // existing parent directory, so watch that directory.
-        None => {
-            if let Some(parent) = std::path::Path::new(&branch_ref)
-                .parent()
-                .and_then(|p| p.to_str())
-                .and_then(git_path)
-            {
-                println!("cargo:rerun-if-changed={}", parent.display());
-            }
-        }
-    }
-    if let Some(packed) = git_path("packed-refs") {
-        println!("cargo:rerun-if-changed={}", packed.display());
-    }
 }
 
 /// CI test shards, in the order scripts/ci/test-shards.py lists them. Keep

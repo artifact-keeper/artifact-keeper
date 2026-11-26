@@ -111,24 +111,37 @@ permissions: {}
 # - The group is keyed by `event_name` + `ref` so push and workflow_dispatch
 #   for the same branch are in DIFFERENT groups. A manual run (`workflow_dispatch`)
 #   never gets cancelled by an auto run, and vice versa.
-# - A BRANCH PUSH is additionally keyed by its commit (#6080): every pushed
-#   commit is a group of its own. GitHub keeps only ONE pending run per group
-#   and a newer one REPLACES it, so in a per-ref group a merge landing while
-#   the previous commit's run was still waiting cancelled that run outright
-#   (zero jobs, no `sha-<sha>` images). When that commit was a Release
-#   Candidate the candidate died with it (57a8ac57, 2026-11-10), which is why
-#   every cut needed a merge freeze on main; and a run stuck queued with no
-#   runner held the group for every later commit (ea9425b6, 75 min). Per
-#   commit, neither can happen. The order the per-ref queue used to impose on
-#   the branch's floating tags (`:main`, `:dev`, `:X.Y-dev`) is kept by
-#   scripts/ci/decide-branch-floating-tags.sh in each merge job instead: a run
-#   whose commit is older than the one those tags already name publishes its
-#   `sha-<sha>` tag and leaves them alone. Tag pushes, dispatches (the
-#   promote) and the schedule keep their per-ref groups.
+# - MAIN PUSHES COALESCE (#6242). `main`/`master` pushes share one group per
+#   branch, so GitHub keeps at most one running and one PENDING run there,
+#   and a newer push replaces the pending one. A burst of merges therefore
+#   builds the commit in flight and the newest commit, not every commit in
+#   between: on the 1.12.2 cut day, 13 intermediate main runs sat in the
+#   self-hosted amd64 pool's queue for hours and had to be cancelled by hand.
+#   A run that has started is never cancelled (`cancel-in-progress: false`,
+#   #2099), and the floating tags `:main` / `:dev` are moved by the newest
+#   commit either way (scripts/ci/decide-branch-floating-tags.sh keeps them
+#   from moving backwards).
+# - A RE-RUN IS NEVER REPLACED. An attempt after the first gets a group of
+#   its own (`-rerun-<run id>-<attempt>`: keyed on the run, so two re-runs of
+#   different main runs, e.g. a person's "re-run failed jobs" on the tip and a
+#   candidate's re-run of an older commit, never share a group), so a re-run
+#   of a superseded commit's run runs
+#   beside the branch's queue instead of joining it and being replaced again
+#   (run 42710734527's attempt 2 was, on 2026-11-09). That is how a commit
+#   whose run was replaced gets its `sha-<sha>` images: the Release Candidate
+#   re-runs it ("Wait for a successful Docker Publish run" in
+#   release-candidate.yml, state=cancelled from
+#   scripts/ci/resolve-candidate-publish-run.sh), the same push run with the
+#   same signing identity and provenance. Run 42757946445 is the precedent:
+#   attempt 1 was replaced with zero jobs and attempt 2 built it.
+# - Every other branch push (`release/**`) keeps a group per commit (#6080):
+#   those lines get a handful of pushes, and each one is a commit a patch
+#   release may be cut from. Tag pushes, dispatches (the promote) and the
+#   schedule keep their per-ref groups.
 #   .github/workflows/docker-publish-watchdog.yml cancels, loudly, any run
-#   that is still queued with no runner after 30 minutes.
-# - `cancel-in-progress` is ALWAYS false. Runs queue behind each other and
-#   every one of them finishes.
+#   that is still queued with no runner after 30 minutes, so a stuck run
+#   holds main's group for at most that long.
+# - `cancel-in-progress` is ALWAYS false. A run that has started finishes.
 #
 # This workflow *publishes* — it is not a check whose only product is a
 # pass/fail verdict, so a cancelled run is not merely wasted CI time, it is a
@@ -151,7 +164,7 @@ permissions: {}
 # those minutes by gambling that the *next* run completes — and when merges
 # arrive faster than the amd64 build takes, that gamble loses every time.
 concurrency:
-  group: docker-publish-${{ github.event_name }}-${{ github.ref }}${{ (github.event_name == 'push' && startsWith(github.ref, 'refs/heads/')) && format('-{0}', github.sha) || '' }}
+  group: docker-publish-${{ github.event_name }}-${{ github.ref }}${{ (github.event_name == 'push' && startsWith(github.ref, 'refs/heads/') && github.ref != 'refs/heads/main' && github.ref != 'refs/heads/master') && format('-{0}', github.sha) || '' }}${{ github.run_attempt != '1' && format('-rerun-{0}-{1}', github.run_id, github.run_attempt) || '' }}
   cancel-in-progress: false
 
 env:
@@ -362,13 +375,11 @@ jobs:
             # copies) while the certified commit may live on a maintenance
             # branch. Deriving it here rather than accepting it as an input is
             # the point: an attacker who could name the branch would only have
-            # to put their version in Cargo.toml. The same call refuses a
-            # commit whose release-candidate.yml is not byte-identical to a
-            # copy that lives on main.
+            # to put their version in Cargo.toml.
             rc=0
             resolved="$(GITHUB_OUTPUT='' scripts/ci/resolve-certified-ref.sh "$SRC")" || rc=$?
             if [[ "$rc" -ne 0 ]]; then
-              echo "::error title=promote_source_sha is on no releasable branch::${SRC} is on neither main nor the maintenance branch its Cargo.toml names, or its release-candidate.yml is not a copy that lives on main (resolver exit ${rc}; its message is above). Nothing is promoted."
+              echo "::error title=promote_source_sha is on no releasable branch::${SRC} is on neither main nor the maintenance branch its Cargo.toml names (resolver exit ${rc}; its message is above). Nothing is promoted."
               exit 1
             fi
             SRC_BRANCH="$(sed -n 's/^certified_branch=//p' <<<"$resolved" | head -1)"
@@ -586,7 +597,7 @@ jobs:
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
 
       - name: Log in to Container Registry
-        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -597,7 +608,7 @@ jobs:
       # used to pre-seed the Grype CVE DB inside Dockerfile.backend) are
       # not subject to the 100-pull/6h anonymous rate limit.
       - name: Log in to Docker Hub (for transitive base-image pulls)
-        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -680,7 +691,6 @@ jobs:
           # fall back to the system allocator if that default is edited.
           build-args: |
             GIT_SHA=${{ github.sha }}
-            APP_VERSION=${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
             CARGO_BUILD_JOBS=${{ matrix.cargo-build-jobs }}
             CARGO_FEATURES=jemalloc
 
@@ -743,7 +753,7 @@ jobs:
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
 
       - name: Log in to Container Registry
-        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -752,7 +762,7 @@ jobs:
       # Authenticate to Docker Hub for transitive base-image pulls; see
       # the matching step in build-backend for rationale.
       - name: Log in to Docker Hub (for transitive base-image pulls)
-        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -831,7 +841,7 @@ jobs:
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
 
       - name: Log in to Container Registry
-        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -840,7 +850,7 @@ jobs:
       # Authenticate to Docker Hub for transitive base-image pulls; see
       # the matching step in build-backend for rationale.
       - name: Log in to Docker Hub (for transitive base-image pulls)
-        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -916,7 +926,7 @@ jobs:
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
 
       - name: Log in to Container Registry
-        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -947,7 +957,6 @@ jobs:
           provenance: mode=max
           build-args: |
             GIT_SHA=${{ github.sha }}
-            APP_VERSION=${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
 
       - name: Export digest
         run: |
@@ -980,7 +989,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Log in to Container Registry
-        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -991,6 +1000,14 @@ jobs:
         with:
           name: backend-digests-amd64
           path: /tmp/backend-digests
+
+      # The arm64 backend digest is read only for the embedded-SBOM check
+      # below; the Trivy passes scan amd64.
+      - name: Download backend arm64 digest
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: backend-digests-arm64
+          path: /tmp/backend-digests-arm64
 
       - name: Download openscap amd64 digest
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
@@ -1159,6 +1176,42 @@ jobs:
           pull_with_retry "${{ steps.refs.outputs.openscap }}"
           pull_with_retry "${{ steps.refs.outputs.scanner-adapter }}"
 
+      # The backend binary is built with `cargo auditable` (#6180), so it
+      # carries its own dependency graph, which is what lets Trivy, Syft and
+      # `cargo audit bin` list its crates. Read it back out of the image this
+      # run built, with the gate the release tarballs use: `cargo audit bin`
+      # exits 0 on a binary with NO embedded data, so the gate asserts on its
+      # output. Dropping `auditable` from Dockerfile.backend fails here.
+      # Advisories it prints do not block (see the script's header).
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
+        with:
+          # Same pin as release.yml and ci.yml (#6178).
+          tool: cargo-audit@0.23.0
+
+      # Both architectures: `docker create` never runs the arm64 image, and
+      # `cargo audit bin` reads an ELF of either.
+      - name: Verify the backend binary carries its dependency graph
+        env:
+          # The runner's own toolchain: `cargo audit` compiles nothing, so
+          # there is no need to install rust-toolchain.toml's channel here.
+          RUSTUP_TOOLCHAIN: stable
+          AMD64_REF: ${{ steps.refs.outputs.backend }}
+          ARM64_DIGEST_DIR: /tmp/backend-digests-arm64
+          IMAGE: ${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}
+        run: |
+          set -euo pipefail
+          arm64_ref="${IMAGE}@sha256:$(ls "$ARM64_DIGEST_DIR")"
+          for leg in "amd64 ${AMD64_REF}" "arm64 ${arm64_ref}"; do
+            read -r arch ref <<<"$leg"
+            bin="${RUNNER_TEMP}/artifact-keeper-${arch}"
+            docker pull -q --platform "linux/${arch}" "$ref" >/dev/null
+            cid="$(docker create --platform "linux/${arch}" "$ref")"
+            docker cp "${cid}:/usr/local/bin/artifact-keeper" "$bin"
+            docker rm "$cid" >/dev/null
+            BINARY="$bin" ./scripts/ci/assert-binary-sbom.sh
+          done
+
       # ---- Pass 1: SARIF visibility (all severities, never blocks) ----
 
       - name: Trivy SARIF - Backend
@@ -1233,6 +1286,14 @@ jobs:
       # Every image is gated with `if: always()` so one blocking image does not
       # hide another's CRITICAL/HIGH findings.
 
+      # REPORT-ONLY CRATES (#6180). Since the binary embeds its dependency
+      # graph, Trivy sees its ~700 Rust crates; before that it saw none. For
+      # one release their findings go to the Security tab through the SARIF
+      # pass above (which does scan the binary) and do not block, while they
+      # are triaged and a .trivyignore policy for crates is agreed. Rust
+      # advisories already block merges through ci.yml's `cargo audit`.
+      # Remove `skip-files` to make crate findings blocking. Only this one
+      # file is skipped: the Go binaries and the RPMs stay gated.
       - name: Trivy gate - Backend
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # 0.36.0
         if: always()
@@ -1242,6 +1303,7 @@ jobs:
           severity: 'CRITICAL,HIGH'
           ignore-unfixed: true
           trivyignores: '.trivyignore'
+          skip-files: '/usr/local/bin/artifact-keeper'
           exit-code: '1'
           skip-setup-trivy: true
           cache: 'false'
@@ -1295,21 +1357,21 @@ jobs:
           TRIVY_SKIP_DB_UPDATE: 'true'
 
       - name: Upload Backend Trivy SARIF
-        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4
         if: always()
         with:
           sarif_file: 'backend-trivy.sarif'
           category: 'trivy-backend'
 
       - name: Upload OpenSCAP Trivy SARIF
-        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4
         if: always()
         with:
           sarif_file: 'openscap-trivy.sarif'
           category: 'trivy-openscap'
 
       - name: Upload Scanner Adapter Trivy SARIF
-        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4
         if: always()
         with:
           sarif_file: 'scanner-adapter-trivy.sarif'
@@ -1317,7 +1379,7 @@ jobs:
 
       # Alpine SARIF upload skipped while alpine builds are suspended.
       - name: Upload Backend Alpine Trivy SARIF
-        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4
         if: false
         with:
           sarif_file: 'backend-alpine-trivy.sarif'
@@ -1475,17 +1537,17 @@ jobs:
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
 
       - name: Install cosign
-        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Log in to Docker Hub
-        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -1896,17 +1958,17 @@ jobs:
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
 
       - name: Install cosign
-        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Log in to Docker Hub
-        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -2206,17 +2268,17 @@ jobs:
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
 
       - name: Install cosign
-        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Log in to Docker Hub
-        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -2593,17 +2655,17 @@ jobs:
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
 
       - name: Install cosign
-        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Log in to Docker Hub
-        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -2802,14 +2864,14 @@ jobs:
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Log in to Docker Hub
-        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -3110,7 +3172,7 @@ jobs:
       # what a bare `verify` accepts, so a drift here would change the
       # verdict without changing the gate.
       - name: Install cosign
-        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
 
       - name: Probe ghcr.io manifests for expected semver tags
         id: probe

@@ -100,6 +100,27 @@ the checks above run. The metadata check reads one copy of a manifest and the
 scan workspace unpacks the other, so neither can be vouched for. Published
 packages do not carry repeated paths.
 
+**Embedded build POMs (Maven).** A Maven-built JAR embeds the POM it was
+built from at `META-INF/maven/<groupId>/<artifactId>/pom.xml`. That POM
+declares what the JAR was built against (`provided` and `test` scope
+included), not only what it ships. Grype has not graded those declarations
+since #5340. By default the Trivy filesystem scan still does, so the default
+is unchanged. Set `TRIVY_IGNORE_EMBEDDED_POM_DECLARATIONS=true` (opt-in,
+default `false`) to stop the Trivy filesystem scan grading dependencies that
+are only *declared* in a JAR's embedded build POM, which removes false
+positives such as #6233's. What the archive ships is then graded from the
+`pom.properties` of the archive and of each component bundled in it. Even
+when enabled, the Trivy scan keeps a build POM in two cases, because Trivy
+does not open nested JARs and the POM may be the only thing that names a
+bundled library:
+- a POM with no `pom.properties` beside it;
+- any archive that bundles JVM archives: a `.war` or `.ear`, a `WEB-INF/lib`
+  or `BOOT-INF/lib` directory, or a nested `.jar`, `.war`, `.ear`, `.aar`,
+  `.hpi` or `.jpi` anywhere in it.
+
+The setting applies to every Trivy filesystem scan, on uploads as well as
+proxy pulls. See [Known gaps](#known-gaps) for what it misses when enabled.
+
 **Archive formats graded on their contents (Go, Composer, Conan, CocoaPods, Swift).** The gate
 takes the coordinate from the request and checks it against the archive
 first, as for every format: a Go module zip must hold only
@@ -364,8 +385,11 @@ streams unscanned with `X-AK-Scan: pending`.
 
 A first install asks for many never-seen files at once, and only
 `MAX_CONCURRENT_SCAN_EXTRACTIONS` scans (default 4, shared with upload scans)
-run at a time, so most of them queue. A file scan runs in a task of its own and
-requests wait on it:
+run at a time, so most of them queue. A repository whose scans are the only
+ones waiting uses all of them. While other repositories' scans wait too, each
+repository queues at most `MAX_CONCURRENT_SCAN_EXTRACTIONS_PER_TENANT` (default
+half, rounded up) for the shared slots, so one busy repository cannot starve
+the others. A file scan runs in a task of its own and requests wait on it:
 
 | Limit | Value | What happens at the limit |
 | --- | --- | --- |
@@ -520,15 +544,30 @@ costs rows rather than memory.
 
 `GET /api/v1/admin/security/scan-queue` (admin only, and refused to a
 repository-scoped token, since it lists every repository's jobs) lists the outstanding jobs
-and the depth per kind and state. Hosted scans share the queue at the lowest
-priority, so a rescan of a whole repository cannot starve a waiting pull.
+and the depth per kind and state.
+
+**Claim order.** A worker claims a `fail_closed` pull's job first, since a
+client is parked on it. Hosted scans (`scan_on_upload`, pushed images and
+`POST /api/v1/security/scan`) come next, ahead of the `fail_open` and
+`record_only` backfill, so a burst of cold proxy fetches does not hold back
+upload verdicts. Backfill ages: a backfill job is claimed as though it were a
+hosted job queued `SCAN_QUEUE_BACKFILL_AGING_SECS` (default `600`) after it, so
+it still goes ahead of any hosted scan queued more than that later, and a steady
+stream of uploads cannot starve it either. `0` claims hosted and backfill jobs
+in plain age order. The window bounds the head start, not an upload's wait:
+once a backlog is older than the window, uploads queue behind the part of it
+queued more than the window before them, so a backlog that keeps growing still
+needs more worker slots. Rescans come after everything else. Each kind's
+`ak_scan_queue_oldest_pending_seconds` shows how long its oldest due job has
+waited.
 
 **Running the worker separately.** With the queue on, `SCAN_WORKER_ENABLED`
 (default `true`) has each instance drain it. In a multi-replica deployment set
 it `false` on the API pods and run the same image with it on as a scan worker.
 The worker has to read what an API pod wrote: object storage, or a filesystem
 volume both can mount. `SCAN_WORKER_CONCURRENCY` sets how many jobs one worker
-runs at once and defaults to `MAX_CONCURRENT_SCAN_EXTRACTIONS`. Each job takes
+runs at once and defaults to 4, or `MAX_CONCURRENT_SCAN_EXTRACTIONS` if that is
+lower. Each job takes
 an extraction permit, so raise the two together. `SCAN_WORKER_TRIVY_ADAPTER_URL`
 gives the scans a worker runs their own scanner-adapter URL in place of
 `TRIVY_ADAPTER_URL`, so a worker pod can use an adapter running next to it while
@@ -536,6 +575,28 @@ the API pods keep the Service URL. It is read only with the queue and the worker
 on. Only the URL changes: the worker's adapter client sends the same credentials
 as the API pods' (for example a `TRIVY_ADAPTER_TOKEN`, where set), so the
 adapter next to the worker must accept them.
+
+**Scanners that never return.** A queued job has a 600 s budget. Each scanner
+in it stops when the budget runs out: its `scan_results` row is recorded
+`failed` with "scanner <name> was stopped at the end of the queued scan job's
+600s budget", and the job goes back to the queue for another attempt, like a
+job whose scanner engine was unavailable. The scanners of one job share that
+budget, so two that hang cannot run longer than one. `SCANNER_PROCESS_TIMEOUT_SECS`
+(unset by default, no limit of its own) also limits each local `grype` or
+`trivy` process, in queued and in-process scans alike: past it the process is
+killed and its row recorded `failed`, and a queued job is retried. Set it
+above the longest scan you expect to finish. Scans through the scanner adapter
+are not affected by it; the adapter client keeps its own budgets.
+
+Without the queue, the stuck-scan janitor (`STUCK_SCAN_THRESHOLD_SECS`, default
+1800) marks a hung scan's rows `failed` but never stops the hung `grype`. On
+such pods, set `SCANNER_PROCESS_TIMEOUT_SECS` to match `STUCK_SCAN_THRESHOLD_SECS`
+(1800 by default), or lower, such as `900`, if your slowest scans finish well
+inside that. A retried on-demand scan reuses its rows: between
+attempts they read `failed`, and during the retry `running` with the error
+"retrying after a failed attempt: ...". Either way they still count as that
+failure, so a `block_on_fail` policy holds the artifact until a retry that
+succeeds completes the rows and releases the hold.
 
 **Rescans after a vulnerability-database update.** `SCAN_RESCAN_MAX_PER_DAY`
 (default `0`, off) has the worker look every 15 minutes for stored artifacts
@@ -547,7 +608,10 @@ build a scan recorded. Each scan type's last-known build is kept in
 never moves backwards there; to forget one (for example after rolling a
 scanner's database back on purpose), delete its row,
 `DELETE FROM scan_vuln_db_builds WHERE scan_type = 'grype';`, and the next pass
-records the build the scanner reports now. A latest scan with no recorded build
+records the build the scanner reports now. Proxy scan verdicts keep their own
+record of builds (`proxy_scan_db_versions`, see
+[After a vulnerability-database update](#after-a-vulnerability-database-update));
+the rollback procedure for those is described there. A latest scan with no recorded build
 counts as older. Each such content digest, in a repository with scanning on,
 becomes one `rescan` job at the lowest priority, below hosted scans, so every
 other job is claimed first. The worker scans the digest once, with the scanners
@@ -591,12 +655,159 @@ hold:
 - it is less than 30 days old, and
 - the scanner version it was recorded with matches the live scanner version
   (a vulnerability-database update changes the version, so the bytes are
-  scanned again against the new data).
+  scanned again against the new data), apart from the database-update grace
+  below.
 
 If either version string is unknown, a `fail_open` or `record_only`
 repository falls back to the 30-day window alone. A `fail_closed` repository
-reuses a `clean` verdict only when both versions are known and equal;
-otherwise it scans again, and an inconclusive result is `423`.
+reuses a `clean` verdict only when both versions are known and equal (or
+covered by its opted-in grace); otherwise it scans again, and an inconclusive result is
+`423`.
+
+### After a vulnerability-database update
+
+The version string carries the database build (`grype-0.120.1+db-2026-11-10`),
+so a database update used to make every stored verdict stale at once. The next
+pull of every cached package was scanned again, all together: on the request
+path under `fail_closed` (the client waited for it or got a `423`), or as a
+queued scan under `fail_open`.
+
+Since 1.13.0 the instance applies a **database-update grace**. For a window
+after it first sees a new database build, a verdict that the same scanner
+binary graded against the previous build still decides the pull. A `clean`
+verdict serves (`X-AK-Scan: clean`) and a `vulnerable` one blocks. The window
+depends on the repository's action:
+
+| Action | Setting | Default | Ceiling |
+|---|---|---|---|
+| `fail_open`, `record_only` | `PROXY_SCAN_DB_GRACE_HOURS` | `6` | `72` |
+| `fail_closed` | `PROXY_SCAN_DB_GRACE_HOURS_FAIL_CLOSED` | `0` (off) | `24` |
+
+`0` turns the grace off for those actions. A larger value is clamped to the
+ceiling, with a warning in the log. Under `fail_open` and `record_only` a pull
+decided by a `clean` verdict is served either way, so for it the grace only
+changes how the pull is labelled and when the scan runs. A pull decided by a
+`vulnerable` verdict from the previous build is **refused** (`403` under
+`fail_open`) for the window, where before the update made it `pending` and it
+was served while the new scan ran: an availability change in the safe
+direction. Under `fail_closed` it is an **opt-in trade**: within the
+window, a pull can be served clean from a verdict made before the new database
+added an advisory. Opt in only if that exposure (at most the window, on top of
+the time a database build already takes to reach you) is acceptable.
+
+A `vulnerable` verdict also keeps blocking for the whole window, even when the
+new database would grade the bytes clean (a withdrawn advisory). This
+paragraph and the performance note below come from nicola-preda's #6307.
+
+Performance note: with the `fail_closed` default of `0`, each database update
+still re-scans every cached package of a `fail_closed` repository on its next
+pull, as before 1.13.0. That is the thundering herd this grace exists to
+avoid, so plan scan capacity for it, or opt in.
+
+A pull that the grace decides also re-grades the bytes in the background,
+against the new build:
+
+- With the [durable scan queue](#the-durable-scan-queue) on, the re-grade is a
+  `proxy_file` job at priority 5. It is claimed after every other job, within
+  the worker's rescan slots (half of `SCAN_WORKER_CONCURRENCY`), and it asks
+  the scanner adapter for its background band. A pull that does wait for the
+  same bytes raises the job as usual.
+- Otherwise the re-grade runs in the serving process, at most two at a time
+  (fixed), from the bytes the pull holds when a slot is free. With both slots
+  busy, a cached file waits its turn in a backlog of up to 10,000 (fixed).
+  Each waiting entry holds a reference to the cached object, not its bytes,
+  which are read when it runs. An image or an OS package cannot wait that
+  way, so with no slot free its re-grade is `deferred` and a later pull asks
+  again.
+
+Each process asks for a digest's re-grade at most once every ten minutes
+(fixed). The re-grade reads the cached object, or the bytes already in hand,
+and never the upstream. It records its verdict against the live build, so the
+next pull is decided by that verdict. Only what is pulled is re-graded, so the
+most-pulled packages go first in practice, and the work uses spare scan
+capacity.
+
+**The re-grade is best effort; the window is the bound.** A re-grade can be
+deferred, dropped by a full backlog, lost on a restart, or fail (for example
+when the cached object is gone). Then the verdict keeps deciding pulls until
+the window ends, and a later pull asks again. Two rules decide what happens
+when the window ends:
+
+- A digest whose re-grade is still queued, in the scan queue or in the
+  process's backlog, keeps the grace for at most one more window. A backlog
+  then drains instead of falling back to scans on the request path all at
+  once.
+- Everything else behaves exactly as before the grace existed.
+
+Watch the backlog against the window with
+`ak_proxy_scan_regrade_backlog_oldest_seconds{where="queue"|"in_process"}` and
+`ak_proxy_scan_db_grace_window_seconds{action_class="serving"|"fail_closed"}`.
+For example, alert on
+
+```promql
+max(ak_proxy_scan_regrade_backlog_oldest_seconds)
+  > 0.5 * max(ak_proxy_scan_db_grace_window_seconds)
+```
+
+The worker, or the serving process, also logs a warning once the oldest
+re-grade has waited half the window. `ak_proxy_scan_regrades_total{outcome}`
+counts re-grades by outcome: `queued` (a queue job), `started` (in process,
+running or waiting its turn) and `deferred` (no slot free for an image or OS
+package).
+
+The grace never covers:
+
+- a scanner binary upgrade (`grype-0.119.0` to `grype-0.120.1`), which is
+  scanned again on the next pull, as before;
+- a verdict older than the newest build of the same binary that this fleet
+  recorded below the live one. "Newest" is by build date, not by when the
+  build was recorded, so a replica pinned to an old database cannot widen the
+  grace;
+- a build string that is not a `YYYY-MM-DD` date, or an unknown version on
+  either side.
+
+The window starts when the fleet first saw the build, recorded in
+`proxy_scan_db_versions` (migration 401) and measured on the database's clock,
+so a restart or a new replica does not reopen it. As a result, a replica that
+installs the new database more than the window after the first sighting gets
+no grace for it.
+
+A verdict graded against a **newer** build than the live one is reused while
+the fleet first saw that build within the pull's own action window: up to
+`PROXY_SCAN_DB_GRACE_HOURS` for `fail_open` and `record_only`, and up to
+`PROXY_SCAN_DB_GRACE_HOURS_FAIL_CLOSED` for `fail_closed`. At the defaults, a
+`fail_closed` pull therefore re-scans such a verdict exactly as before 1.13.0. This happens when one replica
+updates before another, or during a rolling upgrade. Before, the replica with
+the older build re-scanned it, and the next replica re-scanned it back. The
+trust is bounded so that a build that was rolled back stops counting.
+
+**Rolling back a database build.** If a build grades wrongly (for example it
+misses an advisory and grades a vulnerable package clean) and you roll back
+to the previous build, the replicas on the older build keep trusting the bad
+build's verdicts until its trust window ends: the pull's action window after
+the fleet first saw the build (`fail_closed` at its default of `0` never
+trusts it). To stop that at once, and to re-scan everything the bad build
+graded on its next pull, purge its verdicts and its record, **once every
+replica has left the bad build**. A replica still on it re-records the build
+with a new first sighting, which would start a fresh trust window, and keeps
+writing verdicts graded by it:
+
+```sql
+DELETE FROM proxy_scan_results WHERE scanner_version = 'grype-0.120.1+db-2026-11-20';
+DELETE FROM proxy_scan_db_versions WHERE scanner_version = 'grype-0.120.1+db-2026-11-20';
+```
+
+Each process reloads its record within a minute, and the fast paths' verdict
+memo within 30 seconds. Deleting a verdict makes the next pull of those bytes
+scan them again (under `fail_closed` inline, as for a first pull). It is not a
+waiver: a vulnerable package graded vulnerable again is blocked again.
+
+With the `fail_closed` grace on, the presigned-redirect fast paths
+([below](#proxy-cache-fast-paths)) do not redirect a `clean` verdict that only
+the grace vouches for. That pull reads the body through the buffered gate
+instead, which queues the re-grade. The cost is one buffered read per such
+pull, of a body at most the scan cap, until the digest is re-graded. After
+that, the redirect is used again. `fail_open` fast paths are unaffected.
 
 A verdict also records the coordinate it was graded as (`pin_identity`,
 migration 301). For most formats the bytes name that coordinate themselves (an
@@ -858,6 +1069,14 @@ have no core proxy path to gate.
   [The proxy cache and the gate](#the-proxy-cache-and-the-gate)). To enforce
   the Virtual's policy for every client, enable scan-on-proxy on the member
   too, or do not grant clients read access to the member.
+- **With `TRIVY_IGNORE_EMBEDDED_POM_DECLARATIONS=true`, any shaded library
+  whose own `META-INF/maven/**` wasn't carried into the jar is flagged by
+  neither engine.** maven-shade embeds the original build POM, so the
+  shaded dependency is named only by that POM's declaration. For example,
+  jackson-core's shaded fastdoubleparser has no `pom.properties` in the
+  jar. Grype has ignored embedded POM declarations since #5340, and the
+  opt-in makes Trivy ignore them too. The default (`false`) keeps grading
+  them. #6261 tracks a shading heuristic for both engines.
 - **Maven-layout archives other than `.jar`/`.war`/`.ear`** (`.aar`,
   `.hpi`/`.jpi`, `.nbm`, `.jmod`, `.rar`, `.zip`) are scanned as raw files,
   not unpacked, and carry no identity pin.
@@ -905,6 +1124,26 @@ have no core proxy path to gate.
   there, not through the `pods/` route; the same holds for a Composer
   package installed from `source` (a VCS checkout) instead of its `dist`,
   and for a Go client whose `GOPROXY` falls back to `direct`.
+- **Go: only `GOPROXY` without a fallback fully enforces the gate.** With
+  `GOPROXY=https://<ak>/go/<repo>,direct`, `go` moves on to `direct` when
+  the repository answers 404 or 410. With `GOPROXY=https://<ak>/go/<repo>|direct`
+  it moves on after *any* error, including the `403` `scan_blocked`, the
+  `423` and the 5xx a failing upstream gets. In both cases the client then
+  fetches from the VCS without going through the gate. `@v/list`,
+  `@latest`, `.info`, `.mod` and `.zip` answer with a 5xx, never a 404, when
+  the upstream cannot answer (5xx, 429, no connection, timeout) or refuses
+  the Remote's own credentials, whether they are configured as upstream auth
+  or embedded in the upstream URL as `user:pass@` (#6214). On a Remote that
+  is a 502 or 503 (a scanning Remote's `.zip` can answer 500). Through a
+  Virtual it is a 503 with `Retry-After` when no member served. A 401/403 to
+  a Remote with no credentials stays a 404 on `@v/list`, `@latest` and
+  `.info`, and on every route through a Virtual, because an S3-style
+  upstream answers 403 for a key it does not hold. So `,direct` falls through
+  only for a module the upstream really does not have (or refuses
+  anonymously), or an `@latest` the age gate withholds on purpose. To
+  enforce the gate for every module, set `GOPROXY=https://<ak>/go/<repo>`
+  with no fallback. Modules that match `GOPRIVATE` or `GONOPROXY` also skip
+  the proxy, so keep those patterns limited to modules you trust.
 - **One stored verdict per digest.** A digest holds one verdict row, so
   byte-identical files pulled alternately as two coordinates (see
   [Verdicts and freshness](#verdicts-and-freshness)) are scanned again on

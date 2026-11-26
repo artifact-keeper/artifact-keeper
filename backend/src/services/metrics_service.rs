@@ -85,6 +85,23 @@ pub fn init_metrics() -> PrometheusHandle {
     handle
 }
 
+/// Publish `ak_build_info{version, git} 1` (#5656): the running build, for
+/// dashboards that join it onto other series and for spotting a mixed-version
+/// rollout. Called at startup, after the recorder is installed. It carries
+/// `# HELP` text, like every family that is described.
+pub fn publish_build_info() {
+    metrics::describe_gauge!(
+        "ak_build_info",
+        "Always 1. The labels name the running build: version and git commit."
+    );
+    gauge!(
+        "ak_build_info",
+        "version" => crate::build_info::VERSION,
+        "git" => crate::build_info::short_sha()
+    )
+    .set(1.0);
+}
+
 /// The recorder [`init_metrics`] installs: the Prometheus recorder alone, or a
 /// fan-out of it and `otel`.
 pub(crate) fn build_global_recorder(
@@ -324,10 +341,99 @@ pub fn record_proxy_scan_queue_refused(limit: &'static str) {
     counter!("ak_proxy_scan_queue_refused_total", "limit" => limit).increment(1);
 }
 
+/// A re-grade of a proxied file whose verdict, graded against the previous
+/// vulnerability-DB build, decided a pull under the DB-update grace (#6300).
+/// `outcome` is `queued` (a scan-queue job), `started` (in this process,
+/// running or waiting its turn) or `deferred` (an image or OS package
+/// re-grade found no free slot; a later pull asks again).
+pub fn record_proxy_scan_regrade(outcome: &'static str) {
+    counter!("ak_proxy_scan_regrades_total", "outcome" => outcome).increment(1);
+}
+
+/// The DB-update grace windows this process applies (#6300), in seconds:
+/// `action_class` `serving` (`fail_open`, `record_only`) and `fail_closed`.
+/// Alert when the re-grade backlog's age nears them
+/// (`ak_proxy_scan_regrade_backlog_oldest_seconds`).
+pub fn record_proxy_scan_db_grace_window(serving_secs: f64, fail_closed_secs: f64) {
+    gauge!("ak_proxy_scan_db_grace_window_seconds", "action_class" => "serving").set(serving_secs);
+    gauge!("ak_proxy_scan_db_grace_window_seconds", "action_class" => "fail_closed")
+        .set(fail_closed_secs);
+}
+
+/// Age of the oldest proxy re-grade still waiting (#6300): `where` is
+/// `queue` (a pending `proxy_file` job at the re-grade priority, published by
+/// the scan worker) or `in_process` (this process's own backlog). `0` when
+/// none waits.
+pub fn record_proxy_scan_regrade_backlog_oldest(location: &'static str, secs: f64) {
+    gauge!("ak_proxy_scan_regrade_backlog_oldest_seconds", "where" => location).set(secs);
+}
+
+/// One step of a proxy cache fill that runs detached from its request
+/// (#5220, #5509, #5617). `kind` is `buffered` (a buffered fill, detached
+/// from the start) or `stream_drain` (the rest of a streamed body whose client
+/// stopped reading). `outcome`:
+///
+/// * `started`: the fill took a `PROXY_UPSTREAM_MAX_DETACHED_FILLS` permit
+///   and runs on its own task;
+/// * `finished`: it ended within its deadline (cached, or failed upstream);
+/// * `abandoned`: it hit the fetch deadline plus the commit allowance and
+///   was dropped unfinished;
+/// * `refused`: no permit was free, so a buffered fill runs in its request
+///   (and ends if the client goes away) and a drain is not started at all.
+///
+/// A steady `refused` rate means the cap is too low for the traffic.
+pub fn record_proxy_detached_fill(kind: &'static str, outcome: &'static str) {
+    counter!("ak_proxy_detached_fills_total", "kind" => kind, "outcome" => outcome).increment(1);
+}
+
+/// Detached proxy cache fills running now, by `kind` (see
+/// [`record_proxy_detached_fill`]). `+1` when one starts, `-1` when it ends.
+pub fn record_proxy_detached_fills_in_flight(kind: &'static str, delta: f64) {
+    gauge!("ak_proxy_detached_fills_in_flight", "kind" => kind).increment(delta);
+}
+
+/// The `PROXY_UPSTREAM_MAX_DETACHED_FILLS` this process runs with (#5617), so
+/// a dashboard can compare `ak_proxy_detached_fills_in_flight` with it.
+pub fn record_proxy_detached_fills_limit(limit: usize) {
+    gauge!("ak_proxy_detached_fills_limit").set(limit as f64);
+}
+
+/// A request that waited on another request's buffered fill, whose upstream
+/// fetch then hit `PROXY_UPSTREAM_FETCH_DEADLINE_SECS`, took that verdict
+/// (the stale copy, or the error) instead of fetching again (#5617).
+pub fn record_proxy_fill_follower_inherited() {
+    counter!("ak_proxy_fill_followers_inherited_total").increment(1);
+}
+
+/// A `popularity` curation rule flagged a Remote or Virtual download, which
+/// is served (#5840). Counted on every flag; the log line is written at
+/// `warn` once per (repository, package, rule) per hour. `rule_id` is the
+/// rule's UUID, so the cardinality is bounded by the number of rules.
+pub fn record_curation_proxy_flag(repo_key: &str, rule_id: uuid::Uuid) {
+    counter!(
+        "ak_curation_proxy_flags_total",
+        "repository" => repo_key.to_string(),
+        "rule_id" => rule_id.to_string(),
+    )
+    .increment(1);
+}
+
 /// A queued `fail_closed` proxy scan dropped because no request wanted it any
 /// more (#5231).
 pub fn record_proxy_scan_abandoned() {
     counter!("ak_proxy_scan_abandoned_total").increment(1);
+}
+
+/// Count one proxied pull served without a scan and without one queued, so it
+/// never gets a verdict. `reason` is a fixed string, never the file name
+pub fn record_proxy_scan_unscannable(repo_key: &str, format: &str, reason: &'static str) {
+    counter!(
+        "ak_proxy_scan_unscannable_total",
+        "repository" => repo_key.to_string(),
+        "format" => format.to_string(),
+        "reason" => reason,
+    )
+    .increment(1);
 }
 
 /// Record one committed artifact upload: `ak_artifact_uploads_total` and the
@@ -457,6 +563,32 @@ pub fn set_serve_verify_buffer_bytes_reserved(bytes: usize) {
 /// the load.
 pub fn record_serve_verify_buffer_fallback() {
     counter!("ak_serve_verify_buffer_fallback_total").increment(1);
+}
+
+/// A stored object whose bytes did not match their recorded SHA-256, found by
+/// the serve-time verifier (`storage::verify`, #4323). `phase` is
+/// `before_headers` (an object of at most 4 MiB, checked before anything is
+/// sent: refused with the `502 STORED_OBJECT_INTEGRITY`, or for a Remote OCI
+/// blob repaired from upstream, #5169) or `streaming` (the transfer was
+/// aborted before its last chunk: a larger object, one the verification
+/// budget had no room for, and every proxy-cache hit). The buffered
+/// proxy-cache read is not counted here: its mismatch is a cache miss,
+/// `ak_proxy_cache_lookups_total{result="miss_checksum_mismatch"}`. Any
+/// increase means corrupted storage: the admin storage scrub finds the
+/// affected rows.
+pub fn record_stored_object_integrity_failure(phase: &'static str) {
+    counter!("ak_stored_object_integrity_failures_total", "phase" => phase).increment(1);
+}
+
+/// A Remote's proxy-cache entry evicted because its stored bytes did not
+/// match the digest its sidecar records (#4323); the next read refetches it
+/// upstream. `repository` is the Remote's key.
+pub fn record_proxy_cache_integrity_eviction(repository: &str) {
+    counter!(
+        "ak_proxy_cache_integrity_evictions_total",
+        "repository" => repository.to_string()
+    )
+    .increment(1);
 }
 
 /// Outcome of a CEP-27 publish attestation decision (#4711). `outcome` is one
@@ -689,6 +821,33 @@ pub fn record_scan_inventory_success(scan_type: &str) {
     .increment(1);
 }
 
+/// `ak_health_monitor_up{service}`: 1 when the health monitor's last check of
+/// `service` was healthy, else 0 (#5651). One series per checked dependency
+/// (database, storage, scanner-adapter, ...), so an alert can fire on a
+/// component going down without polling the health log.
+pub fn record_health_monitor_status(service: &str, healthy: bool) {
+    metrics::describe_gauge!(
+        "ak_health_monitor_up",
+        "1 when the health monitor's last check of the service was healthy, else 0."
+    );
+    gauge!("ak_health_monitor_up", "service" => service.to_string()).set(if healthy {
+        1.0
+    } else {
+        0.0
+    });
+}
+
+/// `ak_health_monitor_postgres_restarts_total`: Postgres restarts the health
+/// monitor detected (#5651). A restart is usually over before the next check,
+/// so the up gauge alone would not show it.
+pub fn record_health_monitor_postgres_restart() {
+    metrics::describe_counter!(
+        "ak_health_monitor_postgres_restarts_total",
+        "Postgres restarts detected by the health monitor (pg_postmaster_start_time after the last check)."
+    );
+    counter!("ak_health_monitor_postgres_restarts_total").increment(1);
+}
+
 /// Record a webhook delivery event.
 pub fn record_webhook_delivery(event: &str, success: bool) {
     let status = if success { "success" } else { "failure" };
@@ -726,6 +885,25 @@ pub fn record_webhook_dead_letter(event: &str) {
         "event" => event.to_string()
     )
     .increment(1);
+}
+
+/// Record a failed send to one webhook endpoint and the backoff it now waits
+/// out (#5195). Labelled by webhook id: webhooks are created by
+/// administrators, so the label set stays small.
+pub fn record_webhook_endpoint_failure(webhook_id: uuid::Uuid, backoff_secs: f64) {
+    let id = webhook_id.to_string();
+    counter!("ak_webhook_endpoint_failures_total", "webhook_id" => id.clone()).increment(1);
+    gauge!("ak_webhook_endpoint_backoff_seconds", "webhook_id" => id).set(backoff_secs);
+}
+
+/// Record that a backed-off webhook endpoint accepted a delivery again.
+pub fn record_webhook_endpoint_recovered(webhook_id: uuid::Uuid) {
+    gauge!("ak_webhook_endpoint_backoff_seconds", "webhook_id" => webhook_id.to_string()).set(0.0);
+}
+
+/// Pending (not delivered, not dead-lettered) deliveries for one webhook.
+pub fn set_webhook_delivery_backlog(webhook_id: uuid::Uuid, pending: f64) {
+    gauge!("ak_webhook_delivery_backlog", "webhook_id" => webhook_id.to_string()).set(pending);
 }
 
 /// Record download side-effect events (stats/audit) dropped by the bounded
@@ -976,6 +1154,20 @@ pub fn record_proxy_cache_cap_refusing(repo_key: &str) {
         "repository" => repo_key.to_string()
     )
     .increment(1);
+}
+
+/// One re-catalog sweep pass's counts (#6429), by `outcome`: `scanned` keys
+/// listed, `recataloged` rows restored from a sidecar, the `skipped_*`
+/// reasons, `met_row`, `raced` and `failed`. A steady `recataloged` rate means
+/// catalog rows are being lost (a database crash or failover under the async
+/// catalog commit, or failing catalog writes).
+pub fn record_proxy_cache_recatalog(outcome: &'static str, count: u64) {
+    counter!("ak_proxy_cache_recatalog_total", "outcome" => outcome).increment(count);
+}
+
+/// Bytes the re-catalog sweep put back on Remotes' ledgers (#6429).
+pub fn record_proxy_cache_recatalog_bytes(bytes: u64) {
+    counter!("ak_proxy_cache_recatalog_bytes_total").increment(bytes);
 }
 
 /// Counters recorded while a test ran, as `(name, labels, value)`; read one
@@ -1356,6 +1548,24 @@ mod tests {
     }
 
     #[test]
+    fn build_info_is_exported_with_help_text_5656() {
+        let recorder = prometheus_builder().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, publish_build_info);
+        let text = handle.render();
+        assert!(text.contains("# HELP ak_build_info "), "{text}");
+        let line = text
+            .lines()
+            .find(|l| l.starts_with("ak_build_info{"))
+            .unwrap_or_else(|| panic!("no ak_build_info sample: {text}"));
+        assert!(
+            line.contains(&format!("version=\"{}\"", crate::build_info::VERSION)),
+            "{line}"
+        );
+        assert!(line.ends_with(" 1"), "{line}");
+    }
+
+    #[test]
     fn test_record_scan_inventory_success_does_not_panic() {
         record_scan_inventory_success("trivy");
         record_scan_inventory_success("openscap");
@@ -1401,6 +1611,14 @@ mod tests {
     #[test]
     fn test_record_webhook_dead_letter_does_not_panic() {
         record_webhook_dead_letter("artifact.uploaded");
+    }
+
+    #[test]
+    fn test_record_webhook_endpoint_metrics_do_not_panic() {
+        let id = uuid::Uuid::new_v4();
+        record_webhook_endpoint_failure(id, 30.0);
+        record_webhook_endpoint_recovered(id);
+        set_webhook_delivery_backlog(id, 3.0);
     }
 
     #[test]

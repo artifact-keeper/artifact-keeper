@@ -85,6 +85,11 @@ pub enum QuotaScope {
     Project,
     /// The instance-wide storage quota (`STORAGE_QUOTA_BYTES`).
     Instance,
+    /// Not a quota: the storage volume is at `STORAGE_DISK_BLOCK_PERCENT`
+    /// (#5191). `limit_bytes` is the volume's capacity, `used_bytes` what is
+    /// in use, `threshold_percent` the block threshold. Checked before every
+    /// other scope, from a cached reading.
+    Disk,
 }
 
 impl QuotaScope {
@@ -94,6 +99,7 @@ impl QuotaScope {
             QuotaScope::Repository => "Repository storage quota exceeded",
             QuotaScope::Project => "Project storage quota exceeded",
             QuotaScope::Instance => "Storage quota reached",
+            QuotaScope::Disk => crate::services::quota::QuotaRefusal::DISK_MESSAGE,
         }
     }
 }
@@ -111,6 +117,12 @@ pub struct QuotaDenial {
     pub repository: Option<String>,
     /// Key of the project whose quota refused it (project scope only).
     pub project: Option<String>,
+    /// The bytes the refused write would have added, when known. Lets the
+    /// refusal tell "this upload does not fit in the space left" apart from
+    /// "the quota is full" (usage below the limit versus at it).
+    pub additional_bytes: Option<u64>,
+    /// The block threshold of a disk-scope denial.
+    pub threshold_percent: Option<u8>,
 }
 
 impl QuotaDenial {
@@ -121,7 +133,16 @@ impl QuotaDenial {
             used_bytes,
             repository: None,
             project: None,
+            additional_bytes: None,
+            threshold_percent: None,
         }
+    }
+
+    /// This denial, recording that the refused write would have added
+    /// `additional_bytes` (ignored unless positive).
+    pub(crate) fn with_additional(mut self, additional_bytes: i64) -> Self {
+        self.additional_bytes = u64::try_from(additional_bytes).ok().filter(|n| *n > 0);
+        self
     }
 
     /// Client-facing reason for this refusal (the message of its body).
@@ -2933,6 +2954,18 @@ impl RepositoryService {
         additional_bytes: i64,
     ) -> Result<Option<QuotaDenial>> {
         let repo = self.get_by_id(repo_id).await?;
+        self.quota_preflight_for(&repo, additional_bytes).await
+    }
+
+    /// [`Self::quota_preflight`] for a caller that already read the
+    /// repository row (the shared upload service, #6318), so the pre-check
+    /// does not read it a second time. Same checks, same answer.
+    pub async fn quota_preflight_for(
+        &self,
+        repo: &Repository,
+        additional_bytes: i64,
+    ) -> Result<Option<QuotaDenial>> {
+        let repo_id = repo.id;
         let repo_quota = finite_quota(repo.quota_bytes);
         // Only hit the DB for usage when a finite quota is actually set.
         let repo_usage = match repo_quota {
@@ -2965,11 +2998,13 @@ impl RepositoryService {
             additional_bytes,
         ) {
             Some(denial) => Some(denial),
+            // The instance quota, then the disk threshold (#5191).
             None => {
                 crate::services::quota::storage::instance_denial(&self.db, additional_bytes).await?
             }
         };
         Ok(match denial {
+            Some(denial) if denial.scope == QuotaScope::Disk => Some(denial),
             Some(denial) => Some(self.label_denial(repo_id, denial).await),
             None => None,
         })
@@ -3061,6 +3096,7 @@ impl RepositoryService {
     ) -> Option<QuotaDenial> {
         let refuse = |scope: QuotaScope, usage: QuotaUsage| {
             QuotaDenial::new(scope, usage.quota_bytes.unwrap_or(0), usage.used_bytes)
+                .with_additional(additional_bytes)
         };
         // An upload that adds no bytes (a re-push of identical content, a
         // shrinking overwrite) is always admitted, even when usage is already
@@ -3144,6 +3180,35 @@ impl RepositoryService {
     /// A `None`/non-positive quota at both levels means unlimited: the call
     /// returns `allowed = true` without locking or touching the ledger.
     pub async fn check_quota_locked(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        repo_id: Uuid,
+        path: &str,
+        new_size: i64,
+    ) -> Result<QuotaAdmission> {
+        let admission = self
+            .check_quota_locked_logical(tx, repo_id, path, new_size)
+            .await?;
+        // The disk threshold (#5191), from a cached reading, after every
+        // quota: a `QuotaScope::Disk` denial therefore means the write fits
+        // every quota, so a caller that writes no bytes (an OCI blob mount)
+        // can admit it. It does not net out an overwrite: a rewrite still
+        // writes the new bytes before it frees the old ones.
+        if admission.allowed {
+            if let Some(denial) = crate::services::quota::disk::denial(new_size) {
+                return Ok(QuotaAdmission {
+                    allowed: false,
+                    denied_by: Some(denial),
+                    base_usage: admission.base_usage,
+                });
+            }
+        }
+        Ok(admission)
+    }
+
+    /// [`Self::check_quota_locked`] without the disk threshold: the
+    /// repository, project and instance quotas.
+    async fn check_quota_locked_logical(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         repo_id: Uuid,
@@ -4847,6 +4912,12 @@ mod tests {
                 assert_eq!(
                     (Some(d.limit_bytes), d.used_bytes),
                     (usage.quota_bytes, usage.used_bytes),
+                    "case {label}"
+                );
+                // ...and the size of the write it refused.
+                assert_eq!(
+                    d.additional_bytes,
+                    u64::try_from(*additional).ok(),
                     "case {label}"
                 );
             }

@@ -23,6 +23,7 @@ use axum::Router;
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::info;
 
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
@@ -219,24 +220,50 @@ async fn handle_get(
     // before anything is fetched or cached.
     reject_ambiguous_go_request(&repo, &request)?;
 
+    // Each arm is boxed (#6270): held inline, every arm's future sits in this
+    // handler's state and poll frame at once, which with the virtual member
+    // walk below it overflows the stack of a debug-build test thread.
     match request {
         GoProxyRequest::List { module } => {
-            list_versions(&state, auth.as_ref(), &repo, &module).await
+            Box::pin(list_versions(&state, auth.as_ref(), &repo, &module)).await
         }
         GoProxyRequest::Info { module, version } => {
-            version_info(&state, auth.as_ref(), &repo, &module, &version).await
+            Box::pin(version_info(
+                &state,
+                auth.as_ref(),
+                &repo,
+                &module,
+                &version,
+            ))
+            .await
         }
         GoProxyRequest::Mod { module, version } => {
-            get_mod_file(&state, auth.as_ref(), &repo, &module, &version, &ctx).await
+            Box::pin(get_mod_file(
+                &state,
+                auth.as_ref(),
+                &repo,
+                &module,
+                &version,
+                &ctx,
+            ))
+            .await
         }
         GoProxyRequest::Zip { module, version } => {
-            download_zip(&state, auth.as_ref(), &repo, &module, &version, &ctx).await
+            Box::pin(download_zip(
+                &state,
+                auth.as_ref(),
+                &repo,
+                &module,
+                &version,
+                &ctx,
+            ))
+            .await
         }
         GoProxyRequest::Latest { module } => {
-            latest_version(&state, auth.as_ref(), &repo, &module).await
+            Box::pin(latest_version(&state, auth.as_ref(), &repo, &module)).await
         }
         GoProxyRequest::SumDb { host, path } => {
-            serve_sumdb(&state, auth.as_ref(), &repo, &host, &path).await
+            Box::pin(serve_sumdb(&state, auth.as_ref(), &repo, &host, &path)).await
         }
     }
 }
@@ -639,15 +666,17 @@ async fn handle_put(
 
 /// Proxy a Go metadata request to the upstream for remote repos, or resolve
 /// through virtual repo members. Returns `Ok(response)` if the proxy produced
-/// a result, or `Err(())` if no proxy was available and the caller should fall
-/// back to the local/not-found response.
+/// a result, `Err(None)` if no proxy was available or the upstream does not
+/// have it (the caller falls back to its local/not-found response), and
+/// `Err(Some(response))` when the upstream could not answer (#6214): that
+/// response is the retryable 502/503 the caller must serve instead of a 404.
 async fn try_proxy_go_metadata(
     state: &SharedState,
     auth: Option<&AuthExtension>,
     repo: &RepoInfo,
     upstream_path: &str,
     default_content_type: &str,
-) -> Result<Response, ()> {
+) -> Result<Response, Option<Response>> {
     // Remote repo: proxy to upstream. The upstream body is forwarded
     // VERBATIM (`.info` JSON / `.mod` bytes as the upstream served them), so
     // the upstream `Content-Encoding` must be re-declared when present
@@ -656,12 +685,7 @@ async fn try_proxy_go_metadata(
         if let (Some(ref upstream_url), Some(ref proxy)) =
             (&repo.upstream_url, &state.proxy_service)
         {
-            if let Ok(proxy_helpers::CachedBody {
-                content,
-                content_type,
-                content_encoding,
-                stale_since,
-            }) = proxy_helpers::proxy_fetch_capped_encoded_with_format(
+            let fetched = proxy_helpers::proxy_fetch_capped_encoded_with_format(
                 proxy,
                 repo.id,
                 &repo.key,
@@ -670,16 +694,23 @@ async fn try_proxy_go_metadata(
                 proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
                 RepositoryFormat::Go,
             )
-            .await
-            {
-                return Ok(proxy_helpers::forward_verbatim_metadata(
-                    content,
-                    content_type,
-                    default_content_type,
-                    content_encoding,
-                    stale_since,
-                ));
-            }
+            .await;
+            let proxy_helpers::CachedBody {
+                content,
+                content_type,
+                content_encoding,
+                stale_since,
+            } = match fetched {
+                Ok(body) => body,
+                Err(resp) => return Err(go_fetch_failure(state, repo.id, upstream_url, resp).await),
+            };
+            return Ok(proxy_helpers::forward_verbatim_metadata(
+                content,
+                content_type,
+                default_content_type,
+                content_encoding,
+                stale_since,
+            ));
         }
     }
 
@@ -689,7 +720,11 @@ async fn try_proxy_go_metadata(
     // caller's default only as the fallback for a member that declared none.
     if repo.repo_type == RepositoryType::Virtual {
         let ct = default_content_type.to_string();
-        if let Ok(resp) = proxy_helpers::resolve_virtual_metadata(
+        // The walk answers 503 + `Retry-After` when no member served and one
+        // could not answer, or 502 for a member past its deadline (#6214).
+        // Only a 5xx is surfaced; any other failure keeps the route's 404, as
+        // before.
+        return proxy_helpers::resolve_virtual_metadata_reporting_unavailable(
             &state.db,
             auth,
             state.proxy_service.as_deref(),
@@ -709,12 +744,65 @@ async fn try_proxy_go_metadata(
             },
         )
         .await
-        {
-            return Ok(resp);
-        }
+        .map_err(|resp| resp.status().is_server_error().then_some(resp));
     }
 
-    Err(())
+    Err(None)
+}
+
+/// Sort a failed upstream metadata fetch into a miss (`None`) or a failure
+/// the client must see (#6214). The upstream answering 404 or 410, refusing
+/// the request (401, 403 and the other permanent 4xx) or the path being
+/// rejected is a miss, so the route keeps its 404. An upstream that could not
+/// answer (5xx, 429, a transport failure or timeout) or a fault on this
+/// server's side (a database pool timeout) is the 502/503 the `.mod` and
+/// `.zip` routes already serve: `go` reads 404 and 410 as "this proxy does
+/// not have the module" and moves on to the next `GOPROXY` entry, so an
+/// outage must not look like one.
+///
+/// The surfaced status is always a 5xx: `proxy_helpers::map_proxy_error`
+/// renders an unavailable failure as 502 or 503 today, and anything else
+/// marked unavailable is answered with
+/// [`proxy_helpers::member_unavailable_response`] rather than passed through.
+///
+/// A credentialed refusal is not decided here (it needs the repository's
+/// upstream-auth configuration); see [`go_fetch_failure`].
+fn upstream_failure(resp: Response) -> Option<Response> {
+    if !proxy_helpers::is_member_unavailable_response(&resp) {
+        return None;
+    }
+    Some(if resp.status().is_server_error() {
+        resp
+    } else {
+        proxy_helpers::member_unavailable_response()
+    })
+}
+
+/// [`upstream_failure`] for a fetch from the Remote `repo_id`, plus the
+/// credentialed refusal (#6214): an upstream 401/403 (or an upstream
+/// authentication failure) to a Remote that has upstream credentials
+/// configured means those credentials no longer work, not that the module is
+/// missing, so it is answered with the 502 `.mod` gives rather than the 404
+/// that sends `GOPROXY=<ak>,direct` to the next entry. An anonymous 401/403
+/// stays a miss: an S3-style upstream answers 403 for a key it does not hold.
+/// Credentials embedded in `upstream_url` (`user:pass@`) count as configured.
+async fn go_fetch_failure(
+    state: &SharedState,
+    repo_id: uuid::Uuid,
+    upstream_url: &str,
+    resp: Response,
+) -> Option<Response> {
+    let refused = proxy_helpers::is_upstream_auth_refusal(&resp);
+    if proxy_helpers::is_credentialed_upstream_refusal(&state.db, repo_id, upstream_url, refused)
+        .await
+    {
+        return Some(if resp.status().is_server_error() {
+            resp
+        } else {
+            (StatusCode::BAD_GATEWAY, "Failed to fetch from upstream").into_response()
+        });
+    }
+    upstream_failure(resp)
 }
 
 /// Parse a goproxy `@v/list` document into its version lines.
@@ -756,26 +844,26 @@ fn filter_version_list(body: &str, blocked: &std::collections::HashSet<String>) 
 /// * a caller that forwards the bytes VERBATIM after parsing a copy
 ///   (`@latest`) must re-declare the coding on its response (RFC 9110 §8.4),
 ///   e.g. via [`proxy_helpers::forward_verbatim_metadata`].
+///
+/// `Ok(None)` is a miss: no proxy, or the upstream (every member, for a
+/// virtual) does not have the document. `Err` is a failure the caller serves
+/// instead of its 404 (#6214): the Remote's own 502/503 when its upstream
+/// could not answer, and for a virtual a 503 + `Retry-After` when no member
+/// served and at least one could not answer (see [`upstream_failure`]).
 async fn fetch_go_metadata_with_source(
     state: &SharedState,
     auth: Option<&AuthExtension>,
     repo: &RepoInfo,
     upstream_path: &str,
-) -> Option<(
-    uuid::Uuid,
-    Bytes,
-    Option<String>,
-    Option<chrono::DateTime<chrono::Utc>>,
-)> {
-    let proxy = state.proxy_service.as_ref()?;
+) -> Result<Option<GoMetadataSource>, Response> {
+    let Some(proxy) = state.proxy_service.as_ref() else {
+        return Ok(None);
+    };
     if repo.repo_type == RepositoryType::Remote {
-        let upstream_url = repo.upstream_url.as_deref()?;
-        let proxy_helpers::CachedBody {
-            content,
-            content_type: _content_type,
-            content_encoding,
-            stale_since,
-        } = proxy_helpers::proxy_fetch_capped_encoded_with_format(
+        let Some(upstream_url) = repo.upstream_url.as_deref() else {
+            return Ok(None);
+        };
+        let fetched = proxy_helpers::proxy_fetch_capped_encoded_with_format(
             proxy,
             repo.id,
             &repo.key,
@@ -784,18 +872,30 @@ async fn fetch_go_metadata_with_source(
             proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
             RepositoryFormat::Go,
         )
-        .await
-        .ok()?;
-        return Some((repo.id, content, content_encoding, stale_since));
+        .await;
+        let proxy_helpers::CachedBody {
+            content,
+            content_type: _content_type,
+            content_encoding,
+            stale_since,
+        } = match fetched {
+            Ok(body) => body,
+            Err(resp) => {
+                return go_fetch_failure(state, repo.id, upstream_url, resp)
+                    .await
+                    .map_or(Ok(None), Err)
+            }
+        };
+        return Ok(Some((repo.id, content, content_encoding, stale_since)));
     }
     if repo.repo_type == RepositoryType::Virtual {
         // Caller-authorized member walk (#3323): a Remote member may hold
         // credentials for a private upstream feed, so proxying one for a caller
         // who cannot read that member would launder a credentialed private
         // index to them. The sibling `download_zip` was already gated this way.
-        let members = proxy_helpers::authorized_virtual_members(&state.db, auth, repo.id)
-            .await
-            .ok()?;
+        // A fault resolving the member set is retryable, not a miss (#6214).
+        let members = proxy_helpers::authorized_virtual_members(&state.db, auth, repo.id).await?;
+        let mut any_unavailable = false;
         for member in members {
             if member.repo_type != crate::models::repository::RepositoryType::Remote {
                 continue;
@@ -803,12 +903,7 @@ async fn fetch_go_metadata_with_source(
             let Some(upstream_url) = member.upstream_url.as_deref() else {
                 continue;
             };
-            if let Ok(proxy_helpers::CachedBody {
-                content,
-                content_type: _content_type,
-                content_encoding,
-                stale_since,
-            }) = proxy_helpers::proxy_fetch_capped_encoded_with_format(
+            match proxy_helpers::proxy_fetch_capped_encoded_with_format(
                 proxy,
                 member.id,
                 &member.key,
@@ -819,12 +914,37 @@ async fn fetch_go_metadata_with_source(
             )
             .await
             {
-                return Some((member.id, content, content_encoding, stale_since));
+                Ok(proxy_helpers::CachedBody {
+                    content,
+                    content_type: _content_type,
+                    content_encoding,
+                    stale_since,
+                }) => return Ok(Some((member.id, content, content_encoding, stale_since))),
+                // A lower-priority member may still serve; only when none
+                // does is the outage the answer.
+                Err(resp) => {
+                    any_unavailable |= go_fetch_failure(state, member.id, upstream_url, resp)
+                        .await
+                        .is_some()
+                }
             }
         }
+        if any_unavailable {
+            return Err(proxy_helpers::member_unavailable_response());
+        }
     }
-    None
+    Ok(None)
 }
+
+/// A Go metadata document and where it came from, as
+/// [`fetch_go_metadata_with_source`] returns it:
+/// `(source_repo_id, body_as_transferred, content_encoding, stale_since)`.
+type GoMetadataSource = (
+    uuid::Uuid,
+    Bytes,
+    Option<String>,
+    Option<chrono::DateTime<chrono::Utc>>,
+);
 
 /// Strip a declared content coding off a buffered Go metadata body so it can
 /// be PARSED (#3280). Runs through the shared bounded decoder
@@ -1047,8 +1167,15 @@ async fn list_versions(
     // Virtual repo: COLLATE the version list across every member the caller may
     // read, rather than serving the first member that answers (#833).
     if repo.repo_type == RepositoryType::Virtual {
-        let collated = collate_virtual_version_list(state, auth, repo, module, &body).await?;
-        if collated.is_empty() {
+        let (collated, module_exists) =
+            collate_virtual_version_list(state, auth, repo, module, &body).await?;
+        // An empty collation is not by itself a miss: a module that exists but
+        // carries no tagged version has a legitimately empty `@v/list`, which
+        // the GOPROXY protocol answers with 200 and an empty body. Only a
+        // module no member could resolve is a 404, as on the non-virtual arm
+        // below, which serves the (possibly empty) upstream body and answers
+        // 404 solely on an upstream miss.
+        if virtual_list_is_not_found(&collated, module_exists) {
             return Err((StatusCode::NOT_FOUND, "module not found").into_response());
         }
         return Ok(Response::builder()
@@ -1061,7 +1188,7 @@ async fn list_versions(
     if body.is_empty() {
         let upstream_path = build_go_upstream_list_path(module);
         if let Some((source_repo_id, content, content_encoding, _stale_since)) =
-            fetch_go_metadata_with_source(state, auth, repo, &upstream_path).await
+            fetch_go_metadata_with_source(state, auth, repo, &upstream_path).await?
         {
             // This arm REBUILDS the document (parse + age-gate filter), so a
             // declared coding must be stripped before parsing and dropped from
@@ -1141,13 +1268,22 @@ async fn list_versions(
 /// newline-separated list and the `go` toolchain reads every non-empty line as
 /// a version, so there is no comment syntax to carry a warning. The server log
 /// is the only channel.
+///
+/// Returns `(document, module_exists)`. `module_exists` is true when the
+/// document lists a version, or when a Remote member ANSWERED the listing, even
+/// with an empty body: that is how the caller tells "exists but has no tagged
+/// version" (200, empty) apart from "no member could resolve it" (404). A
+/// Remote member whose upstream answers 404 or fails contributes `None` and
+/// does not set it, so an unknown module still answers 404, and because only
+/// members this caller may read are asked, the flag is no existence oracle
+/// over a member it could not read directly.
 async fn collate_virtual_version_list(
     state: &SharedState,
     auth: Option<&AuthExtension>,
     repo: &RepoInfo,
     module: &str,
     own_body: &str,
-) -> Result<String, Response> {
+) -> Result<(String, bool), Response> {
     let members = proxy_helpers::authorized_virtual_members(&state.db, auth, repo.id).await?;
 
     // Seed with the virtual's own (age-gate-filtered) rows. A virtual holds no
@@ -1187,21 +1323,38 @@ async fn collate_virtual_version_list(
         .iter()
         .filter(|m| m.repo_type == RepositoryType::Remote)
         .collect();
+    // A Remote member that answers, even with an empty list, proves the module
+    // exists upstream. A miss or a failure is `None` and does not count.
+    let mut any_remote_answered = false;
     if !remote_members.is_empty() {
         let upstream_path = build_go_upstream_list_path(module);
+        let any_unavailable = AtomicBool::new(false);
         for chunk in remote_members.chunks(proxy_helpers::MAX_VIRTUAL_FANOUT) {
-            let batch =
-                futures::future::join_all(chunk.iter().copied().map(|member| {
-                    fetch_member_version_list(state, member, module, &upstream_path)
-                }))
-                .await;
+            let batch = futures::future::join_all(chunk.iter().copied().map(|member| {
+                fetch_member_version_list(state, member, module, &upstream_path, &any_unavailable)
+            }))
+            .await;
             for list in batch.into_iter().flatten() {
+                any_remote_answered = true;
                 merged.extend(parse_version_list(&list));
             }
         }
+        // #6214: nothing listed, no member answered, and one could not answer.
+        // "Not found" is unknowable, and `go` reads a 404 as "this proxy does
+        // not have the module", so the answer is the retryable 503 the
+        // virtual `.mod`/`.zip` walks give. A member that answered, even with
+        // an empty list, is not an outage, nor is a set of plain misses.
+        if virtual_list_is_outage(
+            &merged,
+            any_remote_answered,
+            any_unavailable.load(Ordering::Relaxed),
+        ) {
+            return Err(proxy_helpers::member_unavailable_response());
+        }
     }
 
-    Ok(dedup_version_list(merged))
+    let module_exists = any_remote_answered || !merged.is_empty();
+    Ok((dedup_version_list(merged), module_exists))
 }
 
 /// One Remote member's contribution to a collated `@v/list`, or `None` when it
@@ -1222,15 +1375,11 @@ async fn fetch_member_version_list(
     member: &crate::models::repository::Repository,
     module: &str,
     upstream_path: &str,
+    any_unavailable: &AtomicBool,
 ) -> Option<String> {
     let proxy = state.proxy_service.as_ref()?;
     let upstream_url = member.upstream_url.as_deref()?;
-    let proxy_helpers::CachedBody {
-        content,
-        content_type: _content_type,
-        content_encoding,
-        ..
-    } = proxy_helpers::proxy_fetch_capped_encoded_with_format(
+    let fetched = proxy_helpers::proxy_fetch_capped_encoded_with_format(
         proxy,
         member.id,
         &member.key,
@@ -1239,15 +1388,29 @@ async fn fetch_member_version_list(
         proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
         RepositoryFormat::Go,
     )
-    .await
-    .map_err(|_| {
-        tracing::debug!(
-            member_key = %member.key,
-            module = %module,
-            "@v/list upstream fetch miss for virtual member; skipping it"
-        );
-    })
-    .ok()?;
+    .await;
+    let proxy_helpers::CachedBody {
+        content,
+        content_type: _content_type,
+        content_encoding,
+        ..
+    } = match fetched {
+        Ok(body) => body,
+        Err(resp) => {
+            if go_fetch_failure(state, member.id, upstream_url, resp)
+                .await
+                .is_some()
+            {
+                any_unavailable.store(true, Ordering::Relaxed);
+            }
+            tracing::debug!(
+                member_key = %member.key,
+                module = %module,
+                "@v/list upstream fetch miss for virtual member; skipping it"
+            );
+            return None;
+        }
+    };
     let decoded = decode_go_metadata_body(&content, content_encoding.as_deref())
         .map_err(|_| {
             tracing::warn!(
@@ -1261,6 +1424,8 @@ async fn fetch_member_version_list(
     filter_go_version_list(state, member.id, module, &upstream_body)
         .await
         .map_err(|_| {
+            // A policy read that failed is a fault on this side, not a miss.
+            any_unavailable.store(true, Ordering::Relaxed);
             tracing::warn!(
                 member_key = %member.key,
                 module = %module,
@@ -1268,6 +1433,13 @@ async fn fetch_member_version_list(
             );
         })
         .ok()
+}
+
+/// Whether a collated `@v/list` is an outage rather than a miss (#6214):
+/// nothing was listed, no Remote member answered (even with an empty list),
+/// and at least one could not answer (see [`upstream_failure`]).
+fn virtual_list_is_outage(merged: &[String], any_answered: bool, any_unavailable: bool) -> bool {
+    merged.is_empty() && !any_answered && any_unavailable
 }
 
 /// Render collected `@v/list` lines as the served document, keeping the FIRST
@@ -1282,6 +1454,18 @@ fn dedup_version_list(versions: Vec<String>) -> String {
         .filter(|v| !v.is_empty() && seen.insert(v.clone()))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Whether a virtual repository's `@v/list` collation is a genuine 404.
+///
+/// A module that exists but has no tagged version (it is consumed by
+/// pseudo-version only) has an EMPTY `@v/list`, and the GOPROXY protocol
+/// answers it with 200 and an empty body: proxy.golang.org does, and so does
+/// the non-virtual arm of [`list_versions`]. `go install pkg@<pseudo-version>`
+/// reads `@v/list` and fails on a 404 there, so an empty collation is a miss
+/// only when no member could resolve the module at all.
+fn virtual_list_is_not_found(collated: &str, module_exists: bool) -> bool {
+    collated.is_empty() && !module_exists
 }
 
 // ---------------------------------------------------------------------------
@@ -1373,12 +1557,19 @@ async fn version_info(
             }
 
             let upstream_path = build_go_upstream_path(module, version, "info");
-            if let Ok(resp) =
-                try_proxy_go_metadata(state, auth, repo, &upstream_path, "application/json").await
+            // Boxed for the same stack-size reason as the walk it wraps (#6270).
+            return match Box::pin(try_proxy_go_metadata(
+                state,
+                auth,
+                repo,
+                &upstream_path,
+                "application/json",
+            ))
+            .await
             {
-                return Ok(resp);
-            }
-            return Err(not_found);
+                Ok(resp) => Ok(resp),
+                Err(failure) => Err(failure.unwrap_or(not_found)),
+            };
         }
     };
 
@@ -1422,7 +1613,13 @@ async fn get_mod_file(
     )
     .fetch_optional(&state.db)
     .await
-    .map_err(crate::api::handlers::db_err)?
+    .map_err(crate::api::handlers::db_err)?;
+    // #6433: a proxy-cache row nothing vouches for is no row (the proxy path
+    // below resolves it); a held or refused one is the gate's answer.
+    let artifact = proxy_helpers::vouched_row(state, repo.id, artifact, |a| {
+        proxy_helpers::ServedRowRef::new(&a.storage_key, Some(a.size_bytes))
+    })
+    .await?
     .ok_or_else(|| {
         (
             StatusCode::NOT_FOUND,
@@ -1473,7 +1670,9 @@ async fn get_mod_file(
                 let upstream_path = build_go_upstream_path(module, version, "mod");
                 let module_clone = module.to_string();
                 let version_clone = version.to_string();
-                let result = proxy_helpers::resolve_virtual_download(
+                // #6214: a member refusing its own credentials is
+                // unavailable, so an all-miss walk answers 503, not 404.
+                let result = proxy_helpers::resolve_virtual_download_reporting_refusals(
                     &state.db,
                     auth,
                     state.proxy_service.as_deref(),
@@ -1570,7 +1769,13 @@ async fn download_zip(
     )
     .fetch_optional(&state.db)
     .await
-    .map_err(crate::api::handlers::db_err)?
+    .map_err(crate::api::handlers::db_err)?;
+    // #6433: a proxy-cache row nothing vouches for is no row (the proxy path
+    // below resolves it); a held or refused one is the gate's answer.
+    let artifact = proxy_helpers::vouched_row(state, repo.id, artifact, |a| {
+        proxy_helpers::ServedRowRef::new(&a.storage_key, Some(a.size_bytes))
+    })
+    .await?
     .ok_or_else(|| {
         (
             StatusCode::NOT_FOUND,
@@ -1711,26 +1916,31 @@ async fn download_zip(
                 let version_clone = version.to_string();
                 // #5810: no member scans; the virtual's member-fallback policy.
                 let fallback = proxy_helpers::virtual_member_fallback(&state.db, repo.id).await;
-                let result = proxy_helpers::resolve_virtual_download_from_members(
-                    allowed,
-                    fallback,
-                    state.proxy_service.as_deref(),
-                    &upstream_path,
-                    Some(ctx),
-                    |member_id, location| {
-                        let db = db.clone();
-                        let state = state.clone();
-                        let name = module_clone.clone();
-                        let ver = version_clone.clone();
-                        async move {
-                            proxy_helpers::local_fetch_by_name_version_and_suffix(
-                                &db, &state, member_id, &location, &name, &ver, "%.zip",
-                            )
-                            .await
-                        }
-                    },
-                )
-                .await;
+                // #6214: see the `.mod` walk.
+                let no_fetch_urls = std::collections::HashMap::new();
+                let result =
+                    proxy_helpers::resolve_virtual_download_from_members_reporting_refusals(
+                        &state.db,
+                        allowed,
+                        fallback,
+                        state.proxy_service.as_deref(),
+                        &upstream_path,
+                        &no_fetch_urls,
+                        Some(ctx),
+                        |member_id, location| {
+                            let db = db.clone();
+                            let state = state.clone();
+                            let name = module_clone.clone();
+                            let ver = version_clone.clone();
+                            async move {
+                                proxy_helpers::local_fetch_by_name_version_and_suffix(
+                                    &db, &state, member_id, &location, &name, &ver, "%.zip",
+                                )
+                                .await
+                            }
+                        },
+                    )
+                    .await;
 
                 return match result {
                     Ok(fetched) => {
@@ -1959,10 +2169,11 @@ async fn serve_scanned_virtual_go_zip(
         default_content_type: "application/zip",
         disposition: None,
         ctx,
+        report_refusals: true,
     };
     let scanned = |member: crate::models::repository::Repository, policy| async move {
         let upstream_url = member.upstream_url.clone().unwrap_or_default();
-        serve_scanned_go_zip(
+        let served = serve_scanned_go_zip(
             state,
             proxy,
             (member.id, &member.key, &upstream_url),
@@ -1970,12 +2181,47 @@ async fn serve_scanned_virtual_go_zip(
             policy,
             ctx,
         )
-        .await
+        .await;
+        scanned_member_refusal(state, member.id, &upstream_url, served).await
     };
     crate::api::handlers::proxy_scan_archive::walk_scanned_archive_members(
         state, virtual_id, members, runs, scanned,
     )
     .await
+}
+
+/// A scanning Remote member's failure in the Virtual module-zip walk, with a
+/// refusal of the member's own credentials read as unavailable (#6214).
+///
+/// The scanned fetch renders its error without the refusal marker, so this
+/// keys on what it does carry: a 5xx the shared classifier did not mark
+/// unavailable is a permanent upstream answer (an upstream 401/403, an
+/// authentication failure, another permanent 4xx); a 404/410 renders as 404
+/// and a policy block as 403/409/423, so neither is touched. From a member
+/// that carries credentials, that answer is unavailable, so a walk nothing
+/// serves answers the retryable 503, not a 404 `go` falls through on.
+async fn scanned_member_refusal(
+    state: &SharedState,
+    member_id: uuid::Uuid,
+    upstream_url: &str,
+    served: Result<Response, Response>,
+) -> Result<Response, Response> {
+    let resp = match served {
+        Err(resp)
+            if resp.status().is_server_error()
+                && !proxy_helpers::is_member_unavailable_response(&resp) =>
+        {
+            resp
+        }
+        other => return other,
+    };
+    if proxy_helpers::is_credentialed_upstream_refusal(&state.db, member_id, upstream_url, true)
+        .await
+    {
+        Err(proxy_helpers::member_unavailable_response())
+    } else {
+        Err(resp)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2018,7 +2264,7 @@ async fn latest_version(
         Err(not_found) => {
             let upstream_path = build_go_upstream_latest_path(module);
             if let Some((source_repo_id, content, content_encoding, stale_since)) =
-                fetch_go_metadata_with_source(state, auth, repo, &upstream_path).await
+                fetch_go_metadata_with_source(state, auth, repo, &upstream_path).await?
             {
                 // Parse a DECODED copy for the age gate (#3280): a coded
                 // upstream body used to fail `from_slice` here and 404 the
@@ -4534,6 +4780,94 @@ mod virtual_collation_tests {
              dropped, and the order the members were walked in survives"
         );
     }
+
+    /// Only an empty collation that no member could resolve is a 404.
+    #[test]
+    fn test_virtual_list_is_not_found_only_when_no_member_resolved_the_module() {
+        assert!(super::virtual_list_is_not_found("", false));
+        assert!(
+            !super::virtual_list_is_not_found("", true),
+            "an existing module with no tagged version lists nothing and is not a miss"
+        );
+        assert!(!super::virtual_list_is_not_found("v1.0.0", true));
+    }
+
+    /// A module that exists upstream but has no tagged version has an empty
+    /// `@v/list`. The virtual must answer it as its Remote member does when
+    /// read directly, 200 with an empty body, and keep answering 404 for a
+    /// module the upstream does not know. Before the fix the virtual answered
+    /// 404 for both, so `go install pkg@latest` failed through a virtual
+    /// repository while it worked through the member behind it (#6211).
+    #[tokio::test]
+    async fn test_virtual_go_list_is_200_empty_for_an_untagged_module_db() {
+        const UNTAGGED: &str = "example.com/untagged-lib";
+        const ABSENT: &str = "example.com/absent-lib";
+
+        // The fixture repo is the Remote member.
+        let Some(fx) = tdh::Fixture::setup("remote", "go").await else {
+            return;
+        };
+        // Only the untagged module's listing is mounted, with an empty body;
+        // wiremock answers 404 for every other path.
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/{UNTAGGED}/@v/list")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/plain; charset=utf-8")
+                    .set_body_bytes(Vec::new()),
+            )
+            .mount(&upstream)
+            .await;
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(upstream.uri())
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("point the remote member at its upstream");
+        tdh::publish_repo(&fx.pool, fx.repo_id).await;
+
+        let (virtual_id, virtual_key, _vdir) = tdh::create_repo(&fx.pool, "virtual", "go").await;
+        tdh::publish_repo(&fx.pool, virtual_id).await;
+        tdh::link_virtual_member(&fx.pool, virtual_id, fx.repo_id, 0).await;
+
+        let cache_dir = tempfile::tempdir().expect("tempdir");
+        let proxy =
+            tdh::build_proxy_service_with_fs(fx.pool.clone(), cache_dir.path().to_str().unwrap());
+        let state =
+            tdh::build_state_with_proxy(fx.pool.clone(), &fx.storage_dir.to_string_lossy(), proxy);
+
+        let member_uri = format!("/{}/{UNTAGGED}/@v/list", fx.repo_key);
+        let virtual_uri = format!("/{virtual_key}/{UNTAGGED}/@v/list");
+        let absent_uri = format!("/{virtual_key}/{ABSENT}/@v/list");
+        let anon = || tdh::router_anon(super::router(), state.clone());
+        let (member_status, member_body) = tdh::send(anon(), tdh::get(member_uri)).await;
+        let (virtual_status, virtual_body) = tdh::send(anon(), tdh::get(virtual_uri)).await;
+        let (absent_status, _) = tdh::send(anon(), tdh::get(absent_uri)).await;
+
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(virtual_id)
+            .execute(&fx.pool)
+            .await;
+        fx.teardown().await;
+
+        assert_eq!(member_status, axum::http::StatusCode::OK);
+        assert!(
+            member_body.is_empty(),
+            "the Remote member serves the upstream's empty list"
+        );
+        assert_eq!(
+            virtual_status,
+            axum::http::StatusCode::OK,
+            "a virtual must answer an existing untagged module as its member does, not 404"
+        );
+        assert!(virtual_body.is_empty());
+        assert_eq!(
+            absent_status,
+            axum::http::StatusCode::NOT_FOUND,
+            "a module no member can resolve is still a 404"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -5565,5 +5899,508 @@ mod sumdb_cache_5344_tests {
         assert!(reject_ambiguous_go_request(&repo, &request).is_err());
         repo.repo_type = "hosted".to_string();
         assert!(reject_ambiguous_go_request(&repo, &request).is_ok());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #6214: `@v/list`, `@latest` and `.info` answer an upstream outage with the
+// same retryable 502/503 as `.mod`, not with the 404 `go` reads as "missing".
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod upstream_failure_6214_unit_tests {
+    use super::{upstream_failure, virtual_list_is_outage};
+    use axum::http::StatusCode;
+
+    #[test]
+    fn test_only_an_unavailable_member_failure_is_surfaced() {
+        let unavailable = super::proxy_helpers::member_unavailable_response();
+        assert_eq!(
+            upstream_failure(unavailable).map(|r| r.status()),
+            Some(StatusCode::SERVICE_UNAVAILABLE)
+        );
+        let miss = axum::response::IntoResponse::into_response((StatusCode::NOT_FOUND, "miss"));
+        assert!(
+            upstream_failure(miss).is_none(),
+            "an upstream 404 stays a miss"
+        );
+        // A failure marked unavailable keeps its own 5xx (`.mod`'s 502)...
+        let mut bad_gateway =
+            axum::response::IntoResponse::into_response((StatusCode::BAD_GATEWAY, "upstream"));
+        bad_gateway
+            .extensions_mut()
+            .insert(super::proxy_helpers::MemberUnavailable);
+        assert_eq!(
+            upstream_failure(bad_gateway).map(|r| r.status()),
+            Some(StatusCode::BAD_GATEWAY)
+        );
+        // ...and is never passed through as a 4xx `go` could fall through on.
+        let mut not_5xx =
+            axum::response::IntoResponse::into_response((StatusCode::NOT_FOUND, "odd"));
+        not_5xx
+            .extensions_mut()
+            .insert(super::proxy_helpers::MemberUnavailable);
+        assert_eq!(
+            upstream_failure(not_5xx).map(|r| r.status()),
+            Some(StatusCode::SERVICE_UNAVAILABLE)
+        );
+        // A permanent refusal (`.mod`'s 502 for an upstream 401/403) is a miss.
+        let refused =
+            axum::response::IntoResponse::into_response((StatusCode::BAD_GATEWAY, "refused"));
+        assert!(upstream_failure(refused).is_none());
+    }
+
+    #[test]
+    fn test_virtual_list_is_an_outage_only_when_nothing_answered() {
+        assert!(
+            !virtual_list_is_outage(&[], false, false),
+            "plain misses are a 404"
+        );
+        assert!(virtual_list_is_outage(&[], false, true));
+        assert!(
+            !virtual_list_is_outage(&["v1.0.0".to_string()], false, true),
+            "a partial listing is still served"
+        );
+        assert!(
+            !virtual_list_is_outage(&[], true, true),
+            "a member that answered an empty list is not an outage (#6211)"
+        );
+    }
+}
+
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod upstream_failure_6214_tests {
+    use crate::api::handlers::test_db_helpers as tdh;
+    use axum::http::StatusCode;
+    use uuid::Uuid;
+    use wiremock::matchers::{method, path_regex};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// The upstream answers 500 for every document of this module.
+    const ERRORING: &str = "example.com/upstream-500";
+    /// The upstream answers 429 for every document of this module.
+    const RATE_LIMITED: &str = "example.com/upstream-429";
+    /// The upstream answers 410 for every document of this module.
+    const GONE: &str = "example.com/upstream-410";
+    /// Not mounted: wiremock answers 404.
+    const ABSENT: &str = "example.com/upstream-404";
+    /// The upstream answers 401 for every document of this module.
+    const UNAUTHORIZED: &str = "example.com/upstream-401";
+    /// The upstream answers 403 for every document of this module.
+    const FORBIDDEN: &str = "example.com/upstream-403";
+    const VERSION: &str = "v1.0.0";
+
+    /// The three metadata routes this issue is about, then `.mod`, whose
+    /// status they must match.
+    fn routes(repo_key: &str, module: &str) -> [(&'static str, String); 4] {
+        [
+            ("@v/list", format!("/{repo_key}/{module}/@v/list")),
+            ("@latest", format!("/{repo_key}/{module}/@latest")),
+            (".info", format!("/{repo_key}/{module}/@v/{VERSION}.info")),
+            (".mod", format!("/{repo_key}/{module}/@v/{VERSION}.mod")),
+        ]
+    }
+
+    struct Rig {
+        fx: tdh::Fixture,
+        state: crate::api::SharedState,
+        extra_repos: Vec<Uuid>,
+        _cache_dir: tempfile::TempDir,
+        _mock: MockServer,
+    }
+
+    impl Rig {
+        async fn get(&self, uri: String) -> (StatusCode, axum::http::HeaderMap) {
+            let router = tdh::router_anon(super::router(), self.state.clone());
+            let (status, _body, headers) = tdh::send_with_headers(router, tdh::get(uri)).await;
+            (status, headers)
+        }
+
+        /// A public repository of `repo_type` the rig deletes on teardown.
+        async fn repo(&mut self, repo_type: &str, upstream: Option<&str>) -> (Uuid, String) {
+            let (id, key, _dir) = tdh::create_repo(&self.fx.pool, repo_type, "go").await;
+            if let Some(upstream) = upstream {
+                sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+                    .bind(upstream)
+                    .bind(id)
+                    .execute(&self.fx.pool)
+                    .await
+                    .expect("point the remote at its upstream");
+            }
+            tdh::publish_repo(&self.fx.pool, id).await;
+            self.extra_repos.push(id);
+            (id, key)
+        }
+
+        async fn teardown(self) {
+            // Virtuals were created after their members, so delete in reverse.
+            for id in self.extra_repos.iter().rev() {
+                let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                    .bind(id)
+                    .execute(&self.fx.pool)
+                    .await;
+            }
+            self.fx.teardown().await;
+        }
+    }
+
+    /// The fixture repo is a public Remote whose upstream is a wiremock.
+    async fn setup() -> Option<Rig> {
+        let fx = tdh::Fixture::setup("remote", "go").await?;
+        let mock = MockServer::start().await;
+        for (module, status) in [
+            (ERRORING, 500),
+            (RATE_LIMITED, 429),
+            (GONE, 410),
+            (UNAUTHORIZED, 401),
+            (FORBIDDEN, 403),
+        ] {
+            Mock::given(method("GET"))
+                .and(path_regex(format!("^/{module}/@")))
+                .respond_with(ResponseTemplate::new(status))
+                .mount(&mock)
+                .await;
+        }
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(mock.uri())
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("point the remote at its upstream");
+        tdh::publish_repo(&fx.pool, fx.repo_id).await;
+        let cache_dir = tempfile::tempdir().expect("tempdir");
+        let proxy =
+            tdh::build_proxy_service_with_fs(fx.pool.clone(), cache_dir.path().to_str().unwrap());
+        let state =
+            tdh::build_state_with_proxy(fx.pool.clone(), &fx.storage_dir.to_string_lossy(), proxy);
+        Some(Rig {
+            fx,
+            state,
+            extra_repos: Vec::new(),
+            _cache_dir: cache_dir,
+            _mock: mock,
+        })
+    }
+
+    /// On a Remote, an upstream that answers 5xx or 429, or cannot be reached,
+    /// makes `@v/list`, `@latest` and `.info` answer what `.mod` answers: a
+    /// retryable 502/503. Before the fix they answered 404 and `go` moved on
+    /// to the next `GOPROXY` entry. An upstream 404 or 410 is still a 404.
+    #[tokio::test]
+    async fn test_remote_metadata_routes_answer_upstream_failure_like_mod_6214_db() {
+        let Some(mut rig) = setup().await else {
+            return;
+        };
+        // Port 1: nothing listens, so the fetch fails fast with a transport error.
+        let (_, dead_key) = rig.repo("remote", Some("http://127.0.0.1:1")).await;
+        let live_key = rig.fx.repo_key.clone();
+
+        // Misses first, so nothing the failing fetches leave behind can be
+        // what answers the 404 checks.
+        let mut misses = Vec::new();
+        for module in [ABSENT, GONE] {
+            for (route, uri) in routes(&live_key, module) {
+                misses.push((module, route, rig.get(uri).await.0));
+            }
+        }
+
+        let mut failures = Vec::new();
+        for (repo_key, module) in [
+            (live_key.as_str(), ERRORING),
+            (live_key.as_str(), RATE_LIMITED),
+            (dead_key.as_str(), ABSENT),
+        ] {
+            let mut statuses = Vec::new();
+            for (route, uri) in routes(repo_key, module) {
+                statuses.push((route, rig.get(uri).await.0));
+            }
+            failures.push((module, statuses));
+        }
+        rig.teardown().await;
+
+        for (module, statuses) in failures {
+            let mod_status = statuses[3].1;
+            assert!(
+                matches!(
+                    mod_status,
+                    StatusCode::BAD_GATEWAY | StatusCode::SERVICE_UNAVAILABLE
+                ),
+                "{module}: .mod answers an upstream failure with 502/503, got {mod_status}"
+            );
+            for (route, status) in &statuses[..3] {
+                assert_eq!(
+                    *status, mod_status,
+                    "{module}: {route} must answer an upstream failure as .mod does, \
+                     not with the 404 `go` reads as a missing module"
+                );
+            }
+        }
+        for (module, route, status) in misses {
+            assert_eq!(
+                status,
+                StatusCode::NOT_FOUND,
+                "{module}: {route} keeps 404 for an upstream that does not have it"
+            );
+        }
+    }
+
+    /// Through a Virtual over a failing Remote the three routes answer the
+    /// 503 + `Retry-After` the Virtual's `.mod` already answers; a module the
+    /// member's upstream does not have is still a 404.
+    #[tokio::test]
+    async fn test_virtual_metadata_routes_answer_member_outage_with_503_6214_db() {
+        let Some(mut rig) = setup().await else {
+            return;
+        };
+        let (dead_id, _) = rig.repo("remote", Some("http://127.0.0.1:1")).await;
+        let (live_virtual, live_key) = rig.repo("virtual", None).await;
+        tdh::link_virtual_member(&rig.fx.pool, live_virtual, rig.fx.repo_id, 0).await;
+        let (dead_virtual, dead_key) = rig.repo("virtual", None).await;
+        tdh::link_virtual_member(&rig.fx.pool, dead_virtual, dead_id, 0).await;
+
+        // Misses first: the member breaker opens after repeated failures,
+        // and must not be what answers the 404 checks.
+        let mut misses = Vec::new();
+        for module in [ABSENT, GONE] {
+            for (route, uri) in routes(&live_key, module) {
+                misses.push((module, route, rig.get(uri).await.0));
+            }
+        }
+
+        let mut outages = Vec::new();
+        for (repo_key, module) in [
+            (live_key.as_str(), ERRORING),
+            (live_key.as_str(), RATE_LIMITED),
+            (dead_key.as_str(), ABSENT),
+        ] {
+            for (route, uri) in routes(repo_key, module) {
+                let (status, headers) = rig.get(uri).await;
+                outages.push((module, route, status, headers.contains_key("retry-after")));
+            }
+        }
+        rig.teardown().await;
+
+        for (module, route, status, retry_after) in outages {
+            assert_eq!(
+                status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{module}: {route} through a Virtual must answer a member outage with 503"
+            );
+            assert!(retry_after, "{module}: {route} 503 carries Retry-After");
+        }
+        for (module, route, status) in misses {
+            assert_eq!(
+                status,
+                StatusCode::NOT_FOUND,
+                "{module}: {route} through a Virtual keeps 404 for a module no member has"
+            );
+        }
+    }
+
+    /// An upstream 401/403 to a Remote that has upstream credentials
+    /// configured means the credentials no longer work: `@v/list`, `@latest`
+    /// and `.info` answer the 502 `.mod` answers (a Virtual over it, 503 +
+    /// `Retry-After`), not the 404 that sends `GOPROXY=<ak>,direct` past the
+    /// scan gate. Credentials embedded in the upstream URL (`user:pass@`)
+    /// count as configured. The same refusal of an anonymous Remote stays a
+    /// 404 (an S3-style upstream answers 403 for a key it does not hold).
+    #[tokio::test]
+    async fn test_credentialed_upstream_refusal_is_not_a_miss_6214_db() {
+        if std::env::var("JWT_SECRET").is_err() && std::env::var("SSO_ENCRYPTION_KEY").is_err() {
+            // No key to encrypt the Remote's credentials with.
+            return;
+        }
+        let Some(mut rig) = setup().await else {
+            return;
+        };
+        let upstream = rig._mock.uri();
+        let (cred_id, cred_key) = rig.repo("remote", Some(&upstream)).await;
+        let creds = crate::services::upstream_auth::build_credentials_json(
+            &crate::services::upstream_auth::UpstreamAuthType::Bearer {
+                token: "expired-token".to_string(),
+            },
+        );
+        crate::services::upstream_auth::save_upstream_auth(&rig.fx.pool, cred_id, "bearer", &creds)
+            .await
+            .expect("save upstream auth");
+        crate::services::upstream_auth::invalidate_upstream_auth_cache(cred_id);
+        let (cred_virtual, cred_virtual_key) = rig.repo("virtual", None).await;
+        tdh::link_virtual_member(&rig.fx.pool, cred_virtual, cred_id, 0).await;
+        // Credentials embedded in the upstream URL are sent as Basic auth
+        // (#4452) but are not in the auth configuration.
+        let userinfo_upstream = upstream.replacen("://", "://dtf-reader:expired@", 1);
+        let (userinfo_id, userinfo_key) = rig.repo("remote", Some(&userinfo_upstream)).await;
+        let (userinfo_virtual, userinfo_virtual_key) = rig.repo("virtual", None).await;
+        tdh::link_virtual_member(&rig.fx.pool, userinfo_virtual, userinfo_id, 0).await;
+        let anon_key = rig.fx.repo_key.clone();
+
+        let mut anonymous = Vec::new();
+        let mut credentialed = Vec::new();
+        let mut through_virtual = Vec::new();
+        for module in [UNAUTHORIZED, FORBIDDEN] {
+            // `.mod` answers 502 for any upstream 401/403; the metadata
+            // routes keep the anonymous refusal a miss.
+            for (route, uri) in routes(&anon_key, module).into_iter().take(3) {
+                anonymous.push((module, route, rig.get(uri).await.0));
+            }
+            for key in [&cred_key, &userinfo_key] {
+                let mut statuses = Vec::new();
+                for (route, uri) in routes(key, module) {
+                    statuses.push((route, rig.get(uri).await.0));
+                }
+                credentialed.push((module, statuses));
+            }
+            for key in [&cred_virtual_key, &userinfo_virtual_key] {
+                for (route, uri) in routes(key, module).into_iter().take(3) {
+                    let (status, headers) = rig.get(uri).await;
+                    through_virtual.push((
+                        module,
+                        route,
+                        status,
+                        headers.contains_key("retry-after"),
+                    ));
+                }
+            }
+        }
+        rig.teardown().await;
+
+        for (module, statuses) in credentialed {
+            let mod_status = statuses[3].1;
+            assert_eq!(
+                mod_status,
+                StatusCode::BAD_GATEWAY,
+                "{module}: .mod answers a credentialed refusal with 502"
+            );
+            for (route, status) in &statuses[..3] {
+                assert_eq!(
+                    *status, mod_status,
+                    "{module}: {route} must answer a credentialed refusal as .mod does, not 404"
+                );
+            }
+        }
+        for (module, route, status, retry_after) in through_virtual {
+            assert_eq!(
+                status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{module}: {route} through a Virtual over a credentialed member that is refused"
+            );
+            assert!(retry_after, "{module}: {route} 503 carries Retry-After");
+        }
+        for (module, route, status) in anonymous {
+            assert_eq!(
+                status,
+                StatusCode::NOT_FOUND,
+                "{module}: {route} keeps 404 for a refusal of an anonymous Remote"
+            );
+        }
+    }
+    /// `.mod` and `.zip` on a credentialed refusal (#6214). On a Remote both
+    /// already answer a 5xx (the proxy error mapping renders an upstream
+    /// 401/403 as a 502, the scanned fetch as a 5xx). Through a Virtual the
+    /// download walk read the refusal as a miss, so a Virtual whose only
+    /// other member misses answered 404 and `go` fell through to `direct`;
+    /// it now answers 503 + `Retry-After`, for configured credentials,
+    /// credentials in the upstream URL, and a scanning member. A Virtual over
+    /// an anonymous Remote keeps the 404.
+    #[tokio::test]
+    async fn test_credentialed_refusal_on_mod_and_zip_6214_db() {
+        if std::env::var("JWT_SECRET").is_err() && std::env::var("SSO_ENCRYPTION_KEY").is_err() {
+            return;
+        }
+        let Some(mut rig) = setup().await else {
+            return;
+        };
+        let upstream = rig._mock.uri();
+        let creds = crate::services::upstream_auth::build_credentials_json(
+            &crate::services::upstream_auth::UpstreamAuthType::Bearer {
+                token: "expired-token".to_string(),
+            },
+        );
+        let (cred_id, cred_key) = rig.repo("remote", Some(&upstream)).await;
+        let (scan_id, scan_key) = rig.repo("remote", Some(&upstream)).await;
+        for id in [cred_id, scan_id] {
+            crate::services::upstream_auth::save_upstream_auth(&rig.fx.pool, id, "bearer", &creds)
+                .await
+                .expect("save upstream auth");
+            crate::services::upstream_auth::invalidate_upstream_auth_cache(id);
+        }
+        sqlx::query(
+            "INSERT INTO scan_configs (repository_id, scan_enabled, scan_on_upload, \
+                 scan_on_proxy, proxy_scan_action, block_on_policy_violation, severity_threshold) \
+             VALUES ($1, true, false, true, 'fail_closed', false, 'high')",
+        )
+        .bind(scan_id)
+        .execute(&rig.fx.pool)
+        .await
+        .expect("seed scan_configs");
+        let userinfo_upstream = upstream.replacen("://", "://dtf-reader:expired@", 1);
+        let (userinfo_id, userinfo_key) = rig.repo("remote", Some(&userinfo_upstream)).await;
+        // A hosted member that does not have the module: the walk's other
+        // members miss.
+        let (hosted_id, _) = rig.repo("local", None).await;
+        let mut virtuals = Vec::new();
+        for (member, label) in [
+            (cred_id, "configured credentials"),
+            (userinfo_id, "credentials in the URL"),
+            (scan_id, "scanning member, configured credentials"),
+            (rig.fx.repo_id, "anonymous"),
+        ] {
+            let (virtual_id, virtual_key) = rig.repo("virtual", None).await;
+            tdh::link_virtual_member(&rig.fx.pool, virtual_id, member, 0).await;
+            tdh::link_virtual_member(&rig.fx.pool, virtual_id, hosted_id, 1).await;
+            virtuals.push((virtual_key, label));
+        }
+
+        let module = UNAUTHORIZED;
+        let mod_uri = |key: &str| format!("/{key}/{module}/@v/{VERSION}.mod");
+        let zip_uri = |key: &str| format!("/{key}/{module}/@v/{VERSION}.zip");
+        let mut remote = Vec::new();
+        for (key, label) in [
+            (&cred_key, "configured credentials"),
+            (&userinfo_key, "credentials in the URL"),
+            (&scan_key, "scanning, configured credentials"),
+        ] {
+            remote.push((label, ".mod", rig.get(mod_uri(key)).await.0));
+            remote.push((label, ".zip", rig.get(zip_uri(key)).await.0));
+        }
+        let mut through_virtual = Vec::new();
+        for (key, label) in &virtuals {
+            for (route, uri) in [(".mod", mod_uri(key)), (".zip", zip_uri(key))] {
+                let (status, headers) = rig.get(uri).await;
+                through_virtual.push((*label, route, status, headers.contains_key("retry-after")));
+            }
+        }
+        let _ = sqlx::query("DELETE FROM scan_configs WHERE repository_id = $1")
+            .bind(scan_id)
+            .execute(&rig.fx.pool)
+            .await;
+        rig.teardown().await;
+
+        for (label, route, status) in remote {
+            assert!(
+                status.is_server_error(),
+                "Remote ({label}): {route} answers a credentialed refusal with a 5xx, got {status}"
+            );
+        }
+        for (label, route, status, retry_after) in through_virtual {
+            if label == "anonymous" {
+                assert_eq!(
+                    status,
+                    StatusCode::NOT_FOUND,
+                    "Virtual over an anonymous Remote: {route} keeps 404"
+                );
+                continue;
+            }
+            assert_eq!(
+                status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Virtual ({label}): {route} must answer a refused member with 503, not 404"
+            );
+            assert!(
+                retry_after,
+                "Virtual ({label}): {route} 503 carries Retry-After"
+            );
+        }
     }
 }

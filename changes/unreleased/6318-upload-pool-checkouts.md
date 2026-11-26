@@ -1,0 +1,5 @@
+---
+section: Changed
+issues: [#6318]
+---
+- **An upload goes back to the database connection pool fewer times: a PyPI upload takes 11 pool checkouts instead of 19** (#6318). Each checkout is a chance to wait on, or time out on, a busy pool, so per-upload connection demand is what limits how many uploads a small pool (`DATABASE_MAX_CONNECTIONS`) carries at once. The shared upload path now reads the repository row once instead of four times, reads an upload's existing row once for both immutability checks, skips the RPM repodata-layout lookup for repositories that are not RPM, and counts the upload in `ak_artifact_uploads_total` from values it already holds. Together with the single catalog write (#6346) that takes a PyPI upload from 19 checkouts to 11. Quota, immutability, quarantine and scan-on-upload checks are unchanged. The storage existence check stays inside the commit transaction: it is what keeps storage garbage collection from deleting an object an upload is about to reference (#4980).

@@ -5,11 +5,11 @@
 # WHY A SCRIPT, AND WHY CREATION IS BLOCKED IN THE FIRST PLACE
 # -----------------------------------------------------------
 # Ruleset 20038606 ("Release branch protection") governs
-# `refs/heads/release/[0-9]*.[0-9]*.x` with `pull_request`,
-# `required_status_checks` (both contexts pinned to app 15368,
-# `do_not_enforce_on_create: false`), `non_fast_forward`, `deletion`, and NO
-# bypass actors. A required status check cannot exist on a ref that does not
-# exist yet, so the very push that would create a release line is refused:
+# `refs/heads/release/[0-9]*.[0-9]*.x` with `pull_request` (currently zero
+# required approvals, #6216), `required_status_checks` (both contexts pinned to
+# app 15368, `do_not_enforce_on_create: false`), `non_fast_forward`, `deletion`,
+# and NO bypass actors. A required status check cannot exist on a ref that does
+# not exist yet, so the very push that would create a release line is refused:
 #
 #   remote: - Required status check "Verify commits trace back to main" is expected.
 #
@@ -33,6 +33,10 @@
 # the ruleset restored from an EXIT trap so it cannot be left relaxed, the
 # before/after JSON diffed field by field, and an audit summary printed for the
 # release PR or the issue.
+#
+# The review requirement is reported, not enforced here: the ruleset lives in
+# GitHub settings, and raising it needs a maintainer decision about a second
+# approver (and a bypass actor while only one maintainer is active, #6216).
 #
 # Deleting a release line needs the same toggle for the same reason: the
 # `deletion` rule has no bypass actor either.
@@ -110,6 +114,37 @@ die() {
   exit 1
 }
 
+warn() {
+  echo "warning: $*" >&2
+}
+
+# #6216 found "pull request required" with required_approving_review_count = 0.
+# The ruleset is maintained in GitHub settings, not here, so report the gap
+# instead of blocking a line: raising it needs a maintainer decision, including
+# a bypass actor while only one maintainer can approve release/* PRs.
+warn_review_requirement() {
+  local ruleset review count stale last_push
+  if ! ruleset="$(gh api "repos/${REPO}/rulesets/${RULESET}" 2>/dev/null)"; then
+    warn "could not read ruleset ${RULESET}; its review requirement is unverified (#6216)."
+    return 0
+  fi
+  review="$(jq -c '.rules[]? | select(.type == "pull_request") | .parameters' <<< "$ruleset")"
+  if [[ -z "$review" || "$review" == "null" ]]; then
+    warn "ruleset ${RULESET} has no pull_request rule; a release PR needs a second reviewer (#6216)."
+    return 0
+  fi
+  count="$(jq -r '.required_approving_review_count // 0' <<< "$review")"
+  [[ "$count" =~ ^[0-9]+$ ]] || count=0
+  (( count >= 1 )) \
+    || warn "ruleset ${RULESET} requires ${count} approving review(s); at least 1 is recommended (#6216)."
+  stale="$(jq -r '.dismiss_stale_reviews_on_push // false' <<< "$review")"
+  [[ "$stale" == "true" ]] \
+    || warn "ruleset ${RULESET} does not dismiss stale approvals on push (#6216)."
+  last_push="$(jq -r '.require_last_push_approval // false' <<< "$review")"
+  [[ "$last_push" == "true" ]] \
+    || warn "ruleset ${RULESET} does not require the last push to be approved by someone else (#6216)."
+}
+
 args=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -151,6 +186,10 @@ BRANCH="release/${LINE}.x"
 admin="$(gh api "repos/${REPO}" --jq '.permissions.admin' 2> /dev/null || true)"
 [[ "$admin" == "true" ]] \
   || die "gh must be authenticated as an admin of ${REPO} (.permissions.admin = '${admin:-<unreadable>}')."
+
+# 1a. Report a missing review requirement without blocking the cut: changing
+#     the ruleset is a maintainer decision (#6216).
+warn_review_requirement
 
 # 2. A clean fetch. Every ancestry answer below is read from local refs; a
 #    stale origin/main would make them lies rather than checks.

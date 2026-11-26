@@ -1312,7 +1312,12 @@ async fn fetch_upstream_commit_sha(
     );
 
     // Own deadline, not the shared client's: see `COMMIT_SHA_FALLBACK_TIMEOUT`.
-    let bytes = match tokio::time::timeout(COMMIT_SHA_FALLBACK_TIMEOUT, fetch).await {
+    let bytes = match crate::services::upstream_circuit::within_own_deadline(
+        COMMIT_SHA_FALLBACK_TIMEOUT,
+        fetch,
+    )
+    .await
+    {
         Ok(Ok((bytes, _content_type))) => bytes,
         Ok(Err(_response)) => {
             tracing::debug!(
@@ -1560,12 +1565,17 @@ async fn download_file_namespaced(
 /// runtime-query + `try_get` shape
 /// `proxy_helpers::find_artifact_by_name_lowercase` uses. The checksum feeds
 /// the resolve ETag (#2915).
+///
+/// #6433: a proxy-cache row its cache sidecar does not vouch for is no row,
+/// so a Remote resolves the file through its proxy path; a held or refused
+/// one is the gate's answer.
 async fn find_stored_file(
-    db: &PgPool,
+    state: &crate::api::AppState,
     repository_id: uuid::Uuid,
     artifact_path: &str,
 ) -> Result<Option<sqlx::postgres::PgRow>, Response> {
-    sqlx::query(
+    use sqlx::Row;
+    let row = sqlx::query(
         "SELECT id, storage_key, size_bytes, checksum_sha256 FROM artifacts \
          WHERE repository_id = $1 \
            AND is_deleted = false \
@@ -1574,9 +1584,16 @@ async fn find_stored_file(
     )
     .bind(repository_id)
     .bind(artifact_path)
-    .fetch_optional(db)
+    .fetch_optional(&state.db)
     .await
-    .map_err(super::db_err)
+    .map_err(super::db_err)?;
+    proxy_helpers::vouched_row(state, repository_id, row, |r| {
+        proxy_helpers::ServedRowRef::new(
+            r.try_get::<&str, _>("storage_key").unwrap_or_default(),
+            r.try_get::<i64, _>("size_bytes").ok(),
+        )
+    })
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1602,7 +1619,7 @@ async fn download_file_impl(
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()).into_response())?;
 
     use sqlx::Row;
-    let mut artifact = find_stored_file(&state.db, repo.id, &artifact_path).await?;
+    let mut artifact = find_stored_file(&state, repo.id, &artifact_path).await?;
 
     // `snapshot_download` (and `hf_hub_download` once a ref is cached) asks for
     // every file at the commit model info reported, `/resolve/<sha>/<file>`.
@@ -1623,7 +1640,7 @@ async fn download_file_impl(
             .filter(|local| *local != revision)
         {
             let local_path = format!("{model_id}/{local}/{filename}");
-            artifact = find_stored_file(&state.db, repo.id, &local_path).await?;
+            artifact = find_stored_file(&state, repo.id, &local_path).await?;
             if artifact.is_some() {
                 revision = local;
                 artifact_path = local_path;

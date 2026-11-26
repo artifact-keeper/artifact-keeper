@@ -1037,15 +1037,26 @@ pub async fn revoke_role(
     Ok(())
 }
 
-/// Unknown fields are refused (400) rather than dropped (#4226): this endpoint
-/// takes no repository restriction, and a client sending one must learn that
-/// instead of receiving a broader token than it asked for.
+/// Unknown fields are refused (400) rather than dropped (#4226), so a client
+/// that misspells a restriction learns that instead of receiving a broader
+/// token than it asked for.
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CreateUserApiTokenRequest {
     pub name: String,
     pub scopes: Vec<String>,
     pub expires_in_days: Option<i64>,
+    /// Restrict the token to the repositories this selector matches, as on
+    /// `POST /api/v1/auth/tokens` (#5643, #4219): the same shape and storage
+    /// as a service-account token's `repo_selector`, resolved when the token
+    /// authenticates. It only narrows the owner's own repository permissions,
+    /// never widens them. Omit it for a token with the owner's full access; a
+    /// selector with no criteria is refused. A repository created later that
+    /// matches is picked up once the token's cached authentication expires
+    /// (up to 5 minutes).
+    #[serde(default)]
+    #[schema(value_type = Option<Object>)]
+    pub repo_selector: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -1151,7 +1162,9 @@ async fn list_user_tokens_inner(
     request_body = CreateUserApiTokenRequest,
     responses(
         (status = 200, description = "API token created successfully", body = ApiTokenCreatedResponse),
-        (status = 403, description = "Cannot create tokens for other users"),
+        (status = 400, description = "Unknown field, invalid scope, or a repo_selector that does not restrict", body = crate::api::openapi::ErrorResponse),
+        (status = 401, description = "Not authenticated", body = crate::api::openapi::ErrorResponse),
+        (status = 403, description = "Cannot create tokens for other users, or a scope or repo_selector exceeds what the presenting credential may delegate", body = crate::api::openapi::ErrorResponse),
     ),
     security(("bearer_auth" = []))
 )]
@@ -1191,19 +1204,28 @@ async fn create_api_token_inner(
     // are unaffected.
     auth.enforce_mint_ceiling(&payload.scopes)?;
 
+    if let Some(selector) = &payload.repo_selector {
+        crate::services::repo_selector_service::validate_token_repo_selector(selector)?;
+    }
+
     // Repository ceiling (#4225): a repository-restricted credential passes
-    // its restriction on to the token it mints.
-    let inherited = auth.mint_repo_ceiling(false)?;
+    // its restriction on to the token it mints, and may not name a different
+    // one. Otherwise the request's selector (if any) is kept as is (#5643),
+    // exactly as `POST /api/v1/auth/tokens` does.
+    let selector = match auth.mint_repo_ceiling(payload.repo_selector.is_some())? {
+        Some(ids) => Some(crate::services::repo_selector_service::inherited_token_selector(&ids)),
+        None => payload.repo_selector.clone(),
+    };
 
     let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
     let minted = auth_service
         .generate_api_token_with_policy(id, &payload.name, payload.scopes, payload.expires_in_days)
         .await?;
-    if let Some(ids) = inherited {
+    // If this write fails the plaintext is never returned, so the
+    // unrestricted row is unusable.
+    if let Some(selector) = &selector {
         crate::services::repo_selector_service::store_token_selector(
-            &state.db,
-            minted.id,
-            &crate::services::repo_selector_service::inherited_token_selector(&ids),
+            &state.db, minted.id, selector,
         )
         .await?;
     }
@@ -1858,7 +1880,9 @@ pub async fn list_current_user_tokens(
     request_body = CreateUserApiTokenRequest,
     responses(
         (status = 200, description = "API token created successfully", body = ApiTokenCreatedResponse),
-        (status = 403, description = "Requested scopes require administrator privileges"),
+        (status = 400, description = "Unknown field, invalid scope, or a repo_selector that does not restrict", body = crate::api::openapi::ErrorResponse),
+        (status = 401, description = "Not authenticated", body = crate::api::openapi::ErrorResponse),
+        (status = 403, description = "Requested scopes require administrator privileges, or a scope or repo_selector exceeds what the presenting credential may delegate", body = crate::api::openapi::ErrorResponse),
     ),
     security(("bearer_auth" = []))
 )]
@@ -2613,6 +2637,22 @@ mod tests {
         assert_eq!(req.name, "CI token");
         assert_eq!(req.scopes, vec!["read", "deploy"]);
         assert_eq!(req.expires_in_days, Some(90));
+    }
+
+    #[test]
+    fn test_create_api_token_request_accepts_repo_selector_5643() {
+        let json = r#"{"name":"n","scopes":[],"repo_selector":{"match_formats":["npm"]}}"#;
+        let req: CreateUserApiTokenRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            req.repo_selector,
+            Some(serde_json::json!({"match_formats": ["npm"]}))
+        );
+        // A misspelled field is still refused, never dropped (#4226).
+        let err = serde_json::from_str::<CreateUserApiTokenRequest>(
+            r#"{"name":"n","scopes":[],"repo_selektor":{}}"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("repo_selektor"), "{err}");
     }
 
     #[test]
@@ -3452,6 +3492,47 @@ mod router_split_tests {
 
         delete_user_row(&pool, caller_id).await;
         delete_user_row(&pool, target_id).await;
+    }
+
+    /// #5608: deleting a user removes the fine-grained permission rules that
+    /// name it. Pre-fix the rows survived the DELETE (no FK on the polymorphic
+    /// principal pair) and showed up as `principal_name: null`.
+    #[tokio::test]
+    async fn delete_user_removes_its_permission_rules_5608() {
+        let Some((pool, state, admin_id, admin_name)) = setup().await else {
+            return;
+        };
+        let (target_id, _) = tdh::create_user(&pool).await;
+        let (repo_id, _repo_name, storage_dir) = tdh::create_repo(&pool, "local", "npm").await;
+        tdh::grant_permission(&pool, "user", target_id, "repository", repo_id, &["read"]).await;
+        let app = build_admin_app(state, tdh::admin_auth(admin_id, &admin_name));
+
+        let req = Request::builder()
+            .method(Method::DELETE)
+            .uri(format!("/{}", target_id))
+            .body(Body::empty())
+            .unwrap();
+        let (status, body) = tdh::send(app, req).await;
+        let remaining: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM permissions WHERE principal_id = $1")
+                .bind(target_id)
+                .fetch_one(&pool)
+                .await
+                .expect("count the deleted user's rules");
+
+        tdh::cleanup(&pool, repo_id, admin_id).await;
+        let _ = std::fs::remove_dir_all(storage_dir);
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "delete_user failed: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(
+            remaining, 0,
+            "deleting a user must remove its permission rules (#5608)"
+        );
     }
 
     // ── password_router: change_password reachable for self ───────────

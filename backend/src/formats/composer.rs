@@ -156,12 +156,13 @@ impl FormatHandler for ComposerHandler {
 
         // Extract composer.json from archive packages
         if matches!(info.kind, ComposerPathKind::Archive) && !content.is_empty() {
-            // #2561: permit-scoped decode; on saturation skip this best-effort
-            // metadata enrichment rather than blocking/queueing.
+            // #2561: permit-scoped decode; on saturation it waits briefly for a
+            // slot (#6230), and skips this best-effort enrichment if none frees.
             if let Ok(Ok(composer_json)) =
-                crate::util::bounded_archive::with_ingest_extraction(|| {
+                crate::util::bounded_archive::with_ingest_extraction_waiting(|| {
                     Self::parse_composer_json(content)
                 })
+                .await
             {
                 metadata["composer"] = serde_json::to_value(&composer_json)?;
             }

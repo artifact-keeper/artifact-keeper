@@ -685,11 +685,28 @@ pub fn init_tracing(otel_endpoint: Option<&str>, service_name: &str) -> Option<O
             Some(guard)
         }
         None => {
+            // The root filter is wrapped so the read-retry layer can see what
+            // a request wrote (#5941); what is logged is unchanged.
             tracing_subscriber::registry()
-                .with(rust_log_filter())
+                .with(crate::api::middleware::db_read_retry::observe_writes(
+                    rust_log_filter(),
+                ))
                 .with(build_fmt_layer(log_format, log_ansi))
                 .init();
             None
+        }
+    }
+}
+
+/// The process exit code for the server's result. The error goes through the
+/// subscriber, so under `LOG_FORMAT=json` it is one JSON line instead of the
+/// plain `Error: ...` an `Err` returned from `main` prints (#5656)
+pub fn exit_code<E: std::fmt::Display>(result: Result<(), E>) -> std::process::ExitCode {
+    match result {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            tracing::error!(error = %e, "fatal error, exiting");
+            std::process::ExitCode::FAILURE
         }
     }
 }
@@ -751,8 +768,12 @@ fn subscriber_filters(
 
 /// The stdout layer of the OTLP-path subscriber, under its global filter.
 type FmtLayer = Box<
-    dyn Layer<tracing_subscriber::layer::Layered<EnvFilter, tracing_subscriber::Registry>>
-        + Send
+    dyn Layer<
+            tracing_subscriber::layer::Layered<
+                crate::api::middleware::db_read_retry::WriteObserver<EnvFilter>,
+                tracing_subscriber::Registry,
+            >,
+        > + Send
         + Sync,
 >;
 
@@ -772,7 +793,11 @@ fn otel_path_subscriber(
         exported_logs,
     } = filters;
     tracing_subscriber::registry()
-        .with(global)
+        // Wrapped so the read-retry layer can see what a request wrote
+        // (#5941); what is logged and exported is unchanged.
+        .with(crate::api::middleware::db_read_retry::observe_writes(
+            global,
+        ))
         .with(fmt_layer.with_filter(stdout))
         .with(layer_or_identity(
             log_layer.map(|layer| layer.with_filter(exported_logs)),
@@ -784,6 +809,14 @@ fn otel_path_subscriber(
         .with(layer_or_identity(
             db_tracer.map(db_spans::DbQuerySpanLayer::new),
         ))
+        // With per-layer filters, `tracing::enabled!` follows them: keep
+        // sqlx's statement events enabled inside a read-retry scope so the
+        // write observer sees them whatever RUST_LOG says (#5941).
+        .with(
+            crate::api::middleware::db_read_retry::statement_interest_layer(
+                crate::api::middleware::db_read_retry::enabled_from_env(),
+            ),
+        )
 }
 
 /// `layer`, or a layer that does nothing.
@@ -1291,6 +1324,41 @@ mod tests {
         (capture.text(), exported)
     }
 
+    /// #5941: on the production OTLP-path subscriber at `RUST_LOG=info`, in
+    /// every DB_QUERY_SPANS mode, a write statement inside a read-retry scope
+    /// is seen by the write observer, a read is not, and the statement does
+    /// not reach stdout.
+    #[tokio::test]
+    async fn the_otlp_subscriber_lets_the_read_retry_see_writes_at_rust_log_info() {
+        use crate::api::middleware::db_read_retry::tests::sqlx_like_statement_marks_write;
+        for mode in [
+            db_spans::DbQuerySpans::Log,
+            db_spans::DbQuerySpans::All,
+            db_spans::DbQuerySpans::Off,
+        ] {
+            let capture = Capture::default();
+            let exported = crate::testing::otel::ExportedSpans::default();
+            let subscriber = otel_path_subscriber(
+                subscriber_filters(|| EnvFilter::new("info"), mode),
+                build_fmt_layer_with_writer(LogFormat::Json, false, capture.clone()),
+                None,
+                exported.tracer(),
+                mode.enabled().then(|| exported.tracer()),
+            );
+            let _g = tracing::subscriber::set_default(subscriber);
+            assert!(sqlx_like_statement_marks_write("BEGIN").await, "{mode:?}");
+            assert!(
+                !sqlx_like_statement_marks_write("SELECT 1").await,
+                "{mode:?}"
+            );
+            assert!(
+                !capture.text().contains("BEGIN"),
+                "{mode:?}: {}",
+                capture.text()
+            );
+        }
+    }
+
     const DEFAULT_FILTER_WITH_OTHER_AT_INFO: &str =
         "artifact_keeper_backend=debug,tower_http=debug,sqlx::query=info,other_crate=info";
 
@@ -1544,6 +1612,44 @@ mod tests {
             .lines()
             .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("not JSON ({e}): {l}")))
             .collect()
+    }
+
+    /// #5656: the error that stops the server is a JSON line under
+    /// `LOG_FORMAT=json`, not plain text on stderr
+    #[test]
+    fn test_exit_code_logs_the_fatal_error_as_one_json_line() {
+        let capture = Capture::default();
+        let subscriber = tracing_subscriber::registry().with(build_fmt_layer_with_writer(
+            LogFormat::Json,
+            false,
+            capture.clone(),
+        ));
+        let code = tracing::subscriber::with_default(subscriber, || {
+            exit_code(Err::<(), _>(crate::error::AppError::Database(
+                "pool timed out while waiting for an open connection".to_string(),
+            )))
+        });
+        assert_eq!(code, std::process::ExitCode::FAILURE);
+        let lines = json_lines(&capture);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(lines[0]["level"], "ERROR");
+        assert_eq!(lines[0]["fields"]["message"], "fatal error, exiting");
+        let error = lines[0]["fields"]["error"].as_str().expect("error field");
+        assert!(error.contains("pool timed out"), "{error}");
+    }
+
+    #[test]
+    fn test_exit_code_is_success_and_silent_for_ok() {
+        let capture = Capture::default();
+        let subscriber = tracing_subscriber::registry().with(build_fmt_layer_with_writer(
+            LogFormat::Json,
+            false,
+            capture.clone(),
+        ));
+        let code =
+            tracing::subscriber::with_default(subscriber, || exit_code(Ok::<(), String>(())));
+        assert_eq!(code, std::process::ExitCode::SUCCESS);
+        assert!(capture.text().is_empty(), "{}", capture.text());
     }
 
     #[test]

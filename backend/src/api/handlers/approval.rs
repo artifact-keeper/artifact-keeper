@@ -1015,6 +1015,11 @@ pub async fn approve_promotion(
     let source_storage = state.storage_for_repo(&source_repo.storage_location())?;
     let target_storage = state.storage_for_repo(&target_repo.storage_location())?;
 
+    // An approved promotion writes the bytes again: refused at the disk block
+    // threshold (#5191), before the source is read.
+    if let Some(refusal) = crate::services::quota::disk::refusal(None) {
+        return Err(AppError::QuotaRefused(Box::new(refusal)));
+    }
     let content = source_storage
         .get(&artifact.storage_key)
         .await

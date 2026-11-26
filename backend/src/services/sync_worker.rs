@@ -41,6 +41,44 @@ const PEER_HEARTBEAT_TIMEOUT_SECS: u64 = 10;
 /// `(stale_check_interval_ticks * 10s) + (stale_threshold_minutes * 60s)`.
 const STALE_CHECK_INTERVAL_TICKS: u64 = 6;
 
+/// Consecutive failed probes or transfers before an online or syncing peer
+/// is marked `degraded`. Override with `PEER_DEGRADED_FAILURE_THRESHOLD`
+const PEER_DEGRADED_FAILURE_THRESHOLD: i32 = 3;
+
+pub(crate) fn peer_degraded_failure_threshold() -> i32 {
+    env_i32_min(
+        "PEER_DEGRADED_FAILURE_THRESHOLD",
+        PEER_DEGRADED_FAILURE_THRESHOLD,
+        1,
+    )
+}
+
+/// Mark an online or syncing peer `degraded` once it has failed `threshold`
+/// consecutive probes or transfers; `offline` stays with the stale-heartbeat
+/// sweep, and a good probe brings any of them back. Returns whether the peer
+/// was demoted.
+///
+/// One conditional UPDATE, so the failure count and status it acts on are
+/// the ones current when the row is written: a probe on another replica that
+/// has just reset the peer to online with 0 failures leaves it online, where
+/// a read followed by a status-matched write would still demote it.
+async fn demote_failing_peer(
+    db: &PgPool,
+    peer_id: Uuid,
+    threshold: i32,
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE peer_instances SET status = 'degraded', updated_at = NOW() \
+         WHERE id = $1 AND status IN ('online', 'syncing') \
+           AND consecutive_failures >= $2",
+    )
+    .bind(peer_id)
+    .bind(threshold)
+    .execute(db)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
 /// Read the configured stale-peer threshold (minutes) from
 /// `PEER_STALE_THRESHOLD_MINUTES`, falling back to
 /// `STALE_PEER_THRESHOLD_MINUTES`.  Non-positive values are rejected so we
@@ -588,6 +626,7 @@ async fn mark_peer_probe_failed(db: &PgPool, peer_id: Uuid) -> Result<(), sqlx::
     .execute(db)
     .await?;
 
+    demote_failing_peer(db, peer_id, peer_degraded_failure_threshold()).await?;
     Ok(())
 }
 
@@ -1145,44 +1184,11 @@ async fn process_pending_tasks(
 
     // Reset retriable failed tasks for peers that have recovered (backoff expired).
     // This runs once per tick for all recovered peers in a single query.
-    let retried = sqlx::query(
-        r#"
-        UPDATE sync_tasks
-        SET status = 'pending', error_message = NULL, started_at = NULL, completed_at = NULL,
-            claimed_by = NULL, claim_token = NULL, claim_expires_at = NULL
-        WHERE status = 'failed'
-          AND retry_count < GREATEST(max_retries, $1)
-          AND (
-              EXISTS (
-                  SELECT 1
-                  FROM artifacts a
-                  WHERE a.id = sync_tasks.artifact_id
-                    AND (sync_tasks.task_type = 'delete' OR a.is_deleted = false)
-              )
-              -- #5624: a delete that outlived its artifact row.
-              OR (
-                  sync_tasks.task_type = 'delete'
-                  AND sync_tasks.artifact_id IS NULL
-                  AND sync_tasks.target_path IS NOT NULL
-              )
-          )
-          AND peer_instance_id = ANY(
-              SELECT id FROM peer_instances
-              WHERE is_local = false
-                AND status IN ('online', 'syncing')
-                AND (backoff_until IS NULL OR backoff_until <= NOW())
-          )
-        "#,
-    )
-    .bind(retry_policy.max_retries)
-    .execute(db)
-    .await
-    .map_err(|e| format!("Failed to reset retriable tasks: {e}"))?;
-
-    if retried.rows_affected() > 0 {
+    let retried = rearm_retriable_failed_tasks(db, retry_policy.max_retries, None).await?;
+    if retried > 0 {
         tracing::info!(
             "Reset {} failed sync task(s) for retry after peer recovery",
-            retried.rows_affected()
+            retried
         );
     }
 
@@ -1220,6 +1226,12 @@ async fn process_pending_tasks(
                 peer.concurrent_transfers_limit.unwrap_or(5)
             );
             continue;
+        }
+
+        // #5921: a draining process claims no new transfers.
+        if crate::services::shutdown_drain::is_draining() {
+            tracing::debug!("draining for shutdown; not claiming sync tasks");
+            break;
         }
 
         // ── Claim pending tasks (RowClaimedQueue) ───────────────────────
@@ -1314,6 +1326,53 @@ async fn process_pending_tasks(
     }
 
     Ok(())
+}
+
+/// Flip `failed` tasks that still have attempts left back to `pending` for
+/// every peer that is online or syncing and out of backoff, when their
+/// artifact is live (or, for an orphaned delete, its address is kept).
+/// `only_peer` limits it to one peer (tests on the shared database).
+async fn rearm_retriable_failed_tasks(
+    db: &PgPool,
+    max_retries: i32,
+    only_peer: Option<Uuid>,
+) -> Result<u64, String> {
+    sqlx::query(
+        r#"
+        UPDATE sync_tasks
+        SET status = 'pending', error_message = NULL, started_at = NULL, completed_at = NULL,
+            claimed_by = NULL, claim_token = NULL, claim_expires_at = NULL
+        WHERE status = 'failed'
+          AND retry_count < GREATEST(max_retries, $1)
+          AND (
+              EXISTS (
+                  SELECT 1
+                  FROM artifacts a
+                  WHERE a.id = sync_tasks.artifact_id
+                    AND (sync_tasks.task_type = 'delete' OR a.is_deleted = false)
+              )
+              -- #5624: a delete that outlived its artifact row.
+              OR (
+                  sync_tasks.task_type = 'delete'
+                  AND sync_tasks.artifact_id IS NULL
+                  AND sync_tasks.target_path IS NOT NULL
+              )
+          )
+          AND ($2::UUID IS NULL OR peer_instance_id = $2)
+          AND peer_instance_id = ANY(
+              SELECT id FROM peer_instances
+              WHERE is_local = false
+                AND status IN ('online', 'syncing')
+                AND (backoff_until IS NULL OR backoff_until <= NOW())
+          )
+        "#,
+    )
+    .bind(max_retries)
+    .bind(only_peer)
+    .execute(db)
+    .await
+    .map(|r| r.rows_affected())
+    .map_err(|e| format!("Failed to reset retriable tasks: {e}"))
 }
 
 /// Execute a single claimed sync task (push or delete) to a remote peer.
@@ -1480,7 +1539,8 @@ async fn execute_transfer(
         }
         Err(e) => {
             let msg = format!("HTTP request failed: {e}");
-            handle_transfer_failure(db, task, &msg, retry_policy).await;
+            let scope = failure_scope_for_send_error(&e);
+            handle_transfer_failure_scoped(db, task, &msg, retry_policy, scope).await;
             Err(msg)
         }
     }
@@ -1823,7 +1883,8 @@ async fn execute_oci_transfer(
             }
             Err(e) => {
                 let msg = format!("HTTP request failed: {e}");
-                handle_transfer_failure(db, task, &msg, retry_policy).await;
+                let scope = failure_scope_for_send_error(&e);
+                handle_transfer_failure_scoped(db, task, &msg, retry_policy, scope).await;
                 return Err(msg);
             }
         }
@@ -1932,7 +1993,7 @@ async fn execute_chunked_transfer(
     let init_url = build_chunked_upload_session_url(peer_endpoint);
     let init_body = build_chunked_upload_session_body(task, chunk_size);
 
-    let init_response = client
+    let init_response = match client
         .post(&init_url)
         .header("Authorization", format!("Bearer {}", peer_api_key))
         .header(REPLICATION_REQUEST_HEADER, REPLICATION_REQUEST_VALUE)
@@ -1940,7 +2001,17 @@ async fn execute_chunked_transfer(
         .json(&init_body)
         .send()
         .await
-        .map_err(|e| format!("Failed to init chunked upload: {e}"))?;
+    {
+        Ok(response) => response,
+        Err(e) => {
+            // Charged like every other send error (#6134), instead of leaving
+            // the task claimed until its claim lapses.
+            let msg = format!("Failed to init chunked upload: {e}");
+            let scope = failure_scope_for_send_error(&e);
+            handle_transfer_failure_scoped(db, task, &msg, retry_policy, scope).await;
+            return Err(msg);
+        }
+    };
 
     if !init_response.status().is_success() {
         let status = init_response.status();
@@ -2048,7 +2119,8 @@ async fn execute_chunked_transfer(
                 let msg = format!("Chunk {} upload failed: {e}", chunk_index);
                 cancel_chunked_upload_session(client, peer_endpoint, peer_api_key, &session_id)
                     .await;
-                handle_transfer_failure(db, task, &msg, retry_policy).await;
+                let scope = failure_scope_for_send_error(&e);
+                handle_transfer_failure_scoped(db, task, &msg, retry_policy, scope).await;
                 return Err(msg);
             }
         }
@@ -2106,7 +2178,8 @@ async fn execute_chunked_transfer(
         Err(e) => {
             let msg = format!("Chunked upload session complete failed: {e}");
             cancel_chunked_upload_session(client, peer_endpoint, peer_api_key, &session_id).await;
-            handle_transfer_failure(db, task, &msg, retry_policy).await;
+            let scope = failure_scope_for_send_error(&e);
+            handle_transfer_failure_scoped(db, task, &msg, retry_policy, scope).await;
             Err(msg)
         }
     }
@@ -2154,7 +2227,8 @@ async fn execute_delete(
         }
         Err(e) => {
             let msg = format!("HTTP delete request failed: {e}");
-            handle_transfer_failure(db, task, &msg, retry_policy).await;
+            let scope = failure_scope_for_send_error(&e);
+            handle_transfer_failure_scoped(db, task, &msg, retry_policy, scope).await;
             Err(msg)
         }
     }
@@ -2249,6 +2323,7 @@ async fn handle_transfer_success(db: &PgPool, task: &Claimed<TaskRow>, bytes_tra
         r#"
         UPDATE sync_tasks
         SET status = 'completed', completed_at = NOW(), bytes_transferred = $2,
+            unreachable_since = NULL,
             claimed_by = NULL, claim_token = NULL, claim_expires_at = NULL
         WHERE id = $1
           AND status = 'in_progress'
@@ -2414,6 +2489,29 @@ pub(crate) enum FailureScope {
     /// retry of the same row cannot change (checksum mismatch, immutable path
     /// already occupied). Fail the task without spending the peer's backoff.
     Item,
+    /// The peer could not be reached at all: no connection was established
+    /// (refused, connect timeout, name resolution), as during a network
+    /// partition (#6134). Charged to the peer like [`FailureScope::Peer`]
+    /// (backoff, failure counters, demotion), but the attempt does not use
+    /// up the task's retry budget: a transfer that never reached the peer
+    /// says nothing about the item, and a write made as the peer dropped
+    /// off the network would otherwise spend all its attempts before the
+    /// peer is marked down and never be delivered once it is back. The task
+    /// waits like any retriable failure: it is re-armed when the peer is
+    /// online again and out of backoff.
+    Unreachable,
+}
+
+/// Classify a transfer request that got no response (#6134): a connection
+/// that was never established is [`FailureScope::Unreachable`]; anything
+/// else (a timeout or a reset after the request was sent, a body error)
+/// stays a [`FailureScope::Peer`] failure and counts as an attempt.
+pub(crate) fn failure_scope_for_send_error(e: &reqwest::Error) -> FailureScope {
+    if e.is_connect() {
+        FailureScope::Unreachable
+    } else {
+        FailureScope::Peer
+    }
 }
 
 /// Classify a non-success peer response (#4921).
@@ -2429,6 +2527,10 @@ pub(crate) enum FailureScope {
 /// the peer key is not an administrator's token (#5455): it then replicates
 /// as an ordinary writer. Counting them against the peer would back off
 /// every other delivery to it.
+///
+/// A `403 DISK_THRESHOLD_EXCEEDED` (#5191) stays a peer failure: the
+/// receiver's volume refuses every write until disk is freed, so the peer is
+/// backed off and the task retried, never failed as an item.
 pub(crate) fn failure_scope_for_peer_response(status: u16, body: &str) -> FailureScope {
     let body = body.to_ascii_lowercase();
     let item = match status {
@@ -2720,42 +2822,49 @@ async fn handle_transfer_failure_scoped(
     retry_policy: SyncRetryPolicy,
     scope: FailureScope,
 ) {
-    let decision = match scope {
-        FailureScope::Peer => evaluate_task_failure(task.retry_count, task.max_retries),
-        FailureScope::Item => RetryDecision::PermanentlyFailed {
-            total_attempts: (task.retry_count + 1).max(task.max_retries),
-        },
-    };
-
     // Mark task as failed with updated retry count (owner only). If the claim
     // was lost, the current owner drives the task's fate; skip the peer
     // backoff/counter updates too so this stale worker cannot double-penalize
     // the peer for one logical attempt.
-    let failed = sqlx::query(
-        r#"
-        UPDATE sync_tasks
-        SET status = 'failed',
-            completed_at = NOW(),
-            error_message = $2,
-            retry_count = $3,
-            claimed_by = NULL,
-            claim_token = NULL,
-            claim_expires_at = NULL
-        WHERE id = $1
-          AND status = 'in_progress'
-          AND claim_token = $4
-        "#,
-    )
-    .bind(task.id)
-    .bind(error_message)
-    .bind(decision.new_retry_count())
-    .bind(task.claim_token())
-    .execute(db)
-    .await;
+    let (decision, failed) = if scope == FailureScope::Unreachable {
+        mark_unreachable_failure(db, task, error_message).await
+    } else {
+        let decision = match scope {
+            FailureScope::Item => RetryDecision::PermanentlyFailed {
+                total_attempts: (task.retry_count + 1).max(task.max_retries),
+            },
+            _ => evaluate_task_failure(task.retry_count, task.max_retries),
+        };
+        // An answered attempt ends a run of unreachable ones (#6134).
+        let failed = sqlx::query(
+            r#"
+            UPDATE sync_tasks
+            SET status = 'failed',
+                completed_at = NOW(),
+                error_message = $2,
+                retry_count = $3,
+                unreachable_since = NULL,
+                claimed_by = NULL,
+                claim_token = NULL,
+                claim_expires_at = NULL
+            WHERE id = $1
+              AND status = 'in_progress'
+              AND claim_token = $4
+            "#,
+        )
+        .bind(task.id)
+        .bind(error_message)
+        .bind(decision.new_retry_count())
+        .bind(task.claim_token())
+        .execute(db)
+        .await
+        .map(|r| r.rows_affected() == 1);
+        (decision, failed)
+    };
 
     match failed {
-        Ok(result) if result.rows_affected() == 1 => {}
-        Ok(_) => {
+        Ok(true) => {}
+        Ok(false) => {
             tracing::warn!(
                 "Sync task {} failed here but its claim was lost (expired and recovered); \
                  skipping task/peer failure bookkeeping",
@@ -2794,7 +2903,23 @@ async fn handle_transfer_failure_scoped(
         return;
     }
 
-    let log_msg = format_retry_log(task.id, &decision, error_message);
+    let log_msg = if scope == FailureScope::Unreachable && decision.is_retriable() {
+        format!(
+            "Sync task {} could not reach the peer (attempt not counted, {}/{} used), \
+             will retry after peer recovery: {}",
+            task.id, task.retry_count, task.max_retries, error_message
+        )
+    } else if scope == FailureScope::Unreachable {
+        format!(
+            "Sync task {} permanently failed: the peer has been unreachable for more than \
+             {} s (SYNC_TASK_UNREACHABLE_MAX_SECS): {}",
+            task.id,
+            sync_task_unreachable_max_secs(),
+            error_message
+        )
+    } else {
+        format_retry_log(task.id, &decision, error_message)
+    };
     if decision.is_retriable() {
         tracing::info!("{}", log_msg);
     } else {
@@ -2829,7 +2954,112 @@ async fn handle_transfer_failure_scoped(
     .execute(db)
     .await;
 
+    // Without probes a demoted peer waits for its own heartbeat to come back
+    if env_bool("PEER_HEARTBEAT_ENABLED", true) {
+        if let Err(e) =
+            demote_failing_peer(db, task.peer_instance_id, peer_degraded_failure_threshold()).await
+        {
+            tracing::warn!("Failed to demote peer {}: {e}", task.peer_instance_id);
+        }
+    }
+
     rearm_if_superseded(db, task).await;
+}
+
+/// Default of `SYNC_TASK_UNREACHABLE_MAX_SECS`: how long a task may keep
+/// failing to reach its peer before it is failed for good (#6134).
+pub(crate) const DEFAULT_SYNC_TASK_UNREACHABLE_MAX_SECS: u64 = 86_400;
+
+/// `SYNC_TASK_UNREACHABLE_MAX_SECS` (at least 60): a task whose transfers
+/// have not reached the peer for this long, counted from the first such
+/// failure in an unbroken run of them, is failed for good on the next one.
+pub(crate) fn sync_task_unreachable_max_secs() -> u64 {
+    env_u64_min(
+        "SYNC_TASK_UNREACHABLE_MAX_SECS",
+        DEFAULT_SYNC_TASK_UNREACHABLE_MAX_SECS,
+        60,
+    )
+}
+
+/// Record a [`FailureScope::Unreachable`] failure (#6134). The attempt does
+/// not use up the task's retry budget, but the run of unreachable failures
+/// is bounded: `unreachable_since` stamps the first, and a failure after
+/// [`sync_task_unreachable_max_secs`] makes the task permanently failed
+/// (visible as `failed` with an error naming the limit), so a peer that
+/// stays online but never accepts a connection from here (a one-way
+/// firewall, a TLS certificate this side refuses, a dead scored endpoint)
+/// does not keep a task retrying forever. One statement, claim-guarded like
+/// the other failure write; `Ok(false)` when the claim was lost.
+async fn mark_unreachable_failure(
+    db: &PgPool,
+    task: &Claimed<TaskRow>,
+    error_message: &str,
+) -> (RetryDecision, Result<bool, sqlx::Error>) {
+    let limit = sync_task_unreachable_max_secs();
+    let row: Result<Option<(bool, i32)>, sqlx::Error> = sqlx::query_as(
+        r#"
+        UPDATE sync_tasks st
+        SET status = 'failed',
+            completed_at = NOW(),
+            error_message = CASE WHEN o.expired
+                THEN 'peer unreachable for more than ' || $3::BIGINT || ' s: ' || $2
+                ELSE $2 END,
+            retry_count = CASE WHEN o.expired
+                THEN GREATEST(st.retry_count + 1, st.max_retries)
+                ELSE st.retry_count END,
+            unreachable_since = COALESCE(st.unreachable_since, NOW()),
+            claimed_by = NULL,
+            claim_token = NULL,
+            claim_expires_at = NULL
+        FROM (
+            SELECT id,
+                   (unreachable_since IS NOT NULL
+                    AND unreachable_since <= NOW() - make_interval(secs => $3::BIGINT::FLOAT8))
+                       AS expired
+            FROM sync_tasks
+            WHERE id = $1
+        ) o
+        WHERE st.id = o.id
+          AND st.status = 'in_progress'
+          AND st.claim_token = $4
+        RETURNING o.expired, st.retry_count
+        "#,
+    )
+    .bind(task.id)
+    .bind(error_message)
+    .bind(limit as i64)
+    .bind(task.claim_token())
+    .fetch_optional(db)
+    .await;
+    match row {
+        Ok(Some((true, total_attempts))) => {
+            metrics::counter!("ak_sync_task_unreachable_failures_total", "outcome" => "exhausted")
+                .increment(1);
+            (
+                RetryDecision::PermanentlyFailed { total_attempts },
+                Ok(true),
+            )
+        }
+        Ok(Some((false, attempt))) => {
+            metrics::counter!("ak_sync_task_unreachable_failures_total", "outcome" => "retrying")
+                .increment(1);
+            (
+                RetryDecision::WillRetry {
+                    attempt,
+                    max_retries: task.max_retries,
+                },
+                Ok(true),
+            )
+        }
+        Ok(None) => (
+            RetryDecision::PermanentlyFailed { total_attempts: 0 },
+            Ok(false),
+        ),
+        Err(e) => (
+            RetryDecision::PermanentlyFailed { total_attempts: 0 },
+            Err(e),
+        ),
+    }
 }
 
 /// Build the full URL for uploading an artifact to a remote peer.
@@ -5351,6 +5581,233 @@ mod tests {
         std::env::remove_var("SYNC_PEER_CONNECT_TIMEOUT_SECS");
     }
 
+    #[test]
+    fn test_peer_degraded_failure_threshold_env_6030() {
+        std::env::remove_var("PEER_DEGRADED_FAILURE_THRESHOLD");
+        assert_eq!(
+            peer_degraded_failure_threshold(),
+            PEER_DEGRADED_FAILURE_THRESHOLD
+        );
+        std::env::set_var("PEER_DEGRADED_FAILURE_THRESHOLD", "5");
+        assert_eq!(peer_degraded_failure_threshold(), 5);
+        std::env::set_var("PEER_DEGRADED_FAILURE_THRESHOLD", "0");
+        assert_eq!(peer_degraded_failure_threshold(), 1);
+        std::env::remove_var("PEER_DEGRADED_FAILURE_THRESHOLD");
+    }
+
+    async fn demotion_peer(status: &str) -> Option<(sqlx::PgPool, Uuid)> {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let pool = tdh::try_pool().await?;
+        let peer_id = tdh::register_test_peer(&pool, "demote-6030", "t").await;
+        sqlx::query(
+            "UPDATE peer_instances SET status = $2::instance_status, \
+             last_heartbeat_at = NOW() WHERE id = $1",
+        )
+        .bind(peer_id)
+        .bind(status)
+        .execute(&pool)
+        .await
+        .expect("set status");
+        Some((pool, peer_id))
+    }
+
+    async fn peer_state(pool: &sqlx::PgPool, peer_id: Uuid) -> (String, i32) {
+        sqlx::query_as(
+            "SELECT status::TEXT, consecutive_failures FROM peer_instances WHERE id = $1",
+        )
+        .bind(peer_id)
+        .fetch_one(pool)
+        .await
+        .expect("peer")
+    }
+
+    async fn drop_peer(pool: &sqlx::PgPool, peer_id: Uuid) {
+        let _ = sqlx::query("DELETE FROM peer_instances WHERE id = $1")
+            .bind(peer_id)
+            .execute(pool)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn stale_syncing_peer_goes_offline_6030() {
+        let Some((pool, peer_id)) = demotion_peer("syncing").await else {
+            return;
+        };
+        sqlx::query(
+            "UPDATE peer_instances SET last_heartbeat_at = NOW() - INTERVAL '10 minutes' \
+             WHERE id = $1",
+        )
+        .bind(peer_id)
+        .execute(&pool)
+        .await
+        .expect("age heartbeat");
+
+        run_stale_peer_detection(&pool, 5).await;
+        let (status, _) = peer_state(&pool, peer_id).await;
+        drop_peer(&pool, peer_id).await;
+
+        assert_eq!(status, "offline");
+    }
+
+    #[tokio::test]
+    async fn failed_probes_demote_a_syncing_peer_until_one_succeeds_6030() {
+        let Some((pool, peer_id)) = demotion_peer("syncing").await else {
+            return;
+        };
+        let mut seen = Vec::new();
+        for _ in 0..PEER_DEGRADED_FAILURE_THRESHOLD {
+            mark_peer_probe_failed(&pool, peer_id)
+                .await
+                .expect("probe failed");
+            seen.push(peer_state(&pool, peer_id).await.0);
+        }
+        mark_peer_online(&pool, peer_id).await.expect("probe ok");
+        let after = peer_state(&pool, peer_id).await;
+        drop_peer(&pool, peer_id).await;
+
+        assert_eq!(seen, ["syncing", "syncing", "degraded"]);
+        assert_eq!(after, ("online".to_string(), 0));
+    }
+
+    #[tokio::test]
+    async fn demotion_only_needs_the_threshold_on_online_or_syncing_6030() {
+        let Some((pool, peer_id)) = demotion_peer("online").await else {
+            return;
+        };
+        let set = |status: &'static str, failures: i32| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query(
+                    "UPDATE peer_instances SET status = $2::instance_status, \
+                     consecutive_failures = $3 WHERE id = $1",
+                )
+                .bind(peer_id)
+                .bind(status)
+                .bind(failures)
+                .execute(&pool)
+                .await
+                .expect("seed peer");
+            }
+        };
+        let mut got = Vec::new();
+        for (status, failures) in [
+            ("online", 3),
+            ("syncing", 4),
+            ("syncing", 2),
+            ("degraded", 9),
+            ("offline", 9),
+        ] {
+            set(status, failures).await;
+            let demoted = demote_failing_peer(&pool, peer_id, 3)
+                .await
+                .expect("demote");
+            got.push((demoted, peer_state(&pool, peer_id).await.0));
+        }
+        drop_peer(&pool, peer_id).await;
+
+        let want: Vec<(bool, String)> = [
+            (true, "degraded"),
+            (true, "degraded"),
+            (false, "syncing"),
+            (false, "degraded"),
+            (false, "offline"),
+        ]
+        .into_iter()
+        .map(|(d, s)| (d, s.to_string()))
+        .collect();
+        assert_eq!(got, want);
+    }
+
+    /// A probe on another replica resets the peer to online with 0 failures
+    /// while this replica is demoting it on the count it saw a moment ago.
+    /// The reset holds the row lock until it commits, so the demotion runs
+    /// against the reset row and must leave the recovered peer online. A
+    /// demotion that read `(online, 3)` first and then matched only on
+    /// `status = 'online'` wrote `degraded` over it.
+    #[tokio::test]
+    async fn demotion_skips_a_peer_reset_meanwhile_6030() {
+        let Some((pool, peer_id)) = demotion_peer("online").await else {
+            return;
+        };
+        sqlx::query("UPDATE peer_instances SET consecutive_failures = 3 WHERE id = $1")
+            .bind(peer_id)
+            .execute(&pool)
+            .await
+            .expect("seed failures");
+
+        let mut reset = pool.begin().await.expect("begin");
+        sqlx::query(
+            "UPDATE peer_instances SET status = 'online', consecutive_failures = 0 \
+             WHERE id = $1",
+        )
+        .bind(peer_id)
+        .execute(&mut *reset)
+        .await
+        .expect("reset");
+        let reset_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *reset)
+            .await
+            .expect("reset backend pid");
+
+        let demotion = tokio::spawn({
+            let pool = pool.clone();
+            async move { demote_failing_peer(&pool, peer_id, 3).await }
+        });
+        // Let the demotion reach the locked row before the reset commits.
+        // Only a session blocked by THIS reset counts, so a parallel test's
+        // peer update cannot stand in for it (#6252).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let blocked = loop {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM pg_stat_activity \
+                 WHERE $1 = ANY(pg_blocking_pids(pid))",
+            )
+            .bind(reset_pid)
+            .fetch_one(&pool)
+            .await
+            .expect("pg_stat_activity");
+            if waiting > 0 {
+                break true;
+            }
+            if std::time::Instant::now() > deadline {
+                break false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        };
+        // #6252: without this the test passed after 5 s without exercising
+        // the race when the demotion never waited on the reset's row lock.
+        let finished_early = demotion.is_finished();
+        reset.commit().await.expect("commit reset");
+        assert!(
+            blocked && !finished_early,
+            "the demotion must wait on the reset's row lock (blocked={blocked}, \
+             finished before the commit={finished_early})"
+        );
+
+        let demoted = demotion.await.expect("join").expect("demote");
+        let after = peer_state(&pool, peer_id).await;
+        drop_peer(&pool, peer_id).await;
+
+        assert!(!demoted, "a peer reset to 0 failures must not be demoted");
+        assert_eq!(after, ("online".to_string(), 0));
+    }
+
+    #[tokio::test]
+    async fn failed_probes_leave_an_offline_peer_offline_6030() {
+        let Some((pool, peer_id)) = demotion_peer("offline").await else {
+            return;
+        };
+        for _ in 0..PEER_DEGRADED_FAILURE_THRESHOLD {
+            mark_peer_probe_failed(&pool, peer_id)
+                .await
+                .expect("probe failed");
+        }
+        let (status, _) = peer_state(&pool, peer_id).await;
+        drop_peer(&pool, peer_id).await;
+
+        assert_eq!(status, "offline");
+    }
+
     // -----------------------------------------------------------------------
     // Cluster-wide task claims (Tier-2: no-op without DATABASE_URL)
     // -----------------------------------------------------------------------
@@ -5746,6 +6203,17 @@ mod tests {
             ),
             FailureScope::Item
         );
+        // #5191: a receiver whose storage volume is at its disk block
+        // threshold refuses every write until disk is freed. That is the
+        // peer's condition, not this item's, and it clears on its own: back
+        // the peer off and keep the task for a retry, never fail the item.
+        assert_eq!(
+            failure_scope_for_peer_response(
+                403,
+                r#"{"code":"DISK_THRESHOLD_EXCEEDED","message":"server storage nearly full: free disk or add storage (the storage volume is 98.4% full, 98.4 GiB of 100.0 GiB; writes are refused from 98%). Downloads are not affected.","limit_bytes":105226698752,"used_bytes":105656795136,"threshold_percent":98,"used_percent":98.4}"#
+            ),
+            FailureScope::Peer
+        );
         // A chunk still in progress is a transient 409.
         assert_eq!(
             failure_scope_for_peer_response(409, "Chunk 0 is already being uploaded"),
@@ -6030,6 +6498,303 @@ mod tests {
         server.verify().await;
     }
 
+    /// An `http://` address on loopback that refuses connections: a port
+    /// bound and released.
+    fn refusing_endpoint_6134() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        drop(listener);
+        format!("http://{addr}")
+    }
+
+    /// #6134: a send that never connected is `Unreachable`; one that
+    /// connected and then timed out waiting for the answer is a `Peer`
+    /// failure that counts as an attempt.
+    #[tokio::test]
+    async fn send_error_scope_separates_unreachable_from_timeouts_6134() {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(300))
+            .build()
+            .unwrap();
+        let refused = client
+            .get(refusing_endpoint_6134())
+            .send()
+            .await
+            .expect_err("nothing listens");
+        assert_eq!(
+            failure_scope_for_send_error(&refused),
+            FailureScope::Unreachable,
+            "{refused:?}"
+        );
+        // Accepts the connection, never answers.
+        let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", silent.local_addr().unwrap());
+        let hold = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = silent.accept().await {
+                held.push(sock);
+            }
+        });
+        let timed_out = client.get(&url).send().await.expect_err("no answer");
+        hold.abort();
+        assert!(timed_out.is_timeout(), "{timed_out:?}");
+        assert_eq!(failure_scope_for_send_error(&timed_out), FailureScope::Peer);
+    }
+
+    /// Mark the fixture peer as the worker would see it while its heartbeat
+    /// still looks fresh: online, out of backoff.
+    async fn peer_looks_up_6134(f: &ClaimFixture) {
+        sqlx::query(
+            "UPDATE peer_instances SET status = 'online', last_heartbeat_at = NOW(), \
+             backoff_until = NULL WHERE id = $1",
+        )
+        .bind(f.peer_id)
+        .execute(&f.pool)
+        .await
+        .expect("peer up");
+    }
+
+    /// One worker round for the fixture peer: re-arm its retriable failed
+    /// tasks, claim, and run the claimed push against `endpoint`. `None` when
+    /// nothing was claimable.
+    async fn worker_round_6134(
+        f: &ClaimFixture,
+        endpoint: &str,
+        policy: SyncRetryPolicy,
+    ) -> Option<Result<(), String>> {
+        rearm_retriable_failed_tasks(&f.pool, policy.max_retries, Some(f.peer_id))
+            .await
+            .expect("rearm");
+        let claimed = claim_all(f, 5, 5, "worker-6134", 60.0).await;
+        let task = claimed.first()?;
+        let registry = Arc::new(StorageRegistry::new(
+            HashMap::new(),
+            "filesystem".to_string(),
+        ));
+        Some(
+            execute_transfer(
+                &f.pool,
+                &reqwest::Client::new(),
+                registry,
+                task,
+                endpoint,
+                "peer-key",
+                policy,
+            )
+            .await,
+        )
+    }
+
+    /// #6134: a push written as its peer drops off the network is retried
+    /// while the peer still looks online (its heartbeat is not stale yet).
+    /// Every attempt fails to connect. Those attempts must not use up the
+    /// task's 3 retries, or the push is terminal before the peer is marked
+    /// down and is never delivered after the partition heals. The worker is
+    /// driven round by round (re-arm, claim, transfer) so the window is
+    /// deterministic: four attempts inside it, then the heal.
+    #[tokio::test]
+    async fn push_during_a_partition_is_delivered_after_the_heal_6134() {
+        use wiremock::matchers::{method, path as url_path};
+        use wiremock::{Mock, ResponseTemplate};
+        let Some(f) = setup_claim_fixture(1).await else {
+            return;
+        };
+        let (path, key, _sha) = store_fixture_artifact_5627(&f, false).await;
+        let policy = SyncRetryPolicy {
+            max_retries: 3,
+            backoff_base_secs: 1,
+            backoff_max_secs: 1,
+        };
+        let partitioned = refusing_endpoint_6134();
+        let mut attempts = 0;
+        for _ in 0..4 {
+            peer_looks_up_6134(&f).await;
+            match worker_round_6134(&f, &partitioned, policy).await {
+                Some(result) => {
+                    assert!(result.is_err(), "{result:?}");
+                    attempts += 1;
+                }
+                None => break,
+            }
+        }
+        let during = push_outcome_5627(&f).await;
+        let since_during = unreachable_since_6134(&f).await;
+
+        // The heal: the peer accepts the push again.
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(url_path(format!(
+                "/api/v1/repositories/{key}/artifacts/{path}"
+            )))
+            .respond_with(ResponseTemplate::new(201))
+            .expect(1)
+            .mount(&server)
+            .await;
+        peer_looks_up_6134(&f).await;
+        let healed = worker_round_6134(&f, &server.uri(), policy).await;
+        let after = push_outcome_5627(&f).await;
+        let since_after = unreachable_since_6134(&f).await;
+        teardown_claim_fixture(&f).await;
+
+        assert!(since_during.is_some(), "the unreachable run is stamped");
+        assert!(
+            since_after.is_none(),
+            "a delivery clears the unreachable run"
+        );
+
+        assert_eq!(
+            attempts, 4,
+            "the push stopped being retried during the partition: {during:?}"
+        );
+        assert_eq!(during.0, "failed", "{during:?}");
+        assert_eq!(
+            during.1, 0,
+            "attempts that never reached the peer used up the task's retries: {during:?}"
+        );
+        assert!(
+            during
+                .2
+                .as_deref()
+                .is_some_and(|e| e.contains("HTTP request failed")),
+            "{during:?}"
+        );
+        assert_eq!(
+            (during.3, during.4),
+            (4, 4),
+            "each attempt is still charged to the peer: {during:?}"
+        );
+        assert!(
+            matches!(healed, Some(Ok(()))),
+            "the push was not delivered after the heal: {healed:?}, {after:?}"
+        );
+        assert_eq!(after.0, "completed", "{after:?}");
+        server.verify().await;
+    }
+
+    async fn unreachable_since_6134(f: &ClaimFixture) -> Option<chrono::DateTime<Utc>> {
+        sqlx::query_scalar("SELECT unreachable_since FROM sync_tasks WHERE id = $1")
+            .bind(f.task_ids[0])
+            .fetch_one(&f.pool)
+            .await
+            .expect("task")
+    }
+
+    /// #6134 review: unreachable attempts are bounded. Once the run of them
+    /// is older than `SYNC_TASK_UNREACHABLE_MAX_SECS` (default 24 h), the
+    /// next one fails the task for good, with an error naming the limit, and
+    /// it is not claimed again. An answered failure ends the run.
+    #[tokio::test]
+    async fn unreachable_run_past_the_limit_fails_the_task_6134() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, ResponseTemplate};
+        let Some(f) = setup_claim_fixture(1).await else {
+            return;
+        };
+        let _ = store_fixture_artifact_5627(&f, false).await;
+        let policy = SyncRetryPolicy {
+            max_retries: 3,
+            backoff_base_secs: 1,
+            backoff_max_secs: 1,
+        };
+        let partitioned = refusing_endpoint_6134();
+
+        // An answered failure clears a run in progress.
+        peer_looks_up_6134(&f).await;
+        let first = worker_round_6134(&f, &partitioned, policy).await;
+        let stamped = unreachable_since_6134(&f).await;
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        peer_looks_up_6134(&f).await;
+        let answered = worker_round_6134(&f, &server.uri(), policy).await;
+        let cleared = unreachable_since_6134(&f).await;
+
+        // A run that began two days ago: the next unreachable attempt is
+        // terminal.
+        peer_looks_up_6134(&f).await;
+        let _ = worker_round_6134(&f, &partitioned, policy).await;
+        sqlx::query(
+            "UPDATE sync_tasks SET unreachable_since = NOW() - INTERVAL '2 days' WHERE id = $1",
+        )
+        .bind(f.task_ids[0])
+        .execute(&f.pool)
+        .await
+        .expect("age the run");
+        peer_looks_up_6134(&f).await;
+        let last = worker_round_6134(&f, &partitioned, policy).await;
+        let outcome = push_outcome_5627(&f).await;
+        peer_looks_up_6134(&f).await;
+        let again = worker_round_6134(&f, &partitioned, policy).await;
+        teardown_claim_fixture(&f).await;
+
+        assert!(matches!(first, Some(Err(_))), "{first:?}");
+        assert!(stamped.is_some());
+        assert!(matches!(answered, Some(Err(_))), "{answered:?}");
+        assert!(
+            cleared.is_none(),
+            "an answered failure ends the unreachable run"
+        );
+        assert!(matches!(last, Some(Err(_))), "{last:?}");
+        assert_eq!(outcome.0, "failed", "{outcome:?}");
+        assert_eq!(
+            outcome.1, 3,
+            "terminal: the retry budget is spent: {outcome:?}"
+        );
+        assert!(
+            outcome
+                .2
+                .as_deref()
+                .is_some_and(|e| e.starts_with("peer unreachable for more than 86400 s: ")),
+            "{outcome:?}"
+        );
+        assert!(
+            again.is_none(),
+            "a task past the limit is not retried: {again:?}"
+        );
+    }
+
+    /// #6134 control: a peer that answers (here 503) still spends one of the
+    /// task's attempts per failure, so a push it keeps refusing is terminal
+    /// after 3, as before.
+    #[tokio::test]
+    async fn peer_that_answers_5xx_still_uses_up_the_retries_6134() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, ResponseTemplate};
+        let Some(f) = setup_claim_fixture(1).await else {
+            return;
+        };
+        let _ = store_fixture_artifact_5627(&f, false).await;
+        let policy = SyncRetryPolicy {
+            max_retries: 3,
+            backoff_base_secs: 1,
+            backoff_max_secs: 1,
+        };
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("busy"))
+            .mount(&server)
+            .await;
+        let mut attempts = 0;
+        for _ in 0..4 {
+            peer_looks_up_6134(&f).await;
+            match worker_round_6134(&f, &server.uri(), policy).await {
+                Some(_) => attempts += 1,
+                None => break,
+            }
+        }
+        let outcome = push_outcome_5627(&f).await;
+        teardown_claim_fixture(&f).await;
+
+        assert_eq!(attempts, 3, "{outcome:?}");
+        assert_eq!(
+            (outcome.0.as_str(), outcome.1),
+            ("failed", 3),
+            "{outcome:?}"
+        );
+    }
+
     /// #5627 control: a 409 immutable for DIFFERENT bytes is still a failed
     /// push (an item rejection, #4921), and so is one the peer's metadata
     /// cannot confirm.
@@ -6211,6 +6976,31 @@ mod tests {
             "the row must point at a content-addressed object"
         );
         assert_eq!(metadata["revision"], 1);
+    }
+
+    #[tokio::test]
+    async fn failed_transfers_demote_the_peer_6030() {
+        let Some(f) = setup_claim_fixture(1).await else {
+            return;
+        };
+        make_protobuf_commit_row(&f, false).await;
+        sqlx::query(
+            "UPDATE peer_instances SET status = 'syncing', consecutive_failures = $2 \
+             WHERE id = $1",
+        )
+        .bind(f.peer_id)
+        .bind(PEER_DEGRADED_FAILURE_THRESHOLD - 1)
+        .execute(&f.pool)
+        .await
+        .expect("seed failures");
+        let flaky = mock_upload_peer(503, "unavailable").await;
+
+        let result = run_claimed_transfer(&f, &flaky).await;
+        let (status, _) = peer_state(&f.pool, f.peer_id).await;
+        teardown_claim_fixture(&f).await;
+
+        assert!(result.is_err());
+        assert_eq!(status, "degraded");
     }
 
     /// #4921: a permanent rejection of one artifact (409 checksum mismatch)
@@ -6700,6 +7490,8 @@ mod tests {
     /// owner's token can no longer finalize the row afterwards.
     #[tokio::test]
     async fn expired_sync_task_claims_recover_and_fence_stale_owner() {
+        let _serial =
+            crate::api::handlers::test_db_helpers::sync_claim_recovery_serial_lock().await;
         let Some(f) = setup_claim_fixture(1).await else {
             return;
         };
@@ -6750,10 +7542,16 @@ mod tests {
     /// They must not occupy peer capacity forever after the claim columns land.
     #[tokio::test]
     async fn legacy_in_progress_sync_task_without_claim_metadata_recovers() {
+        let _serial =
+            crate::api::handlers::test_db_helpers::sync_claim_recovery_serial_lock().await;
         let Some(f) = setup_claim_fixture(1).await else {
             return;
         };
 
+        // The row and its peer's counter change together, as a transfer's
+        // claim changes them: a sweep between two separate statements would
+        // reset the row before the counter it compensates was set (#5671).
+        let mut seed = f.pool.begin().await.expect("begin seed");
         sqlx::query(
             r#"
             UPDATE sync_tasks
@@ -6766,14 +7564,15 @@ mod tests {
             "#,
         )
         .bind(f.task_ids[0])
-        .execute(&f.pool)
+        .execute(&mut *seed)
         .await
         .expect("seed legacy in_progress task");
         sqlx::query("UPDATE peer_instances SET active_transfers = 1 WHERE id = $1")
             .bind(f.peer_id)
-            .execute(&f.pool)
+            .execute(&mut *seed)
             .await
             .expect("seed active transfer counter");
+        seed.commit().await.expect("commit seed");
 
         // Instance-wide, like the test above: the row and its peer's counter
         // are what this test owns, not the returned count (#5818).

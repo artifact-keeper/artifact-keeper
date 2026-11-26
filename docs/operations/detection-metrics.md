@@ -127,7 +127,11 @@ sum by (surface) (increase(ak_auth_failures_total{reason="unknown_user"}[10m])) 
 |---|---|---|---|
 | `ak_proxy_scan_verdicts_total` | counter | `verdict`, `action` | a pull from a repository with scan-on-proxy enabled passes the scan gate |
 | `ak_proxy_scan_queue_refused_total` | counter | `limit` | a proxied file gets no scan for now because the in-flight table has no room: `423` under `fail_closed`, served `pending` otherwise. `limit` is `scans`, `bytes`, `repository_scans`, `repository_bytes`, `scan_waiters` or `repository_waiters` |
+| `ak_proxy_scan_regrades_total` | counter | `outcome` | a proxied file whose verdict from the previous vulnerability-database build decided a pull under `PROXY_SCAN_DB_GRACE_HOURS` is re-graded in the background (#6300): `queued` (a lowest-priority scan-queue job), `started` (in the serving process, running or waiting for one of its two slots) or `deferred` (an image or OS package re-grade found both slots busy; a later pull asks again) |
+| `ak_proxy_scan_regrade_backlog_oldest_seconds` | gauge | `where` | how long the oldest proxy re-grade after a vulnerability-database update has waited (#6300): `queue` (pending priority-5 `proxy_file` jobs, from the scan worker; take `max()` across pods) or `in_process` (the serving process's own backlog). `0` with none. Alert when it passes half of `ak_proxy_scan_db_grace_window_seconds` |
+| `ak_proxy_scan_db_grace_window_seconds` | gauge | `action_class` | the database-update grace windows this process applies (#6300): `serving` (`fail_open`, `record_only`; `PROXY_SCAN_DB_GRACE_HOURS`) and `fail_closed` (`PROXY_SCAN_DB_GRACE_HOURS_FAIL_CLOSED`, `0` unless opted in) |
 | `ak_proxy_scan_abandoned_total` | counter | | a queued `fail_closed` scan leaves the queue because no request has wanted it for 30 seconds |
+| `ak_proxy_scan_unscannable_total` | counter | `repository`, `format`, `reason` | a fail-open or record-only pull is served `pending` with no scan run or queued, so these bytes never get a verdict |
 
 `verdict` is what the pull was judged as: `clean`, `vulnerable`, `pending` (a
 first pull served before its scan, fail-open or record-only) or `inconclusive`
@@ -138,6 +142,19 @@ served and counted as `clean`.
 `action` is what was done with the pull: `served`, `blocked` (403),
 `locked` (423 under fail-closed) or `recorded` (a record-only repository
 serving a vulnerable verdict).
+
+`reason` of `ak_proxy_scan_unscannable_total` is `identity_not_established`:
+the bytes do not declare the coordinate they are served at (a manifest that
+does not parse, another name or version, two archive entries at one path).
+The same pull logs `served, will not be scanned: identity not established`
+instead of the fail-open line and also counts as `pending` / `served` above,
+so a format that stops establishing identity shows up here rather than in the
+fail-open share. Under fail-closed the same bytes are a 423.
+
+```promql
+# Repositories serving bytes that will never be scanned
+sum by (repository, format) (increase(ak_proxy_scan_unscannable_total[1h])) > 0
+```
 
 ## Not included
 

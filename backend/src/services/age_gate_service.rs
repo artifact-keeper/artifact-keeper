@@ -717,8 +717,100 @@ impl AgeGatePolicy {
 /// than a policy cache. The memos live beside their readers; the writes that
 /// invalidate them live here, so this is the one seam that has to know about
 /// both.
-fn invalidate_decision_memos(repository_id: Uuid) {
+///
+/// The Virtual Maven metadata merges of every Virtual reaching the repository
+/// are dropped too (#6345), and the same invalidation is published to the
+/// other replicas, which apply it through [`forget_decision_memos`].
+///
+/// Callers run this right after the commit and before their next `.await`.
+/// Everything that must not be lost happens here, synchronously: the
+/// repository's own memos are dropped, the merge epoch moves (so no merge in
+/// flight keeps a pre-decision document), and the task that lists the
+/// Virtuals, drops their merges and notifies the other replicas is spawned.
+/// A request future dropped after this point (client disconnect) cannot
+/// cancel any of it. [`DecisionInvalidation::settle`] then waits, bounded,
+/// for that task, so a response normally follows the merge drop.
+pub(crate) fn invalidate_decision_memos(db: &PgPool, repository_id: Uuid) -> DecisionInvalidation {
     crate::api::handlers::vscode::invalidate_gallery_age_gate_memo(repository_id);
+    crate::services::age_gate_maven::forget_listings_for_repo(repository_id);
+    crate::api::handlers::maven::begin_virtual_metadata_invalidation();
+    let db = db.clone();
+    DecisionInvalidation(tokio::spawn(async move {
+        let virtual_ids = virtuals_reaching(&db, repository_id).await;
+        crate::api::handlers::maven::forget_virtual_metadata_merges(virtual_ids.as_deref());
+        crate::services::cache_invalidation::notify_age_gate_decision_changed(
+            &db,
+            repository_id,
+            virtual_ids,
+        )
+        .await;
+    }))
+}
+
+/// How long a decision's response waits for its Virtual merge drop and
+/// broadcast. Past it (a starved pool), the response goes out and the spawned
+/// task finishes on its own.
+const DECISION_INVALIDATION_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The spawned part of [`invalidate_decision_memos`].
+#[must_use = "settle it after emitting the decision's event"]
+pub(crate) struct DecisionInvalidation(tokio::task::JoinHandle<()>);
+
+impl DecisionInvalidation {
+    /// Wait up to [`DECISION_INVALIDATION_WAIT`] for the Virtual merge drop
+    /// and the broadcast. Dropping this future, or the timeout, leaves the
+    /// task running.
+    pub(crate) async fn settle(self) {
+        if tokio::time::timeout(DECISION_INVALIDATION_WAIT, self.0)
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                "age gate: Virtual metadata invalidation still running after {:?}; \
+                 responding without waiting for it",
+                DECISION_INVALIDATION_WAIT
+            );
+        }
+    }
+}
+
+/// Drop this process's memos of `repository_id`'s age-gate decisions, and the
+/// Virtual Maven metadata merges of `virtual_ids` (all of them when `None`).
+/// Runs on the replica that took the write and, from the cache-invalidation
+/// listener, on every other replica.
+pub fn forget_decision_memos(repository_id: Uuid, virtual_ids: Option<&[Uuid]>) {
+    crate::api::handlers::vscode::invalidate_gallery_age_gate_memo(repository_id);
+    crate::services::age_gate_maven::forget_listings_for_repo(repository_id);
+    crate::api::handlers::maven::forget_virtual_metadata_merges(virtual_ids);
+}
+
+/// Every Virtual that has `repository_id` as a member, directly or through
+/// nested Virtuals (#3840), the reverse of the walk in
+/// `proxy_helpers::virtual_has_age_gated_member`. `None` when the lookup
+/// fails, which callers read as "every Virtual".
+async fn virtuals_reaching(db: &PgPool, repository_id: Uuid) -> Option<Vec<Uuid>> {
+    sqlx::query_scalar::<_, Uuid>(
+        "WITH RECURSIVE up(repo_id) AS ( \
+            SELECT vrm.virtual_repo_id FROM virtual_repo_members vrm \
+             WHERE vrm.member_repo_id = $1 \
+            UNION \
+            SELECT vrm.virtual_repo_id FROM up \
+              JOIN virtual_repo_members vrm ON vrm.member_repo_id = up.repo_id \
+         ) \
+         SELECT repo_id FROM up",
+    )
+    .bind(repository_id)
+    .fetch_all(db)
+    .await
+    .map_err(|e| {
+        tracing::warn!(
+            error = %e,
+            %repository_id,
+            "age gate: could not list the Virtuals over a repository; \
+             dropping every Virtual Maven metadata merge"
+        );
+    })
+    .ok()
 }
 
 pub struct AgeGateService {
@@ -1451,13 +1543,15 @@ impl AgeGateService {
                 "Age gate review changed concurrently; retry".to_string(),
             ));
         }
-        invalidate_decision_memos(review.repository_id);
+        // Before the next await (#6345): see `invalidate_decision_memos`.
+        let invalidation = invalidate_decision_memos(&self.db, review.repository_id);
         self.event_bus.emit_for_repo(
             "age_gate.approved",
             id,
             review.repository_id,
             Some(reviewer_id.to_string()),
         );
+        invalidation.settle().await;
 
         self.get_review_by_id(id).await
     }
@@ -1515,13 +1609,15 @@ impl AgeGateService {
                 "Age gate review changed concurrently; retry".to_string(),
             ));
         }
-        invalidate_decision_memos(review.repository_id);
+        // Before the next await (#6345): see `invalidate_decision_memos`.
+        let invalidation = invalidate_decision_memos(&self.db, review.repository_id);
         self.event_bus.emit_for_repo(
             "age_gate.rejected",
             id,
             review.repository_id,
             Some(reviewer_id.to_string()),
         );
+        invalidation.settle().await;
 
         self.get_review_by_id(id).await
     }
@@ -1585,13 +1681,15 @@ impl AgeGateService {
                 "Age gate review changed concurrently; retry".to_string(),
             ));
         }
-        invalidate_decision_memos(review.repository_id);
+        // Before the next await (#6345): see `invalidate_decision_memos`.
+        let invalidation = invalidate_decision_memos(&self.db, review.repository_id);
         self.event_bus.emit_for_repo(
             "age_gate.reopened",
             id,
             review.repository_id,
             Some(reviewer_id.to_string()),
         );
+        invalidation.settle().await;
 
         let updated = self.get_review_by_id(id).await?;
         Ok((previous_status, updated))
@@ -1720,7 +1818,7 @@ impl AgeGateService {
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
 
-        invalidate_decision_memos(repo_id);
+        invalidate_decision_memos(&self.db, repo_id).settle().await;
         Ok(PolicyWrite {
             previous: current,
             was_locked: locked,

@@ -337,12 +337,14 @@ pub(crate) async fn run_storage_gc_tick_follow_on(
 pub fn spawn_all(
     db: PgPool,
     config: Config,
-    _primary_storage: Arc<dyn crate::storage::StorageBackend>,
+    primary_storage: Arc<dyn crate::storage::StorageBackend>,
     storage_registry: Arc<crate::storage::StorageRegistry>,
     smtp_service: Option<Arc<SmtpService>>,
     event_bus: Arc<EventBus>,
     advisory_client: Arc<crate::services::scanner_service::AdvisoryClient>,
     proxy_service: Option<Arc<crate::services::proxy_service::ProxyService>>,
+    npm_packument_cache: Option<Arc<crate::services::npm_packument_cache::NpmPackumentCache>>,
+    lifecycle_derived_state: crate::services::lifecycle_service::SweepDerivedState,
 ) {
     // Daily metrics snapshot (runs every hour, captures once per day via UPSERT)
     {
@@ -397,6 +399,25 @@ pub fn spawn_all(
                 ticker.tick().await;
                 if let Err(e) = service.record_expired().await {
                     tracing::warn!("Failed to record lapsed acknowledgements: {}", e);
+                }
+            }
+        });
+    }
+
+    // Migration jobs whose replica died (every minute, from startup, #6253):
+    // pause `running` jobs whose worker claim lapsed so `/resume` takes them.
+    // DB-only and idempotent (`IdempotentDbOnly`).
+    {
+        let service = crate::services::migration_service::MigrationService::new(db.clone());
+        tokio::spawn(async move {
+            let mut ticker = interval(Duration::from_secs(60));
+            loop {
+                ticker.tick().await;
+                if let Err(e) = service.pause_stale_running_jobs().await {
+                    tracing::warn!(
+                        "Failed to pause migration jobs whose worker was lost: {}",
+                        e
+                    );
                 }
             }
         });
@@ -496,6 +517,7 @@ pub fn spawn_all(
     {
         let db = db.clone();
         let config_clone = config.clone();
+        let storage = primary_storage.clone();
         tokio::spawn(async move {
             tokio::time::sleep(jittered_startup_delay(15)).await;
             let monitor = HealthMonitorService::new(db.clone(), MonitorConfig::default());
@@ -514,7 +536,10 @@ pub fn spawn_all(
                     tracing::debug!("Another replica owns the health monitor lease; skipping");
                     continue;
                 };
-                match monitor.check_all_services(&config_clone).await {
+                match monitor
+                    .check_all_services(&config_clone, Some(&storage))
+                    .await
+                {
                     Ok(results) => {
                         for entry in &results {
                             if entry.status != "healthy" {
@@ -546,9 +571,13 @@ pub fn spawn_all(
     {
         let db = db.clone();
         let check_secs = config.lifecycle_check_interval_secs;
+        let proxy_service = proxy_service.clone();
         tokio::spawn(async move {
             tokio::time::sleep(jittered_startup_delay(60)).await;
-            let service = LifecycleService::new(db.clone()).with_proxy_service(proxy_service);
+            let service = LifecycleService::new(db.clone())
+                .with_proxy_service(proxy_service)
+                .with_npm_packument_cache(npm_packument_cache)
+                .with_derived_state(lifecycle_derived_state);
             let mut ticker = interval(Duration::from_secs(check_secs));
 
             loop {
@@ -893,6 +922,49 @@ pub fn spawn_all(
         });
     }
 
+    // Trigger-kept row counts behind `/admin/stats` (#3094, migration 414).
+    // Seeds any table not seeded yet (the first run after the upgrade; until
+    // then the endpoint keeps its live COUNT(*)), compacts the delta rows
+    // every minute so a read sums a handful of rows, and trues every table up
+    // once a day on one replica (scheduler lease, skipped while fresh): the
+    // drift safety net for writes made with triggers off.
+    {
+        let db = db.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            let mut ticker = interval(Duration::from_secs(60));
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                match crate::services::row_counts::seed_missing(&db).await {
+                    Ok(0) => {}
+                    Ok(n) => tracing::info!(tables = n, "Seeded trigger-kept row counts"),
+                    Err(e) => tracing::warn!("Row-count seeding failed: {}", e),
+                }
+                // Lease-gated and skipped while every table was trued up in
+                // the last 23 h: one full COUNT(*) per table per day for the
+                // whole cluster, not one per replica.
+                match crate::services::row_counts::true_up_if_due(&db).await {
+                    Ok(done) => {
+                        for (table, drift) in done {
+                            if let Some(drift) = drift.filter(|d| *d != 0) {
+                                tracing::warn!(
+                                    table,
+                                    drift,
+                                    "Repaired trigger-kept row-count drift"
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => tracing::warn!("Row-count true-up failed: {}", e),
+                }
+                if let Err(e) = crate::services::row_counts::compact(&db).await {
+                    tracing::warn!("Row-count compaction failed: {}", e);
+                }
+            }
+        });
+    }
+
     // Backup schedule execution (check every 5 minutes)
     {
         let db = db.clone();
@@ -932,18 +1004,13 @@ pub fn spawn_all(
         });
     }
 
-    // Webhook delivery retry processor (every 30 seconds)
+    // Webhook delivery worker (#5195): claims when a delivery is enqueued or a
+    // lane finishes, and polls every few seconds for retries that came due.
     {
         let db = db.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(15)).await;
-            let mut ticker = interval(Duration::from_secs(30));
-            loop {
-                ticker.tick().await;
-                if let Err(e) = crate::api::handlers::webhooks::process_webhook_retries(&db).await {
-                    tracing::warn!("Webhook retry processing failed: {}", e);
-                }
-            }
+            crate::api::handlers::webhooks::run_webhook_delivery_worker(db).await;
         });
     }
 
@@ -1203,6 +1270,70 @@ pub fn spawn_all(
         }
     }
 
+    // Proxy-cache re-catalog sweep (#6429): restores the catalog row of a
+    // cached entry whose row was lost (the async catalog commit of #5635, or
+    // a failed best-effort write). One replica at a time; the lease is renewed
+    // for the whole pass and a lost lease stops it between pages. Off with
+    // PROXY_CACHE_RECATALOG_INTERVAL_SECS=0.
+    if let Some(proxy) = proxy_service.as_ref() {
+        use crate::services::proxy_cache_recatalog as recatalog;
+        let config = recatalog::SweepConfig::from_env();
+        tracing::info!("{}", config.startup_message());
+        if let Some(every) = config.interval {
+            let db = db.clone();
+            let startup = config.startup_delay_secs();
+            let sweep = recatalog::RecatalogSweep::new(
+                db.clone(),
+                proxy.cache_storage_backend(),
+                proxy.cache_scope().clone(),
+                config,
+            );
+            tokio::spawn(async move {
+                tokio::time::sleep(jittered_startup_delay(startup)).await;
+                let mut ticker = interval(every);
+                ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+                // A chunk that stopped mid-walk is continued after a short
+                // pause; the interval separates complete walks.
+                let mut mid_walk = false;
+                loop {
+                    if mid_walk {
+                        tokio::time::sleep(recatalog::CONTINUE_DELAY).await;
+                    } else {
+                        ticker.tick().await;
+                    }
+                    mid_walk = false;
+                    let Some(lease) =
+                        crate::services::cluster_work::try_acquire_scheduler_lease_quiet(
+                            &db,
+                            recatalog::LEASE_NAME,
+                            recatalog::LEASE_TTL_SECS,
+                        )
+                        .await
+                    else {
+                        tracing::debug!("Another replica owns the proxy-cache re-catalog lease");
+                        continue;
+                    };
+                    let (renewal, lost) = lease
+                        .spawn_renewal_with_cancellation(db.clone(), recatalog::LEASE_TTL_SECS);
+                    match sweep.run_pass(Some(&lost), Some(&lease)).await {
+                        Ok(report) => {
+                            recatalog::log_pass(&report);
+                            mid_walk = !report.complete && !report.interrupted;
+                            if report.complete {
+                                // The next walk starts a full interval after
+                                // this one ended, however long it took.
+                                ticker.reset();
+                            }
+                        }
+                        Err(e) => tracing::warn!("Proxy-cache re-catalog pass failed: {}", e),
+                    }
+                    drop(renewal);
+                    lease.release(&db).await;
+                }
+            });
+        }
+    }
+
     // Chunked upload session cleanup + orphaned incus staging sweep (every hour)
     {
         let db = db.clone();
@@ -1278,6 +1409,10 @@ pub fn spawn_all(
     }
 
     // Password expiry notifications (configurable interval, default: hourly)
+    //
+    // Named in the one "Background schedulers started" line below; it used
+    // to log its own copy of that line as well (#5656).
+    let password_expiry: &str;
     if config.password_expiry_days > 0 {
         if let Some(smtp) = smtp_service {
             let db = db.clone();
@@ -1310,18 +1445,12 @@ pub fn spawn_all(
                     }
                 }
             });
-            tracing::info!(
-                "Background schedulers started: metrics, health monitor, lifecycle, stuck-scan janitor, backup schedules, sync policies, webhook retries, curation sync, upload cleanup, password expiry notifications"
-            );
+            password_expiry = ", password expiry notifications";
         } else {
-            tracing::info!(
-                "Background schedulers started: metrics, health monitor, lifecycle, stuck-scan janitor, backup schedules, sync policies, webhook retries, curation sync, upload cleanup (password expiry notifications skipped: SMTP not configured)"
-            );
+            password_expiry = " (password expiry notifications skipped: SMTP not configured)";
         }
     } else {
-        tracing::info!(
-            "Background schedulers started: metrics, health monitor, lifecycle, stuck-scan janitor, backup schedules, sync policies, webhook retries, curation sync, upload cleanup"
-        );
+        password_expiry = "";
     }
     // Download-ticket cleanup (every 10 minutes).
     //
@@ -1447,7 +1576,7 @@ pub fn spawn_all(
     }
 
     tracing::info!(
-        "Background schedulers started: metrics, health monitor, lifecycle, stuck-scan janitor, backup schedules, sync policies, webhook retries, curation sync, upload cleanup, download ticket cleanup, age-gate auto-approval, environment advisory re-evaluation, audit retention"
+        "Background schedulers started: metrics, health monitor, lifecycle, stuck-scan janitor, backup schedules, sync policies, webhook retries, curation sync, upload cleanup, download ticket cleanup, age-gate auto-approval, environment advisory re-evaluation, audit retention{password_expiry}"
     );
 }
 
@@ -1834,6 +1963,14 @@ async fn execute_due_backup_schedules(
         };
 
     for due_schedule in &due_schedules {
+        // #5921: a draining process starts no new backup run; another
+        // replica claims the due run.
+        if crate::services::shutdown_drain::is_draining() {
+            tracing::info!(
+                "draining for shutdown; leaving due scheduled backups to another replica"
+            );
+            break;
+        }
         let claimed = match claim_backup_schedule_run(
             db,
             due_schedule.id,

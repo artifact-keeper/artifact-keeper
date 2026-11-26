@@ -37,10 +37,10 @@ on:
     tags: ['v*']
   workflow_dispatch:
 
-permissions:
-  contents: write
-  packages: write
-  actions: write
+# Nothing is granted by default (#6178): every job declares exactly what it
+# uses. build-binaries compiles ~600 crates (every build.rs and proc macro
+# runs), so it holds a read-only token and no persisted credentials.
+permissions: {}
 
 # One release run per tag, and never cancel one. Two runs for the same tag would
 # both pass the preflight and then race to publish, and the winner decides which
@@ -56,6 +56,9 @@ jobs:
   release-preflight:
     name: Release identity preflight
     runs-on: ubuntu-latest
+    # p100 ~0.2m over 29 runs (2026-08..2026-11). A sparse checkout and a few
+    # git/grep assertions: 10 is a floor, not a multiple.
+    timeout-minutes: 10
     permissions:
       contents: read
     steps:
@@ -235,6 +238,7 @@ jobs:
   preflight-evidence:
     name: Require a green Release Preflight for this commit
     runs-on: ubuntu-latest
+    # p100 ~0.2m over 26 runs (2026-08..2026-11).
     timeout-minutes: 5
     permissions:
       contents: read
@@ -283,6 +287,7 @@ jobs:
     name: Require a release-candidate certification for this commit
     needs: [release-preflight]
     runs-on: ubuntu-latest
+    # p100 ~0.5m over 21 runs (2026-08..2026-11).
     timeout-minutes: 10
     permissions:
       contents: read
@@ -391,6 +396,8 @@ jobs:
     # commit to completion -- so this job timeout is only a hard ceiling
     # against a genuinely hung publish: cold-cache amd64 worst case (~90 min)
     # + runner queue + cosign/provenance + margin.
+    # p100 ~33m over 28 runs (2026-08..2026-11); kept at 130 for the cold-cache
+    # case above, which the sample does not contain.
     timeout-minutes: 130
     permissions:
       packages: read
@@ -715,9 +722,17 @@ jobs:
     permissions:
       contents: read
       packages: read
-    # Still @main: SHA-pinning waits on branch protection for
-    # artifact-keeper-test, and on the 1.12.0 gate wiring landing there.
-    uses: artifact-keeper/artifact-keeper-test/.github/workflows/release-gate.yml@main
+    # Pinned to an artifact-keeper-test commit, not @main (#6170): a gate
+    # change reaches a candidate only through a bump PR in this repo, which
+    # Mergify does not auto-merge. CODEOWNERS lists this file to mark
+    # ownership only; no code-owner review is enforced yet (#4071), and
+    # ruleset 20038606 still requires zero approvals on release/* (#6216).
+    # Changing that ruleset is a maintainer decision. The pin does not wait on
+    # protection for artifact-keeper-test (#6178). All five callers carry ONE
+    # sha, and
+    # scripts/ci/check-gate-workflow-pins.sh enforces both that and that the
+    # sha is on artifact-keeper-test main.
+    uses: artifact-keeper/artifact-keeper-test/.github/workflows/release-gate.yml@1c4552bd7ef12cbc05541f18dbba5868c4444b5b # artifact-keeper-test main as of 2026-11-19
     with:
       backend_tag: ${{ needs.resolve-candidate-digest.outputs.version }}
       backend_digest: ${{ needs.resolve-candidate-digest.outputs.backend_digest }}
@@ -737,6 +752,9 @@ jobs:
           && needs.candidate-certified.outputs.certified != 'true'
           && needs.release-gate.result != 'success' }}
     runs-on: ubuntu-latest
+    # No samples: this runs only on a re-run attempt, and is one echo.
+    # 5 is a floor.
+    timeout-minutes: 5
     permissions: {}
     steps:
       - name: Explain
@@ -751,6 +769,20 @@ jobs:
   build-binaries:
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+    # Per leg, p100 over 25-27 successful legs (2026-08..2026-11):
+    #   linux-amd64 ~34m, linux-arm64 ~35m, windows-amd64 ~56m (cross-builds
+    #   on ubuntu-latest) -> 180, about 3x: 1.12 is memory-bound (legs died of
+    #   OOM before the swap step) and a leg that swaps hard runs long.
+    #   darwin-amd64 ~157m, darwin-arm64 ~167m (both v1.12.1; ~80-90m through
+    #   v1.11.14, ~108-156m on v1.12.0) -> 360, the hosted maximum: anything
+    #   lower only kills a build that would have finished. Fix the build time,
+    #   not this number (#6218). Almost all of it is the `Build` step.
+    timeout-minutes: ${{ startsWith(matrix.os, 'macos') && 360 || 180 }}
+    # Read-only (#6178): it used to inherit the workflow's contents, packages
+    # and actions WRITE while running third-party build code. It only checks
+    # out, compiles and uploads an artifact (the runtime token, not this one).
+    permissions:
+      contents: read
     # The gate must be green -- or, for a certified stable tag, skipped
     # because it already passed on these digests in the candidate (#3772).
     # Stated explicitly with `!cancelled()` rather than left to the default
@@ -794,29 +826,80 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@1.98.0
+        uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master 2026-11-15; the toolchain input picks the compiler
         with:
+          toolchain: 1.98.0
           targets: ${{ matrix.target }}
 
+      # Bounded (#6272): each download attempt is capped and retried on
+      # azure.archive.ubuntu.com (scripts/ci/apt-install-bounded.sh), so a
+      # crawling apt mirror cannot hold the build to the job ceiling.
       - name: Install build dependencies (Linux)
         if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler pkg-config libssl-dev
+        timeout-minutes: 12
+        run: bash scripts/ci/apt-install-bounded.sh protobuf-compiler pkg-config libssl-dev
 
       - name: Install cross-compilation tools
         if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: sudo apt-get install -y gcc-aarch64-linux-gnu
+        timeout-minutes: 12
+        run: bash scripts/ci/apt-install-bounded.sh gcc-aarch64-linux-gnu
 
       - name: Install Windows cross-compilation tools
         if: matrix.target == 'x86_64-pc-windows-gnu'
-        run: sudo apt-get install -y mingw-w64
+        # Above 3 x 4-minute capped downloads plus the full mingw-w64 unpack, so
+        # the step timeout can never kill dpkg mid-unpack.
+        timeout-minutes: 20
+        run: APT_ATTEMPT_TIMEOUT=4m bash scripts/ci/apt-install-bounded.sh mingw-w64
+
+      # The 1.12 backend's release build fills the hosted VM's 15 GiB of RAM
+      # and 2 GiB of swap. Over it, the runner stops answering instead of
+      # being OOM-killed: "The runner has received a shutdown signal", exit
+      # 143. That killed v1.12.0's aarch64 and Windows legs (run 44223297721)
+      # and the Windows cross-build twice (run 44236328312), while 1.11.14,
+      # a smaller tree, built every target. Same remedy as ci.yml's unit
+      # legs ("Add swap"): a 12 GiB swapfile on the ~80 GB disk. Best effort.
+      - name: Add swap
+        if: runner.os == 'Linux'
+        run: |
+          if sudo fallocate -l 12G /ak-ci-swapfile \
+             && sudo chmod 600 /ak-ci-swapfile \
+             && sudo mkswap /ak-ci-swapfile >/dev/null \
+             && sudo swapon /ak-ci-swapfile; then
+            echo "added a 12 GiB swapfile"
+          else
+            echo "::warning title=No extra swap::could not add /ak-ci-swapfile; this job runs with the image's default swap only."
+          fi
+          swapon --show
+          free -m
 
       - name: Install build dependencies (macOS)
         if: runner.os == 'macOS'
-        run: brew install protobuf
+        timeout-minutes: 10
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+        run: brew install protobuf || { sleep 10; brew install protobuf; }
+
+      # #6218: the macos-latest runner is a 3-core M1 VM with 7 GiB of RAM
+      # and no fixed swap. With the release profile's `codegen-units = 1`
+      # the whole 1.12 backend crate goes through LLVM as one module, the VM
+      # pages to compressed memory and swap for most of the build, and the
+      # legs took 145-167 min on v1.12.x (they were 65-90 min on 1.11.x,
+      # when the crate was ~24% smaller). 16 units let rustc work on smaller
+      # modules in parallel; thin LTO (unchanged) still optimises across
+      # them. Measured on the hosted runner (PR #6292, same commit, same
+      # runner): aarch64-apple-darwin took 178 min with 1 unit and 69 min
+      # with 16, with less than half the swap-outs. Only the macOS legs change: Linux
+      # and Windows keep `codegen-units = 1`. The same value must be set in
+      # release.yml and release-cli-caches.yml, before `Cache Cargo`
+      # (rust-cache keys on CARGO_* variables), or the tag build misses the
+      # warmed cache.
+      - name: Use 16 codegen units on the 7 GiB macOS runners
+        if: runner.os == 'macOS'
+        run: echo "CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16" >> "$GITHUB_ENV"
 
       # Restore only (#4927). A cache saved here lands on the tag's own ref,
       # which no later tag can read, so it was about 950 MB per target of
@@ -840,22 +923,29 @@ jobs:
       #   cargo-audit      reads the embedded graph back out, so the claim is
       #                    checked here rather than asserted in a doc
       - name: Install SBOM tooling
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
         with:
-          tool: cargo-auditable,cargo-cyclonedx,cargo-audit
+          # Exact versions (#6178): the ones v1.12.3 resolved from @latest.
+          # Keep them equal to release-cli-caches.yml's.
+          tool: cargo-auditable@0.7.7,cargo-cyclonedx@0.5.10,cargo-audit@0.23.0
 
-      - name: Set version from tag
+      # The build below is `--locked` (#6180): it builds the committed
+      # Cargo.lock, the one `cargo audit` checked, or fails. This step used to
+      # rewrite Cargo.toml's version from the tag, which `--locked` refuses
+      # (Cargo.lock records the workspace version too), and which could only
+      # make the tarball differ from the certified commit. The release-prep
+      # PR sets the version, so check it instead. A prerelease tag
+      # (vX.Y.Z-rc.N) builds the X.Y.Z it was cut from, as the image does.
+      - name: Check the workspace version matches the tag
+        shell: bash
         run: |
-          VERSION=${GITHUB_REF_NAME#v}
-          echo "Setting workspace version to ${VERSION}"
-          # Portable in-place edit: GNU `sed -i` and BSD/macOS `sed -i` take
-          # incompatible arguments (BSD requires a backup suffix), which broke
-          # the macOS release builds (#1538: "sed: 1: Cargo.toml: invalid
-          # command code C"). Use a temp file so the same step works on the
-          # Linux and macOS runners alike.
-          sed "s/^version = \".*\"/version = \"${VERSION}\"/" Cargo.toml > Cargo.toml.tmp
-          mv Cargo.toml.tmp Cargo.toml
-          head -5 Cargo.toml
+          VERSION="${GITHUB_REF_NAME#v}"
+          CARGO_VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          if [ "${VERSION%%-*}" != "${CARGO_VERSION}" ]; then
+            echo "::error title=Tag does not match Cargo.toml::Tag ${GITHUB_REF_NAME} but Cargo.toml says ${CARGO_VERSION}. Land the release-prep PR that sets version = \"${VERSION%%-*}\" and tag that commit."
+            exit 1
+          fi
+          echo "Cargo.toml version ${CARGO_VERSION} matches ${GITHUB_REF_NAME}"
 
       # jemalloc fixes its page size at compile time. The aarch64 Linux leg is
       # cross-compiled on a 4 KiB-page x86_64 runner, so build it for 64 KiB
@@ -892,7 +982,11 @@ jobs:
         # that `cargo audit bin` read a complete graph out of. cargo-auditable's
         # own CI covers native macOS and an ELF cross with a GCC cross-toolchain
         # (i686), which is the shape of the aarch64-unknown-linux-gnu leg.
-        run: cargo auditable build --release --target ${{ matrix.target }} --features ${{ matrix.features }}
+        #
+        # GIT_SHA is the commit /health and the startup log report. build.rs
+        # no longer reads git itself (#6181), so a shipped build passes it,
+        # from the commit actually checked out, as git rev-parse gave before.
+        run: GIT_SHA="$(git rev-parse HEAD)" cargo auditable build --locked --release --target ${{ matrix.target }} --features ${{ matrix.features }}
 
       - name: Package binary (Unix)
         if: "!contains(matrix.target, 'windows')"
@@ -1010,6 +1104,8 @@ jobs:
       ${{ !cancelled()
           && needs.build-binaries.result == 'success'
           && needs.resolve-candidate-digest.result == 'success' }}
+    # p100 ~1.7m over 24 runs (2026-08..2026-11); 35 covers the probe step's own
+    # 30-minute registry deadline.
     timeout-minutes: 35
     steps:
       - name: Checkout tag (for CHANGELOG verification)
@@ -1206,6 +1302,10 @@ jobs:
   release:
     name: Create Release
     runs-on: ubuntu-latest
+    # p100 ~1.5m over 24 runs (2026-08..2026-11). Network-bound (asset download,
+    # cosign keyless signing, attestations, ~20 asset uploads), so 15 is a
+    # floor for a slow Sigstore or uploads API rather than 2-3x.
+    timeout-minutes: 15
     needs: [preflight-evidence, candidate-certified, build-binaries, release-gate, verify-images-published]
     # DECLARED, not inherited (#3558). This job used to take the workflow-level
     # set, which gave it `packages: write` it has never used and -- more to the
@@ -1331,7 +1431,7 @@ jobs:
       # job that cannot be rehearsed without cutting a tag, so it should not
       # also be the place a silent CLI bump lands.
       - name: Install cosign
-        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
         with:
           cosign-release: v3.1.3
 
@@ -1469,8 +1569,25 @@ jobs:
             echo "generate=true" >> "$GITHUB_OUTPUT"
           fi
 
+      # GITHUB_TOKEN gets a 403 on Create Release when the commit is not a
+      # branch tip (#6338, softprops/action-gh-release#411). release-promote
+      # pins `publish/vX.Y.Z` at the commit before it tags; this makes sure
+      # the pin is there (a promote from before #6338, or a pin deleted since)
+      # and only warns when it cannot: a commit that is still a tip releases
+      # without it.
+      - name: Keep the release commit a branch tip
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if ! bash scripts/ci/pin-release-branch.sh pin "$TAG" "$SHA"; then
+            echo "::warning title=publish/${TAG} not pinned::If Create Release fails with 403, create the branch by hand (gh api -X POST repos/${GITHUB_REPOSITORY}/git/refs -f ref=refs/heads/publish/${TAG} -f sha=${SHA}) and re-run the failed jobs (RELEASING.md, step 8)."
+          fi
+
       - name: Create Release
-        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v2
+        uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4
         with:
           tag_name: ${{ steps.version.outputs.tag }}
           # Pin the release to the commit this run tested. The tag already
@@ -1487,6 +1604,16 @@ jobs:
           files: release-assets/*
           fail_on_unmatched_files: true
           overwrite_files: false
+
+      # The Release exists, so the pin has done its job. Runs only after a
+      # successful Create Release: a failed attempt keeps the branch for the
+      # re-run. Never fails the job.
+      - name: Remove the release pin branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+          SHA: ${{ github.sha }}
+        run: bash scripts/ci/pin-release-branch.sh unpin "$TAG" "$SHA" || true
 
       - name: Notify Windows MSI build
         uses: peter-evans/repository-dispatch@28959ce8df70de7be546dd1250a005dd32156697 # v4.0.1
@@ -1561,6 +1688,7 @@ jobs:
       actions: write   # dispatch docker-publish and follow its run
       contents: read
       packages: read
+    # p100 ~21m over 20 runs (2026-08..2026-11).
     timeout-minutes: 45
     steps:
       # The assert at the end derives which adapter floating tags must have
@@ -1817,6 +1945,7 @@ jobs:
       contents: read
     # The sync builds the backend to export the spec (~15 min cold) and then
     # pushes; the follower polls until it concludes.
+    # p100 ~17m over 15 runs (2026-08..2026-11).
     timeout-minutes: 45
     steps:
       - name: Checkout (scripts)
@@ -1903,6 +2032,7 @@ jobs:
     permissions:
       actions: write   # dispatch release-announce.yml and follow its run
       contents: read
+    # p100 ~0.7m over 2 runs (2026-08..2026-11).
     timeout-minutes: 20
     steps:
       - name: Checkout (scripts)
@@ -1963,6 +2093,8 @@ jobs:
       actions: write   # dispatch ami-build.yml and follow its run
       contents: read
     # A Packer build plus the AMI copy; the follower polls until it concludes.
+    # p100 ~0.1m over 2 runs (2026-08..2026-11) is not a sample of that: ami-build.yml
+    # is disabled, so the dispatch returns at once. 120 is sized for Packer.
     timeout-minutes: 120
     steps:
       - name: Checkout (scripts)

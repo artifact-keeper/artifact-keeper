@@ -56,6 +56,11 @@
 #   state=blocked                           exit 20  (runs exist, all
 #                                                     completed, none green)
 #   state=none                              exit 21  (no matching runs yet)
+#   state=cancelled run_id=<id>             exit 22  (only with
+#                                                     RESOLVE_REPORT_CANCELLED=1:
+#                                                     no success, nothing in
+#                                                     flight, and the newest
+#                                                     push run was cancelled)
 #   state=infra                             exit 30  (could not query; NOT a
 #                                                     verdict either way)
 #
@@ -64,6 +69,15 @@
 #   RESOLVE_REF       (required) ref name the release runs on (e.g. v1.8.2)
 #   RESOLVE_REPO      owner/name  (default artifact-keeper/artifact-keeper)
 #   RESOLVE_WORKFLOW  workflow file (default docker-publish.yml)
+#   RESOLVE_REPORT_CANCELLED  1 -> report a cancelled newest push run as
+#                     state=cancelled (exit 22) instead of state=blocked.
+#                     The Release Candidate sets it (#6242): main pushes
+#                     coalesce in docker-publish.yml's concurrency group, so
+#                     an intermediate commit's push run is REPLACED while it
+#                     waits (cancelled, zero jobs), and the candidate re-runs
+#                     that run rather than calling the commit unpublishable.
+#                     release.yml leaves it unset: a tag push is never
+#                     coalesced, and a cancelled tag run stays a block.
 #
 set -uo pipefail
 
@@ -110,6 +124,7 @@ runs_sorted="$(printf '%s\n%s\n' "$push_tsv" "$dispatch_tsv" \
 n_runs=0
 success_id=""                      # newest success wins (input is oldest->newest)
 pending_id=""; pending_status=""   # newest unfinished likewise
+last_push_id=""; last_push_conclusion=""  # newest push run, for state=cancelled
 # shellcheck disable=SC2034  # r_branch: already filtered by the awk above;
 # kept in the TSV so the log lines and the self-test stub share one schema.
 while IFS=$'\t' read -r r_id r_event r_branch r_status r_conclusion r_created; do
@@ -121,6 +136,9 @@ while IFS=$'\t' read -r r_id r_event r_branch r_status r_conclusion r_created; d
   elif [[ "$r_status" != "completed" ]]; then
     pending_id="$r_id"; pending_status="$r_status"
   fi
+  if [[ "$r_event" == "push" ]]; then
+    last_push_id="$r_id"; last_push_conclusion="$r_conclusion"
+  fi
 done <<< "$runs_sorted"
 
 if [[ -n "$success_id" ]]; then
@@ -130,6 +148,15 @@ fi
 if [[ -n "$pending_id" ]]; then
   echo "state=pending run_id=${pending_id} status=${pending_status}"
   exit 10
+fi
+if [[ "$n_runs" -gt 0 && "${RESOLVE_REPORT_CANCELLED:-0}" == "1" \
+      && "$last_push_conclusion" == "cancelled" ]]; then
+  # Not a failed build: the commit's push run never finished (replaced while
+  # pending by a newer push, or cancelled by hand or by the watchdog). A
+  # re-run of that same run builds it; the caller decides whether to.
+  echo "state=cancelled run_id=${last_push_id}"
+  echo "the newest push run for ${REF}@${SHA} (${last_push_id}) was cancelled before it published" >&2
+  exit 22
 fi
 if [[ "$n_runs" -gt 0 ]]; then
   echo "state=blocked"

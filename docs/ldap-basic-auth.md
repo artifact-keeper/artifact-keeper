@@ -27,8 +27,9 @@ attempt. A restart only clears the in-process credential cache.
 Any format handler that accepts Basic auth works, for example:
 
 ```bash
-# npm
-npm login --registry https://registry.example.com/npm/my-repo
+# npm (Basic credentials in .npmrc; `npm login` / `npm adduser` are not
+# supported, in either the web or the legacy flow)
+npm config set //registry.example.com/npm/my-repo/:_auth "$(printf '%s' 'alice:AD-password' | base64)"
 
 # Composer
 composer config --global http-basic.registry.example.com alice 'AD-password'

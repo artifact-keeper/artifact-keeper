@@ -23,7 +23,7 @@ use regex::Regex;
 use reqwest::Client;
 use serde::Deserialize;
 use sqlx::PgPool;
-use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore};
+use tokio::sync::{Notify, OwnedSemaphorePermit, RwLock, Semaphore};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
@@ -31,6 +31,7 @@ use crate::error::{AppError, Result};
 use crate::models::artifact::{Artifact, ArtifactMetadata};
 use crate::models::security::{ProxyFinding, RawFinding, RawPackage, Severity, VulnDbProvenance};
 use crate::models::user::User;
+use crate::services::advisory_exclusions::AdvisoryExclusions;
 use crate::services::auth_service::AuthService;
 use crate::services::environment_reeval::{AdvisoryDelta, AdvisoryDeltaSink};
 use crate::services::grype_scanner::GrypeScanner;
@@ -4017,8 +4018,9 @@ const DEFAULT_MAX_CONCURRENT_SCAN_EXTRACTIONS: usize = 4;
 const MAX_CONCURRENT_SCAN_EXTRACTIONS_ENV: &str = "MAX_CONCURRENT_SCAN_EXTRACTIONS";
 
 /// Effective concurrent-extraction cap, honouring
-/// [`MAX_CONCURRENT_SCAN_EXTRACTIONS_ENV`] over the default.
-fn max_concurrent_scan_extractions() -> usize {
+/// [`MAX_CONCURRENT_SCAN_EXTRACTIONS_ENV`] over the default. The queue
+/// worker's default concurrency reads it too (#6033).
+pub(crate) fn max_concurrent_scan_extractions() -> usize {
     positive_env_or(
         MAX_CONCURRENT_SCAN_EXTRACTIONS_ENV,
         DEFAULT_MAX_CONCURRENT_SCAN_EXTRACTIONS as u64,
@@ -4037,6 +4039,16 @@ fn scan_extraction_semaphore() -> &'static Arc<Semaphore> {
     SEM.get_or_init(|| Arc::new(Semaphore::new(max_concurrent_scan_extractions())))
 }
 
+/// Signalled each time a scan returns a [`scan_extraction_semaphore`] permit
+/// (#5243), so a scan waiting over its tenant's fair share can take a permit no
+/// other scan is queued for. Without it such a scan woke only when one of its
+/// own tenant's fair-share scans finished, and a lone repository settled at its
+/// fair share (2 of the default 4) after its first burst.
+fn scan_extraction_freed() -> &'static Arc<Notify> {
+    static FREED: OnceLock<Arc<Notify>> = OnceLock::new();
+    FREED.get_or_init(|| Arc::new(Notify::new()))
+}
+
 /// Env var pinning the per-tenant fair-share floor used by the #2555 fairness
 /// layer. A blank, non-numeric, or zero value falls back to the computed
 /// `ceil(N/2)` default (see [`scan_extraction_per_tenant_fair_share`]).
@@ -4053,7 +4065,9 @@ const MAX_CONCURRENT_SCAN_EXTRACTIONS_PER_TENANT_ENV: &str =
 ///
 /// * When a tenant is alone, the opportunistic path in
 ///   [`acquire_scan_extraction_permit_from`] lets it burst to the full global
-///   `N` (no throttle without contention).
+///   `N` (no throttle without contention), and keep it there: a scan over its
+///   share takes any permit that frees while no other scan is queued for one
+///   (#5243).
 /// * When multiple tenants contend, each tenant only ever crowds up to
 ///   `fair_share` requests into the global FIFO, so the remaining backlog waits
 ///   on the tenant's *own* semaphore instead of blocking peers. Under sustained
@@ -4077,6 +4091,10 @@ fn scan_extraction_per_tenant_fair_share() -> usize {
 /// map stays bounded even with many short-lived tenants.
 struct TenantExtractionEntry {
     sem: Arc<Semaphore>,
+    /// One permit: held by the tenant's one over-share scan that watches the
+    /// global pool for a free permit (#5243), so a freed permit wakes one task
+    /// per tenant rather than the tenant's whole backlog.
+    burst: Arc<Semaphore>,
     refs: usize,
 }
 
@@ -4104,6 +4122,8 @@ fn scan_extraction_tenant_registry() -> TenantExtractionRegistry {
 struct ScanExtractionPermit {
     repository_id: Uuid,
     registry: TenantExtractionRegistry,
+    // Told when `_global` is returned (#5243).
+    freed: Arc<Notify>,
     // Held for the whole scan; `None` only in the impossible closed-semaphore
     // case (we fall through rather than shed a legitimate scan, matching the
     // prior `.ok()` behaviour).
@@ -4126,7 +4146,12 @@ impl Drop for ScanExtractionPermit {
                 }
             }
         }
-        // `_global` releases when the field drops after this method returns.
+        // Return the global permit, then wake the over-share scans watching for
+        // one (#5243). A scan queued on the global semaphore is handed the
+        // permit first, so the over-share scans only find it when none is.
+        if self._global.take().is_some() {
+            self.freed.notify_waiters();
+        }
     }
 }
 
@@ -4140,6 +4165,7 @@ async fn acquire_scan_extraction_permit_from(
     repository_id: Uuid,
     global: Arc<Semaphore>,
     registry: TenantExtractionRegistry,
+    freed: Arc<Notify>,
     fair_share: usize,
 ) -> ScanExtractionPermit {
     // Register this scan against its tenant and fetch the tenant's semaphore.
@@ -4147,20 +4173,23 @@ async fn acquire_scan_extraction_permit_from(
     // refcount bump: if this future is dropped at a later `.await` (permit
     // acquisition), the guard's `Drop` still decrements the refcount and prunes
     // the entry, keeping acquire/release symmetric on every exit path (#2595).
-    let (tenant_sem, mut permit) = {
+    let (tenant_sem, burst_gate, mut permit) = {
         let mut reg = registry.lock().expect("tenant registry mutex poisoned");
         let entry = reg
             .entry(repository_id)
             .or_insert_with(|| TenantExtractionEntry {
                 sem: Arc::new(Semaphore::new(fair_share.max(1))),
+                burst: Arc::new(Semaphore::new(1)),
                 refs: 0,
             });
         entry.refs += 1;
         (
             entry.sem.clone(),
+            entry.burst.clone(),
             ScanExtractionPermit {
                 repository_id,
                 registry: registry.clone(),
+                freed: freed.clone(),
                 _global: None,
                 _tenant: None,
             },
@@ -4181,20 +4210,60 @@ async fn acquire_scan_extraction_permit_from(
         Err(_) => match global.clone().try_acquire_owned() {
             Ok(gp) => (None, Some(gp)),
             // Global is contended too, so do NOT jump the FIFO ahead of other
-            // tenants: wait for this tenant's OWN fair-share slot first, then the
+            // tenants: wait for this tenant's OWN fair-share slot, then the
             // global slot. This bounds a busy tenant to `fair_share` requests in
-            // the global queue, leaving room for peers.
-            Err(_) => {
-                let tp = tenant_sem.acquire_owned().await.ok();
-                let gp = global.acquire_owned().await.ok();
-                (tp, gp)
-            }
+            // the global queue, leaving room for peers. Meanwhile take a global
+            // permit that frees while nobody is queued for it (#5243), as the
+            // burst above does, so a lone tenant stays at `N`.
+            Err(_) => wait_over_share(tenant_sem, burst_gate, global, &freed).await,
         },
     };
 
     permit._global = global_permit;
     permit._tenant = tenant_permit;
     permit
+}
+
+/// The wait of a scan over its tenant's fair share while the global pool is
+/// full: `(tenant permit, global permit)` once it has its turn.
+///
+/// The scan queues for a tenant slot, then the global slot, as before (#2555).
+/// While it waits, the tenant's first such scan also watches the pool: each
+/// time a permit is returned it tries to take one at once (#5243).
+/// `try_acquire` only succeeds when no scan is queued on the global semaphore,
+/// since a returned permit goes to the head of that queue first, so this never
+/// overtakes another tenant's queued scan. Before it, a scan here woke only
+/// when one of its own tenant's fair-share scans finished, so the permits its
+/// burst scans returned sat idle and a lone repository ran `fair_share` scans
+/// at a time after the first wave.
+async fn wait_over_share(
+    tenant_sem: Arc<Semaphore>,
+    burst_gate: Arc<Semaphore>,
+    global: Arc<Semaphore>,
+    freed: &Notify,
+) -> (Option<OwnedSemaphorePermit>, Option<OwnedSemaphorePermit>) {
+    let tenant_turn = tenant_sem.acquire_owned();
+    tokio::pin!(tenant_turn);
+    let _watching = tokio::select! {
+        biased;
+        tp = &mut tenant_turn => return (tp.ok(), global.acquire_owned().await.ok()),
+        gate = burst_gate.acquire_owned() => gate.ok(),
+    };
+    loop {
+        // Registered before the try, so a permit returned between the two is
+        // not missed.
+        let returned = freed.notified();
+        tokio::pin!(returned);
+        returned.as_mut().enable();
+        if let Ok(gp) = global.clone().try_acquire_owned() {
+            return (None, Some(gp));
+        }
+        tokio::select! {
+            biased;
+            tp = &mut tenant_turn => return (tp.ok(), global.acquire_owned().await.ok()),
+            _ = &mut returned => {}
+        }
+    }
 }
 
 /// Process-wired entry point for [`acquire_scan_extraction_permit_from`], using
@@ -4205,6 +4274,7 @@ async fn acquire_scan_extraction_permit(repository_id: Uuid) -> ScanExtractionPe
         repository_id,
         scan_extraction_semaphore().clone(),
         scan_extraction_tenant_registry(),
+        scan_extraction_freed().clone(),
         scan_extraction_per_tenant_fair_share(),
     )
     .await
@@ -4805,10 +4875,20 @@ pub(crate) fn validate_trivy_purl(raw: &str) -> Option<String> {
 /// pre-joined expressions like `"MIT OR Apache-2.0"` are wrapped as
 /// `LicenseRef-<sanitised>` so a downstream policy engine cannot silently
 /// classify them as permissive. (#1152)
+///
+/// An element that is already a conjunctive SPDX expression (`AND` /
+/// `WITH`, no `OR`, such as `MIT AND PSF-2.0`) is kept as an expression,
+/// each operand canonicalised (an unlisted id wrapped on its own), so
+/// `["MIT AND PSF-2.0", "ISC"]` is stored as `MIT AND LicenseRef-PSF-2.0 AND ISC`
+/// instead of `LicenseRef-MIT-AND-PSF-2.0 AND ISC`, an expression with an
+/// opaque operand (#6379). Every arm of a conjunction applies, so this
+/// cannot green-light a package on one of them; an element with `OR` stays
+/// wrapped. See [`crate::services::spdx_licenses::conjunctive_spdx_expression`].
 pub(crate) fn sanitize_trivy_licenses(raw: &[String]) -> Option<String> {
+    use crate::services::spdx_licenses::{conjunctive_spdx_expression, sanitize_license_term};
     let terms: Vec<String> = raw
         .iter()
-        .filter_map(|s| crate::services::spdx_licenses::sanitize_license_term(s))
+        .filter_map(|s| conjunctive_spdx_expression(s).or_else(|| sanitize_license_term(s)))
         .collect();
     if terms.is_empty() {
         None
@@ -6573,6 +6653,61 @@ pub trait Scanner: Send + Sync {
     }
 }
 
+/// Env var for the wall-clock limit on one local scanner process (#5942):
+/// the `grype` and `trivy` children the backend spawns itself. Unset, blank,
+/// `0` or unparsable means no limit of its own, the behaviour before it
+/// existed. Scans through the scanner adapter are not affected: the adapter
+/// client has its own budgets (submission, queue and report polling).
+pub const SCANNER_PROCESS_TIMEOUT_ENV: &str = "SCANNER_PROCESS_TIMEOUT_SECS";
+
+/// The local scanner process limit this process runs with, from
+/// [`SCANNER_PROCESS_TIMEOUT_ENV`]. Read at call time, like the other scan
+/// env knobs, so a test can set it per process.
+pub(crate) fn scanner_process_timeout() -> Option<Duration> {
+    parse_scanner_process_timeout(std::env::var(SCANNER_PROCESS_TIMEOUT_ENV).ok().as_deref())
+}
+
+fn parse_scanner_process_timeout(raw: Option<&str>) -> Option<Duration> {
+    raw.and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .map(Duration::from_secs)
+}
+
+/// Wait for a local scanner child (`output`, from a `kill_on_drop` command)
+/// under [`SCANNER_PROCESS_TIMEOUT_ENV`] (#5942). Past the limit the future
+/// is dropped, which kills the child, and the scan gets an error naming the
+/// limit; inside a queued job the timeout is also noted so the job is retried
+/// rather than finishing with a `failed` row. The outer `Result` is the
+/// timeout, the inner one the spawn, so each caller keeps its own spawn-error
+/// classification.
+pub(crate) async fn wait_scanner_process(
+    program: &str,
+    output: impl std::future::Future<Output = std::io::Result<std::process::Output>>,
+) -> Result<std::io::Result<std::process::Output>> {
+    wait_scanner_process_with_limit(program, scanner_process_timeout(), output).await
+}
+
+async fn wait_scanner_process_with_limit(
+    program: &str,
+    limit: Option<Duration>,
+    output: impl std::future::Future<Output = std::io::Result<std::process::Output>>,
+) -> Result<std::io::Result<std::process::Output>> {
+    let Some(limit) = limit else {
+        return Ok(output.await);
+    };
+    match tokio::time::timeout(limit, output).await {
+        Ok(out) => Ok(out),
+        Err(_) => {
+            crate::services::scan_queue::note_scanner_timed_out();
+            Err(AppError::Internal(format!(
+                "{program} did not finish within {SCANNER_PROCESS_TIMEOUT_ENV}={}s; \
+                 the process was stopped",
+                limit.as_secs()
+            )))
+        }
+    }
+}
+
 /// Maximum wall-clock time we will wait for a scanner CLI's `--version`
 /// subcommand to return. A hung version probe is serialized through
 /// `OnceCell::get_or_init`, so any single hang would head-of-line block
@@ -7191,6 +7326,9 @@ pub struct AdvisoryClient {
     delta_sink: Option<Arc<dyn AdvisoryDeltaSink>>,
     /// Wall-clock budget for fetching full OSV records after a batch (#4150).
     osv_hydrate_budget: Duration,
+    /// Packages never sent to an external feed (#5691,
+    /// `ADVISORY_EXCLUDE_PATTERNS`). Empty by default: nothing is excluded.
+    exclusions: AdvisoryExclusions,
 }
 
 struct CachedAdvisory {
@@ -7338,6 +7476,22 @@ const GITHUB_ADVISORY_URL: &str = "https://api.github.com/advisories";
 
 impl AdvisoryClient {
     pub fn new(github_token: Option<String>) -> Self {
+        let exclusions = AdvisoryExclusions::from_env();
+        if !exclusions.is_empty() {
+            info!(
+                patterns = exclusions.len(),
+                "ADVISORY_EXCLUDE_PATTERNS is set: matching packages are never sent to \
+                 OSV.dev or the GitHub Advisory Database (#5691)"
+            );
+        }
+        for (pattern, why) in exclusions.suspicious() {
+            warn!(
+                pattern = %pattern,
+                "ADVISORY_EXCLUDE_PATTERNS entry probably matches nothing: {why}. \
+                 Patterns are package-URL globs on `pkg:<type>/<name>`, e.g. \
+                 `pkg:npm/@acme/*` (#5691)"
+            );
+        }
         Self {
             http: crate::services::http_client::base_client_builder()
                 .timeout(Duration::from_secs(30))
@@ -7354,6 +7508,7 @@ impl AdvisoryClient {
                 .ok()
                 .and_then(|v| v.trim().parse::<u64>().ok())
                 .map_or(OSV_HYDRATE_BUDGET, Duration::from_secs),
+            exclusions,
         }
     }
 
@@ -7386,11 +7541,23 @@ impl AdvisoryClient {
             cache_ttl,
             delta_sink: None,
             osv_hydrate_budget: OSV_HYDRATE_BUDGET,
+            exclusions: AdvisoryExclusions::default(),
         }
     }
 
     fn osv_batch_url(&self) -> &str {
         &self.osv_batch_url
+    }
+
+    /// The `ADVISORY_EXCLUDE_PATTERNS` this client applies (#5691).
+    pub(crate) fn exclusions(&self) -> &AdvisoryExclusions {
+        &self.exclusions
+    }
+
+    /// #5691: `dep` matches `ADVISORY_EXCLUDE_PATTERNS` and must never be
+    /// named in a request to an external feed.
+    pub(crate) fn excluded(&self, dep: &Dependency) -> bool {
+        self.exclusions.excludes(&dep.ecosystem, &dep.name)
     }
 
     fn github_advisory_url(&self) -> &str {
@@ -7435,6 +7602,12 @@ impl AdvisoryClient {
         {
             let cache = self.cache.read().await;
             for (i, dep) in deps.iter().enumerate() {
+                // #5691: an excluded package is never asked about. Recorded
+                // as unasked, not degraded: leaving it out is deliberate.
+                if self.excluded(dep) {
+                    out.not_queried.push(i);
+                    continue;
+                }
                 match cache.get(&Self::cache_key(dep)) {
                     Some(cached) if cached.fetched_at.elapsed() < cache_ttl => {
                         out.per_dep[i] = cached.findings.clone();
@@ -7655,6 +7828,11 @@ impl AdvisoryClient {
         };
 
         for (i, dep) in deps.iter().enumerate() {
+            // #5691: never name an excluded package to the feed.
+            if self.excluded(dep) {
+                out.not_queried.push(i);
+                continue;
+            }
             let ecosystem_param = match dep.ecosystem.as_str() {
                 "npm" => "npm",
                 "PyPI" | "pypi" => "pip",
@@ -8253,6 +8431,15 @@ struct CondaCoverageGap {
     reason: String,
 }
 
+/// What [`DependencyScanner::plan_conda_queries`] made of a batch: the
+/// queries to send, the conda packages no alias could identify, and how many
+/// conda packages `ADVISORY_EXCLUDE_PATTERNS` left out (#5691).
+struct CondaPlan {
+    planned: Vec<(Dependency, DepOrigin)>,
+    gaps: Vec<CondaCoverageGap>,
+    excluded: usize,
+}
+
 impl DependencyScanner {
     /// The CVE an advisory is about: its first `CVE-` alias, or its own id
     /// when that is a CVE.
@@ -8408,15 +8595,26 @@ impl DependencyScanner {
     fn plan_conda_queries(
         batch: Vec<(Dependency, DepOrigin)>,
         map: &crate::services::conda_identity::AliasMap,
-    ) -> (Vec<(Dependency, DepOrigin)>, Vec<CondaCoverageGap>) {
+        exclusions: &AdvisoryExclusions,
+    ) -> CondaPlan {
         use crate::services::conda_identity::{pypi_aliases, AliasCoverage};
 
         let mut planned = Vec::with_capacity(batch.len());
         let mut gaps = Vec::new();
+        let mut excluded = 0;
 
         for (dep, origin) in batch {
             if origin != DepOrigin::Declared || dep.ecosystem != ECOSYSTEM_CONDA {
                 planned.push((dep, origin));
+                continue;
+            }
+
+            // #5691: matched on the conda name the artifact ships, BEFORE it is
+            // rewritten to a PyPI alias or an unscoped query, which a
+            // `pkg:conda/...` pattern could never match. Left out entirely:
+            // not queried, and not a coverage gap, since it is deliberate.
+            if exclusions.excludes(ECOSYSTEM_CONDA, &dep.name) {
+                excluded += 1;
                 continue;
             }
 
@@ -8460,7 +8658,11 @@ impl DependencyScanner {
             }
         }
 
-        (planned, gaps)
+        CondaPlan {
+            planned,
+            gaps,
+            excluded,
+        }
     }
 
     /// The conda package an artifact IS, as a dependency to resolve advisories
@@ -9045,8 +9247,15 @@ impl DependencyScanner {
         // naming the conda package the artifact ships rather than the PyPI
         // alias it was looked up under -- and keeps naming the ones no alias
         // could be found for, which leave the batch entirely.
-        let (batch, conda_gaps) =
-            Self::plan_conda_queries(batch, crate::services::conda_identity::process_alias_map());
+        let CondaPlan {
+            planned: batch,
+            gaps: conda_gaps,
+            excluded: conda_excluded,
+        } = Self::plan_conda_queries(
+            batch,
+            crate::services::conda_identity::process_alias_map(),
+            self.advisory.exclusions(),
+        );
 
         for gap in &conda_gaps {
             warn!(
@@ -9091,12 +9300,31 @@ impl DependencyScanner {
             );
         }
 
-        if !gh_results.not_queried.is_empty() {
+        // #5691: what ADVISORY_EXCLUDE_PATTERNS kept out of every external
+        // request for this scan (conda names before planning, the rest in the
+        // advisory client), recorded so a reader can tell it from coverage.
+        let excluded: Vec<bool> = deps.iter().map(|d| self.advisory.excluded(d)).collect();
+        let advisory_excluded = conda_excluded + excluded.iter().filter(|e| **e).count();
+        if advisory_excluded > 0 {
+            info!(
+                artifact_id = %artifact.id,
+                advisory_excluded,
+                "dependencies matching ADVISORY_EXCLUDE_PATTERNS were not sent to \
+                 any external advisory feed (#5691)"
+            );
+        }
+
+        let gh_unasked = gh_results
+            .not_queried
+            .iter()
+            .filter(|&&i| !excluded.get(i).copied().unwrap_or(false))
+            .count();
+        if gh_unasked > 0 {
             tracing::debug!(
                 artifact_id = %artifact.id,
-                count = gh_results.not_queried.len(),
-                "GitHub Advisory does not serve these dependencies' ecosystems; \
-                 they were never asked about, and OSV is their only coverage"
+                count = gh_unasked,
+                "GitHub Advisory was not asked about these dependencies (no token, \
+                 or an ecosystem it does not serve); OSV is their only coverage"
             );
         }
 
@@ -9347,6 +9575,8 @@ mod construction {
             trivy_url: Option<String>,
             trivy_adapter_url: Option<String>,
             incus_scanner_enabled: bool,
+            // #6233: TRIVY_IGNORE_EMBEDDED_POM_DECLARATIONS.
+            trivy_ignore_embedded_pom_declarations: bool,
             storage: Arc<dyn StorageBackend>,
             storage_registry: Arc<crate::storage::StorageRegistry>,
             storage_base_path: String,
@@ -9411,10 +9641,15 @@ mod construction {
                         "Trivy filesystem scanner enabled (scanner-adapter at {})",
                         adapter_url
                     );
-                    scanners.push(Arc::new(TrivyFsScanner::new_with_adapter(
-                        adapter_url.clone(),
-                        scan_workspace_path.clone(),
-                    )));
+                    scanners.push(Arc::new(
+                        TrivyFsScanner::new_with_adapter(
+                            adapter_url.clone(),
+                            scan_workspace_path.clone(),
+                        )
+                        .with_ignore_embedded_pom_declarations(
+                            trivy_ignore_embedded_pom_declarations,
+                        ),
+                    ));
                     if let Some(capability) = incus_capability {
                         info!("Incus container image scanner enabled (scanner-adapter)");
                         scanners.push(Arc::new(
@@ -9428,10 +9663,12 @@ mod construction {
                 }
                 (None, Some(url)) => {
                     info!("Trivy filesystem scanner enabled (local CLI)");
-                    scanners.push(Arc::new(TrivyFsScanner::new(
-                        url.clone(),
-                        scan_workspace_path.clone(),
-                    )));
+                    scanners.push(Arc::new(
+                        TrivyFsScanner::new(url.clone(), scan_workspace_path.clone())
+                            .with_ignore_embedded_pom_declarations(
+                                trivy_ignore_embedded_pom_declarations,
+                            ),
+                    ));
                     if let Some(capability) = incus_capability {
                         info!("Incus container image scanner enabled (local CLI)");
                         scanners.push(Arc::new(crate::services::incus_scanner::IncusScanner::new(
@@ -9835,8 +10072,13 @@ impl ScannerService {
     /// proxy serve path threads this into `verdict_is_fresh` as
     /// `current_version` so a cached verdict from an older scanner / CVE-DB
     /// forces a re-scan instead of serving stale-clean until the TTL expires.
+    ///
+    /// Also records the version's first sighting for the vulnerability-DB
+    /// update grace (#6300), once per version per process.
     pub async fn cve_scanner_version(&self) -> Option<String> {
-        cve_authoritative_scanner_version(&self.scanners).await
+        let version = cve_authoritative_scanner_version(&self.scanners).await?;
+        crate::services::proxy_scan_service::observe_live_scanner_version(&self.db, &version).await;
+        Some(version)
     }
 
     /// Test-only constructor with injected leaf scanners, for handler tests
@@ -10125,6 +10367,21 @@ impl ScannerService {
             // The id was already returned to the client in TriggerScanResponse,
             // so we must keep the same row alive (UPDATE rather than INSERT).
             let prepared_action = resolve_prepared_action(prepared.remove(scanner.scan_type()));
+            // #5942: a retried queued job reaches here with the row its
+            // timed-out attempt recorded `failed`. Reopen it before anything
+            // below touches it: the dedup conversions (`convert_to_reused`)
+            // only update a `running` row, so on a `failed` one they were
+            // no-ops that left attempt 1's row and its partial findings as
+            // the artifact's latest result. The reopened
+            // row keeps counting as that failure for the gates until this
+            // attempt completes or fails it. Reopening is one statement,
+            // committed before any of those take their locks, so the lock
+            // order stays as it was.
+            if let PreparedScanAction::Reuse(target_id) = &prepared_action {
+                self.scan_result_service
+                    .reopen_failed_scan(*target_id)
+                    .await?;
+            }
 
             // Gate on applicability BEFORE creating a scan_results row or
             // copying a reusable result. A non-applicable scanner must leave
@@ -10416,6 +10673,7 @@ impl ScannerService {
             // Either reuse path failed or no reusable scan: run a fresh scan.
             // If we still have a prepared id, reuse it; otherwise create a row.
             let scan_result = match prepared_action {
+                // Reopened above when an earlier attempt left it `failed`.
                 PreparedScanAction::Reuse(target_id) => {
                     self.scan_result_service.get_scan(target_id).await?
                 }
@@ -10437,9 +10695,16 @@ impl ScannerService {
             // for dedup-checking and may sit briefly before scan invocation).
             // See issue #902.
             let started_at = chrono::Utc::now();
-            match scanner
-                .scan_target(&target, metadata.as_ref(), &content)
-                .await
+            // #5942: in a queued job the scanner stops at the job's deadline
+            // and its row is recorded `failed` (the job is then retried),
+            // instead of the job budget dropping the whole scan with this row
+            // and every later one left `running`. In-process scans run as
+            // before.
+            match crate::services::scan_queue::within_job_deadline(
+                scanner.name(),
+                scanner.scan_target(&target, metadata.as_ref(), &content),
+            )
+            .await
             {
                 Ok(ScanOutput {
                     findings,
@@ -10650,10 +10915,12 @@ impl ScannerService {
                     // scanner. It is not completed without the findings it
                     // lost (that would be a cleaner verdict than the scanner
                     // gave), and `?` here used to abandon the row `running`
-                    // and skip every later scanner.
+                    // and skip every later scanner. #5942: on a row a retry
+                    // reopened, this replaces the failed attempt's findings
+                    // and packages in the same transaction.
                     if let Err(e) = self
                         .scan_result_service
-                        .create_findings(scan_result.id, artifact_id, &findings)
+                        .create_findings_for_row(scan_result.id, artifact_id, &findings)
                         .await
                     {
                         let reason = format!(
@@ -10794,7 +11061,7 @@ impl ScannerService {
                     // identity) must fail THIS scan, named, and the set moves
                     // on. The `?` here used to abandon the row `running` and
                     // skip every later scanner.
-                    if let Err(e) = self
+                    let settled = match self
                         .scan_result_service
                         .complete_scan(
                             scan_result.id,
@@ -10815,18 +11082,28 @@ impl ScannerService {
                         )
                         .await
                     {
-                        let reason =
-                            format!("{} could not record its scan result: {e}", scanner.name());
-                        error!("Scan of artifact {}: {}", artifact_id, reason);
-                        self.record_failed_scan(
-                            artifact_id,
-                            &artifact.checksum_sha256,
-                            scan_result.id,
-                            scanner.as_ref(),
-                            &reason,
-                            started_at,
-                        )
-                        .await?;
+                        Ok(settled) => settled,
+                        Err(e) => {
+                            let reason =
+                                format!("{} could not record its scan result: {e}", scanner.name());
+                            error!("Scan of artifact {}: {}", artifact_id, reason);
+                            self.record_failed_scan(
+                                artifact_id,
+                                &artifact.checksum_sha256,
+                                scan_result.id,
+                                scanner.as_ref(),
+                                &reason,
+                                started_at,
+                            )
+                            .await?;
+                            continue;
+                        }
+                    };
+                    // #6423: a queued job whose claim was recovered for a rerun
+                    // left the row as recovery recorded it. These totals were
+                    // discarded, so neither log them as a completed scan nor
+                    // grade quarantine on them: the rerun does both.
+                    if !settled {
                         continue;
                     }
                     catalog_set.record_completed(
@@ -11627,7 +11904,8 @@ impl ScannerService {
     /// The artifact side of a failed scan: `flagged` unless it is already in
     /// a blocking state, then `block_on_fail` policies (#2912) bound to
     /// `scanned`, the bytes the scan was for (the hold is unbound when that
-    /// is unknown, as [`Self::scan_hold_row`] does for `None`).
+    /// is unknown, as [`Self::scan_hold_row`] does for `None`). The `flagged`
+    /// write is bound to `scanned` as well (#5766).
     async fn flag_after_failed_scan(&self, artifact_id: Uuid, scanned: Option<&str>) {
         // Mark as flagged on failure (conservative), but never
         // downgrade an artifact that is already in a blocking or
@@ -11636,13 +11914,24 @@ impl ScannerService {
         // artifact (policy violation, or admin action) must not
         // silently un-block it by stomping the status back to
         // 'flagged'. Only flag from a non-blocking state.
-        if let Err(e) = sqlx::query!(
-            "UPDATE artifacts SET quarantine_status = 'flagged' \
-             WHERE id = $1 \
-               AND (quarantine_status IS NULL \
-                    OR quarantine_status IN ('clean', 'flagged', 'unscanned'))",
-            artifact_id,
-        )
+        //
+        // #5766: bound to the bytes the scan was for. A tag row is rewritten
+        // in place when the tag moves, so after a failed scan of D1 an
+        // unbound write would mark D2, which this scan never read. On an OCI
+        // manifest row the write is a no-op once the row names other bytes;
+        // any other row is written as before.
+        let bind = scanned.map(|s| s.trim().to_ascii_lowercase());
+        if let Err(e) = sqlx::query(concat!(
+            "UPDATE artifacts a SET quarantine_status = 'flagged' \
+             WHERE a.id = $1 \
+               AND (a.quarantine_status IS NULL \
+                    OR a.quarantine_status IN ('clean', 'flagged', 'unscanned')) \
+               AND ($2::text IS NULL OR a.checksum_sha256 = $2::bpchar OR NOT ",
+            crate::services::oci_migration_reindex::reindex_manifest_path_shape_sql!(),
+            ")"
+        ))
+        .bind(artifact_id)
+        .bind(bind.as_deref())
         .execute(&self.db)
         .await
         {
@@ -12398,6 +12687,25 @@ pub(crate) mod test_helpers {
     }
 }
 
+/// Test override: run an upload's scan inline in the triggering task (#5692).
+///
+/// Production fan-out stays fire-and-forget. A regression test that asserts
+/// which metadata the scan saw at its start needs the scan to run inside
+/// `trigger_scan_on_upload`, before the handler can proceed to its next write.
+#[cfg(test)]
+pub(crate) static TEST_INLINE_SCAN_ON_UPLOAD: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+fn scan_on_upload_runs_inline() -> bool {
+    TEST_INLINE_SCAN_ON_UPLOAD.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+#[cfg(not(test))]
+fn scan_on_upload_runs_inline() -> bool {
+    false
+}
+
 /// Fire-and-forget `scan_on_upload` trigger for a freshly-inserted artifact.
 ///
 /// Mirrors the gate already inlined in [`ArtifactService::upload`] so that
@@ -12465,6 +12773,7 @@ pub async fn scan_on_upload_enabled(db: &PgPool, repository_id: Uuid) -> bool {
 /// the upload response is not delayed. Call it AFTER the row is committed
 /// (and after format metadata is written, where the handler writes any), so
 /// the scan sees the finished artifact. Returns whether a scan was spawned.
+/// Unit tests can set `TEST_INLINE_SCAN_ON_UPLOAD` to run it synchronously.
 ///
 /// The `every_format_upload_triggers_scan_on_upload` ratchet test in
 /// `api::handlers::proxy_helpers` requires every handler that inserts an
@@ -12479,6 +12788,36 @@ pub async fn trigger_scan_on_upload(
     artifact_id: Uuid,
 ) -> bool {
     record_upload_metrics(db, repository_id, artifact_id).await;
+    trigger_scan_after_upload_metrics(db, scanner, repository_id, artifact_id).await
+}
+
+/// [`trigger_scan_on_upload`] for a caller that already holds the
+/// repository's key and format and the artifact's size (the shared upload
+/// service's finalize, #6318): the upload is counted from them instead of a
+/// lookup, which saved nothing but a pool checkout per upload. The scan gate
+/// and the scan itself are the same code.
+pub async fn trigger_scan_on_upload_for(
+    db: &PgPool,
+    scanner: Option<Arc<ScannerService>>,
+    upload: (&str, &str, i64),
+    repository_id: Uuid,
+    artifact_id: Uuid,
+) -> bool {
+    let (repo_key, format, size_bytes) = upload;
+    crate::services::metrics_service::record_artifact_upload(
+        repo_key,
+        format,
+        u64::try_from(size_bytes).unwrap_or(0),
+    );
+    trigger_scan_after_upload_metrics(db, scanner, repository_id, artifact_id).await
+}
+
+async fn trigger_scan_after_upload_metrics(
+    db: &PgPool,
+    scanner: Option<Arc<ScannerService>>,
+    repository_id: Uuid,
+    artifact_id: Uuid,
+) -> bool {
     let Some(scanner) = scanner else {
         return false;
     };
@@ -12493,11 +12832,16 @@ pub async fn trigger_scan_on_upload(
             ),
         }
     }
-    spawn_scan_on_upload(should_scan, artifact_id, move |aid| async move {
+    let scan = move |aid| async move {
         if let Err(e) = scanner.scan_artifact(aid).await {
             tracing::warn!(artifact_id = %aid, error = %e, "scan_on_upload trigger failed");
         }
-    })
+    };
+    if scan_on_upload_runs_inline() {
+        scan(artifact_id).await;
+        return true;
+    }
+    spawn_scan_on_upload(should_scan, artifact_id, scan)
 }
 
 /// Queue a committed upload's scan at the hosted band (#5946). A pushed OCI
@@ -12594,6 +12938,7 @@ mod tests {
             trivy_url,
             trivy_adapter_url,
             incus_scanner_enabled,
+            false,
             storage,
             storage_registry,
             "/tmp/ak-incus-construction-test".to_string(),
@@ -13981,6 +14326,79 @@ mod tests {
         );
     }
 
+    /// #5766: the `flagged` write after a FAILED scan binds to the bytes the
+    /// scan was for. The tag row already names D2 (the tag moved while the
+    /// scan of D1 ran), so the failure of D1's scan leaves it alone; the
+    /// control failure of a scan of D2 flags it. A non-manifest row is
+    /// flagged whatever `scanned` says, as before.
+    #[tokio::test]
+    async fn failed_scan_flag_after_a_tag_move_leaves_the_new_digest_5766() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+        let (d1, d2) = (fresh_checksum(), fresh_checksum());
+        let (tag_row, other_row) = (Uuid::new_v4(), Uuid::new_v4());
+        for (id, path, sum) in [
+            (tag_row, "v2/app/manifests/1.0", &d2),
+            (other_row, "app/readme.txt", &d2),
+        ] {
+            sqlx::query(
+                "INSERT INTO artifacts (id, repository_id, name, path, size_bytes, \
+                                        checksum_sha256, content_type, storage_key, \
+                                        quarantine_status) \
+                 VALUES ($1, $2, $3, $3, 10, $4, 'application/octet-stream', $5, 'clean')",
+            )
+            .bind(id)
+            .bind(fx.repo_id)
+            .bind(path)
+            .bind(sum)
+            .bind(format!("k/{id}"))
+            .execute(&fx.pool)
+            .await
+            .expect("insert row");
+        }
+        let status = |id: Uuid| {
+            let pool = fx.pool.clone();
+            async move {
+                sqlx::query_scalar::<_, Option<String>>(
+                    "SELECT quarantine_status FROM artifacts WHERE id = $1",
+                )
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .expect("read status")
+            }
+        };
+
+        let scanner = scanner_for_fixture(&fx);
+        scanner.flag_after_failed_scan(tag_row, Some(&d1)).await;
+        let tag_after_d1 = status(tag_row).await;
+        scanner.flag_after_failed_scan(other_row, Some(&d1)).await;
+        let other_after_d1 = status(other_row).await;
+        scanner
+            .flag_after_failed_scan(tag_row, Some(&d2.to_ascii_uppercase()))
+            .await;
+        let tag_after_d2 = status(tag_row).await;
+        fx.teardown().await;
+
+        assert_eq!(
+            tag_after_d1.as_deref(),
+            Some("clean"),
+            "a failed scan of D1 must not flag the tag row, which names D2"
+        );
+        assert_eq!(
+            other_after_d1.as_deref(),
+            Some("flagged"),
+            "a non-manifest row is flagged as before"
+        );
+        assert_eq!(
+            tag_after_d2.as_deref(),
+            Some("flagged"),
+            "control: a failed scan of D2 flags the tag row"
+        );
+    }
+
     /// The regression test for the headline bug (#2912): an enabled scan policy
     /// must actually quarantine at scan completion.
     ///
@@ -15243,6 +15661,98 @@ mod tests {
             "timeout did not fire promptly; elapsed was {:?}",
             elapsed
         );
+    }
+
+    /// #5942: unset, blank, garbage or `0` is no limit (the behaviour before
+    /// the knob), so a scan that finishes today cannot start failing.
+    #[test]
+    fn scanner_process_timeout_is_off_unless_set() {
+        assert_eq!(parse_scanner_process_timeout(None), None);
+        assert_eq!(parse_scanner_process_timeout(Some("")), None);
+        assert_eq!(parse_scanner_process_timeout(Some("soon")), None);
+        assert_eq!(parse_scanner_process_timeout(Some("-1")), None);
+        assert_eq!(parse_scanner_process_timeout(Some("0")), None);
+        assert_eq!(
+            parse_scanner_process_timeout(Some(" 900 ")),
+            Some(Duration::from_secs(900))
+        );
+    }
+
+    /// `sh -c` that records its pid, then sleeps `secs` and prints `done`.
+    #[cfg(unix)]
+    fn sleeping_child(pidfile: &std::path::Path, secs: u32) -> tokio::process::Command {
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg(format!(
+                "echo $$ > '{}'; exec sleep {secs}",
+                pidfile.display()
+            ))
+            .kill_on_drop(true);
+        command
+    }
+
+    /// #5942: a local scanner process past `SCANNER_PROCESS_TIMEOUT_SECS` is
+    /// stopped (killed through `kill_on_drop`, not orphaned) and the scan gets
+    /// an error naming the limit. One that finishes inside the limit returns
+    /// its output untouched, and with no limit nothing changes.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_local_scanner_process_past_its_limit_is_killed() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("pid");
+
+        let started = std::time::Instant::now();
+        let err = wait_scanner_process_with_limit(
+            "grype",
+            Some(Duration::from_secs(1)),
+            sleeping_child(&pidfile, 600).output(),
+        )
+        .await
+        .expect_err("a hung process must time out");
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(
+            err.to_string()
+                .contains("grype did not finish within SCANNER_PROCESS_TIMEOUT_SECS=1s"),
+            "{err}"
+        );
+        let pid = std::fs::read_to_string(&pidfile).unwrap();
+        let stat = std::path::PathBuf::from(format!("/proc/{}/stat", pid.trim()));
+        if std::path::Path::new("/proc/self/stat").exists() {
+            // Killed: gone, or a zombie until tokio reaps it.
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                let alive = std::fs::read_to_string(&stat)
+                    .map(|s| !s.contains(") Z "))
+                    .unwrap_or(false);
+                if !alive {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the timed-out child {} is still running",
+                    pid.trim()
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+
+        let mut slow = tokio::process::Command::new("/bin/sh");
+        slow.args(["-c", "sleep 1; echo done"]).kill_on_drop(true);
+        let out =
+            wait_scanner_process_with_limit("grype", Some(Duration::from_secs(20)), slow.output())
+                .await
+                .expect("inside the limit")
+                .expect("spawned");
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "done");
+
+        let mut quick = tokio::process::Command::new("/bin/sh");
+        quick.args(["-c", "echo done"]);
+        let out = wait_scanner_process_with_limit("grype", None, quick.output())
+            .await
+            .expect("no limit")
+            .expect("spawned");
+        assert!(out.status.success());
     }
 
     /// Default `Scanner::version()` returns None so existing scanners
@@ -20219,6 +20729,7 @@ tonic-build = "0.12"
             cache_ttl,
             delta_sink: None,
             osv_hydrate_budget: OSV_HYDRATE_BUDGET,
+            exclusions: AdvisoryExclusions::default(),
         };
 
         let deps: Vec<_> = (0..1001)
@@ -20311,6 +20822,7 @@ tonic-build = "0.12"
             cache_ttl,
             delta_sink: None,
             osv_hydrate_budget: OSV_HYDRATE_BUDGET,
+            exclusions: AdvisoryExclusions::default(),
         };
 
         let deps = vec![Dependency {
@@ -20417,6 +20929,7 @@ tonic-build = "0.12"
             cache_ttl,
             delta_sink: Some(sink.clone()),
             osv_hydrate_budget: OSV_HYDRATE_BUDGET,
+            exclusions: AdvisoryExclusions::default(),
         };
         (server, client, sink)
     }
@@ -20485,6 +20998,7 @@ tonic-build = "0.12"
             cache_ttl: Duration::from_secs(3600),
             delta_sink: Some(sink.clone()),
             osv_hydrate_budget: OSV_HYDRATE_BUDGET,
+            exclusions: AdvisoryExclusions::default(),
         };
         let deps = vec![Dependency {
             name: "never-seen-pkg".to_string(),
@@ -20542,6 +21056,7 @@ tonic-build = "0.12"
                 cache_ttl: Duration::from_secs(3600),
                 delta_sink: None,
                 osv_hydrate_budget: OSV_HYDRATE_BUDGET,
+                exclusions: AdvisoryExclusions::default(),
             })
         }
 
@@ -21126,6 +21641,165 @@ tonic-build = "0.12"
                     .map(|m| &m.id)
                     .collect::<Vec<_>>()
             );
+        }
+
+        // -------------------------------------------------------------------
+        // #5691: internal packages are never named to an external feed
+        // -------------------------------------------------------------------
+
+        /// `advisory_client_for` with `ADVISORY_EXCLUDE_PATTERNS` set to `raw`.
+        fn excluding_client(osv_url: &str, github: Option<&str>, raw: &str) -> AdvisoryClient {
+            let mut client = Arc::try_unwrap(advisory_client_for(osv_url, github))
+                .unwrap_or_else(|_| unreachable!("a fresh Arc has one owner"));
+            client.exclusions = AdvisoryExclusions::parse(raw);
+            client
+        }
+
+        fn eco_dep(name: &str, version: &str, ecosystem: &str) -> Dependency {
+            Dependency {
+                name: name.to_string(),
+                version: Some(version.to_string()),
+                ecosystem: ecosystem.to_string(),
+            }
+        }
+
+        /// The names in every querybatch the mock received.
+        async fn osv_names_sent(server: &MockServer) -> Vec<String> {
+            server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .iter()
+                .filter(|r| r.url.path() == "/v1/querybatch")
+                .filter_map(|r| serde_json::from_slice::<serde_json::Value>(&r.body).ok())
+                .flat_map(|b| {
+                    b["queries"]
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter_map(|q| q["package"]["name"].as_str().map(str::to_string))
+                })
+                .collect()
+        }
+
+        #[tokio::test]
+        async fn test_excluded_package_is_never_sent_to_osv_and_public_one_still_is() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/querybatch"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [{ "vulns": [{ "id": "GHSA-j7hp-h8jx-5ppr" }] }]
+                })))
+                .mount(&server)
+                .await;
+            let client = excluding_client(
+                &format!("{}/v1/querybatch", server.uri()),
+                None,
+                "pkg:pypi/acme-*",
+            );
+
+            let lookup = client
+                .query_osv_detailed(&[pypi("acme-billing", "4.2.0"), pypi("pillow", "10.0.0")])
+                .await;
+
+            assert_eq!(
+                osv_names_sent(&server).await,
+                vec!["pillow".to_string()],
+                "the internal package must not appear in any OSV request"
+            );
+            assert!(
+                !lookup.degraded,
+                "a deliberate exclusion is not an unanswered question"
+            );
+            assert_eq!(lookup.not_queried, vec![0]);
+            assert!(lookup.per_dep[0].is_empty());
+            assert_eq!(
+                lookup.per_dep[1].len(),
+                1,
+                "the public package keeps its match"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_a_batch_of_only_excluded_packages_sends_no_request() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(500))
+                .expect(0)
+                .mount(&server)
+                .await;
+            let client = excluding_client(
+                &format!("{}/v1/querybatch", server.uri()),
+                None,
+                "pkg:npm/@acme/*",
+            );
+            let lookup = client
+                .query_osv_detailed(&[eco_dep("@acme/billing", "4.2.0", "npm")])
+                .await;
+            assert!(!lookup.degraded);
+            assert_eq!(lookup.not_queried, vec![0]);
+        }
+
+        #[tokio::test]
+        async fn test_excluded_package_is_never_sent_to_github() {
+            let gh = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/advisories"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+                .mount(&gh)
+                .await;
+            let client = excluding_client(
+                "http://127.0.0.1:1/unused",
+                Some(&format!("{}/advisories", gh.uri())),
+                "pkg:maven/com.example.internal/*",
+            );
+            let lookup = client
+                .query_github_detailed(&[
+                    eco_dep("com.example.internal:billing-lib", "4.2.0", "Maven"),
+                    eco_dep("org.apache.commons:commons-text", "1.9", "Maven"),
+                ])
+                .await;
+
+            let asked: Vec<String> = gh
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .iter()
+                .map(|r| r.url.query().unwrap_or_default().to_string())
+                .collect();
+            assert_eq!(
+                asked.len(),
+                1,
+                "only the public package is asked: {asked:?}"
+            );
+            assert!(asked[0].contains("commons-text"));
+            assert!(!asked.iter().any(|q| q.contains("internal")));
+            assert!(!lookup.degraded);
+            assert_eq!(lookup.not_queried, vec![0]);
+        }
+
+        /// Unset, nothing changes: every dependency is asked, as before #5691.
+        #[tokio::test]
+        async fn test_no_exclusions_sends_every_package() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/querybatch"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({ "results": [{}, {}] })),
+                )
+                .mount(&server)
+                .await;
+            let client = excluding_client(&format!("{}/v1/querybatch", server.uri()), None, "");
+            let lookup = client
+                .query_osv_detailed(&[pypi("acme-billing", "4.2.0"), pypi("pillow", "10.0.0")])
+                .await;
+            assert_eq!(
+                osv_names_sent(&server).await,
+                vec!["acme-billing".to_string(), "pillow".to_string()]
+            );
+            assert!(lookup.not_queried.is_empty());
         }
 
         // -------------------------------------------------------------------
@@ -25502,6 +26176,7 @@ tonic-build = "0.12"
     async fn test_scan_extraction_lone_tenant_reaches_full_global() {
         let global = Arc::new(Semaphore::new(4));
         let registry: TenantExtractionRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let freed = Arc::new(Notify::new());
         let fair = 2; // ceil(4/2)
         let tenant = Uuid::new_v4();
 
@@ -25509,7 +26184,13 @@ tonic-build = "0.12"
         for i in 0..4 {
             let permit = tokio::time::timeout(
                 Duration::from_millis(500),
-                acquire_scan_extraction_permit_from(tenant, global.clone(), registry.clone(), fair),
+                acquire_scan_extraction_permit_from(
+                    tenant,
+                    global.clone(),
+                    registry.clone(),
+                    freed.clone(),
+                    fair,
+                ),
             )
             .await
             .unwrap_or_else(|_| panic!("lone tenant throttled at permit {} of N=4", i));
@@ -25524,7 +26205,13 @@ tonic-build = "0.12"
         // The 5th scan is correctly bounded by the GLOBAL cap, not per-tenant.
         let blocked = tokio::time::timeout(
             Duration::from_millis(150),
-            acquire_scan_extraction_permit_from(tenant, global.clone(), registry.clone(), fair),
+            acquire_scan_extraction_permit_from(
+                tenant,
+                global.clone(),
+                registry.clone(),
+                freed.clone(),
+                fair,
+            ),
         )
         .await;
         assert!(
@@ -25535,6 +26222,102 @@ tonic-build = "0.12"
         drop(held);
     }
 
+    /// #5243: a lone tenant STAYS at `N` past its first wave. With N=4 and a
+    /// fair share of 2, its first four scans are two fair-share scans and two
+    /// bursts, and the rest wait over its share. When the bursts finish, the
+    /// waiting scans take the two permits they returned. Before the fix those
+    /// scans woke only when a fair-share scan finished, so the permits sat
+    /// idle and the tenant ran two scans at a time from then on. A second
+    /// tenant queued on the pool still gets the next permit ahead of the first
+    /// tenant's backlog.
+    #[tokio::test]
+    async fn test_scan_extraction_lone_tenant_stays_at_full_global_after_first_wave() {
+        let global = Arc::new(Semaphore::new(4));
+        let registry: TenantExtractionRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let freed = Arc::new(Notify::new());
+        let fair = 2;
+        let tenant = Uuid::new_v4();
+        let acquire = |t: Uuid| {
+            let (g, r, f) = (global.clone(), registry.clone(), freed.clone());
+            tokio::spawn(async move { acquire_scan_extraction_permit_from(t, g, r, f, fair).await })
+        };
+
+        let mut wave = Vec::new();
+        for _ in 0..4 {
+            wave.push(
+                acquire_scan_extraction_permit_from(
+                    tenant,
+                    global.clone(),
+                    registry.clone(),
+                    freed.clone(),
+                    fair,
+                )
+                .await,
+            );
+        }
+        let bursts: Vec<_> = wave.split_off(2);
+        assert!(
+            bursts.iter().all(|p| p._tenant.is_none()),
+            "scans 3 and 4 burst"
+        );
+        let backlog: Vec<_> = (0..4).map(|_| acquire(tenant)).collect();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(backlog.iter().all(|h| !h.is_finished()), "the pool is full");
+
+        // The two bursts finish: two of the waiting scans take their permits.
+        drop(bursts);
+        let mut started = Vec::new();
+        let mut waiting = Vec::new();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        for h in backlog {
+            if h.is_finished() {
+                started.push(h.await.expect("scan task"));
+            } else {
+                waiting.push(h);
+            }
+        }
+        assert_eq!(
+            started.len(),
+            2,
+            "a lone tenant fell back to its fair share once its bursts finished"
+        );
+        assert_eq!(
+            global.available_permits(),
+            0,
+            "every permit is in use again"
+        );
+
+        // Contention: a second tenant queues on the pool, and the next permit a
+        // first-tenant burst returns goes to it, not to the first tenant's
+        // remaining backlog.
+        let peer = acquire(Uuid::new_v4());
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let burst = started.pop().expect("a burst");
+        assert!(burst._tenant.is_none());
+        drop(burst);
+        let peer_permit = tokio::time::timeout(Duration::from_millis(1000), peer)
+            .await
+            .expect("the second tenant starved behind the first tenant's backlog")
+            .expect("peer task");
+        assert!(
+            waiting.iter().all(|h| !h.is_finished()),
+            "the first tenant's backlog overtook the queued second tenant"
+        );
+
+        drop(peer_permit);
+        drop(started);
+        drop(wave);
+        for h in waiting {
+            drop(
+                tokio::time::timeout(Duration::from_millis(1000), h)
+                    .await
+                    .expect("backlog drains")
+                    .expect("scan task"),
+            );
+        }
+        assert_eq!(global.available_permits(), 4);
+    }
+
     /// Under contention a busy tenant cannot monopolize the FIFO: a second
     /// tenant's single scan acquires a global permit ahead of the first tenant's
     /// backlog, because that backlog waits on tenant 1's OWN semaphore rather
@@ -25543,18 +26326,29 @@ tonic-build = "0.12"
     async fn test_scan_extraction_second_tenant_not_starved_by_backlog() {
         let global = Arc::new(Semaphore::new(2));
         let registry: TenantExtractionRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let freed = Arc::new(Notify::new());
         let fair = 1; // ceil(2/2)
         let tenant1 = Uuid::new_v4();
         let tenant2 = Uuid::new_v4();
 
         // Tenant 1 saturates the global pool alone: one fair-share permit plus
         // one opportunistic burst permit.
-        let p1_fair =
-            acquire_scan_extraction_permit_from(tenant1, global.clone(), registry.clone(), fair)
-                .await;
-        let p1_burst =
-            acquire_scan_extraction_permit_from(tenant1, global.clone(), registry.clone(), fair)
-                .await;
+        let p1_fair = acquire_scan_extraction_permit_from(
+            tenant1,
+            global.clone(),
+            registry.clone(),
+            freed.clone(),
+            fair,
+        )
+        .await;
+        let p1_burst = acquire_scan_extraction_permit_from(
+            tenant1,
+            global.clone(),
+            registry.clone(),
+            freed.clone(),
+            fair,
+        )
+        .await;
         assert_eq!(
             global.available_permits(),
             0,
@@ -25565,18 +26359,20 @@ tonic-build = "0.12"
         let backlog = {
             let g = global.clone();
             let r = registry.clone();
-            tokio::spawn(
-                async move { acquire_scan_extraction_permit_from(tenant1, g, r, fair).await },
-            )
+            let f = freed.clone();
+            tokio::spawn(async move {
+                acquire_scan_extraction_permit_from(tenant1, g, r, f, fair).await
+            })
         };
 
         // Tenant 2 arrives and queues on the global semaphore.
         let t2 = {
             let g = global.clone();
             let r = registry.clone();
-            tokio::spawn(
-                async move { acquire_scan_extraction_permit_from(tenant2, g, r, fair).await },
-            )
+            let f = freed.clone();
+            tokio::spawn(async move {
+                acquire_scan_extraction_permit_from(tenant2, g, r, f, fair).await
+            })
         };
 
         // Let both queued tasks register their waiters.
@@ -25604,6 +26400,7 @@ tonic-build = "0.12"
     async fn test_scan_extraction_no_deadlock_and_prunes_idle_tenants() {
         let global = Arc::new(Semaphore::new(4));
         let registry: TenantExtractionRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let freed = Arc::new(Notify::new());
         let fair = 2;
         let tenants: Vec<Uuid> = (0..5).map(|_| Uuid::new_v4()).collect();
 
@@ -25612,8 +26409,9 @@ tonic-build = "0.12"
             let tenant = tenants[i % tenants.len()];
             let g = global.clone();
             let r = registry.clone();
+            let f = freed.clone();
             handles.push(tokio::spawn(async move {
-                let _permit = acquire_scan_extraction_permit_from(tenant, g, r, fair).await;
+                let _permit = acquire_scan_extraction_permit_from(tenant, g, r, f, fair).await;
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }));
         }
@@ -25644,21 +26442,33 @@ tonic-build = "0.12"
     async fn test_scan_extraction_cancelled_acquire_does_not_leak_refcount() {
         let global = Arc::new(Semaphore::new(1));
         let registry: TenantExtractionRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let freed = Arc::new(Notify::new());
         let fair = 1;
         let blocker = Uuid::new_v4();
         let victim = Uuid::new_v4();
 
         // Saturate the global pool so the next acquire parks on the global await.
-        let held =
-            acquire_scan_extraction_permit_from(blocker, global.clone(), registry.clone(), fair)
-                .await;
+        let held = acquire_scan_extraction_permit_from(
+            blocker,
+            global.clone(),
+            registry.clone(),
+            freed.clone(),
+            fair,
+        )
+        .await;
 
         // The victim is within its fair share (fresh tenant), so it reserves its
         // tenant slot and then blocks at `global.acquire_owned().await`. The
         // timeout drops the acquire future at exactly that cancellation point.
         let cancelled = tokio::time::timeout(
             Duration::from_millis(100),
-            acquire_scan_extraction_permit_from(victim, global.clone(), registry.clone(), fair),
+            acquire_scan_extraction_permit_from(
+                victim,
+                global.clone(),
+                registry.clone(),
+                freed.clone(),
+                fair,
+            ),
         )
         .await;
         assert!(
@@ -25674,9 +26484,14 @@ tonic-build = "0.12"
 
         // Normal acquire/release cycle stays symmetric after the cancellation.
         drop(held);
-        let permit =
-            acquire_scan_extraction_permit_from(victim, global.clone(), registry.clone(), fair)
-                .await;
+        let permit = acquire_scan_extraction_permit_from(
+            victim,
+            global.clone(),
+            registry.clone(),
+            freed.clone(),
+            fair,
+        )
+        .await;
         assert_eq!(
             registry.lock().unwrap().get(&victim).map(|e| e.refs),
             Some(1),
@@ -27626,6 +28441,81 @@ tonic-build = "0.12"
             Some("Apache-2.0"),
             "canonical-case promotion must happen at conversion time"
         );
+    }
+
+    /// #6379: a Trivy license list that joins a conjunctive compound
+    /// expression with other terms keeps the expression, so the SBOM
+    /// exports an expression of real licenses, not one with an opaque
+    /// `LicenseRef-MIT-AND-PSF-2.0` operand. Parentheses, `+` and an
+    /// element longer than the 64-character LicenseRef body survive too.
+    /// An element with `OR` stays wrapped (#1152), alone or joined, and so
+    /// does prose that is not an SPDX expression.
+    #[test]
+    fn test_sanitize_trivy_licenses_keeps_conjunctive_expressions_6379() {
+        let long = "Apache-2.0 AND BSD-3-Clause AND MIT AND ISC AND Zlib AND BSL-1.0 AND 0BSD";
+        assert!(long.len() > 64);
+        let long_want = format!("{long} AND MIT");
+        for (raw, want) in [
+            (
+                vec!["MIT AND PSF-2.0", "ISC"],
+                "MIT AND LicenseRef-PSF-2.0 AND ISC",
+            ),
+            (
+                vec!["ISC", "MIT AND PSF-2.0"],
+                "ISC AND MIT AND LicenseRef-PSF-2.0",
+            ),
+            (vec!["MIT AND PSF-2.0"], "MIT AND LicenseRef-PSF-2.0"),
+            (
+                vec!["(MIT AND PSF-2.0)", "isc"],
+                "(MIT AND LicenseRef-PSF-2.0) AND ISC",
+            ),
+            (vec!["GPL-2.0+ AND MIT", "ISC"], "GPL-2.0+ AND MIT AND ISC"),
+            (
+                vec!["Apache-2.0 WITH LLVM-exception", "MIT"],
+                "Apache-2.0 WITH LLVM-exception AND MIT",
+            ),
+            (
+                vec!["  MIT   AND\tPSF-2.0 ", "ISC"],
+                "MIT AND LicenseRef-PSF-2.0 AND ISC",
+            ),
+            // Operands are canonicalised: known ids take their case, an
+            // unlisted id is wrapped on its own.
+            (vec!["mit AND zlib", "isc"], "MIT AND Zlib AND ISC"),
+            (
+                vec!["MIT AND Acme-EULA", "ISC"],
+                "MIT AND LicenseRef-Acme-EULA AND ISC",
+            ),
+            (vec![long, "MIT"], long_want.as_str()),
+            // #1152 unchanged: a choice is never kept as an expression.
+            (
+                vec!["MIT OR Apache-2.0", "ISC"],
+                "LicenseRef-MIT-OR-Apache-2.0 AND ISC",
+            ),
+            (
+                vec!["(MIT AND ISC) OR GPL-3.0-only"],
+                "LicenseRef-MIT-AND-ISC-OR-GPL-3.0-only",
+            ),
+            // Prose with operator words is not an expression.
+            (
+                vec!["GPL v2 and MIT", "ISC"],
+                "LicenseRef-GPL-v2-and-MIT AND ISC",
+            ),
+            (
+                vec!["MIT/Apache-2.0 AND ISC"],
+                "LicenseRef-MIT-Apache-2.0-AND-ISC",
+            ),
+        ] {
+            let raw: Vec<String> = raw.into_iter().map(str::to_string).collect();
+            assert_eq!(
+                sanitize_trivy_licenses(&raw).as_deref(),
+                Some(want),
+                "{raw:?}"
+            );
+        }
+        // An oversized element is still wrapped and capped.
+        let huge = vec![format!("MIT{}", " AND MIT".repeat(64))];
+        let out = sanitize_trivy_licenses(&huge).unwrap();
+        assert!(out.starts_with("LicenseRef-") && out.len() <= 75, "{out}");
     }
 
     // -----------------------------------------------------------------------
@@ -29887,6 +30777,821 @@ tonic-build = "0.12"
         fx.teardown().await;
     }
 
+    /// #5942: in a queued job, two scanners that never return share the job's
+    /// budget. Each is stopped at the deadline and its row recorded `failed`
+    /// with the retry message (not left `running` for the janitor), the scope
+    /// reports the timeout so the worker retries the job, and a scanner after
+    /// them that answers at once still completes. Real time, not a paused
+    /// clock: the scan does Postgres I/O between the scanners.
+    #[tokio::test]
+    async fn test_hung_scanners_in_a_queued_job_stop_at_its_shared_deadline() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        struct HungScanner(&'static str);
+        #[async_trait::async_trait]
+        impl Scanner for HungScanner {
+            fn name(&self) -> &str {
+                self.0
+            }
+            fn scan_type(&self) -> &str {
+                self.0
+            }
+            async fn scan(
+                &self,
+                _: &Artifact,
+                _: Option<&ArtifactMetadata>,
+                _: &Bytes,
+            ) -> Result<ScanOutput> {
+                std::future::pending().await
+            }
+        }
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let artifact_id = Uuid::new_v4();
+        let checksum = fresh_checksum();
+        let storage_key = format!("scanner-deadline/{artifact_id}.bin");
+        fx.state
+            .storage
+            .put(&storage_key, Bytes::from_static(b"data"))
+            .await
+            .expect("store artifact bytes");
+        sqlx::query(
+            "INSERT INTO artifacts (id, repository_id, name, path, size_bytes, checksum_sha256, \
+                                    content_type, storage_key, is_deleted) \
+             VALUES ($1, $2, 'pkg.bin', 'pkg.bin', 4, $3, 'application/octet-stream', $4, false)",
+        )
+        .bind(artifact_id)
+        .bind(fx.repo_id)
+        .bind(&checksum)
+        .bind(&storage_key)
+        .execute(&fx.pool)
+        .await
+        .expect("insert artifact");
+        let mut scanner = scanner_for_fixture(&fx);
+        scanner.scanners = vec![
+            Arc::new(HungScanner("grype")),
+            Arc::new(HungScanner("filesystem")),
+            Arc::new(inline_proxy_scan_fixtures::TrivialDependencyScanner),
+        ];
+
+        let budget = std::time::Duration::from_secs(2);
+        let started = tokio::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            crate::services::scan_queue::with_job_deadline(
+                started + budget,
+                budget,
+                scanner.scan_artifact_with_options(artifact_id, true, true),
+            ),
+        )
+        .await;
+        let elapsed = started.elapsed();
+        let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
+            "SELECT scan_type, status, error_message FROM scan_results \
+             WHERE artifact_id = $1 ORDER BY scan_type",
+        )
+        .bind(artifact_id)
+        .fetch_all(&fx.pool)
+        .await
+        .expect("read scan rows");
+        cleanup_scan_state(&fx.pool, fx.repo_id).await;
+        fx.teardown().await;
+
+        let (result, timed_out) = outcome.expect("the scan must return at the job deadline");
+        result.expect("scan orchestration succeeds");
+        assert!(
+            timed_out,
+            "the worker must see the timeout to retry the job"
+        );
+        assert!(
+            elapsed < budget * 2,
+            "two hung scanners must share one budget, took {elapsed:?}"
+        );
+        let summary: Vec<(&str, &str)> = rows
+            .iter()
+            .map(|(t, s, _)| (t.as_str(), s.as_str()))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                ("dependency", "completed"),
+                ("filesystem", "failed"),
+                ("grype", "failed")
+            ],
+            "{rows:?}"
+        );
+        for (scan_type, _, error) in &rows[1..] {
+            let error = error.as_deref().unwrap_or_default();
+            assert!(
+                error.contains(&format!("scanner {scan_type} was stopped"))
+                    && error.contains("2s budget"),
+                "{rows:?}"
+            );
+        }
+    }
+
+    /// #5942 review: a queued on-demand scan whose grype attempt timed out and
+    /// whose retry succeeds. The retry scans into the same pre-allocated row,
+    /// so the row must end a clean `completed` (no stale error, inventory not
+    /// `failed`), not keep the first attempt's leftovers. And the
+    /// `block_on_fail` hold the failed attempt put on the artifact is released
+    /// by the successful retry (#5153), so the hold lasts only between
+    /// attempts. The failed row is seeded with a finding and a package, as an
+    /// attempt that stored them and then failed to complete (#5564) leaves
+    /// it: the retry must hold ONE attempt's findings, not both, and the
+    /// janitor must time the retry from its own start.
+    #[tokio::test]
+    async fn a_retry_after_a_timed_out_attempt_completes_the_row_and_releases_the_hold() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct HangsOnce(Arc<AtomicUsize>);
+        #[async_trait::async_trait]
+        impl Scanner for HangsOnce {
+            fn name(&self) -> &str {
+                "grype"
+            }
+            fn scan_type(&self) -> &str {
+                "grype"
+            }
+            async fn scan(
+                &self,
+                _: &Artifact,
+                _: Option<&ArtifactMetadata>,
+                _: &Bytes,
+            ) -> Result<ScanOutput> {
+                if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+                    std::future::pending::<()>().await;
+                }
+                Ok(ScanOutput {
+                    findings: vec![RawFinding {
+                        severity: Severity::Low,
+                        title: "CVE-2026-5942 in libretry".to_string(),
+                        description: None,
+                        cve_id: Some("CVE-2026-5942".to_string()),
+                        affected_component: Some("libretry".to_string()),
+                        affected_version: Some("1.0.0".to_string()),
+                        fixed_version: None,
+                        source: None,
+                        source_url: None,
+                        finding_class: Default::default(),
+                    }],
+                    packages: vec![RawPackage {
+                        name: "libretry".to_string(),
+                        version: Some("1.0.0".to_string()),
+                        purl: None,
+                        license: None,
+                        source_target: None,
+                    }],
+                    ..ScanOutput::default()
+                })
+            }
+        }
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let artifact_id = Uuid::new_v4();
+        insert_test_artifact(&fx, artifact_id, "scanner-retry", None, None).await;
+        seed_enabled_policy(&fx.pool, fx.repo_id, &format!("retry-{artifact_id}")).await;
+        let mut scanner = scanner_for_fixture(&fx);
+        scanner.scanners = vec![Arc::new(HangsOnce(Arc::new(AtomicUsize::new(0))))];
+        let prepared = prepared_pairs_to_map(
+            scanner
+                .prepare_artifact_scan(artifact_id, true, false)
+                .await
+                .expect("prepare"),
+        );
+        let row_id = prepared["grype"];
+        let row = |pool: PgPool| async move {
+            sqlx::query_as::<_, (String, Option<String>, String, bool)>(
+                "SELECT status, error_message, inventory_status, completed_at IS NOT NULL \
+                 FROM scan_results WHERE id = $1",
+            )
+            .bind(row_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read row")
+        };
+        let attempt = |deadline_secs: u64| {
+            let budget = std::time::Duration::from_secs(deadline_secs);
+            crate::services::scan_queue::with_job_deadline(
+                tokio::time::Instant::now() + budget,
+                budget,
+                scanner.scan_artifact_with_prepared(artifact_id, prepared.clone(), true, false),
+            )
+        };
+
+        let source = |pool: PgPool| async move {
+            sqlx::query_as::<_, (Option<String>, Option<String>)>(
+                "SELECT quarantine_status, quarantine_source FROM artifacts WHERE id = $1",
+            )
+            .bind(artifact_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read hold")
+        };
+
+        let (first, timed_out) = attempt(1).await;
+        let after_first = row(fx.pool.clone()).await;
+        let hold_first = source(fx.pool.clone()).await;
+        // What an attempt that stored its findings and then failed leaves.
+        sqlx::query(
+            "INSERT INTO scan_findings (scan_result_id, artifact_id, severity, title) \
+             VALUES ($1, $2, 'low', 'CVE-2026-5942 in libretry')",
+        )
+        .bind(row_id)
+        .bind(artifact_id)
+        .execute(&fx.pool)
+        .await
+        .expect("seed finding");
+        sqlx::query(
+            "INSERT INTO scan_packages (scan_result_id, artifact_id, name, version) \
+             VALUES ($1, $2, 'libretry', '1.0.0')",
+        )
+        .bind(row_id)
+        .bind(artifact_id)
+        .execute(&fx.pool)
+        .await
+        .expect("seed package");
+        let started_first: DateTime<Utc> =
+            sqlx::query_scalar("SELECT started_at FROM scan_results WHERE id = $1")
+                .bind(row_id)
+                .fetch_one(&fx.pool)
+                .await
+                .expect("read started_at");
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        let (db_before_retry,): (DateTime<Utc>,) = sqlx::query_as("SELECT now()")
+            .fetch_one(&fx.pool)
+            .await
+            .expect("db clock");
+        // The retry is in progress: its row is reopened (`running`). The
+        // recorded failure must keep blocking, and a quarantine update from
+        // another scanner in this window must not release the hold.
+        assert!(scanner
+            .scan_result_service
+            .reopen_failed_scan(row_id)
+            .await
+            .expect("reopen"));
+        let policy_during = crate::services::policy_service::PolicyService::new(fx.pool.clone())
+            .evaluate_artifact(artifact_id, fx.repo_id)
+            .await
+            .expect("evaluate during the retry");
+        let gate_during =
+            crate::services::quarantine_service::enforce_download_gate(&fx.pool, artifact_id).await;
+        scanner
+            .update_quarantine_status_of(artifact_id, None, 0)
+            .await
+            .expect("quarantine update during the retry");
+        let hold_during = source(fx.pool.clone()).await;
+        let (second, retry_timed_out) = attempt(30).await;
+        let gate_after =
+            crate::services::quarantine_service::enforce_download_gate(&fx.pool, artifact_id).await;
+        let after_second = row(fx.pool.clone()).await;
+        let hold_second = source(fx.pool.clone()).await;
+        // The #5153 release path audits QUARANTINE_RELEASED with
+        // released_by=scan, from a detached task: wait for it.
+        let mut releases = 0i64;
+        for _ in 0..50 {
+            releases = sqlx::query_scalar(
+                "SELECT count(*) FROM audit_log WHERE action = 'QUARANTINE_RELEASED' \
+                 AND resource_id = $1 AND details->>'released_by' = 'scan'",
+            )
+            .bind(artifact_id)
+            .fetch_one(&fx.pool)
+            .await
+            .expect("read audit");
+            if releases > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let (findings, packages, findings_count, started_second): (i64, i64, i32, DateTime<Utc>) =
+            sqlx::query_as(
+                "SELECT (SELECT count(*) FROM scan_findings WHERE scan_result_id = $1), \
+                        (SELECT count(*) FROM scan_packages WHERE scan_result_id = $1), \
+                        findings_count, started_at FROM scan_results WHERE id = $1",
+            )
+            .bind(row_id)
+            .fetch_one(&fx.pool)
+            .await
+            .expect("read retried row");
+        let rows: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM scan_results WHERE artifact_id = $1")
+                .bind(artifact_id)
+                .fetch_one(&fx.pool)
+                .await
+                .expect("count rows");
+        cleanup_scan_state(&fx.pool, fx.repo_id).await;
+        fx.teardown().await;
+
+        first.expect("first attempt orchestration succeeds");
+        assert!(timed_out, "the first attempt must report its timeout");
+        assert_eq!(after_first.0, "failed", "{after_first:?}");
+        assert!(after_first.1.is_some_and(|e| e.contains("was stopped")));
+        assert_eq!(after_first.2, "failed");
+        assert_eq!(
+            (hold_first.0.as_deref(), hold_first.1.as_deref()),
+            (Some("quarantined"), Some("scan_policy")),
+            "block_on_fail holds the artifact after the failed attempt"
+        );
+
+        second.expect("retry orchestration succeeds");
+        assert!(!retry_timed_out);
+        assert_eq!(rows, 1, "the retry reuses the trigger's row");
+        assert_eq!(
+            after_second,
+            ("completed".to_string(), None, "complete".to_string(), true),
+            "the retried row must not keep the timed-out attempt's leftovers"
+        );
+        assert_eq!(
+            (findings, packages, findings_count),
+            (1, 1, 1),
+            "the retry holds one attempt's findings and packages, not two"
+        );
+        assert!(
+            started_second >= db_before_retry && started_second > started_first,
+            "started_at must be the retry's own start: first {started_first}, \
+             retry began after {db_before_retry}, row says {started_second}"
+        );
+        // Released by the retry through the #5153 path
+        // (`release_cleared_scan_policy_hold_bound`): its audit row, and the
+        // scan_policy source it clears. The status then follows the retry's
+        // own verdict (`flagged`: one low finding the policy allows).
+        assert!(
+            !policy_during.allowed,
+            "block_on_fail must still refuse while the retry runs: {:?}",
+            policy_during.violations
+        );
+        assert!(
+            gate_during.is_err(),
+            "a download must stay blocked while the retry runs"
+        );
+        assert_eq!(
+            (hold_during.0.as_deref(), hold_during.1.as_deref()),
+            (Some("quarantined"), Some("scan_policy")),
+            "a quarantine update during the retry must not release the hold"
+        );
+        assert!(
+            gate_after.is_ok(),
+            "the successful retry opens the download: {gate_after:?}"
+        );
+        assert_eq!(releases, 1, "the retry must release the hold via #5153");
+        assert_eq!(
+            (hold_second.0.as_deref(), hold_second.1.as_deref()),
+            (Some("flagged"), None),
+            "no longer held; the source the release cleared stays cleared"
+        );
+    }
+
+    /// A queued on-demand scan whose grype attempt timed out, and whose retry
+    /// finds that a byte-identical artifact's scan completed during the
+    /// backoff. The retry takes the dedup path (`convert_to_reused`), which
+    /// only converts a `running` row: before the row was reopened ahead of it,
+    /// the conversion was a no-op, the job "succeeded", and the artifact's
+    /// latest grype row stayed `failed` with attempt 1's partial findings and
+    /// the `block_on_fail` hold in place. Now the row ends `completed` as a
+    /// reuse of that source, holding the source's findings and not attempt
+    /// 1's, and the retry releases the hold through the #5153 path.
+    #[tokio::test]
+    async fn a_retry_that_reuses_a_byte_identical_scan_completes_the_failed_row() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let artifact_id = Uuid::new_v4();
+        insert_test_artifact(&fx, artifact_id, "scanner-retry-reuse", None, None).await;
+        seed_enabled_policy(&fx.pool, fx.repo_id, &format!("retry-reuse-{artifact_id}")).await;
+        let mut scanner = scanner_for_fixture(&fx);
+        scanner.scanners = vec![Arc::new(HungScannerForReuse)];
+        let prepared = prepared_pairs_to_map(
+            scanner
+                .prepare_artifact_scan(artifact_id, true, false)
+                .await
+                .expect("prepare"),
+        );
+        let row_id = prepared["grype"];
+
+        // Attempt 1 hits the job deadline.
+        let budget = std::time::Duration::from_secs(1);
+        let (first, timed_out) = crate::services::scan_queue::with_job_deadline(
+            tokio::time::Instant::now() + budget,
+            budget,
+            scanner.scan_artifact_with_prepared(artifact_id, prepared.clone(), true, false),
+        )
+        .await;
+        first.expect("first attempt orchestration succeeds");
+        assert!(timed_out);
+        // Attempt 1 had stored a finding before failing (#5564).
+        sqlx::query(
+            "INSERT INTO scan_findings (scan_result_id, artifact_id, severity, title) \
+             VALUES ($1, $2, 'low', 'attempt-1 partial finding')",
+        )
+        .bind(row_id)
+        .bind(artifact_id)
+        .execute(&fx.pool)
+        .await
+        .expect("seed partial finding");
+        let (status, source): (String, Option<String>) = sqlx::query_as(
+            "SELECT s.status, a.quarantine_source FROM scan_results s \
+             JOIN artifacts a ON a.id = s.artifact_id WHERE s.id = $1",
+        )
+        .bind(row_id)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("read attempt 1");
+
+        // During the backoff, a byte-identical artifact's grype scan completes.
+        let twin = Uuid::new_v4();
+        let source_scan = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO artifacts (id, repository_id, name, path, size_bytes, checksum_sha256, \
+                                    content_type, storage_key, is_deleted) \
+             SELECT $1, repository_id, 'twin.bin', 'twin.bin', size_bytes, checksum_sha256, \
+                    content_type, storage_key, false FROM artifacts WHERE id = $2",
+        )
+        .bind(twin)
+        .bind(artifact_id)
+        .execute(&fx.pool)
+        .await
+        .expect("insert twin");
+        sqlx::query(
+            "INSERT INTO scan_results (id, artifact_id, repository_id, scan_type, status, \
+                                       findings_count, low_count, checksum_sha256, \
+                                       scan_completeness, started_at, completed_at) \
+             SELECT $1, $2, repository_id, 'grype', 'completed', 1, 1, checksum_sha256, \
+                    'complete', NOW(), NOW() FROM artifacts WHERE id = $2",
+        )
+        .bind(source_scan)
+        .bind(twin)
+        .execute(&fx.pool)
+        .await
+        .expect("insert source scan");
+        sqlx::query(
+            "INSERT INTO scan_findings (scan_result_id, artifact_id, severity, title) \
+             VALUES ($1, $2, 'low', 'source finding')",
+        )
+        .bind(source_scan)
+        .bind(twin)
+        .execute(&fx.pool)
+        .await
+        .expect("seed source finding");
+
+        // The retry: no deadline pressure, and the dedup lookup finds the twin.
+        let budget = std::time::Duration::from_secs(30);
+        let (second, retry_timed_out) = crate::services::scan_queue::with_job_deadline(
+            tokio::time::Instant::now() + budget,
+            budget,
+            scanner.scan_artifact_with_prepared(artifact_id, prepared, true, false),
+        )
+        .await;
+        let (after, reused, from, error): (String, bool, Option<Uuid>, Option<String>) =
+            sqlx::query_as(
+                "SELECT status, is_reused, source_scan_id, error_message \
+                 FROM scan_results WHERE id = $1",
+            )
+            .bind(row_id)
+            .fetch_one(&fx.pool)
+            .await
+            .expect("read retried row");
+        let titles: Vec<String> = sqlx::query_scalar(
+            "SELECT title FROM scan_findings WHERE scan_result_id = $1 ORDER BY title",
+        )
+        .bind(row_id)
+        .fetch_all(&fx.pool)
+        .await
+        .expect("read findings");
+        let mut releases = 0i64;
+        for _ in 0..50 {
+            releases = sqlx::query_scalar(
+                "SELECT count(*) FROM audit_log WHERE action = 'QUARANTINE_RELEASED' \
+                 AND resource_id = $1 AND details->>'released_by' = 'scan'",
+            )
+            .bind(artifact_id)
+            .fetch_one(&fx.pool)
+            .await
+            .expect("read audit");
+            if releases > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let hold: (Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT quarantine_status, quarantine_source FROM artifacts WHERE id = $1",
+        )
+        .bind(artifact_id)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("read hold");
+        cleanup_scan_state(&fx.pool, fx.repo_id).await;
+        fx.teardown().await;
+
+        assert_eq!(
+            (status.as_str(), source.as_deref()),
+            ("failed", Some("scan_policy")),
+            "attempt 1 leaves the row failed and the artifact held"
+        );
+        second.expect("retry orchestration succeeds");
+        assert!(!retry_timed_out, "the retry reused, it did not scan");
+        assert_eq!(
+            (after.as_str(), reused, from, error),
+            ("completed", true, Some(source_scan), None),
+            "the retried row must become a completed reuse of the twin's scan"
+        );
+        assert_eq!(
+            titles,
+            vec!["source finding".to_string()],
+            "the row carries the source's findings, not attempt 1's"
+        );
+        assert_eq!(releases, 1, "the retry must release the hold via #5153");
+        assert_ne!(hold.0.as_deref(), Some("quarantined"), "{hold:?}");
+        assert_eq!(hold.1, None, "{hold:?}");
+    }
+
+    /// #6282 review: the retry of a RESCAN. The artifact already has an
+    /// older completed grype row, so the reopened row has to keep outranking
+    /// it in the per-scanner "latest row" pick (`completed_at DESC NULLS
+    /// LAST`). Were its completion time cleared, the old clean row would win,
+    /// `block_on_fail` would let the artifact through while the retry runs,
+    /// and a quarantine update in that window would release the hold.
+    #[tokio::test]
+    async fn a_retried_rescan_keeps_its_failure_over_an_older_completed_scan() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct HangsOnce(Arc<AtomicUsize>);
+        #[async_trait::async_trait]
+        impl Scanner for HangsOnce {
+            fn name(&self) -> &str {
+                "grype"
+            }
+            fn scan_type(&self) -> &str {
+                "grype"
+            }
+            async fn scan(
+                &self,
+                _: &Artifact,
+                _: Option<&ArtifactMetadata>,
+                _: &Bytes,
+            ) -> Result<ScanOutput> {
+                if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+                    std::future::pending::<()>().await;
+                }
+                Ok(ScanOutput::default())
+            }
+        }
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let artifact_id = Uuid::new_v4();
+        insert_test_artifact(&fx, artifact_id, "scanner-rescan-retry", None, None).await;
+        // Yesterday's clean grype scan of these bytes.
+        sqlx::query(
+            "INSERT INTO scan_results (artifact_id, repository_id, scan_type, status, \
+                                       findings_count, checksum_sha256, scan_completeness, \
+                                       started_at, completed_at, created_at) \
+             SELECT id, repository_id, 'grype', 'completed', 0, checksum_sha256, 'complete', \
+                    NOW() - interval '1 day', NOW() - interval '1 day', NOW() - interval '1 day' \
+             FROM artifacts WHERE id = $1",
+        )
+        .bind(artifact_id)
+        .execute(&fx.pool)
+        .await
+        .expect("seed the older completed scan");
+        seed_enabled_policy(&fx.pool, fx.repo_id, &format!("rescan-retry-{artifact_id}")).await;
+        let mut scanner = scanner_for_fixture(&fx);
+        scanner.scanners = vec![Arc::new(HangsOnce(Arc::new(AtomicUsize::new(0))))];
+        // A rescan: bypass_dedup, so the old row is not simply reused.
+        let prepared = prepared_pairs_to_map(
+            scanner
+                .prepare_artifact_scan(artifact_id, true, true)
+                .await
+                .expect("prepare"),
+        );
+        let row_id = prepared["grype"];
+        let attempt = |secs: u64| {
+            let budget = std::time::Duration::from_secs(secs);
+            crate::services::scan_queue::with_job_deadline(
+                tokio::time::Instant::now() + budget,
+                budget,
+                scanner.scan_artifact_with_prepared(artifact_id, prepared.clone(), true, true),
+            )
+        };
+        let hold = |pool: PgPool| async move {
+            sqlx::query_as::<_, (Option<String>, Option<String>)>(
+                "SELECT quarantine_status, quarantine_source FROM artifacts WHERE id = $1",
+            )
+            .bind(artifact_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read hold")
+        };
+        let policy = |pool: PgPool, repo: Uuid| async move {
+            crate::services::policy_service::PolicyService::new(pool)
+                .evaluate_artifact(artifact_id, repo)
+                .await
+                .expect("evaluate")
+                .allowed
+        };
+
+        let (first, timed_out) = attempt(1).await;
+        let hold_first = hold(fx.pool.clone()).await;
+        let allowed_first = policy(fx.pool.clone(), fx.repo_id).await;
+        // The retry is in progress.
+        let reopened = scanner
+            .scan_result_service
+            .reopen_failed_scan(row_id)
+            .await
+            .expect("reopen");
+        let allowed_during = policy(fx.pool.clone(), fx.repo_id).await;
+        let gate_during =
+            crate::services::quarantine_service::enforce_download_gate(&fx.pool, artifact_id).await;
+        scanner
+            .update_quarantine_status_of(artifact_id, None, 0)
+            .await
+            .expect("quarantine update during the retry");
+        let hold_during = hold(fx.pool.clone()).await;
+        let (second, _) = attempt(30).await;
+        let allowed_after = policy(fx.pool.clone(), fx.repo_id).await;
+        let gate_after =
+            crate::services::quarantine_service::enforce_download_gate(&fx.pool, artifact_id).await;
+        let hold_after = hold(fx.pool.clone()).await;
+        let status: String = sqlx::query_scalar("SELECT status FROM scan_results WHERE id = $1")
+            .bind(row_id)
+            .fetch_one(&fx.pool)
+            .await
+            .expect("read row");
+        cleanup_scan_state(&fx.pool, fx.repo_id).await;
+        fx.teardown().await;
+
+        first.expect("first attempt orchestration succeeds");
+        assert!(timed_out);
+        assert_eq!(
+            (hold_first.0.as_deref(), hold_first.1.as_deref()),
+            (Some("quarantined"), Some("scan_policy")),
+            "the failed attempt holds the artifact"
+        );
+        assert!(!allowed_first, "the failed attempt refuses the artifact");
+        assert!(reopened);
+        assert!(
+            !allowed_during,
+            "the reopened row must outrank the older completed scan, so its \
+             failure keeps refusing while the retry runs"
+        );
+        assert!(
+            gate_during.is_err(),
+            "downloads stay blocked during the retry"
+        );
+        assert_eq!(
+            (hold_during.0.as_deref(), hold_during.1.as_deref()),
+            (Some("quarantined"), Some("scan_policy")),
+            "a quarantine update during the retry must not release the hold"
+        );
+        second.expect("retry orchestration succeeds");
+        assert_eq!(status, "completed");
+        assert!(allowed_after, "the successful retry clears the refusal");
+        assert!(gate_after.is_ok(), "{gate_after:?}");
+        assert_ne!(
+            hold_after.0.as_deref(),
+            Some("quarantined"),
+            "{hold_after:?}"
+        );
+    }
+
+    /// A grype stand-in that never returns, so only the dedup path can
+    /// complete its row.
+    struct HungScannerForReuse;
+    #[async_trait::async_trait]
+    impl Scanner for HungScannerForReuse {
+        fn name(&self) -> &str {
+            "grype"
+        }
+        fn scan_type(&self) -> &str {
+            "grype"
+        }
+        async fn scan(
+            &self,
+            _: &Artifact,
+            _: Option<&ArtifactMetadata>,
+            _: &Bytes,
+        ) -> Result<ScanOutput> {
+            std::future::pending().await
+        }
+    }
+
+    /// #5942 review: reopening a failed row for a retry moves it to `running`
+    /// with `started_at` now, so the stuck-scan janitor times the retry from
+    /// its own start (a row queued 25 minutes ago would otherwise be reaped
+    /// mid-retry), and clears its `failed` inventory. It keeps its completion
+    /// time so it still outranks an older completed row of the scanner. Its
+    /// recorded failure (under the retry marker) and its findings stay until
+    /// the retry writes its own result, so the gates keep seeing them. A row
+    /// that is not `failed` is left exactly as it was.
+    #[tokio::test]
+    async fn reopening_a_failed_row_resets_it_for_the_retry() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let artifact_id = Uuid::new_v4();
+        insert_test_artifact(&fx, artifact_id, "scanner-reopen", None, None).await;
+        let (failed_id, completed_id) = (Uuid::new_v4(), Uuid::new_v4());
+        for (id, status) in [(failed_id, "failed"), (completed_id, "completed")] {
+            sqlx::query(
+                "INSERT INTO scan_results (id, artifact_id, repository_id, scan_type, status, \
+                                           findings_count, low_count, error_message, \
+                                           inventory_status, started_at, completed_at) \
+                 VALUES ($1, $2, $3, 'grype', $4, 1, 1, 'attempt 1 timed out', 'failed', \
+                         NOW() - interval '25 minutes', NOW())",
+            )
+            .bind(id)
+            .bind(artifact_id)
+            .bind(fx.repo_id)
+            .bind(status)
+            .execute(&fx.pool)
+            .await
+            .expect("insert row");
+            sqlx::query(
+                "INSERT INTO scan_findings (scan_result_id, artifact_id, severity, title) \
+                 VALUES ($1, $2, 'low', 'CVE-2026-5942 in libretry')",
+            )
+            .bind(id)
+            .bind(artifact_id)
+            .execute(&fx.pool)
+            .await
+            .expect("insert finding");
+            sqlx::query(
+                "INSERT INTO scan_packages (scan_result_id, artifact_id, name) \
+                 VALUES ($1, $2, 'libretry')",
+            )
+            .bind(id)
+            .bind(artifact_id)
+            .execute(&fx.pool)
+            .await
+            .expect("insert package");
+        }
+        let svc = ScanResultService::new(fx.pool.clone());
+        let reopened = svc.reopen_failed_scan(failed_id).await.expect("reopen");
+        let untouched = svc
+            .reopen_failed_scan(completed_id)
+            .await
+            .expect("reopen completed");
+        type Row = (String, Option<String>, bool, String, i32, i64, i64, bool);
+        let read = |id: Uuid| {
+            let pool = fx.pool.clone();
+            async move {
+                sqlx::query_as::<_, Row>(
+                    "SELECT status, error_message, completed_at IS NOT NULL, inventory_status, \
+                            findings_count, \
+                            (SELECT count(*) FROM scan_findings WHERE scan_result_id = $1), \
+                            (SELECT count(*) FROM scan_packages WHERE scan_result_id = $1), \
+                            started_at > NOW() - interval '1 minute' \
+                     FROM scan_results WHERE id = $1",
+                )
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .expect("read row")
+            }
+        };
+        let failed = read(failed_id).await;
+        let completed = read(completed_id).await;
+        cleanup_scan_state(&fx.pool, fx.repo_id).await;
+        fx.teardown().await;
+
+        assert!(reopened);
+        assert_eq!(
+            failed,
+            (
+                "running".to_string(),
+                Some(format!(
+                    "{}attempt 1 timed out",
+                    crate::services::scan_state::RETRYING_AFTER_FAILURE_PREFIX
+                )),
+                true,
+                "complete".to_string(),
+                1,
+                1,
+                1,
+                true
+            ),
+            "the row runs again from now, still carrying its recorded failure and \
+             its findings until the retry writes its own"
+        );
+        assert!(!untouched, "only a failed row is reopened");
+        assert_eq!(
+            completed,
+            (
+                "completed".to_string(),
+                Some("attempt 1 timed out".to_string()),
+                true,
+                "failed".to_string(),
+                1,
+                1,
+                1,
+                false
+            ),
+            "a row that is not failed is left exactly as it was"
+        );
+    }
+
     /// Records the [`ScanTarget::expected_component`] the orchestration hands
     /// each scanner, and replays a caller-supplied finding list. Both halves
     /// are needed by the #3442 tests: one asserts WHICH component the hosted
@@ -31276,9 +32981,10 @@ tonic-build = "0.12"
             advisory_client,
             scan_result_service,
             scan_config_service,
-            None, // trivy_url: skip fs / incus scanners
-            None, // trivy_adapter_url: skip image scanner
-            true, // incus_scanner_enabled (irrelevant without a Trivy URL)
+            None,  // trivy_url: skip fs / incus scanners
+            None,  // trivy_adapter_url: skip image scanner
+            true,  // incus_scanner_enabled (irrelevant without a Trivy URL)
+            false, // trivy_ignore_embedded_pom_declarations (likewise)
             storage,
             storage_registry,
             storage_base_path,
@@ -34222,6 +35928,7 @@ tonic-build = "0.12"
                 cache_ttl: Duration::from_secs(3600),
                 delta_sink: None,
                 osv_hydrate_budget: OSV_HYDRATE_BUDGET,
+                exclusions: AdvisoryExclusions::default(),
             })
         }
 
@@ -35071,6 +36778,7 @@ tonic-build = "0.12"
                 cache_ttl: Duration::from_secs(3600),
                 delta_sink: None,
                 osv_hydrate_budget: OSV_HYDRATE_BUDGET,
+                exclusions: AdvisoryExclusions::default(),
             })
         }
 
@@ -35187,6 +36895,45 @@ tonic-build = "0.12"
                 .as_object()
                 .expect("package object")
                 .clone()
+        }
+
+        /// #5691 review: a `pkg:conda/...` pattern is matched on the conda name
+        /// BEFORE planning rewrites it into a PyPI alias (`numpy`) or leaves it
+        /// unidentified (`acme-internal-tool`). Neither reaches the feed, the
+        /// exclusion is not a coverage gap (the scan stays `complete`), and the
+        /// inventory still names the package.
+        #[tokio::test]
+        async fn test_excluded_conda_package_is_never_sent_whatever_its_alias() {
+            for name in ["numpy", "acme-internal-tool"] {
+                let server = MockServer::start().await;
+                Mock::given(method("POST"))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(answered_clean()))
+                    .expect(0)
+                    .mount(&server)
+                    .await;
+                let mut client = Arc::try_unwrap(advisory_client_at(&format!(
+                    "{}/v1/querybatch",
+                    server.uri()
+                )))
+                .unwrap_or_else(|_| unreachable!("a fresh Arc has one owner"));
+                client.exclusions =
+                    AdvisoryExclusions::parse("pkg:conda/numpy,pkg:conda/acme-internal-*");
+                let scanner = DependencyScanner::new(Arc::new(client));
+
+                let out = scan_conda(&scanner, name, "1.0.0", &Bytes::new()).await;
+
+                assert_eq!(
+                    out.scan_completeness,
+                    ScanCompleteness::Complete,
+                    "{name}: a deliberate exclusion is not a coverage gap"
+                );
+                assert!(
+                    out.packages.iter().any(|p| p.name == name),
+                    "{name}: the inventory still names the package: {:?}",
+                    out.packages
+                );
+                // `expect(0)` is verified when `server` drops.
+            }
         }
 
         // -------------------------------------------------------------------

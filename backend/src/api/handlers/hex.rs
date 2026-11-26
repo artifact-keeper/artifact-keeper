@@ -436,9 +436,10 @@ async fn package_info(
             // member's registry blob is a signed protobuf, not JSON, and the
             // Remote arm of this same endpoint already forwards the
             // upstream's type. The literal survives only as the fallback for
-            // a member that declared none.
+            // a member that declared none. A member that could not answer
+            // makes an empty walk the retryable 503, not a 404 (#6426).
             let upstream_path = format!("packages/{}", name);
-            return proxy_helpers::resolve_virtual_metadata(
+            return proxy_helpers::resolve_virtual_metadata_reporting_unavailable(
                 &state.db,
                 auth.as_ref(),
                 state.proxy_service.as_deref(),
@@ -597,7 +598,9 @@ async fn download_tarball(
     let filename = tarball_file.trim_start_matches('/');
 
     let local_hit =
-        match proxy_helpers::find_local_by_filename_suffix(&state.db, repo.id, filename).await? {
+        match proxy_helpers::find_servable_local_by_filename_suffix(&state, repo.id, filename)
+            .await?
+        {
             Some(a) => Some(a),
             // #2674: a hosted registry advertises every case-variant row's
             // releases under the case-fold winner's spelling (`package_info`
@@ -864,18 +867,21 @@ async fn publish_package(
     //   - metadata.config (Erlang term format)
     //   - contents.tar.gz (the actual package files)
     //   - CHECKSUM (SHA-256 of the above)
-    // #2561: permit-scoped decode, fast-fail 503 on saturation.
-    let (pkg_name, pkg_version) = crate::util::bounded_archive::with_ingest_extraction(|| {
-        extract_name_version_from_tarball(&body)
-    })
-    .map_err(|e| e.into_response())?
-    .map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            format!("Invalid hex tarball: {}", e),
-        )
-            .into_response()
-    })?;
+    // #2561: permit-scoped decode; on saturation it waits briefly
+    // for a slot, then sheds 503 (#6230).
+    let (pkg_name, pkg_version) =
+        crate::util::bounded_archive::with_ingest_extraction_waiting(|| {
+            extract_name_version_from_tarball(&body)
+        })
+        .await
+        .map_err(|e| e.into_response())?
+        .map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("Invalid hex tarball: {}", e),
+            )
+                .into_response()
+        })?;
 
     if pkg_name.is_empty() || pkg_version.is_empty() {
         return Err((
@@ -913,9 +919,10 @@ async fn publish_package(
     // with a 500 on it). Accepting such a tarball only moved the failure to
     // every later read; rejecting it here with a 422 tells the publisher now
     // and leaves no artifact row or storage object behind.
-    let registry_facts = crate::util::bounded_archive::with_ingest_extraction(|| {
+    let registry_facts = crate::util::bounded_archive::with_ingest_extraction_waiting(|| {
         extract_registry_facts_from_tarball(&body)
     })
+    .await
     .map_err(|e| e.into_response())?;
     let (inner_checksum, requirements) = publishable_registry_facts(registry_facts)
         .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e).into_response())?;
@@ -3487,6 +3494,41 @@ mod tests {
         assert!(row.is_some(), "a hex publish must write a packages row");
     }
 
+    /// #6230: a hex publish whose repository's ingest bucket is full waits for
+    /// a permit instead of shedding 503 at once, and succeeds once one frees.
+    #[tokio::test]
+    async fn test_hex_publish_waits_for_ingest_permit_6230() {
+        let Some(f) = tdh::Fixture::setup("local", "hex").await else {
+            return;
+        };
+        let metadata = r#"{<<"name">>, <<"queuedpkg">>}.
+{<<"version">>, <<"1.0.0">>}.
+"#;
+        let tar_data = build_tar(&[
+            ("CHECKSUM", REAL_CHECKSUM.as_bytes()),
+            ("metadata.config", metadata.as_bytes()),
+        ]);
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/{}/publish", f.repo_key))
+            .body(axum::body::Body::from(tar_data))
+            .unwrap();
+        let ((status, body), queued) =
+            crate::util::bounded_archive::test_support::run_queued_behind_full_tenant(
+                crate::util::bounded_archive::TenantKey::Repo(f.repo_id),
+                tdh::send(f.router_with_auth(super::router()), req),
+            )
+            .await;
+        f.teardown().await;
+        assert!(queued, "the publish must have waited for a permit");
+        assert!(
+            status.is_success(),
+            "a queued hex publish must succeed once a permit frees: {} {:?}",
+            status,
+            String::from_utf8_lossy(&body[..])
+        );
+    }
+
     /// #4725: a hosted hex publish must queue a push sync task for a
     /// subscribed push peer, and a publish arriving as peer replication must
     /// not be fanned back out. Fails on `main` (nothing queued).
@@ -4556,6 +4598,50 @@ mod tests {
                 .await;
         }
         fx.teardown().await;
+    }
+
+    /// #6426: through a Virtual, `/packages/{name}` answers a member that
+    /// could not answer (here its upstream is unreachable) with 503 +
+    /// `Retry-After`, and a member whose upstream does not have the package
+    /// with 404. Both answered 404 before.
+    #[tokio::test]
+    async fn test_virtual_package_walk_answers_member_outage_with_503_6426() {
+        let Some(fx) = tdh::Fixture::setup("remote", "hex").await else {
+            return;
+        };
+        let missing = wiremock::MockServer::start().await;
+        let (state, _cache) = tdh::rewire_remote_proxy(&fx, &missing.uri()).await;
+        let (dead_id, _, dead_virt, dead_key) =
+            tdh::create_remote_and_virtual(&fx.pool, "hex", "http://127.0.0.1:1").await;
+        let (miss_id, _, miss_virt, miss_key) =
+            tdh::create_remote_and_virtual(&fx.pool, "hex", &missing.uri()).await;
+        let mut got = Vec::new();
+        for key in [&dead_key, &miss_key] {
+            let app = tdh::router_anon(super::router(), state.clone());
+            let uri = format!("/{key}/packages/nopkg6426");
+            got.push(tdh::send_with_headers(app, tdh::get(uri)).await);
+        }
+        for id in [dead_virt, dead_id, miss_virt, miss_id] {
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(id)
+                .execute(&fx.pool)
+                .await;
+        }
+        fx.teardown().await;
+        assert_eq!(
+            got[0].0,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "unavailable member"
+        );
+        assert!(
+            got[0].2.contains_key("retry-after"),
+            "503 carries Retry-After"
+        );
+        assert_eq!(
+            got[1].0,
+            StatusCode::NOT_FOUND,
+            "a member that does not have it"
+        );
     }
 
     /// #3281: the Virtual arm of `package_info` (pass 3,

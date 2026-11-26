@@ -341,7 +341,7 @@ impl PluginRegistry {
         let result = handler
             .call_parse_metadata(&mut store, path, data)
             .await
-            .map_err(|e: wasmtime::Error| WasmError::CallFailed(e.to_string()))?;
+            .map_err(WasmError::from_call)?;
 
         match result {
             Ok(metadata) => Ok(WasmMetadata::from(metadata)),
@@ -375,7 +375,7 @@ impl PluginRegistry {
         let result = handler
             .call_validate(&mut store, path, data)
             .await
-            .map_err(|e: wasmtime::Error| WasmError::CallFailed(e.to_string()))?;
+            .map_err(WasmError::from_call)?;
 
         match result {
             Ok(()) => Ok(Ok(())),
@@ -415,7 +415,7 @@ impl PluginRegistry {
         let result = handler
             .call_generate_index(&mut store, &wit_artifacts)
             .await
-            .map_err(|e: wasmtime::Error| WasmError::CallFailed(e.to_string()))?;
+            .map_err(WasmError::from_call)?;
 
         match result {
             Ok(Some(files)) => Ok(Some(super::wasm_bindings::index_files_from_wit(files))),
@@ -482,7 +482,7 @@ impl PluginRegistry {
         let result = req_handler
             .call_handle_request(&mut store, &wit_request, &wit_context, &wit_artifacts)
             .await
-            .map_err(|e: wasmtime::Error| WasmError::CallFailed(e.to_string()))?;
+            .map_err(WasmError::from_call)?;
 
         match result {
             Ok(response) => Ok(WasmHttpResponse::from(response)),

@@ -83,8 +83,17 @@ async fn reference(
     let full = repodata_document(&in_subdir, subdir, false, &removed);
     let current = repodata_document(&in_subdir, subdir, true, &removed);
     let json = serde_json::to_vec_pretty(&full).unwrap();
-    // Every encoding holds the bytes `repodata.json` serves (#4175).
-    let zst = zstd::stream::encode_all(json.as_slice(), 3).unwrap();
+    // Every encoding holds the bytes `repodata.json` serves (#4175). The
+    // zstd reference is the whole document through the streaming encoder
+    // the render uses, in one write: what it pins is that chunk boundaries
+    // do not show in the frame. `zstd::encode_all` is no reference, since
+    // its framing is its own choice (0.14.4 began recording the content
+    // size of short inputs, which the streaming encoder cannot know).
+    let zst = {
+        let mut enc = zstd::stream::write::Encoder::new(Vec::new(), 3).unwrap();
+        std::io::Write::write_all(&mut enc, &json).unwrap();
+        enc.finish().unwrap()
+    };
     let mut bz2 = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::default());
     std::io::Write::write_all(&mut bz2, &json).unwrap();
     (
@@ -299,6 +308,11 @@ async fn cursor_render_is_byte_identical_to_the_document_render_4176() {
                 String::from_utf8_lossy(&rendered.json),
                 String::from_utf8_lossy(&json),
                 "{subdir} repodata.json, {rows_per_chunk} per chunk"
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&zstd::decode_all(rendered.zst.as_slice()).unwrap()),
+                String::from_utf8_lossy(&json),
+                "{subdir} repodata.json.zst decodes to repodata.json, {rows_per_chunk} per chunk"
             );
             assert_eq!(
                 rendered.zst, zst,

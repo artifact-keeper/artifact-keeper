@@ -2963,6 +2963,89 @@ impl S3Backend {
             .collect())
     }
 
+    /// The full listing prefix for a caller's `prefix`: composed through
+    /// `make_full_key` so a listing resolves the same physical location a
+    /// `get`/`put` of a key under it would (#3368).
+    fn search_prefix(&self, prefix: Option<&str>) -> String {
+        match (&self.prefix, prefix) {
+            (Some(_), Some(p)) => make_full_key(self.prefix.as_deref(), p),
+            (Some(base), None) => format!("{}/", base.trim_end_matches('/')),
+            (None, Some(p)) => p.to_string(),
+            (None, None) => String::new(),
+        }
+    }
+
+    /// One bounded page of [`Self::list`] (#6429): `ListObjectsV2` with
+    /// `start-after` set to the cursor, read only until the page is full, so a
+    /// page is one listing request. The cursor is the last key returned, in
+    /// the form `get`/`put` accept (prefix stripped, decoded), so it means the
+    /// same thing behind the #3593 REST fallback, which lists the whole prefix
+    /// and slices it. A full page always carries a cursor; the page after the
+    /// last full one may be empty.
+    pub async fn list_page(
+        &self,
+        prefix: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<crate::services::storage_service::KeyPage> {
+        use crate::services::storage_service::KeyPage;
+        let limit = limit.max(1);
+        if !self.list_fallback_latched.load(Ordering::Relaxed) {
+            let list_path: ObjectPath = self.search_prefix(Some(prefix)).into();
+            let mut stream = match cursor {
+                Some(c) => self
+                    .store
+                    .list_with_offset(Some(&list_path), &self.offset_path(c)),
+                None => self.store.list(Some(&list_path)),
+            };
+            let (mut keys, mut taken) = (Vec::new(), 0usize);
+            let mut last_stored: Option<String> = None;
+            let mut failed = None;
+            while taken < limit {
+                match stream.next().await {
+                    Some(Ok(meta)) => {
+                        taken += 1;
+                        let stored = meta.location.as_ref().to_owned();
+                        if let Some(listed) = self.listed_key(&stored, None) {
+                            keys.push(listed.key);
+                        }
+                        last_stored = Some(stored);
+                    }
+                    Some(Err(e)) => {
+                        failed = Some(e);
+                        break;
+                    }
+                    None => break,
+                }
+            }
+            match failed {
+                None => {
+                    // A key no `get` can read is skipped, but the walk still
+                    // moves past it.
+                    let next = (taken == limit).then(|| {
+                        keys.last().cloned().unwrap_or_else(|| {
+                            self.strip_prefix(last_stored.as_deref().unwrap_or_default())
+                        })
+                    });
+                    return Ok(KeyPage { keys, next });
+                }
+                Some(e) if list_response_is_unparsable(&e.to_string()) => {
+                    self.list_fallback_latched.store(true, Ordering::Relaxed);
+                }
+                Some(e) => return Err(s3_storage_error("Failed to list objects", &e)),
+            }
+        }
+        let mut keys = self.list(Some(prefix)).await?;
+        keys.sort_unstable();
+        Ok(KeyPage::from_sorted(keys, cursor, limit))
+    }
+
+    /// The `start-after` object path for a [`Self::list_page`] cursor: the
+    /// stored form of the cursor's full key.
+    fn offset_path(&self, cursor: &str) -> ObjectPath {
+        ObjectPath::from(make_full_key(self.prefix.as_deref(), cursor))
+    }
+
     /// [`Self::list`] that also carries each object's last-modified time
     /// when the listing reports it (`None` on the #3593 REST fallback).
     pub async fn list_with_modified(&self, prefix: Option<&str>) -> Result<Vec<super::ListedKey>> {
@@ -2979,12 +3062,7 @@ impl S3Backend {
         // this arm with a reserved key today. It is kept so that the FIRST one
         // that does resolves the same object `get`/`put` would, rather than
         // silently listing an empty prefix.
-        let search_prefix = match (&self.prefix, prefix) {
-            (Some(_), Some(p)) => make_full_key(self.prefix.as_deref(), p),
-            (Some(base), None) => format!("{}/", base.trim_end_matches('/')),
-            (None, Some(p)) => p.to_string(),
-            (None, None) => String::new(),
-        };
+        let search_prefix = self.search_prefix(prefix);
 
         // Alibaba Cloud OSS returns a ListObjectsV2 body that object_store
         // 0.13's deserialiser rejects with "Got invalid list response:
@@ -5210,6 +5288,44 @@ mod tests {
         .with_path_format(StoragePathFormat::Migration);
         let backend = S3Backend::new(config).await;
         assert!(backend.is_ok());
+    }
+
+    /// #6429: a `list_page` cursor is a key in the form `get`/`put` accept,
+    /// whether it came from a native page or the #3593 REST fallback, so its
+    /// `start-after` path is that key's stored full form: under `S3_PREFIX`
+    /// for artifact keys, at the bucket root for proxy-cache keys, percent-
+    /// encoded like a write. Listing that path back gives the cursor again.
+    #[tokio::test]
+    async fn test_list_page_cursor_is_the_logical_key_under_a_prefix_6429() {
+        let _env = AnonymousS3TestEnv::enter();
+        let config = S3Config::new(
+            "test-bucket".to_string(),
+            "us-east-1".to_string(),
+            Some("http://localhost:9999".to_string()),
+            Some("tenant".to_string()),
+        );
+        let backend = S3Backend::new(config).await.unwrap();
+        for (cursor, stored) in [
+            ("maven/a/a-1.0.jar", "tenant/maven/a/a-1.0.jar"),
+            ("proxy-cache/r/x/__content__", "proxy-cache/r/x/__content__"),
+            ("generic/uni-café.jar", "tenant/generic/uni-caf%C3%A9.jar"),
+        ] {
+            let offset = backend.offset_path(cursor);
+            assert_eq!(offset.as_ref(), stored, "{cursor}");
+            let listed = backend.listed_key(offset.as_ref(), None).expect("decodes");
+            assert_eq!(listed.key, cursor);
+        }
+        // The fallback slices logical keys with the same cursor.
+        let page = crate::services::storage_service::KeyPage::from_sorted(
+            vec![
+                "generic/a".into(),
+                "generic/uni-café.jar".into(),
+                "generic/z".into(),
+            ],
+            Some("generic/uni-café.jar"),
+            10,
+        );
+        assert_eq!(page.keys, vec!["generic/z".to_string()]);
     }
 
     #[tokio::test]

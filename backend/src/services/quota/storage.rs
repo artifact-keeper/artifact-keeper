@@ -151,9 +151,19 @@ pub fn observe(used: u64) {
     }
 }
 
-/// The instance-quota denial of a write that adds `additional_bytes`, or
-/// `None` when it fits (or adds nothing, or no quota is set).
+/// The instance-wide denial of a write that adds `additional_bytes`, or
+/// `None` when it fits (or adds nothing). The instance storage quota first,
+/// then the disk usage threshold (#5191) from its cached reading, so every
+/// caller (trusted peer replication included) gets both, and a
+/// `QuotaScope::Disk` denial means the write fits the quota.
 pub async fn instance_denial(db: &PgPool, additional_bytes: i64) -> Result<Option<QuotaDenial>> {
+    if let Some(denial) = instance_quota_denial(db, additional_bytes).await? {
+        return Ok(Some(denial));
+    }
+    Ok(super::disk::denial(additional_bytes))
+}
+
+async fn instance_quota_denial(db: &PgPool, additional_bytes: i64) -> Result<Option<QuotaDenial>> {
     let quota = settings().quota_bytes;
     if quota == 0 || additional_bytes <= 0 {
         return Ok(None);
@@ -161,15 +171,14 @@ pub async fn instance_denial(db: &PgPool, additional_bytes: i64) -> Result<Optio
     let used = instance_used_bytes(db).await?;
     observe(used);
     let additional = u64::try_from(additional_bytes).unwrap_or(0);
-    Ok(
-        (used.saturating_add(additional) > quota).then(|| QuotaDenial {
-            scope: QuotaScope::Instance,
-            limit_bytes: i64::try_from(quota).unwrap_or(i64::MAX),
-            used_bytes: i64::try_from(used).unwrap_or(i64::MAX),
-            repository: None,
-            project: None,
-        }),
-    )
+    Ok((used.saturating_add(additional) > quota).then(|| {
+        QuotaDenial::new(
+            QuotaScope::Instance,
+            i64::try_from(quota).unwrap_or(i64::MAX),
+            i64::try_from(used).unwrap_or(i64::MAX),
+        )
+        .with_additional(additional_bytes)
+    }))
 }
 
 /// Pre-body admission of a write that declares `declared` bytes (`None` for
@@ -188,8 +197,12 @@ pub async fn admit_declared(db: &PgPool, declared: Option<u64>) -> Result<Option
     }
     let used = instance_used_bytes(db).await?;
     observe(used);
-    Ok(declared_write_refused(s.quota_bytes, used, declared)
-        .then(|| QuotaRefusal::instance_storage(s.quota_bytes, used, s.help_url.clone())))
+    Ok(
+        declared_write_refused(s.quota_bytes, used, declared).then(|| {
+            QuotaRefusal::instance_storage_write(s.quota_bytes, used, declared, s.help_url.clone())
+                .with_content_length(declared)
+        }),
+    )
 }
 
 /// Whether the instance is at its storage quota. A proxy (remote)

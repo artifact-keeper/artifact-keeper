@@ -116,11 +116,18 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         .install_default()
         .expect("Failed to install rustls CryptoProvider");
 
-    // Resolve the shutdown token early so background workers spawned during
-    // startup (email dispatcher, webhook producer) share the same
-    // cancellation source as the HTTP/gRPC servers spawned later. If the
-    // caller did not pass one (console mode) we create our own and bind it
-    // to the OS signal listener.
+    // Resolve the stop token early so background workers spawned during
+    // startup share one cancellation source. If the caller did not pass one
+    // (console mode) we create our own and bind it to the OS signal listener.
+    //
+    // #5921: shutdown is two-phase. `runtime_shutdown_token` is cancelled
+    // the moment a stop is requested: readiness fails and the workers that
+    // claim background work stop claiming. `serve_token` is cancelled only
+    // after the SHUTDOWN_DRAIN_SECS drain (see `services::shutdown_drain`):
+    // it closes the listeners and stops the services requests still feed
+    // during the drain (download events, the webhook producer, cache
+    // invalidation, score refresh).
+    let signal_driven = shutdown_token.is_none();
     let runtime_shutdown_token = match shutdown_token {
         Some(token) => token,
         None => {
@@ -133,6 +140,7 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
             token
         }
     };
+    let serve_token = CancellationToken::new();
 
     // Load environment variables
     if let Ok(env_file) = std::env::var("AK_ENV_FILE") {
@@ -166,6 +174,27 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         "audit event stream configured"
     );
 
+    // #5921: the drain between a stop request and closing the listeners,
+    // read once the env file is loaded.
+    tokio::spawn(
+        artifact_keeper_backend::services::shutdown_drain::drain_then_close(
+            runtime_shutdown_token.clone(),
+            serve_token.clone(),
+            artifact_keeper_backend::services::shutdown_drain::drain_from_env(),
+        ),
+    );
+    // A second SIGTERM or Ctrl+C, during the drain or the close, exits at
+    // once: the operator has asked twice.
+    if signal_driven {
+        let first = runtime_shutdown_token.clone();
+        tokio::spawn(async move {
+            first.cancelled().await;
+            shutdown_signal().await;
+            tracing::warn!("shutdown: second signal, exiting now without waiting for requests");
+            std::process::exit(1);
+        });
+    }
+
     // Load configuration
     let config = Config::from_env()?;
     artifact_keeper_backend::api::middleware::tracing::warn_if_trace_context_untrusted(&config);
@@ -197,10 +226,19 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     // needs nothing from the database or the rest of startup.
     let metrics_handle = metrics_service::init_metrics();
     tracing::info!("Prometheus metrics recorder initialized");
+    metrics_service::publish_build_info();
+    artifact_keeper_backend::services::proxy_scan_service::publish_db_grace_window_gauges();
 
     // Connect to database
     let db_pool = db::create_pool(&config).await?;
     tracing::info!("Connected to database");
+
+    // #5941: the read retry replays only once a write statement has been
+    // seen through this process's real subscriber; otherwise it stays off.
+    if artifact_keeper_backend::api::middleware::db_read_retry::enabled_from_env() {
+        artifact_keeper_backend::api::middleware::db_read_retry::prove_write_detection(&db_pool)
+            .await;
+    }
 
     // Reconcile stale/diverged `_sqlx_migrations` ledgers BEFORE the
     // SKIP_MIGRATIONS gate. These repairs each no-op on fresh and healthy
@@ -227,26 +265,23 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         // or backfill UPDATEs) take longer than the per-query
         // `statement_timeout` that operators commonly set on their Postgres
         // parameter group as an app-query safeguard (10 s on AWS RDS for many
-        // tunings). Acquire a dedicated connection and raise the timeouts
-        // session-locally so the migration runner doesn't share fate with
-        // production query limits. The SET is per-session and is wiped when
-        // the connection is dropped — global limits for normal app queries
-        // are unaffected.
-        let mut conn = db_pool.acquire().await?;
-        sqlx::query("SET statement_timeout = '30min'")
-            .execute(&mut *conn)
-            .await?;
-        sqlx::query("SET lock_timeout = '5min'")
-            .execute(&mut *conn)
-            .await?;
+        // tunings). `with_migration_session` marks the startup connection
+        // close-on-drop before raising the timeouts and closes it afterwards
+        // (keeping its pool slot until then), so these session-local settings
+        // cannot leak into normal app queries (#6319).
         // Takes the migration lock without blocking in pg_advisory_lock (a
         // blocked waiter deadlocks a CREATE INDEX CONCURRENTLY in the holder,
         // #5993), repairs INVALID concurrent index leftovers under that lock
         // (#4426, #5993), then applies pending migrations.
-        artifact_keeper_backend::migration_repair::run_startup_migrations(
-            &mut conn,
-            &artifact_keeper_backend::MIGRATOR,
-        )
+        db::with_migration_session(&db_pool, |conn| {
+            Box::pin(async move {
+                artifact_keeper_backend::migration_repair::run_startup_migrations(
+                    conn,
+                    &artifact_keeper_backend::MIGRATOR,
+                )
+                .await
+            })
+        })
         .await?;
         tracing::info!("Database migrations complete");
     }
@@ -889,6 +924,7 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
             config.trivy_url.clone(),
             trivy_adapter_url,
             config.incus_scanner_enabled,
+            config.trivy_ignore_embedded_pom_declarations,
             primary_storage.clone(),
             storage_registry.clone(),
             config.storage_path.clone(),
@@ -955,6 +991,13 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         ),
     };
     app_state.set_scanner_service(scanner_service);
+    // Migrations started through the API run until the listeners close and
+    // are paused at shutdown (#6253), so a migration started during the drain
+    // is not handed an already-cancelled token (#5921).
+    app_state.shutdown_token = serve_token.clone();
+    // Health and readiness probes read the database through their own small
+    // pool, so a burst that fills the request pool cannot fail them (#4182).
+    app_state.probe_pool = db::create_probe_pool(&config)?;
 
     // Initialize quality check service for health scoring and quality gates
     let quality_check_service = Arc::new(
@@ -965,6 +1008,11 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     );
     app_state.set_quality_check_service(quality_check_service);
     if let Some(search) = search_service {
+        artifact_keeper_backend::services::search_indexer::start_search_indexer(
+            app_state.event_bus.clone(),
+            app_state.db.clone(),
+            search.clone(),
+        );
         app_state.set_search_service(search);
     }
     if let Some(dt) = dt_service_arc {
@@ -1136,11 +1184,11 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     artifact_keeper_backend::services::scan_result_service::spawn_score_refresher(
         app_state.event_bus.clone(),
         app_state.db.clone(),
-        runtime_shutdown_token.clone(),
+        serve_token.clone(),
     );
 
     // Start webhooks v2 producer: subscribes to EventBus and enqueues rows
-    // into webhook_deliveries. The retry scheduler (every 30s) drives
+    // into webhook_deliveries. The delivery worker (woken on enqueue) drives
     // actual HTTP delivery. See backend/src/services/webhook_producer.rs.
     //
     // Gated behind WEBHOOKS_V2_PRODUCER_ENABLED (default off) so v1.1.9
@@ -1153,7 +1201,7 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         artifact_keeper_backend::services::webhook_producer::start_webhook_producer(
             app_state.event_bus.clone(),
             app_state.db.clone(),
-            runtime_shutdown_token.clone(),
+            serve_token.clone(),
         );
         tracing::info!("Webhook producer started (WEBHOOKS_V2_PRODUCER_ENABLED=true)");
     } else {
@@ -1172,7 +1220,7 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     // dispatcher. Sizing: DOWNLOAD_EVENT_QUEUE_DEPTH / DOWNLOAD_EVENT_FLUSH_WORKERS.
     artifact_keeper_backend::services::download_event_dispatch::start_download_event_dispatch(
         app_state.db.clone(),
-        runtime_shutdown_token.clone(),
+        serve_token.clone(),
     );
 
     app_state
@@ -1222,7 +1270,9 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
             permission_service: state.permission_service.clone(),
             npm_packument_cache: state.npm_packument_cache.clone(),
         },
-        runtime_shutdown_token.clone(),
+        // Served requests read the caches it invalidates, so it runs until
+        // the listeners close (#5921).
+        serve_token.clone(),
     )
     .await;
 
@@ -1236,6 +1286,13 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
             tracing::warn!(event = "upstream_jobs_paused", "{message}");
         }
     }
+
+    // #4184: resume the conda warm jobs a previous process left running.
+    // Detached deliberately: lifecycle is governed by the shutdown token.
+    let _conda_warm_resume = artifact_keeper_backend::api::handlers::conda_warm::spawn_resume(
+        state.clone(),
+        runtime_shutdown_token.clone(),
+    );
 
     // #2249: proactive packument invalidation from npm's replication feed.
     // Opt-in (NPM_UPSTREAM_FEED_ENABLED); one replica consumes cluster-wide
@@ -1262,6 +1319,11 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     // Instance quotas: add this replica's download transfer count to the
     // shared monthly counter, and keep the quota gauges current.
     let _transfer_quota_flusher = state.transfer_meter.spawn_flusher();
+    // #5191: read how full the storage volume is, for the disk thresholds.
+    let _disk_monitor = artifact_keeper_backend::services::quota::disk::spawn_monitor(
+        &state.config,
+        runtime_shutdown_token.clone(),
+    );
     if state.config.quotas.storage_quota_bytes > 0 || state.config.quotas.transfer_quota_bytes > 0 {
         tracing::info!(
             storage_quota_bytes = state.config.quotas.storage_quota_bytes,
@@ -1320,6 +1382,8 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         state.event_bus.clone(),
         advisory_client.clone(),
         state.proxy_service.clone(),
+        state.npm_packument_cache.clone(),
+        artifact_keeper_backend::services::lifecycle_service::SweepDerivedState::from_state(&state),
     );
 
     // Drains the durable scan queue (migration 362) when SCAN_QUEUE_ENABLED and
@@ -1336,8 +1400,16 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         runtime_shutdown_token.clone(),
     );
 
+    // #5177: keep each scanner's vulnerability-database age (API + gauges)
+    // current and warn when it passes SCAN_VULN_DB_MAX_AGE_HOURS.
+    artifact_keeper_backend::services::vuln_db_status::spawn_refresher(
+        state.clone(),
+        runtime_shutdown_token.clone(),
+    );
+
     // Keep a handle for the gRPC server before the sync worker consumes db_pool
     let grpc_db_pool = db_pool.clone();
+    let migration_db_pool = db_pool.clone();
 
     // Spawn background sync worker for peer replication
     artifact_keeper_backend::services::sync_worker::spawn_sync_worker(
@@ -1507,24 +1579,56 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         ),
     );
 
-    // The concrete shutdown token used by all servers and background tasks
-    // is resolved earlier in run_server (see `runtime_shutdown_token`) so
-    // that long-lived workers (email dispatcher, webhook producer)
-    // share the same cancellation source as the HTTP/gRPC servers.
-    let shutdown_token = runtime_shutdown_token.clone();
+    // The listeners close on `serve_token`, after the shutdown drain
+    // (#5921); see where it is created in run_server.
+    let shutdown_token = serve_token.clone();
 
     // Start HTTP server
     let addr: SocketAddr = config.bind_address.parse()?;
-    tracing::info!("HTTP server listening on {}", addr);
 
-    // Start gRPC server on a separate port
-    let grpc_port = std::env::var("GRPC_PORT")
-        .unwrap_or_else(|_| "9090".to_string())
-        .parse::<u16>()
-        .unwrap_or(9090);
+    // Start gRPC server on a separate port. A missing or unparseable
+    // GRPC_PORT falls back to 9090; only a valid explicit one counts as
+    // configured for the bind-failure rule below (#6213).
+    let grpc_port_configured = std::env::var("GRPC_PORT")
+        .ok()
+        .and_then(|v| v.parse::<u16>().ok());
+    let grpc_port = grpc_port_configured.unwrap_or(9090);
     // `SocketAddr::new` rather than a `format!`ed string so an IPv6 bind IP
     // (`::1`) needs no brackets (#2161).
     let grpc_addr = SocketAddr::new(config.grpc_bind_ip, grpc_port);
+
+    // #6213: every listener is bound before anything is served. Two
+    // explicitly configured listeners on the same address refuse startup; the
+    // implicit gRPC default yields to HTTP or METRICS_PORT with an ERROR (see
+    // `plan_listeners`).
+    let listener_plan = api::serve::plan_listeners(
+        addr,
+        grpc_addr,
+        grpc_port_configured.is_some(),
+        config
+            .metrics_port
+            .map(|port| SocketAddr::new(config.metrics_bind_ip, port)),
+    )
+    .map_err(|e| {
+        artifact_keeper_backend::error::AppError::Config(format!(
+            "Listener configuration: {e}; give each listener its own port"
+        ))
+    })?;
+    if let Some(msg) = &listener_plan.grpc_disabled {
+        tracing::error!("{msg}");
+    }
+
+    // METRICS_PORT binds before gRPC, so the implicit gRPC default loses any
+    // clash the planner missed. A metrics bind failure, or a gRPC one with
+    // GRPC_PORT set, fails startup; with GRPC_PORT unset gRPC is logged off,
+    // as before (#6213).
+    let metrics_listener_addr = listener_plan.metrics.clone();
+    let api::serve::BoundListeners {
+        grpc: grpc_listener,
+        metrics: metrics_listener,
+    } = api::serve::bind_planned_listeners(&listener_plan, grpc_port_configured.is_some())
+        .await
+        .map_err(|e| artifact_keeper_backend::error::AppError::Config(e.to_string()))?;
 
     // Reuse the existing pool instead of creating a second one (PgPool is Arc-backed)
     let sbom_server = SbomGrpcServer::new(grpc_db_pool.clone());
@@ -1553,57 +1657,66 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     let grpc_auth_cve = grpc_auth.clone();
     let grpc_auth_policy = grpc_auth;
     let grpc_shutdown_token = shutdown_token.clone();
-    tokio::spawn(async move {
-        tracing::info!("gRPC server listening on {}", grpc_addr);
-        #[allow(clippy::result_large_err)]
-        let sbom_interceptor = move |req| grpc_auth_sbom.intercept(req);
-        #[allow(clippy::result_large_err)]
-        let cve_interceptor = move |req| grpc_auth_cve.intercept(req);
-        #[allow(clippy::result_large_err)]
-        let policy_interceptor = move |req| grpc_auth_policy.intercept(req);
-        let mut server = TonicServer::builder()
-            .add_service(SbomServiceServer::with_interceptor(
-                sbom_server,
-                sbom_interceptor,
-            ))
-            .add_service(CveHistoryServiceServer::with_interceptor(
-                cve_history_server,
-                cve_interceptor,
-            ))
-            .add_service(SecurityPolicyServiceServer::with_interceptor(
-                security_policy_server,
-                policy_interceptor,
-            ));
-        if grpc_reflection_enabled {
-            // Include file descriptor for gRPC reflection
-            let reflection_service = tonic_reflection::server::Builder::configure()
-                .register_encoded_file_descriptor_set(include_bytes!(concat!(
-                    env!("OUT_DIR"),
-                    "/sbom_descriptor.bin"
-                )))
-                .build_v1()
-                .expect("Failed to build reflection service");
-            server = server.add_service(reflection_service);
-            tracing::info!("gRPC server reflection enabled");
-        }
-        if let Err(e) = server
-            .serve_with_shutdown(grpc_addr, grpc_shutdown_token.cancelled())
-            .await
-        {
-            tracing::error!("gRPC server error: {}", e);
-        }
-        tracing::info!("gRPC server shut down");
-    });
+    if let Some(grpc_listener) = grpc_listener {
+        tokio::spawn(async move {
+            // Logged once the port is bound (#6213).
+            tracing::info!("gRPC server listening on {}", grpc_addr);
+            #[allow(clippy::result_large_err)]
+            let sbom_interceptor = move |req| grpc_auth_sbom.intercept(req);
+            #[allow(clippy::result_large_err)]
+            let cve_interceptor = move |req| grpc_auth_cve.intercept(req);
+            #[allow(clippy::result_large_err)]
+            let policy_interceptor = move |req| grpc_auth_policy.intercept(req);
+            let mut server = TonicServer::builder()
+                .add_service(SbomServiceServer::with_interceptor(
+                    sbom_server,
+                    sbom_interceptor,
+                ))
+                .add_service(CveHistoryServiceServer::with_interceptor(
+                    cve_history_server,
+                    cve_interceptor,
+                ))
+                .add_service(SecurityPolicyServiceServer::with_interceptor(
+                    security_policy_server,
+                    policy_interceptor,
+                ));
+            if grpc_reflection_enabled {
+                // Include file descriptor for gRPC reflection
+                let reflection_service = tonic_reflection::server::Builder::configure()
+                    .register_encoded_file_descriptor_set(include_bytes!(concat!(
+                        env!("OUT_DIR"),
+                        "/sbom_descriptor.bin"
+                    )))
+                    .build_v1()
+                    .expect("Failed to build reflection service");
+                server = server.add_service(reflection_service);
+                tracing::info!("gRPC server reflection enabled");
+            }
+            // TCP_NODELAY on, as `serve_with_shutdown` sets by default.
+            let incoming =
+                tonic::transport::server::TcpIncoming::from(grpc_listener).with_nodelay(Some(true));
+            if let Err(e) = server
+                .serve_with_incoming_shutdown(incoming, grpc_shutdown_token.cancelled())
+                .await
+            {
+                tracing::error!("gRPC server error: {}", e);
+            }
+            tracing::info!("gRPC server shut down");
+        });
+    }
 
     // Optionally start an unauthenticated metrics-only listener on METRICS_PORT.
-    if let (Some(metrics_port), Some(metrics_state)) = (config.metrics_port, metrics_state) {
+    if let (Some(metrics_listener), Some(metrics_addr), Some(metrics_state)) = (
+        metrics_listener,
+        metrics_listener_addr.map(|l| l.addr),
+        metrics_state,
+    ) {
         tracing::warn!(
-            port = metrics_port,
-            bind_ip = %config.metrics_bind_ip,
+            port = metrics_addr.port(),
+            bind_ip = %metrics_addr.ip(),
             "Starting unauthenticated metrics listener - \
              ensure this port is not reachable from untrusted networks"
         );
-        let metrics_addr = SocketAddr::new(config.metrics_bind_ip, metrics_port);
         let metrics_shutdown = shutdown_token.clone();
         let header_read_timeout = config.http_header_read_timeout();
         tokio::spawn(async move {
@@ -1613,25 +1726,18 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
                     axum::routing::get(api::handlers::health::metrics),
                 )
                 .with_state(metrics_state);
-            match tokio::net::TcpListener::bind(metrics_addr).await {
-                Ok(listener) => {
-                    tracing::info!("Metrics listener on {}", metrics_addr);
-                    if let Err(e) = artifact_keeper_backend::api::serve::serve(
-                        listener,
-                        metrics_app.into_make_service(),
-                        header_read_timeout,
-                        async move { metrics_shutdown.cancelled().await },
-                    )
-                    .await
-                    {
-                        tracing::error!("Metrics listener error: {}", e);
-                    }
-                    tracing::info!("Metrics listener shut down");
-                }
-                Err(e) => {
-                    tracing::error!("Failed to bind metrics listener on {}: {}", metrics_addr, e);
-                }
+            tracing::info!("Metrics listener on {}", metrics_addr);
+            if let Err(e) = artifact_keeper_backend::api::serve::serve(
+                metrics_listener,
+                metrics_app.into_make_service(),
+                header_read_timeout,
+                async move { metrics_shutdown.cancelled().await },
+            )
+            .await
+            {
+                tracing::error!("Metrics listener error: {}", e);
             }
+            tracing::info!("Metrics listener shut down");
         });
     }
 
@@ -1641,6 +1747,7 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     let listen_backlog = config.http_listen_backlog();
     let somaxconn = artifact_keeper_backend::api::serve::read_somaxconn();
     let listener = artifact_keeper_backend::api::serve::bind_listener(addr, listen_backlog).await?;
+    tracing::info!("HTTP server listening on {}", addr);
     tracing::info!(
         requested = ?listen_backlog,
         somaxconn = ?somaxconn,
@@ -1691,6 +1798,39 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     .await?;
 
     tracing::info!("HTTP server shut down");
+
+    // #6253: a migration worker may be mid-transfer and never reach its next
+    // status check before the process exits
+    artifact_keeper_backend::services::migration_service::pause_jobs_on_shutdown(
+        migration_db_pool.clone(),
+        artifact_keeper_backend::services::cluster_work::WorkerIdentity::for_process().as_str(),
+    )
+    .await;
+
+    // #5921: hand the singleton jobs this process holds to the next replica
+    // now rather than at their lease TTL. The jobs were told to stop when
+    // the drain began; wait for them until the drain's end, and leave the
+    // lease of any still running to lapse, so no other replica starts one
+    // while it may still run here.
+    let still_running = artifact_keeper_backend::services::cluster_work::wait_for_scheduler_jobs(
+        artifact_keeper_backend::services::shutdown_drain::drain_deadline()
+            .unwrap_or_else(tokio::time::Instant::now),
+    )
+    .await;
+    if !still_running.is_empty() {
+        tracing::warn!(
+            running_scheduler_jobs = still_running.len(),
+            "shutdown: scheduler jobs still running at the end of the drain; their leases lapse at their TTL"
+        );
+    }
+    let released =
+        artifact_keeper_backend::services::cluster_work::release_scheduler_leases_held_by(
+            &migration_db_pool,
+            artifact_keeper_backend::services::cluster_work::WorkerIdentity::for_process().as_str(),
+            &still_running,
+        )
+        .await;
+    tracing::info!(released_scheduler_leases = released, "shutdown complete");
 
     Ok(())
 }
@@ -1794,13 +1934,14 @@ fn run_healthcheck_subcommand_if_requested() {
 }
 
 #[cfg(not(windows))]
-fn main() -> Result<()> {
+fn main() -> std::process::ExitCode {
     run_healthcheck_subcommand_if_requested();
-    tokio::runtime::Builder::new_multi_thread()
+    let result = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .expect("Failed to create tokio runtime")
-        .block_on(run_server(None))
+        .block_on(run_server(None));
+    artifact_keeper_backend::telemetry::exit_code(result)
 }
 
 #[cfg(windows)]

@@ -626,7 +626,9 @@ pub struct ProxyUpstreamSettings {
     /// Most fills allowed to run detached from their request at once: buffered
     /// fills, and streamed fills whose client stopped reading after the first
     /// bytes (#5509), each within the fetch deadline plus a 60-second commit
-    /// allowance. Env: `PROXY_UPSTREAM_MAX_DETACHED_FILLS`, clamped to
+    /// allowance (for a streamed fill, counted from when its client went
+    /// away). Refusals are counted in `ak_proxy_detached_fills_total`
+    /// (#5617). Env: `PROXY_UPSTREAM_MAX_DETACHED_FILLS`, clamped to
     /// 0..=1024. Default 16. Zero keeps every fill in its request.
     pub max_detached_fills: usize,
 }
@@ -697,6 +699,17 @@ impl ProxyUpstreamSettings {
 ///   the warning threshold.
 /// * `QUOTA_HELP_URL`: an optional `http(s)` link added to every quota
 ///   refusal and shown in the web UI.
+/// * `QUOTA_PRECHECK_BUDGET_MS` (default 500): how long the check before an
+///   upload body is read may wait on the database before it admits the
+///   request unchecked (#6316).
+/// * `STORAGE_DISK_WARN_PERCENT` (default 95) and
+///   `STORAGE_DISK_BLOCK_PERCENT` (default 0, off): thresholds on how full
+///   the filesystem under `STORAGE_PATH` (and `AK_UPLOAD_STAGING_DIR`) is
+///   (#5191). At the warning threshold the backend logs and sets
+///   `ak_storage_disk_state`; at the block threshold writes are refused with
+///   `403 DISK_THRESHOLD_EXCEEDED` while reads keep working. Measured every
+///   `STORAGE_DISK_CHECK_INTERVAL_SECS` (default 5); see
+///   [`crate::services::quota::disk`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct QuotaSettings {
     /// `STORAGE_QUOTA_BYTES`; `0` = off.
@@ -711,6 +724,14 @@ pub struct QuotaSettings {
     pub transfer_grace_percent: u32,
     /// `QUOTA_HELP_URL`, kept only when it is an `http://` or `https://` URL.
     pub help_url: Option<String>,
+    /// `QUOTA_PRECHECK_BUDGET_MS`. Default 500.
+    pub precheck_budget_ms: u64,
+    /// `STORAGE_DISK_WARN_PERCENT`, 0..=100; `0` = off. Default 95.
+    pub disk_warn_percent: u8,
+    /// `STORAGE_DISK_BLOCK_PERCENT`, 0..=100; `0` = off. Default 0.
+    pub disk_block_percent: u8,
+    /// `STORAGE_DISK_CHECK_INTERVAL_SECS`, at least 1. Default 5.
+    pub disk_check_interval_secs: u64,
 }
 
 impl Default for QuotaSettings {
@@ -722,6 +743,10 @@ impl Default for QuotaSettings {
             transfer_warn_percent: 80,
             transfer_grace_percent: 0,
             help_url: None,
+            precheck_budget_ms: 500,
+            disk_warn_percent: 95,
+            disk_block_percent: 0,
+            disk_check_interval_secs: 5,
         }
     }
 }
@@ -745,6 +770,15 @@ impl QuotaSettings {
             )
             .min(1000),
             help_url: Self::parse_help_url(env::var("QUOTA_HELP_URL").ok().as_deref()),
+            precheck_budget_ms: env_parse("QUOTA_PRECHECK_BUDGET_MS", d.precheck_budget_ms),
+            disk_warn_percent: env_parse("STORAGE_DISK_WARN_PERCENT", d.disk_warn_percent).min(100),
+            disk_block_percent: env_parse("STORAGE_DISK_BLOCK_PERCENT", d.disk_block_percent)
+                .min(100),
+            disk_check_interval_secs: env_parse(
+                "STORAGE_DISK_CHECK_INTERVAL_SECS",
+                d.disk_check_interval_secs,
+            )
+            .max(1),
         }
     }
 
@@ -913,6 +947,21 @@ pub struct Config {
     /// Set to `false` or `0` when the deployment does not accept Incus images;
     /// the scanner is then never constructed or consulted.
     pub incus_scanner_enabled: bool,
+
+    /// Whether the Trivy filesystem scan ignores the dependencies a JAR's
+    /// embedded build POM (`META-INF/maven/<g>/<a>/pom.xml`) only declares
+    /// (#6233), as grype has since #5340.
+    ///
+    /// Env var: `TRIVY_IGNORE_EMBEDDED_POM_DECLARATIONS` (opt-in). Default:
+    /// `false`, unchanged behaviour: Trivy grades every embedded build POM's
+    /// declarations. `true` or `1` drops a build POM with a `pom.properties`
+    /// beside it from the Trivy workspace, unless the archive bundles nested
+    /// libraries, which removes false positives such as #6233's. Known gap
+    /// when enabled: any shaded library whose own `META-INF/maven/**` was not
+    /// carried into the jar is then flagged by neither engine (maven-shade
+    /// embeds the original build POM, e.g. jackson-core's shaded
+    /// fastdoubleparser).
+    pub trivy_ignore_embedded_pom_declarations: bool,
 
     /// Lifetime, in seconds, of the short-lived per-repository pull token the
     /// scanner mints for private-image scans (#2093). Env
@@ -1211,8 +1260,9 @@ pub struct Config {
     /// Env var: `SCAN_WORKER_ENABLED`. Default: true.
     pub scan_worker_enabled: bool,
 
-    /// Scan jobs this instance runs concurrently. `None` matches
-    /// `MAX_CONCURRENT_SCAN_EXTRACTIONS`. Raise both together on worker pods.
+    /// Scan jobs this instance runs concurrently. `None` is 4, or
+    /// `MAX_CONCURRENT_SCAN_EXTRACTIONS` if that is lower. Raise both together
+    /// on worker pods.
     /// Env var: `SCAN_WORKER_CONCURRENCY`. Default: unset.
     pub scan_worker_concurrency: Option<usize>,
 
@@ -1329,9 +1379,10 @@ pub struct Config {
     /// databases with restricted connection budgets (e.g., shared RDS).
     ///
     /// Size the whole fleet, not one replica (#4549):
-    /// `DATABASE_MAX_CONNECTIONS × replicas` + the single-flight lock/wait
-    /// connections held outside the pool (capped per replica by
-    /// `PROXY_SINGLEFLIGHT_MAX_LOCK_WAITERS`) + headroom for one
+    /// `(DATABASE_MAX_CONNECTIONS + DATABASE_PROBE_CONNECTIONS) × replicas`,
+    /// plus the single-flight lock/wait connections held outside the pool
+    /// (capped per replica by
+    /// `PROXY_SINGLEFLIGHT_LOCK_MAX_CONNECTIONS`) + headroom for one
     /// rolling-update surge replica must stay below Postgres
     /// `max_connections`. The defaults give 3 × 50 = 150 against a stock
     /// server's 100; see the Database section of `.env.example`.
@@ -1346,6 +1397,54 @@ pub struct Config {
     /// under sustained pool exhaustion instead of piling up; raise for batch
     /// workloads where waiting is preferable to retrying.
     pub database_acquire_timeout_secs: u64,
+
+    /// Longest a request queues at the database admission gate for a slot
+    /// (see `database_request_concurrency`) while every slot is held and the
+    /// pool is busy (#4182). A request whose predicted wait (requests queued
+    /// ahead x average slot hold time / slots) is longer is answered
+    /// `503 POOL_EXHAUSTED` at once with a predicted `Retry-After`; one that
+    /// queues and still gets no slot in time is answered the same. Env var:
+    /// `DATABASE_REQUEST_ACQUIRE_WAIT_MS`. `None` (unset): the pool's own
+    /// acquire timeout, `DATABASE_ACQUIRE_TIMEOUT_SECS x 1000`, so the gate
+    /// sheds only where a queued acquire would have timed out anyway; see
+    /// [`Config::database_request_wait_ms`]. `0` turns the gate off.
+    pub database_request_acquire_wait_ms: Option<u64>,
+
+    /// Connections in the separate pool that `/health` and `/readyz` read
+    /// the database through, so a request pool saturated by a burst does not
+    /// fail the readiness probe of a replica that is busy, not broken
+    /// (#4182). Counts toward the connection budget on top of
+    /// `database_max_connections`. Env var: `DATABASE_PROBE_CONNECTIONS`.
+    /// Default 1. `0` makes the probes share the request pool (the behaviour
+    /// before 1.13).
+    pub database_probe_connections: u32,
+
+    /// How many requests may be in their handler phase at once while the
+    /// request pool is busy (#4182): past it, a request waits for an
+    /// admission permit within `database_request_acquire_wait_ms` and is
+    /// otherwise shed. Bounds how many requests compete for the pool's
+    /// connections, so an admitted request's queries wait behind a bounded
+    /// crowd instead of the whole burst. Sheds nothing while the pool has
+    /// room. Env var: `DATABASE_REQUEST_CONCURRENCY`. Default four per pool
+    /// connection (`None`: `4 × database_max_connections`, see
+    /// [`Config::database_request_slots`]). `0` turns the gate off.
+    pub database_request_concurrency: Option<usize>,
+
+    /// Share of the admission slots (percent) that only requests presenting
+    /// a credential (`Authorization`, `X-API-Key`, the session cookie, a
+    /// `/t/<token>/` path) may take while the pool is busy (#6344), so an
+    /// anonymous flood cannot shed authenticated clients. Env var:
+    /// `DATABASE_REQUEST_CREDENTIALED_RESERVE_PERCENT`. Default 25; `0`
+    /// turns the reserve off.
+    pub database_request_credentialed_reserve_percent: u8,
+
+    /// Share of the admission slots (percent) one client (best-effort client
+    /// IP) may hold or wait for while another client is waiting (#6344);
+    /// past it the client's next request is shed at once. A client alone on
+    /// a busy pool is not limited. Env var:
+    /// `DATABASE_REQUEST_CLIENT_SHARE_PERCENT`. Default 25; `0` turns the
+    /// share off.
+    pub database_request_client_share_percent: u8,
 
     /// Maximum number of bcrypt-bound auth operations (login,
     /// password verification, API-token verification) allowed to run
@@ -1901,6 +2000,7 @@ redacted_debug!(Config {
     show scan_worker_trivy_adapter_url,
     show scan_rescan_max_per_day,
     show incus_scanner_enabled,
+    show trivy_ignore_embedded_pom_declarations,
     show scan_token_ttl_seconds,
     show openscap_url,
     show openscap_profile,
@@ -1959,6 +2059,11 @@ redacted_debug!(Config {
     show database_max_connections,
     show database_min_connections,
     show database_acquire_timeout_secs,
+    show database_request_acquire_wait_ms,
+    show database_probe_connections,
+    show database_request_concurrency,
+    show database_request_credentialed_reserve_percent,
+    show database_request_client_share_percent,
     show database_idle_timeout_secs,
     show database_max_lifetime_secs,
     show database_tcp_keepalives,
@@ -2067,6 +2172,7 @@ impl Default for Config {
             trivy_url: None,
             trivy_adapter_url: None,
             incus_scanner_enabled: true,
+            trivy_ignore_embedded_pom_declarations: false,
             scan_token_ttl_seconds: 300,
             openscap_url: None,
             openscap_profile: crate::services::openscap_scanner::DEFAULT_OPENSCAP_PROFILE.into(),
@@ -2131,6 +2237,11 @@ impl Default for Config {
             database_max_connections: 50,
             database_min_connections: 5,
             database_acquire_timeout_secs: 5,
+            database_request_acquire_wait_ms: None,
+            database_probe_connections: 1,
+            database_request_concurrency: None,
+            database_request_credentialed_reserve_percent: 25,
+            database_request_client_share_percent: 25,
             database_idle_timeout_secs: 600,
             database_max_lifetime_secs: 1800,
             database_tcp_keepalives: true,
@@ -2219,6 +2330,23 @@ impl Default for Config {
 }
 
 impl Config {
+    /// The database admission gate's wait budget in milliseconds (#4182):
+    /// `DATABASE_REQUEST_ACQUIRE_WAIT_MS` when set, otherwise the pool's own
+    /// acquire timeout, so the gate never sheds a request that would have got
+    /// a connection on the pool before it timed out. `0`: gate off.
+    pub fn database_request_wait_ms(&self) -> u64 {
+        self.database_request_acquire_wait_ms
+            .unwrap_or(self.database_acquire_timeout_secs.saturating_mul(1000))
+    }
+
+    /// Database admission slots (#4182): `DATABASE_REQUEST_CONCURRENCY` when
+    /// set, otherwise four per pool connection, so a smaller or larger pool
+    /// scales the gate with it.
+    pub fn database_request_slots(&self) -> usize {
+        self.database_request_concurrency
+            .unwrap_or(4 * self.database_max_connections as usize)
+    }
+
     /// The HTTP/1 header-read timeout to hand the server (#4665); `None`
     /// when `HTTP_HEADER_READ_TIMEOUT_SECS=0` turned it off.
     pub fn http_header_read_timeout(&self) -> Option<std::time::Duration> {
@@ -2298,6 +2426,11 @@ impl Config {
             trivy_adapter_url: env::var("TRIVY_ADAPTER_URL").ok().filter(|s| !s.is_empty()),
             incus_scanner_enabled: parse_opt_out_flag(
                 env::var("INCUS_SCANNER_ENABLED").ok().as_deref(),
+            ),
+            trivy_ignore_embedded_pom_declarations: parse_opt_in_flag(
+                env::var("TRIVY_IGNORE_EMBEDDED_POM_DECLARATIONS")
+                    .ok()
+                    .as_deref(),
             ),
             scan_token_ttl_seconds: env_parse("SCAN_TOKEN_TTL_SECONDS", 300),
             openscap_url: env::var("OPENSCAP_URL").ok(),
@@ -2535,6 +2668,23 @@ impl Config {
             database_max_connections: env_parse("DATABASE_MAX_CONNECTIONS", 50),
             database_min_connections: env_parse("DATABASE_MIN_CONNECTIONS", 5),
             database_acquire_timeout_secs: env_parse("DATABASE_ACQUIRE_TIMEOUT_SECS", 5),
+            database_request_acquire_wait_ms: env::var("DATABASE_REQUEST_ACQUIRE_WAIT_MS")
+                .ok()
+                .and_then(|v| v.trim().parse().ok()),
+            database_probe_connections: env_parse("DATABASE_PROBE_CONNECTIONS", 1),
+            database_request_concurrency: env::var("DATABASE_REQUEST_CONCURRENCY")
+                .ok()
+                .and_then(|v| v.trim().parse().ok()),
+            database_request_credentialed_reserve_percent: env_parse::<u8>(
+                "DATABASE_REQUEST_CREDENTIALED_RESERVE_PERCENT",
+                25,
+            )
+            .min(100),
+            database_request_client_share_percent: env_parse::<u8>(
+                "DATABASE_REQUEST_CLIENT_SHARE_PERCENT",
+                25,
+            )
+            .min(100),
             database_idle_timeout_secs: env_parse("DATABASE_IDLE_TIMEOUT_SECS", 600),
             database_max_lifetime_secs: env_parse("DATABASE_MAX_LIFETIME_SECS", 1800),
             database_tcp_keepalives: !matches!(
@@ -3168,6 +3318,50 @@ fn secret_alphabet_size(chars: &[char]) -> usize {
 #[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod tests {
+
+    /// #4182: the admission slots follow the pool unless pinned.
+    #[test]
+    fn request_slots_default_to_four_per_pool_connection_4182() {
+        let derived = Config {
+            database_max_connections: 20,
+            database_request_concurrency: None,
+            ..Config::default()
+        };
+        assert_eq!(derived.database_request_slots(), 80);
+        assert_eq!(Config::default().database_request_slots(), 200);
+        let pinned = Config {
+            database_request_concurrency: Some(7),
+            ..derived.clone()
+        };
+        assert_eq!(pinned.database_request_slots(), 7);
+        let off = Config {
+            database_request_concurrency: Some(0),
+            ..derived
+        };
+        assert_eq!(off.database_request_slots(), 0);
+    }
+
+    /// #4182: the gate's wait follows the pool's acquire timeout unless set.
+    #[test]
+    fn request_wait_defaults_to_the_acquire_timeout_4182() {
+        assert_eq!(Config::default().database_request_wait_ms(), 5_000);
+        let slower = Config {
+            database_acquire_timeout_secs: 12,
+            ..Config::default()
+        };
+        assert_eq!(slower.database_request_wait_ms(), 12_000);
+        let pinned = Config {
+            database_request_acquire_wait_ms: Some(500),
+            ..slower.clone()
+        };
+        assert_eq!(pinned.database_request_wait_ms(), 500);
+        let off = Config {
+            database_request_acquire_wait_ms: Some(0),
+            ..slower
+        };
+        assert_eq!(off.database_request_wait_ms(), 0);
+    }
+
     use super::*;
     use std::sync::Mutex;
 
@@ -3267,6 +3461,31 @@ mod tests {
             !disabled_config.incus_scanner_enabled,
             "INCUS_SCANNER_ENABLED=false must disable Incus scanner construction"
         );
+    }
+
+    /// #6233: `TRIVY_IGNORE_EMBEDDED_POM_DECLARATIONS` is opt-in: off by
+    /// default (today's behaviour), on only for an explicit `true`/`1`.
+    #[test]
+    fn test_config_trivy_ignore_embedded_pom_declarations_is_opt_in_6233() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_flag = env::var("TRIVY_IGNORE_EMBEDDED_POM_DECLARATIONS").ok();
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
+
+        env::remove_var("TRIVY_IGNORE_EMBEDDED_POM_DECLARATIONS");
+        let default_config = Config::from_env().expect("config should load");
+        env::set_var("TRIVY_IGNORE_EMBEDDED_POM_DECLARATIONS", "true");
+        let enabled_config = Config::from_env().expect("config should load");
+
+        restore_env("DATABASE_URL", saved_db);
+        restore_env("JWT_SECRET", saved_jwt);
+        restore_env("TRIVY_IGNORE_EMBEDDED_POM_DECLARATIONS", saved_flag);
+
+        assert!(!default_config.trivy_ignore_embedded_pom_declarations);
+        assert!(!Config::default().trivy_ignore_embedded_pom_declarations);
+        assert!(enabled_config.trivy_ignore_embedded_pom_declarations);
     }
 
     /// #5288: `UPSTREAM_JOBS_PAUSED` is opt-in; only `true`/`1` pauses the
@@ -4073,6 +4292,104 @@ mod tests {
                  jemalloc (#5130)"
             );
         }
+    }
+
+    /// #6218: with `codegen-units = 1` the 1.12 backend does not fit the
+    /// 7 GiB macos-latest runner, which pages for most of the build and took
+    /// 145-167 min per macOS leg. Both release workflows must raise the unit
+    /// count on macOS only, with the same value, before `Cache Cargo`
+    /// (rust-cache keys on CARGO_* variables, so a mismatch makes the tag
+    /// build miss the warmed cache). Linux and Windows keep the profile's 1.
+    #[test]
+    fn release_macos_legs_raise_codegen_units_6218() {
+        let step = "      - name: Use 16 codegen units on the 7 GiB macOS runners\n        \
+                    if: runner.os == 'macOS'\n        \
+                    run: echo \"CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16\" >> \"$GITHUB_ENV\"\n";
+        for (name, workflow) in [
+            (
+                "release.yml",
+                include_str!("../../.github/workflows/release.yml"),
+            ),
+            (
+                "release-cli-caches.yml",
+                include_str!("../../.github/workflows/release-cli-caches.yml"),
+            ),
+        ] {
+            let at = workflow.find(step).unwrap_or_else(|| {
+                panic!(
+                    "{name} must set CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 on \
+                     macOS only, in the step named \"Use 16 codegen units on \
+                     the 7 GiB macOS runners\" (#6218)"
+                )
+            });
+            let cache = workflow
+                .find("      - name: Cache Cargo\n")
+                .unwrap_or_else(|| panic!("{name} has no `Cache Cargo` step"));
+            assert!(
+                at < cache,
+                "{name} must set the codegen-units override before `Cache \
+                 Cargo`, or the cache key differs between the warm-up and \
+                 the tag build (#6218)"
+            );
+            assert_eq!(
+                workflow
+                    .matches("CARGO_PROFILE_RELEASE_CODEGEN_UNITS")
+                    .count(),
+                1,
+                "{name} must set CARGO_PROFILE_RELEASE_CODEGEN_UNITS exactly \
+                 once, in the macOS-only step (#6218)"
+            );
+        }
+    }
+
+    /// #6193: a release.yml job with no `timeout-minutes` inherits GitHub's
+    /// 6-hour default, so a hung cross-build or poll holds the release for
+    /// hours before anything turns red. Every job must state its own
+    /// ceiling. A reusable-workflow call (`uses:`) cannot take one, so its
+    /// called jobs carry their own.
+    #[test]
+    fn release_jobs_declare_timeouts_6193() {
+        let workflow = include_str!("../../.github/workflows/release.yml");
+        let (_, jobs) = workflow
+            .split_once("\njobs:\n")
+            .expect("release.yml must have a top-level jobs: map");
+        let mut job_names = Vec::new();
+        let mut missing = Vec::new();
+        let mut current: Option<(&str, bool)> = None;
+        for line in jobs.lines() {
+            if !line.starts_with(' ') && !line.is_empty() && !line.starts_with('#') {
+                break; // the next top-level key ends the jobs map
+            }
+            let header = line
+                .strip_prefix("  ")
+                .filter(|rest| !rest.starts_with(' ') && !rest.starts_with('#'))
+                .and_then(|rest| rest.strip_suffix(':'));
+            if let Some(name) = header {
+                if let Some((prev, false)) = current {
+                    missing.push(prev);
+                }
+                job_names.push(name);
+                current = Some((name, false));
+            } else if line.starts_with("    timeout-minutes:") || line.starts_with("    uses:") {
+                if let Some((_, bounded)) = current.as_mut() {
+                    *bounded = true;
+                }
+            }
+        }
+        if let Some((prev, false)) = current {
+            missing.push(prev);
+        }
+        assert!(
+            job_names.contains(&"build-binaries") && job_names.contains(&"release"),
+            "release.yml job parsing found {job_names:?}; the test no longer \
+             sees the jobs it is meant to bound"
+        );
+        assert!(
+            missing.is_empty(),
+            "release.yml jobs without timeout-minutes (#6193): {missing:?}. \
+             Size one from recent run durations, about 2-3x the slowest \
+             observed, with a `# p100 ...` comment."
+        );
     }
 
     #[test]
@@ -7076,6 +7393,32 @@ mod tests {
             "backend service must not use a shell entrypoint; the runtime image \
              has no shell (#2059/#2084). Offending block:\n{backend}"
         );
+    }
+
+    /// Regression guard for #6160: the shipped and local-dev compose files
+    /// list the backend environment explicitly, so an opt-in switch documented
+    /// in `.env.example` has to be forwarded by name. `LDAP_BASIC_AUTH_PASSTHROUGH`
+    /// was missing, which made setting it in `.env` a no-op for the container
+    /// and left Maven uploads with a directory password at 401.
+    #[test]
+    fn compose_backend_forwards_ldap_basic_auth_passthrough() {
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("backend crate has a parent directory (repo root)");
+
+        for file_name in ["docker-compose.yml", "docker-compose.local-dev.yml"] {
+            let compose = read_compose(repo_root, file_name);
+            let backend = compose_service_block(&compose, "backend");
+            assert!(
+                !backend.is_empty(),
+                "backend service not found in {file_name}"
+            );
+            assert!(
+                backend.contains("LDAP_BASIC_AUTH_PASSTHROUGH:"),
+                "{file_name}'s backend service must forward LDAP_BASIC_AUTH_PASSTHROUGH \
+                 from .env (#6160). Offending block:\n{backend}"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------

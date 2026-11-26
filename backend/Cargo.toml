@@ -15,6 +15,12 @@ path = "src/main.rs"
 name = "ak-mcp-introspector"
 path = "src/bin/mcp_introspector/main.rs"
 
+# Serve-time SHA-256 verification cost (#6468): no database or network,
+# `cargo bench --bench serve_verify --profile ci`.
+[[bench]]
+name = "serve_verify"
+harness = false
+
 [features]
 vendored-openssl = ["openssl/vendored"]
 jemalloc = ["dep:tikv-jemallocator"]
@@ -37,6 +43,8 @@ test-shard-services-2 = []
 test-shard-router = []
 
 [dependencies]
+# Commit, version and Debian Release Date floor (#6181)
+ak-build-info = { path = "crates/ak-build-info" }
 openssl = { workspace = true, optional = true }
 # Async runtime
 tokio.workspace = true

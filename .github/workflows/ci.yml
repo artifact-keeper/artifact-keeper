@@ -348,6 +348,14 @@ jobs:
                 manifest=true
                 rust=true
                 ;;
+              # The two advisory ignore lists (#6180) decide the Security
+              # Audit verdict as much as the lockfile does, so a change to
+              # either is held to it. Otherwise as the default arm.
+              .cargo/audit.toml|osv-scanner.toml)
+                code=true
+                manifest=true
+                rust=true
+                ;;
               backend/*|Cargo.toml|Cargo.lock|.sqlx/*|\
               .config/nextest.toml|\
               scripts/ci/run-measured-build.sh)
@@ -362,7 +370,10 @@ jobs:
               scripts/ci/check-token-mint-surface.sh|\
               scripts/ci/check-auth-event-audit.sh|\
               scripts/ci/check-migration-ledger.sh|\
-              scripts/ci/check-duplicate-migrations.sh)
+              scripts/ci/check-duplicate-migrations.sh|\
+              scripts/ci/memory-watch.sh|\
+              scripts/ci/apt-install-bounded.sh|\
+              scripts/ci/memory-cap.sh)
                 code=true
                 rust=true
                 ;;
@@ -588,8 +599,12 @@ jobs:
     # dependency graph, and the job has been cancelled at 20 with every step
     # green, once inside the cache-save step itself (#3944). A cancellation
     # at the ceiling throws the whole run away; ten more minutes of headroom
-    # cost nothing on a green run.
-    timeout-minutes: 30
+    # cost nothing on a green run. 45, not 30 (2026-11-18): with the crate's
+    # growth the hosted 16 GB VM now runs clippy past 30 under memory pressure
+    # (cancelled at the ceiling on main and five PRs that day, 6-12 min
+    # otherwise). A hang still dies well inside 45; root cause tracked
+    # separately.
+    timeout-minutes: 45
     needs: [changes, release-bump]
     # Skip (reported as success for required checks) on docs-only PRs and on
     # version-bump-only release PRs; `!cancelled()` + `!= 'false'` /
@@ -606,8 +621,9 @@ jobs:
 
       # rust-toolchain.toml pins the compiler (#3551); this installs exactly
       # that version, with the clippy and rustfmt components the file lists.
-      - uses: dtolnay/rust-toolchain@1.98.0
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master 2026-11-15; the toolchain input picks the compiler
         with:
+          toolchain: 1.98.0
           components: clippy, rustfmt
 
       # The compiler is an input to this job and it used to be an untracked one
@@ -627,8 +643,12 @@ jobs:
 
       # The self-hosted image shipped protoc; ubuntu-24.04 does not, and
       # build scripts in the dependency tree (which clippy runs) need it.
+      # Bounded (#6272): scripts/ci/apt-install-bounded.sh caps each download
+      # attempt at 3 minutes and retries on azure.archive.ubuntu.com, so a
+      # crawling mirror cannot hold the job to its ceiling.
       - name: Install protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+        timeout-minutes: 12
+        run: bash scripts/ci/apt-install-bounded.sh protobuf-compiler
 
       # Cache the dependency build so only the workspace crate recompiles.
       # ~635 deps are byte-identical run-to-run.
@@ -727,6 +747,30 @@ jobs:
           swapon --show
           free -m
 
+      # Samples MemAvailable, swap in use and the compiler processes' RSS
+      # every 5s until the job ends (#6242); "Memory and disk report"
+      # summarises it. memory.peak alone sat at 15.0 GiB on fast and slow
+      # runs alike and a cancelled run keeps no log, so neither said why
+      # clippy was sometimes 2x slower or stalled.
+      - name: Start the memory sampler
+        run: ./scripts/ci/memory-watch.sh start "$RUNNER_TEMP/memory-watch.tsv" 5
+
+      # Every shipped build (Dockerfile.backend, release.yml) runs with
+      # `--locked` (#6180), so a Cargo.toml change whose Cargo.lock update
+      # was not committed could merge here and then fail the release. Fail
+      # it here, first, with the fix in the message. `--locked` only refuses
+      # a lock that would have to CHANGE: a PR that commits its updated
+      # Cargo.lock passes.
+      - name: Check Cargo.lock is up to date
+        run: |
+          if ! out="$(cargo metadata --locked --format-version 1 2>&1 >/dev/null)"; then
+            printf '%s\n' "$out" >&2
+            if grep -q -- "--locked" <<<"$out"; then
+              echo "::error title=Cargo.lock is out of date::Cargo.toml needs a Cargo.lock change that is not committed. Run \`cargo update -w\` (or the cargo command that changed Cargo.toml) and commit Cargo.lock."
+            fi
+            exit 1
+          fi
+
       - name: Run Clippy
         # CARGO_BUILD_JOBS is the hosted runner's core count. It was capped
         # at 2 and then 4 on the self-hosted pool after lib-test compiles
@@ -734,10 +778,58 @@ jobs:
         # peaks well below the instrumented lib-test build the unit shards
         # run at 4 on the same 16 GB VM. CARGO_INCREMENTAL=0: incremental
         # state is useless in CI's clean checkout and only adds memory.
+        #
+        # TWO PASSES, SO THE TWO BIG RUSTCS NEVER OVERLAP (#6242). The lib
+        # and the lib-test target (the production crate plus ~17.5k inline
+        # tests) are separate rustc processes with no dependency between
+        # them, so a single `--all-targets` starts both at once. Measured
+        # with the sampler on this VM (PR #6263): one process at 14.35 GiB
+        # resident, MemAvailable down to 0.41 GiB, 5.73 GiB in swap and 84
+        # of 110 samples swapping; locally (aarch64, same flags) the lib is
+        # 6.3 GiB and lib-test 12.6 GiB, started in the same second. That
+        # swap is the 5-to-10-minute bimodality, and the stalls.
+        #
+        # Pass 1 checks everything EXCEPT the unit-test targets (lib, bins,
+        # example, every integration test), so pass 2 -- the original
+        # command, so the lint coverage is exactly what it was -- finds all
+        # of that fresh and runs only the lib-test and bin-test rustcs.
+        #
+        # A STALL LEAVES EVIDENCE. Clippy gets 30 of the job's 45 minutes;
+        # past that it is stopped here, and the sampler's summary, the top
+        # processes and any kernel OOM lines are printed while the runner
+        # can still upload its log. A job cancelled at its own ceiling keeps
+        # no log at all.
         env:
           CARGO_BUILD_JOBS: "4"
           CARGO_INCREMENTAL: "0"
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        #
+        # UNDER A MEMORY CAP (#6242). The lib-test rustc alone needs more
+        # than this VM's RAM, so it swaps whatever the two passes do.
+        # memory-cap.sh runs the whole step in a cgroup whose memory.high is
+        # MemTotal minus 2.75 GiB: past it the kernel swaps the compiler's
+        # pages instead of the runner agent's, so a heavy swap slows clippy
+        # down instead of freezing the VM. A Check Rust on PR #6313 sat in
+        # this step for 50+ minutes, past both the 30-minute `timeout` below
+        # and the 45-minute job ceiling: nothing on the VM could run, the
+        # `timeout` included.
+        run: |
+          rc=0
+          ./scripts/ci/memory-cap.sh -- timeout --signal=TERM --kill-after=60s 30m bash -c '
+            set -e
+            echo "::group::clippy pass 1: lib, bins, example, integration tests"
+            cargo clippy --locked --workspace --lib --bins --examples --test "*" -- -D warnings
+            echo "::endgroup::"
+            echo "clippy pass 2: the unit-test targets (all targets; the rest is fresh)"
+            cargo clippy --locked --workspace --all-targets -- -D warnings
+          ' || rc=$?
+          if [ "$rc" = 124 ] || [ "$rc" = 137 ]; then
+            echo "::error title=Clippy stopped after 30 minutes::cargo clippy ran past 30 minutes (5-8 normally) and was stopped so this job keeps its log. The memory numbers below say whether the VM was swapping (#6242)."
+            ./scripts/ci/memory-watch.sh report "$RUNNER_TEMP/memory-watch.tsv"
+            free -m
+            ps -eo pid,rss,etime,stat,comm --sort=-rss | head -15
+            sudo dmesg -T 2>/dev/null | grep -iE 'out of memory|oom|killed process|hung_task' | tail -20 || true
+          fi
+          exit "$rc"
 
       # Memory and disk headroom on the hosted VM, recorded on every run so
       # a drift toward the 16 GB / free-disk ceilings shows before it fails
@@ -758,6 +850,132 @@ jobs:
           free -g
           df -h / | tail -1
           du -sh target 2>/dev/null || true
+          ./scripts/ci/memory-watch.sh stop "$RUNNER_TEMP/memory-watch.tsv"
+          ./scripts/ci/memory-watch.sh report "$RUNNER_TEMP/memory-watch.tsv"
+
+  # WINDOWS CROSS-CHECK (#6022). Every other Rust job here compiles for
+  # Linux only, so code that needs a Unix-only API without a cfg guard
+  # (`std::os::unix::*`, `PermissionsExt`, `symlink`) passed every PR check.
+  # The first build that saw it was release.yml's x86_64-pc-windows-gnu leg
+  # at tag time: v1.12.0's unpacker (#6005, backend/src/services/oci_rootfs.rs)
+  # stopped that leg, and 1.12.0 shipped no GitHub Release (fixed in #6201).
+  # The nightly 🪟 Windows Cross-Build (scheduled-tests.yml) only catches it
+  # after the merge.
+  #
+  # `cargo check`, not a build: type and name resolution is where Unix-only
+  # code fails, and a check emits metadata only, so there is no codegen and
+  # no link. The release-profile link is what fills the hosted VM and gets
+  # the runner killed with exit 143 (release.yml's "Add swap" note). Same
+  # target and features as release.yml's windows leg, and the same mingw-w64
+  # install: build scripts still run for a check, and openssl-src
+  # (`vendored-openssl`) compiles OpenSSL with the mingw C compiler.
+  # Library and binary targets only: the inline test modules are the
+  # 15 GiB lib-test rustc the unit legs shard, and tests do not ship.
+  #
+  # Reported through ✅ CI Complete, like Version Pin Bump, rather than as a
+  # new required context, so it blocks a merge with no branch-protection
+  # change. It runs and may skip exactly when Check Rust does.
+  windows-cross-check:
+    name: 🪟 Windows Cross-Check
+    runs-on: ubuntu-24.04
+    # Always cold (no rust-cache, see below): 6-11 minutes for the check,
+    # plus at most 2 x 6 minutes of package download on a slow mirror and
+    # about a minute to unpack. 40 leaves headroom over that ~24-minute
+    # worst case now that the job is required again.
+    timeout-minutes: 40
+    needs: [changes, release-bump]
+    if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' && needs.release-bump.outputs.bump_only != 'true' }}
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_NET_RETRY: "10"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # rust-toolchain.toml already lists the target; naming it here as
+      # well keeps the job self-describing, as release.yml's leg does.
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master 2026-11-15; the toolchain input picks the compiler
+        with:
+          toolchain: 1.98.0
+          targets: x86_64-pc-windows-gnu
+
+      - name: Assert the pinned Rust toolchain is in force
+        run: ./scripts/ci/check-toolchain-pin.sh --active
+
+      # Only the x86_64 cross compilers, not release.yml's `mingw-w64`
+      # (#6242). That metapackage is 280 MB: i686 and x86_64, posix and
+      # win32 threads, gcc and g++. On runners whose apt mirror is
+      # us-east-2.ec2.archive.ubuntu.com it downloads at 50-100 kB/s, and
+      # this step, not the check, is what ran into the 30-minute ceiling on
+      # 2026-11-18/19: 20 of 66 runs hit the ceiling in it, none in the check
+      # (azure.archive runs fetch it in 20 s). x86_64 posix gcc and g++ are
+      # ~80 MB and all a check needs: build scripts compile C (openssl-src,
+      # aws-lc-sys, ring, libgit2-sys, zstd-sys, lzma-sys, libz-sys,
+      # libsqlite3-sys) with x86_64-w64-mingw32-gcc; g++ in case a
+      # cmake-driven one enables CXX.
+      #
+      # Only the DOWNLOAD is capped: each attempt runs `apt-get update` and
+      # `apt-get install --download-only` under ONE 6-minute timeout, so a
+      # slow mirror fails the attempt, and the second attempt goes to
+      # azure.archive.ubuntu.com and archive.ubuntu.com instead of crawling
+      # into the job ceiling. The real install then runs from the local
+      # archive with no timeout: one killed during unpack would leave dpkg
+      # half-configured, and everything after it fails on "dpkg was
+      # interrupted". Worst case 2 x 6 minutes of download.
+      - name: Install protoc and the x86_64 mingw-w64 cross compilers
+        # Outer bound over the 2 x 6-minute capped downloads and the install.
+        timeout-minutes: 20
+        run: |
+          # libprotobuf-dev: the well-known .proto files (timestamp.proto)
+          # build.rs imports, a Recommends of protobuf-compiler that
+          # --no-install-recommends would otherwise drop.
+          pkgs=(protobuf-compiler libprotobuf-dev pkg-config libssl-dev gcc-mingw-w64-x86-64-posix g++-mingw-w64-x86-64-posix)
+          echo "apt mirrors: $(tr '\n' ' ' < /etc/apt/apt-mirrors.txt 2>/dev/null)"
+          fetch() {
+            sudo timeout 6m bash -c '
+              apt-get update -o Acquire::Retries=3 \
+                && apt-get install --download-only -y --no-install-recommends -o Acquire::Retries=3 "$@"
+            ' _ "${pkgs[@]}"
+          }
+          if ! fetch; then
+            echo "::warning title=Slow apt mirror::downloading the mingw cross compilers did not finish in 6 minutes; retrying on azure.archive.ubuntu.com / archive.ubuntu.com."
+            printf 'http://azure.archive.ubuntu.com/ubuntu/\tpriority:1\nhttp://archive.ubuntu.com/ubuntu/\tpriority:2\n' \
+              | sudo tee /etc/apt/apt-mirrors.txt >/dev/null
+            if ! fetch; then
+              echo "::error title=apt download failed::the mingw cross compilers did not download in 2 x 6 minutes, on the image's mirror or on azure/archive.ubuntu.com."
+              exit 1
+            fi
+          fi
+          sudo apt-get install -y --no-install-recommends "${pkgs[@]}"
+          x86_64-w64-mingw32-gcc --version | head -1
+
+      # No rust-cache: a cold check of the whole graph is 6-11 minutes
+      # (2026-11-18/19, every run that got past the install), and the repo
+      # cache is at its 10 GiB quota, where a windows-check entry would evict
+      # release.yml's cli-* entries (least recently used) and make release
+      # builds cold (#6218).
+
+      # The workspace crate's rustc is the one heavy step here, as in
+      # check-rust, whose cgroup peaks at ~15 GiB on the same VM. Same
+      # best-effort swapfile; it costs seconds.
+      - name: Add swap
+        run: |
+          if sudo fallocate -l 12G /ak-ci-swapfile \
+             && sudo chmod 600 /ak-ci-swapfile \
+             && sudo mkswap /ak-ci-swapfile >/dev/null \
+             && sudo swapon /ak-ci-swapfile; then
+            echo "added a 12 GiB swapfile"
+          else
+            echo "::warning title=No extra swap::could not add /ak-ci-swapfile; this job runs with the image's default swap only."
+          fi
+          swapon --show
+          free -m
+
+      - name: Check the backend compiles for Windows
+        env:
+          SQLX_OFFLINE: true
+          CARGO_BUILD_JOBS: "4"
+          CARGO_INCREMENTAL: "0"
+        run: cargo check --locked --workspace --target x86_64-pc-windows-gnu --features vendored-openssl
 
   # UNIT TESTS + COVERAGE, SHARDED ACROSS GITHUB-HOSTED RUNNERS.
   #
@@ -844,15 +1062,16 @@ jobs:
 
       # rust-toolchain.toml pins the compiler; this installs exactly that
       # version plus llvm-tools (llvm-profdata / llvm-cov for cargo-llvm-cov).
-      - uses: dtolnay/rust-toolchain@1.98.0
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master 2026-11-15; the toolchain input picks the compiler
         with:
+          toolchain: 1.98.0
           components: llvm-tools-preview
 
       - name: Assert the pinned Rust toolchain is in force
         run: ./scripts/ci/check-toolchain-pin.sh --active
 
       # #5273 drives npm through a pending scan and its eventual verdict.
-      - uses: actions/setup-node@v7.1.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         if: matrix.shard == 'handlers-1'
         with:
           node-version: '22'
@@ -861,17 +1080,27 @@ jobs:
         if: matrix.shard == 'handlers-1'
         run: npm install --global npm@10.9.9
 
+      # Exact versions (#6178): an unversioned `tool:` installs whatever
+      # was released last, so a new upstream release could change every leg
+      # at once with no commit here. These are the versions the floating
+      # entries resolved to on main on 2026-11-23. Bump them together with
+      # the other install-action steps; check-action-pins.sh refuses an
+      # unversioned entry.
       - name: Install cargo-llvm-cov, cargo-nextest and sqlx-cli
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
         with:
-          tool: cargo-llvm-cov,cargo-nextest,sqlx-cli
+          tool: cargo-llvm-cov@0.9.1,cargo-nextest@0.9.152,sqlx-cli@0.9.1
 
       # The self-hosted runner image ships protoc; ubuntu-24.04 does not,
       # and build scripts in the dependency tree need it. services-1 also
       # gets squashfs-tools so the incus scanner's real mksquashfs/unsquashfs
       # tests run as the non-root runner user instead of skipping (#4470).
+      # Bounded (#6272): scripts/ci/apt-install-bounded.sh caps each download
+      # attempt at 3 minutes and retries on azure.archive.ubuntu.com, so a
+      # crawling mirror cannot hold the job to its ceiling.
       - name: Install protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler ${{ matrix.shard == 'services-1' && 'squashfs-tools' || '' }}
+        timeout-minutes: 12
+        run: bash scripts/ci/apt-install-bounded.sh protobuf-compiler ${{ matrix.shard == 'services-1' && 'squashfs-tools' || '' }}
 
       # The instrumented dependency graph (~750 crates, 3.3 GB) is identical
       # in every leg, so all legs share one cache entry. Saved from `main`
@@ -892,7 +1121,7 @@ jobs:
         run: |
           set -euo pipefail
           for attempt in 1 2 3; do
-            if cargo fetch; then
+            if cargo fetch --locked; then
               exit 0
             fi
             echo "cargo fetch failed (attempt ${attempt}/3) — retrying" >&2
@@ -942,28 +1171,80 @@ jobs:
           swapon --show
           free -m
 
+      # Same sampler as Check Rust (#6242): MemAvailable, swap in use and
+      # the compiler's RSS every 5 s, summarised in "Disk usage". The peak
+      # RSS that run-measured-build.sh records is capped by the VM's RAM
+      # (14.1-14.4 GiB on every leg), so on its own it cannot show how much
+      # of the compile was in swap.
+      - name: Start the memory sampler
+        run: ./scripts/ci/memory-watch.sh start "$RUNNER_TEMP/memory-watch.tsv" 5
+
       # Only the BIN_SHARD leg has bin-target tests, so only it pays for the
       # bins pass (the non-test library, instrumented, then main.rs's test
       # harness). run-measured-build.sh records each pass's peak RSS in the
       # job summary and retries only a SIGKILL, once (#3856); without sccache
       # on this runner every rustc is a child of cargo, so the number it
       # records is the compiler's own.
+      #
+      # UNDER A MEMORY CAP (#6242). Measured in a 16 GiB, 4-CPU, no-swap
+      # container with these flags, the handlers-1 lib-test rustc needs
+      # 18.2 GiB and is OOM-killed; the peak is in the front end and the
+      # monomorphization collector (`-Z time-passes`: 11.5 GB after borrow
+      # checking, 18.0 GB after collection), before LLVM, so
+      # CARGO_BUILD_JOBS, codegen-units, debuginfo and the linker do not
+      # move it. On this VM the overflow
+      # goes to the swapfile above, and when the kernel reclaims from every
+      # process to make room the runner agent stops answering: main run
+      # 44497657482's handlers-1 died "lost communication" 51 minutes into
+      # this step (8-9 minutes normally). memory-cap.sh runs the build in a
+      # cgroup with memory.high = MemTotal minus 2.75 GiB, so the kernel
+      # swaps the compiler's pages, not the agent's or Postgres's.
+      #
+      # 30 minutes (5-19 normally, the router leg's lib + bins the longest):
+      # a compile that the cap throttles into a crawl fails here with its
+      # log, instead of running into the 60-minute job ceiling.
       - name: Build instrumented test binaries
         id: build
+        timeout-minutes: 30
         run: |
           source <(cargo llvm-cov show-env --sh)
           cargo llvm-cov clean --workspace
           ok=true
-          ./scripts/ci/run-measured-build.sh "lib (${{ matrix.shard }})" \
+          ./scripts/ci/memory-cap.sh -- ./scripts/ci/run-measured-build.sh "lib (${{ matrix.shard }})" \
             cargo nextest run --workspace --lib --no-run --features "test-shard-${{ matrix.shard }}" || ok=false
           if [ "$ok" = true ] && [ "${{ matrix.shard }}" = "$BIN_SHARD" ]; then
-            ./scripts/ci/run-measured-build.sh bins \
+            ./scripts/ci/memory-cap.sh -- ./scripts/ci/run-measured-build.sh bins \
               cargo nextest run --workspace --bins --no-run --features "test-shard-${{ matrix.shard }}" || ok=false
           fi
           if [ "$ok" != true ]; then
             echo "::error title=Test BUILD failed — no test ran (shard ${{ matrix.shard }})::cargo could not build this shard's instrumented test binaries, so none of its tests or coverage ran. A genuine compile error also fails Check Rust on this commit. If the log shows 'signal: 9 (SIGKILL)', the build ran out of memory and was ALREADY retried once (#3856): read the peak RSS in the job summary."
             exit 1
           fi
+
+      # #6329: a test helper used only by another shard's tests (the
+      # `archive_scan_suite` macro in services-1, 2026-11-20) compiles to a
+      # rustc warning in this leg, and `cargo clippy --lib --tests --features
+      # test-shard-<name> -- -D warnings` fails on it locally while CI stayed
+      # green. Re-running the same build is a no-op (seconds: nothing
+      # recompiles) and cargo replays the cached diagnostics, so this reads
+      # the leg's warnings without a second compile and fails on any in the
+      # workspace's own crates.
+      - name: Refuse compiler warnings in this shard's test build
+        if: steps.build.outcome == 'success'
+        env:
+          CARGO_TERM_COLOR: never
+        run: |
+          source <(cargo llvm-cov show-env --sh)
+          out="$(cargo nextest run --workspace --lib --no-run --features "test-shard-${{ matrix.shard }}" 2>&1)"
+          if [ "${{ matrix.shard }}" = "$BIN_SHARD" ]; then
+            out+=$'\n'"$(cargo nextest run --workspace --bins --no-run --features "test-shard-${{ matrix.shard }}" 2>&1)"
+          fi
+          if grep -qE '^warning: `artifact-keeper[^`]*` \(.*\) generated [0-9]+ warnings?' <<<"$out"; then
+            printf '%s\n' "$out" | grep -vE '^ *(Compiling|Finished|Executable|Blocking|Downloaded|Fresh) '
+            echo "::error title=Compiler warnings in shard ${{ matrix.shard }}::this leg's test build has rustc warnings (above). A test helper unused in this shard belongs under lib.rs's shard-subset cfg_attr allow list (#6329); anything else is a real warning to fix."
+            exit 1
+          fi
+          echo "no compiler warnings in the ${{ matrix.shard }} test build"
 
       # See the pool job's history (#3494, #3699, #3479) for the flags:
       # `--bins` on the leg that owns the bin-target tests, `--no-fail-fast`
@@ -978,6 +1259,9 @@ jobs:
       # `test-shards.py filter` skips its tests in all but the one leg its
       # file maps to, so each still runs exactly once (`all()` when every
       # module is gated, the normal case).
+      #
+      # `--profile ci` (.config/nextest.toml): no retries, and a JUnit report
+      # at target/nextest/ci/junit.xml for the two steps below (#6172).
       - name: Run unit tests
         id: unit
         env:
@@ -994,10 +1278,29 @@ jobs:
           filter="$(python3 scripts/ci/test-shards.py filter "${{ matrix.shard }}")"
           echo "nextest filter for this leg: ${filter}"
           if [ "${{ matrix.shard }}" = "$BIN_SHARD" ]; then
-            cargo nextest run --workspace --lib --bins --features "test-shard-${{ matrix.shard }}" -E "$filter" --test-threads 8 --no-fail-fast
+            cargo nextest run --workspace --lib --bins --features "test-shard-${{ matrix.shard }}" -E "$filter" --test-threads 8 --no-fail-fast --profile ci
           else
-            cargo nextest run --workspace --lib --features "test-shard-${{ matrix.shard }}" -E "$filter" --test-threads 8 --no-fail-fast
+            cargo nextest run --workspace --lib --features "test-shard-${{ matrix.shard }}" -E "$filter" --test-threads 8 --no-fail-fast --profile ci
           fi
+
+      # Report only: lists the leg's failed and flaky tests in the job
+      # summary, with an annotation each, and never changes the verdict
+      # (#6172). The `ci` profile does not retry, so "flaky" stays empty
+      # here until a retrying profile runs; the JUnit is the per-test record.
+      - name: Summarise unit test results
+        if: ${{ !cancelled() && steps.unit.outcome != 'skipped' }}
+        run: python3 scripts/ci/nextest-junit-summary.py "Unit tests (${{ matrix.shard }})" target/nextest/ci/junit.xml >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload unit test JUnit report
+        if: always()
+        # Report-only: an artifact-storage outage must not fail a green job.
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: junit-unit-${{ matrix.shard }}
+          path: target/nextest/ci/junit.xml
+          if-no-files-found: warn
+          retention-days: 7
 
       # This leg's share of the report. Only a fully green run yields one (a
       # failed run's counters are partial); `coverage-gates` then reports
@@ -1030,6 +1333,8 @@ jobs:
           du -sh target 2>/dev/null || true
           free -m
           swapon --show
+          ./scripts/ci/memory-watch.sh stop "$RUNNER_TEMP/memory-watch.tsv"
+          ./scripts/ci/memory-watch.sh report "$RUNNER_TEMP/memory-watch.tsv"
 
   # INTEGRATION SUITES (backend/tests/), GitHub-hosted.
   #
@@ -1105,20 +1410,26 @@ jobs:
 
       # rust-toolchain.toml pins the compiler (#3551); this installs exactly
       # that version, and the next step proves it is the one in force.
-      - uses: dtolnay/rust-toolchain@1.98.0
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master 2026-11-15; the toolchain input picks the compiler
+        with:
+          toolchain: 1.98.0
 
       - name: Assert the pinned Rust toolchain is in force
         run: ./scripts/ci/check-toolchain-pin.sh --active
 
       - name: Install cargo-nextest and sqlx-cli
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
         with:
-          tool: cargo-nextest,sqlx-cli
+          tool: cargo-nextest@0.9.152,sqlx-cli@0.9.1
 
       # The self-hosted image shipped protoc; ubuntu-24.04 does not, and
       # build scripts in the dependency tree need it.
+      # Bounded (#6272): scripts/ci/apt-install-bounded.sh caps each download
+      # attempt at 3 minutes and retries on azure.archive.ubuntu.com, so a
+      # crawling mirror cannot hold the job to its ceiling.
       - name: Install protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+        timeout-minutes: 12
+        run: bash scripts/ci/apt-install-bounded.sh protobuf-compiler
 
       # The dependency graph and the library, saved from `main` only (see
       # the note on check-rust's rust-cache step). The pool job had no
@@ -1135,14 +1446,14 @@ jobs:
       # Resolve and fetch in a step of its own with a retry, after a
       # stale/truncated crates.io index failed `main` before any test ran
       # (run 31176621357, 2026-08-07). This retries resolution and download
-      # ONLY; no test step is ever retried. No `--locked`: the build steps do
-      # not use it either, so adding it here would newly fail PRs with a
-      # legitimately-updated Cargo.lock.
+      # ONLY; no test step is ever retried. `--locked` (#6180) fails only a
+      # Cargo.lock that would have to change, never a PR that commits its
+      # updated lock, and nothing later in the job can rewrite the lock.
       - name: Fetch dependencies
         run: |
           set -euo pipefail
           for attempt in 1 2 3; do
-            if cargo fetch; then
+            if cargo fetch --locked; then
               exit 0
             fi
             echo "cargo fetch failed (attempt ${attempt}/3) — retrying" >&2
@@ -1264,7 +1575,9 @@ jobs:
           AK_TESTS_REQUIRE_DB: "1"
           JWT_SECRET: ci-coverage-secret-at-least-32-bytes-long-for-tests
         run: |
-          cargo nextest run --workspace --no-tests=fail --test-threads 8 \
+          rm -f target/nextest/ci/junit.xml
+          trap 'mkdir -p junit && cp target/nextest/ci/junit.xml junit/tier1.xml 2>/dev/null || true' EXIT
+          cargo nextest run --workspace --no-tests=fail --test-threads 8 --profile ci \
             --test workflow_scan_gate_tests \
             --test security_tests \
             --test security_regression_tests \
@@ -1434,7 +1747,9 @@ jobs:
           AK_TESTS_REQUIRE_DB: "1"
           JWT_SECRET: ci-coverage-secret-at-least-32-bytes-long-for-tests
         run: |
-          cargo nextest run --workspace --no-tests=fail --no-fail-fast --test-threads 8 \
+          rm -f target/nextest/ci/junit.xml
+          trap 'mkdir -p junit && cp target/nextest/ci/junit.xml junit/tier2.xml 2>/dev/null || true' EXIT
+          cargo nextest run --workspace --no-tests=fail --no-fail-fast --test-threads 8 --profile ci \
             --run-ignored ignored-only \
             --test lifecycle_policy_tests \
             --test api_token_cache_flush_tests \
@@ -1512,10 +1827,31 @@ jobs:
           AK_TESTS_REQUIRE_DB: "1"
           JWT_SECRET: ci-coverage-secret-at-least-32-bytes-long-for-tests
         run: |
-          cargo nextest run --workspace --no-tests=fail \
+          rm -f target/nextest/ci/junit.xml
+          trap 'mkdir -p junit && cp target/nextest/ci/junit.xml junit/incus.xml 2>/dev/null || true' EXIT
+          cargo nextest run --workspace --no-tests=fail --profile ci \
             --run-ignored ignored-only \
             --test incus_upload_tests \
             test_chunked_upload_cross_repo_session_rejected
+
+      # Report only, as in the unit shards (#6172). Each nextest step above
+      # overwrites target/nextest/ci/junit.xml, so each copies its report to
+      # junit/ on exit; a step that did not run leaves no file, and the
+      # summary names it.
+      - name: Summarise integration test results
+        if: ${{ !cancelled() && steps.build.outcome != 'skipped' }}
+        run: python3 scripts/ci/nextest-junit-summary.py "Integration tests" junit/tier1.xml junit/tier2.xml junit/incus.xml >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload integration test JUnit reports
+        if: always()
+        # Report-only: an artifact-storage outage must not fail a green job.
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: junit-integration
+          path: junit/
+          if-no-files-found: warn
+          retention-days: 7
 
       # The acceptance numbers for keeping this job on hosted PR runs: the
       # per-process peak RSS of each build pass is already in the job
@@ -1579,7 +1915,9 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: dtolnay/rust-toolchain@1.98.0
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master 2026-11-15; the toolchain input picks the compiler
+        with:
+          toolchain: 1.98.0
 
       - name: Assert the pinned Rust toolchain is in force
         run: ./scripts/ci/check-toolchain-pin.sh --active
@@ -1588,12 +1926,16 @@ jobs:
         run: python3 scripts/ci/test-shards.py check
 
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
         with:
-          tool: cargo-nextest
+          tool: cargo-nextest@0.9.152
 
+      # Bounded (#6272): scripts/ci/apt-install-bounded.sh caps each download
+      # attempt at 3 minutes and retries on azure.archive.ubuntu.com, so a
+      # crawling mirror cannot hold the job to its ceiling.
       - name: Install protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+        timeout-minutes: 12
+        run: bash scripts/ci/apt-install-bounded.sh protobuf-compiler
 
       # The integration job's entry: the same uninstrumented dev-profile
       # dependency graph, dev-dependencies included. Restore only.
@@ -1607,7 +1949,7 @@ jobs:
         run: |
           set -euo pipefail
           for attempt in 1 2 3; do
-            if cargo fetch; then
+            if cargo fetch --locked; then
               exit 0
             fi
             echo "cargo fetch failed (attempt ${attempt}/3) — retrying" >&2
@@ -1799,6 +2141,13 @@ jobs:
       - name: Check Trivy gate severity filter
         run: ./scripts/ci/check-trivy-gate-severity.sh
 
+      # #4799: the weekly scan's classifier decides which findings open an
+      # issue, so a wrong verdict is invisible until the next Monday scan.
+      # The self-test pins the stale-:latest and still-live cases offline with
+      # Node; no Docker or network needed.
+      - name: Check Trivy finding classification
+        run: bash scripts/ci/test-trivy-findings.sh
+
       # Stock compose image names (#4479): a short name like
       # `postgres:18-alpine` resolves per host under podman's enforcing
       # short-name mode, so the same file could run different images.
@@ -1871,9 +2220,7 @@ jobs:
       #     once a patch release can be cut from release/X.Y.x. Its
       #     permissive direction hands an attacker-controlled branch the
       #     right to sign, so it must refuse an arbitrary branch, a case
-      #     variant of a real one, a commit on neither, and a
-      #     release-candidate.yml that is not byte-identical to a copy that
-      #     lives on main;
+      #     variant of a real one and a commit on neither;
       #   * registry-tag-digest.sh -- the digest probe the certification is
       #     compared against; must never invent a digest or read a 404 from
       #     an unreadable repository as absence;
@@ -1911,6 +2258,27 @@ jobs:
       - name: Check the candidate publish-run resolver selects and blocks correctly
         run: bash scripts/ci/test-resolve-candidate-publish-run.sh
 
+      # The memory sampler Check Rust runs beside clippy (#6242): it reads
+      # /proc/meminfo and the compiler processes right, and it never fails
+      # the job it watches. Fixtures only, ~2s.
+      - name: Check the memory sampler
+        run: bash scripts/ci/test-memory-watch.sh
+
+      # The bounded apt install every "Install protoc" step runs (#6272): a
+      # hung mirror is killed and retried on azure, a dead one fails in
+      # bounded time, and the unpack itself is never time-boxed. Stub
+      # apt-get, ~10s.
+      - name: Check the bounded apt install
+        run: bash scripts/ci/test-apt-install-bounded.sh
+
+      # The memory cap the backend compiles run under (#6242): memory.high
+      # is MemTotal minus the reserve, the command runs inside the cgroup, a
+      # setup failure only warns, and every hosted step that compiles the
+      # backend crate (unit shards, clippy, the image build) is still
+      # capped. Fake cgroup tree, ~1s.
+      - name: Check the compile memory cap
+        run: bash scripts/ci/test-memory-cap.sh
+
       # What a Release Candidate rerun of the failed gate groups runs, and
       # whether it may run at all (#6076): the wrong commit, a non-candidate
       # original, a replaced record or a dropped failed group must BLOCK.
@@ -1918,19 +2286,43 @@ jobs:
       - name: Check the candidate rerun resolver selects and blocks correctly
         run: bash scripts/ci/test-resolve-candidate-rerun.sh
 
+      # The release gate is pinned by sha (#6170): every caller of an
+      # artifact-keeper-test reusable workflow names one 40-hex commit, and a
+      # newly pinned commit must be on artifact-keeper-test main (a public
+      # repository, so the default token reads the compare API; a PR that
+      # changes no pin makes no call). The self-test stubs `gh`; offline, ~2s.
+      - name: Check the gate pin guard catches what it must
+        run: bash scripts/ci/test-check-gate-workflow-pins.sh
+      - name: Every gate caller pins one artifact-keeper-test commit
+        run: bash scripts/ci/check-gate-workflow-pins.sh check
+      - name: A newly pinned gate commit is on artifact-keeper-test main
+        if: ${{ github.event_name == 'pull_request' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/ci/check-gate-workflow-pins.sh reachable "origin/${GITHUB_BASE_REF}"
+
+      # The CLI cache warm-up dispatch (#6089): a 5xx or 429 is retried and
+      # then only warns, any other error still fails. Stubs `gh`; offline, ~1s.
+      - name: Check the CLI cache warm-up dispatch retries only transient errors
+        run: bash scripts/ci/test-dispatch-cli-cache-warmup.sh
+
       # The nightly release gate (#6073): which lines and images it tests,
       # how it gives way to a release candidate on the shared pool, and the
-      # one-issue-per-red-tier tracking plus the verdict record #6075 reads.
-      # Stubs `gh`; offline, ~2s.
-      - name: Check the nightly release gate's line resolver, sentinel and report
+      # one-issue-per-red-tier tracking plus the verdict record #6075 reads,
+      # and (#6155) the guard that keeps its scheduled triggers to one gate a
+      # night. Stubs `gh`; offline, ~2s.
+      - name: Check the nightly release gate's line resolver, sentinel, once-a-night guard and report
         run: |
           bash scripts/ci/test-nightly-gate-lines.sh
           bash scripts/ci/test-nightly-gate-sentinel.sh
+          bash scripts/ci/test-nightly-gate-once.sh
           bash scripts/ci/test-nightly-gate-report.sh
 
       # #6080: no merge freeze during a candidate. The stale-run finder
       # cancels only runs that are queued with no runner past its threshold,
-      # never a moving one; the floating-tag guard withholds :dev / :X.Y-dev
+      # or (#6289) a superseded main push whose remaining jobs have waited
+      # 45m for a runner, never a moving one, a tag, a dispatch or a re-run;
+      # the floating-tag guard withholds :dev / :X.Y-dev
       # only from a run whose commit is provably older than the one they
       # name. Stubs `gh`; offline.
       - name: Check the stale Docker Publish run finder
@@ -2009,6 +2401,14 @@ jobs:
 
       - name: Check the conflict-marker gate catches what it must
         run: bash scripts/ci/test-check-conflict-markers.sh
+
+      # A native test that writes ~/.npmrc, ~/.cargo or ~/.m2 leaves the test
+      # registry and its credentials on the developer's machine (#5940).
+      - name: Check native tests keep client config in their work dir
+        run: bash scripts/ci/check-native-tests-user-config.sh
+
+      - name: Check the native-test config gate catches what it must
+        run: bash scripts/ci/test-check-native-tests-user-config.sh
 
       # Stock compose version pins (#4481): openscap and web were hardcoded to
       # :latest, so setting ARTIFACT_KEEPER_VERSION still left two images
@@ -2135,6 +2535,15 @@ jobs:
       - name: Check the toolchain-pin gate catches what it must
         run: bash scripts/ci/test-check-toolchain-pin.sh
 
+      # Every `uses:` is a full commit sha and every install-action tool has
+      # an exact version (#6178), so no action or tool can change under this
+      # repo without a commit. Pure file inspection, no network, ~1s.
+      - name: Check every action and installed tool is pinned
+        run: bash scripts/ci/check-action-pins.sh
+
+      - name: Check the action-pin gate catches what it must
+        run: bash scripts/ci/test-check-action-pins.sh
+
       # The daily curl advisory watch (scheduled-curl-advisory-watch.yml,
       # #6003) is the only control over the curl / libcurl the backend and
       # OpenSCAP images build from source, and it is silent while the pins are
@@ -2259,6 +2668,12 @@ jobs:
       - name: Check the post-release dispatch gate catches what it must
         run: bash scripts/ci/test-check-release-downstream-dispatch.sh
 
+      # Create Release gets a 403 from GITHUB_TOKEN when the commit is not a
+      # branch tip (#6338); the promote pins publish/vX.Y.Z and release.yml
+      # removes it. Stub gh, no network, ~1s.
+      - name: Check the release pin branch script and its wiring
+        run: bash scripts/ci/test-pin-release-branch.sh
+
       # The rule the promotion obeys: a floating tag may only name a version
       # with a published GitHub Release, and only if it is newest in that line.
       # Its interesting cases (a backport that moves :X.Y but not :latest, a
@@ -2322,6 +2737,12 @@ jobs:
       # percentage. Throwaway trees, no cargo, ~1s.
       - name: Check the test-shard gates and the coverage merge
         run: bash scripts/ci/test-test-shards.sh
+
+      # The unit and integration jobs' JUnit summary is the only place a
+      # flaky pass shows (#6172); a parser that missed `<flakyFailure>`
+      # would hide it. Real nextest reports, no cargo, ~1s.
+      - name: Check the nextest JUnit summary names flaky and failed tests
+        run: bash scripts/ci/test-nextest-junit-summary.sh
 
       # The coverage merge gate (coverage-gates -> CI Complete). Three ways it
       # can silently stop measuring what it claims: counting inline
@@ -2496,7 +2917,7 @@ jobs:
           sparse-checkout: docker/scanner-adapter
 
       - name: Set up Go
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version-file: docker/scanner-adapter/go.mod
           # Stdlib-only module with no go.sum: nothing to cache.
@@ -2735,7 +3156,7 @@ jobs:
       - name: Setup Node.js for jscpd
         if: ${{ !cancelled() && steps.mb.outcome == 'success' }}
         continue-on-error: true
-        uses: actions/setup-node@v7.1.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '20'
 
@@ -3250,8 +3671,37 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # The `ci`-profile lib rustc in the builder stage needs 17.2 GiB
+      # (measured in a 4-CPU container with this Dockerfile's command,
+      # #6242); this VM has 15.6 GiB of RAM and a 3 GiB zram device, so the
+      # build failed "ResourceExhausted: cannot allocate memory" on main
+      # (jobs 135788683205, 135831967115) and on PRs. Same swapfile as the
+      # Rust jobs. Best effort: a failure here is a ::warning::, never a
+      # red job.
+      - name: Add swap
+        run: |
+          if sudo fallocate -l 12G /ak-ci-swapfile \
+             && sudo chmod 600 /ak-ci-swapfile \
+             && sudo mkswap /ak-ci-swapfile >/dev/null \
+             && sudo swapon /ak-ci-swapfile; then
+            echo "added a 12 GiB swapfile"
+          else
+            echo "::warning title=No extra swap::could not add /ak-ci-swapfile; this job runs with the image's default swap only."
+          fi
+          swapon --show
+          free -m
+
+      # memory / memory-swap: buildkitd (and so the cargo build inside it)
+      # runs in a container with 12 GiB of RAM and up to 15 GiB of swap on
+      # top (Docker's memory-swap is RAM plus swap). Past 12 GiB the kernel
+      # swaps the compiler's pages rather than the runner agent's, the same
+      # job memory-cap.sh does for the Rust jobs (#6242).
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+        with:
+          driver-opts: |
+            memory=12g
+            memory-swap=27g
 
       - name: Build backend image
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
@@ -3303,6 +3753,7 @@ jobs:
           build-args: |
             CARGO_BUILD_JOBS=4
             CARGO_PROFILE=ci
+            GIT_SHA=${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Verify image starts
         run: |
@@ -3366,7 +3817,7 @@ jobs:
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
 
       - name: Log in to GHCR
-        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -3450,15 +3901,41 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: dtolnay/rust-toolchain@1.98.0
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master 2026-11-15; the toolchain input picks the compiler
+        with:
+          toolchain: 1.98.0
 
       - name: Install cargo-audit
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
         with:
-          tool: cargo-audit
+          # Exact version (#6180), the one release.yml pins (#6178).
+          tool: cargo-audit@0.23.0
 
       - name: Audit Rust dependencies
         run: cargo audit
+
+      # osv-scanner beside cargo audit (#6180), under the same blocking rule
+      # (see ci-complete). cargo audit reads only RustSec; OSV also carries
+      # GitHub advisories with crates.io ranges. GHSA-m665-v7pm-7grj (zip
+      # 2.4.2) was published with no RUSTSEC id and cargo audit never saw
+      # it. The ignores, each with a reason and an expiry, are in
+      # osv-scanner.toml. Pinned by version and sha256.
+      - name: Install osv-scanner
+        env:
+          OSV_SCANNER_VERSION: 2.7.0
+          OSV_SCANNER_SHA256: 160c6253e2922e9e0a6a9771c5c4c40a4b3c6090b34a3cdd5e80c96cc2e4218b
+        run: |
+          set -euo pipefail
+          bin="$RUNNER_TEMP/osv-scanner"
+          curl --proto '=https' --tlsv1.2 -sSfL --retry 3 -o "$bin" \
+            "https://github.com/google/osv-scanner/releases/download/v${OSV_SCANNER_VERSION}/osv-scanner_linux_amd64"
+          echo "${OSV_SCANNER_SHA256}  ${bin}" | sha256sum -c -
+          chmod +x "$bin"
+          "$bin" --version
+
+      - name: Scan Cargo.lock with osv-scanner
+        run: |
+          "$RUNNER_TEMP/osv-scanner" scan source --config osv-scanner.toml --lockfile Cargo.lock
 
   # ════════════════════════════════════════════════════════════════════════════
   # FINAL STATUS
@@ -3471,7 +3948,7 @@ jobs:
     # Not smoke-e2e, build-backend-image or build-openscap-image: they are
     # advisory (see the container-chain note in the step below), and a
     # `needs` edge would make this required context wait ~25 min for them.
-    needs: [changes, detect-changes, release-bump, check-rust, test-backend-unit-shard, test-backend-unit, workflow-contracts, shell-tests, version-pin-bump, scanner-adapter-go, go-floor-agreement, coverage-gates, security-audit]
+    needs: [changes, detect-changes, release-bump, check-rust, windows-cross-check, test-backend-unit-shard, test-backend-unit, workflow-contracts, shell-tests, version-pin-bump, scanner-adapter-go, go-floor-agreement, coverage-gates, security-audit]
     if: always()
     # The coverage decision reads the PR's live labels/draft state, the
     # override label's `labeled` events and `/coverage-override` comments,
@@ -3496,6 +3973,7 @@ jobs:
         # the shell control flow.
         env:
           RESULT_CHECK_RUST: ${{ needs.check-rust.result }}
+          RESULT_WINDOWS_CHECK: ${{ needs.windows-cross-check.result }}
           RESULT_UNIT: ${{ needs.test-backend-unit.result }}
           RESULT_UNIT_SHARDS: ${{ needs.test-backend-unit-shard.result }}
           RESULT_WORKFLOW_CONTRACTS: ${{ needs.workflow-contracts.result }}
@@ -3533,7 +4011,8 @@ jobs:
 
           # Docs-only PRs legitimately skip the Tier 1 jobs (see the
           # `changes` job). Version-bump-only release PRs legitimately skip
-          # the heavy Rust jobs — check-rust and test-backend-unit, but NOT
+          # the heavy Rust jobs — check-rust, windows-cross-check and
+          # test-backend-unit, but NOT
           # shell-tests, which still runs on that path (see the
           # `release-bump` job). Any other skip/failure of a Tier 1 job is
           # fatal.
@@ -3549,8 +4028,8 @@ jobs:
           fi
           # The `changes` job found nothing a Rust job reads (a CI-only PR),
           # or, on a push, a merged PR already proved this exact tree green.
-          # Same allowance as the bump path: check-rust and test-backend-unit
-          # may skip; shell-tests and security-audit still run and must
+          # Same allowance as the bump path: check-rust, windows-cross-check
+          # and test-backend-unit may skip; shell-tests and security-audit still run and must
           # succeed. Only an explicit "false" counts -- an empty output (the
           # gate died) makes a skip fatal, matching the jobs' own fail-open
           # `!= 'false'` condition.
@@ -3571,12 +4050,14 @@ jobs:
             elif [[ "$result" == "skipped" && "$docs_only" == "true" ]]; then
               echo "⏭️ $name (docs-only)" >> "$GITHUB_STEP_SUMMARY"
             elif [[ "$result" == "skipped" && "$bump_only" == "true" \
-                    && ( "$name" == "check-rust" || "$name" == "test-backend-unit" ) ]]; then
-              # Only the two heavy Rust jobs are skippable on the bump path.
+                    && ( "$name" == "check-rust" || "$name" == "windows-cross-check" \
+                         || "$name" == "test-backend-unit" ) ]]; then
+              # Only the heavy Rust jobs are skippable on the bump path.
               # shell-tests and security-audit still run and must succeed.
               echo "⏭️ $name (version-bump-only release PR)" >> "$GITHUB_STEP_SUMMARY"
             elif [[ "$result" == "skipped" && "$rust_skipped" == "true" \
-                    && ( "$name" == "check-rust" || "$name" == "test-backend-unit" ) ]]; then
+                    && ( "$name" == "check-rust" || "$name" == "windows-cross-check" \
+                         || "$name" == "test-backend-unit" ) ]]; then
               echo "⏭️ $name (no Rust-job inputs to re-verify)" >> "$GITHUB_STEP_SUMMARY"
             else
               echo "❌ $name: ${result:-missing}" >> "$GITHUB_STEP_SUMMARY"
@@ -3622,6 +4103,10 @@ jobs:
           }
 
           require_success "check-rust" "$RESULT_CHECK_RUST"
+          # The Windows cross-check (#6022) has check-rust's condition, so it
+          # may skip exactly where check-rust may. Advisory from #6243 until
+          # its mingw install stopped hanging (#6242).
+          require_success "windows-cross-check" "$RESULT_WINDOWS_CHECK"
           require_success "test-backend-unit" "$RESULT_UNIT"
           require_success "shell-tests" "$RESULT_SHELL"
 

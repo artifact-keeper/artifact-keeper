@@ -237,7 +237,9 @@ async fn download_package(
     let repo = resolve_cran_repo(&state.db, &repo_key).await?;
 
     let artifact =
-        match proxy_helpers::find_local_by_filename_suffix(&state.db, repo.id, &filename).await? {
+        match proxy_helpers::find_servable_local_by_filename_suffix(&state, repo.id, &filename)
+            .await?
+        {
             Some(a) => a,
             None => {
                 let upstream_path = format!("src/contrib/{}", filename);

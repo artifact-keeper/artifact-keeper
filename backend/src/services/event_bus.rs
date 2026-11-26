@@ -68,12 +68,87 @@ impl DomainEvent {
 /// falls behind, it receives `RecvError::Lagged` and can request a full refresh.
 pub struct EventBus {
     tx: broadcast::Sender<DomainEvent>,
+    capacity: usize,
+}
+
+/// How [`EventBus::publish_paced`] waits for subscribers (#6469).
+#[derive(Debug, Clone, Copy)]
+pub struct Pacing {
+    /// Publish only while fewer than this many events are still queued for
+    /// the slowest subscriber.
+    pub high_water: usize,
+    /// The most a call waits in total. A subscriber that has stopped reading
+    /// (an idle SSE client) keeps the queue full; past this budget the rest
+    /// is published unpaced, as [`EventBus::publish`] would.
+    pub max_wait: std::time::Duration,
+    /// Pause between checks while the queue is at `high_water`.
+    pub poll: std::time::Duration,
+}
+
+impl Pacing {
+    /// A quarter of the buffer, at most 2 s of waiting per call.
+    pub fn for_capacity(capacity: usize) -> Self {
+        Self {
+            high_water: (capacity / 4).max(1),
+            max_wait: std::time::Duration::from_secs(2),
+            poll: std::time::Duration::from_millis(5),
+        }
+    }
 }
 
 impl EventBus {
     pub fn new(capacity: usize) -> Self {
         let (tx, _) = broadcast::channel(capacity);
-        Self { tx }
+        Self { tx, capacity }
+    }
+
+    /// The broadcast buffer size the bus was built with.
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Wait (at most `pacing.max_wait`) until the slowest subscriber has
+    /// fewer than `pacing.high_water` events queued, so a burst published
+    /// right after fits in the buffer (#6469: a sweep page waits here before
+    /// it takes its locks, then publishes without waiting). Returns the time
+    /// spent waiting.
+    pub async fn wait_for_room(&self, pacing: Pacing) -> std::time::Duration {
+        let started = std::time::Instant::now();
+        while started.elapsed() < pacing.max_wait && self.tx.len() >= pacing.high_water {
+            tokio::time::sleep(pacing.poll).await;
+        }
+        started.elapsed()
+    }
+
+    /// Publish a burst without outrunning the subscribers (#6469).
+    ///
+    /// [`EventBus::publish`] never waits, so a burst larger than the buffer
+    /// makes every subscriber that has not caught up (webhook producer, email
+    /// dispatcher, search indexer) drop the oldest events with `Lagged`,
+    /// including unrelated events published at the same time. This publishes
+    /// one event at a time and, while the slowest subscriber still has
+    /// `pacing.high_water` events queued, waits for it to drain, so the
+    /// buffer keeps room for everyone else. Returns the time spent waiting.
+    pub async fn publish_paced(
+        &self,
+        events: impl IntoIterator<Item = DomainEvent>,
+        pacing: Pacing,
+    ) -> std::time::Duration {
+        let started = std::time::Instant::now();
+        let mut waited = std::time::Duration::ZERO;
+        for (i, event) in events.into_iter().enumerate() {
+            while waited < pacing.max_wait && self.tx.len() >= pacing.high_water {
+                tokio::time::sleep(pacing.poll).await;
+                waited = started.elapsed();
+            }
+            self.publish(event);
+            if i % 32 == 31 {
+                // Give the subscriber tasks a turn even when the queue is
+                // short, so a burst does not monopolise this worker thread.
+                tokio::task::yield_now().await;
+            }
+        }
+        waited
     }
 
     /// Publish a domain event. If there are no subscribers the event is dropped silently.
@@ -380,5 +455,95 @@ mod tests {
         assert_eq!(event.event_type, "repository.created");
         assert_eq!(event.entity_id, repo_id.to_string());
         assert_eq!(event.repository_id, Some(repo_id));
+    }
+
+    /// #6469: a paced burst larger than the buffer reaches a subscriber that
+    /// keeps reading without a single `Lagged`, while an unpaced one drops.
+    #[tokio::test]
+    async fn paced_burst_does_not_lag_a_reading_subscriber_6469() {
+        let bus = std::sync::Arc::new(EventBus::new(16));
+        let mut rx = bus.subscribe();
+        let reader = tokio::spawn(async move {
+            let (mut got, mut lagged) = (0usize, 0u64);
+            loop {
+                match rx.recv().await {
+                    Ok(_) => got += 1,
+                    Err(broadcast::error::RecvError::Lagged(n)) => lagged += n,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+                if got + lagged as usize >= 200 {
+                    break;
+                }
+            }
+            (got, lagged)
+        });
+        let events = (0..200).map(|i| DomainEvent::now("artifact.deleted", i.to_string(), None));
+        bus.publish_paced(events, Pacing::for_capacity(bus.capacity()))
+            .await;
+        let (got, lagged) = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
+            .await
+            .expect("reader finishes")
+            .unwrap();
+        assert_eq!(lagged, 0, "no event dropped");
+        assert_eq!(got, 200);
+    }
+
+    /// #6469: a subscriber that never reads cannot wedge a paced publisher;
+    /// it waits at most `max_wait` and then publishes the rest.
+    #[tokio::test]
+    async fn paced_burst_gives_up_waiting_on_a_stalled_subscriber_6469() {
+        let bus = EventBus::new(8);
+        let _stalled = bus.subscribe();
+        let pacing = Pacing {
+            high_water: 2,
+            max_wait: std::time::Duration::from_millis(50),
+            poll: std::time::Duration::from_millis(1),
+        };
+        let started = std::time::Instant::now();
+        let events = (0..100).map(|i| DomainEvent::now("artifact.deleted", i.to_string(), None));
+        let waited = bus.publish_paced(events, pacing).await;
+        assert!(waited >= std::time::Duration::from_millis(50));
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    /// #6469: `wait_for_room` returns once a reading subscriber has drained
+    /// below the high-water mark, and gives up after `max_wait` on a stalled
+    /// one.
+    #[tokio::test]
+    async fn wait_for_room_waits_for_a_drain_and_is_capped_6469() {
+        let bus = std::sync::Arc::new(EventBus::new(16));
+        let mut rx = bus.subscribe();
+        for i in 0..12 {
+            bus.publish(DomainEvent::now("artifact.deleted", i.to_string(), None));
+        }
+        let pacing = Pacing {
+            high_water: 4,
+            max_wait: std::time::Duration::from_secs(5),
+            poll: std::time::Duration::from_millis(1),
+        };
+        let drain = tokio::spawn(async move {
+            for _ in 0..12 {
+                rx.recv().await.unwrap();
+            }
+            rx
+        });
+        let waited = bus.wait_for_room(pacing).await;
+        assert!(bus.tx.len() < 4);
+        assert!(waited < std::time::Duration::from_secs(5));
+        let _rx = drain.await.unwrap();
+
+        let stalled = EventBus::new(8);
+        let _never = stalled.subscribe();
+        for i in 0..8 {
+            stalled.publish(DomainEvent::now("artifact.deleted", i.to_string(), None));
+        }
+        let capped = Pacing {
+            high_water: 2,
+            max_wait: std::time::Duration::from_millis(50),
+            poll: std::time::Duration::from_millis(1),
+        };
+        let waited = stalled.wait_for_room(capped).await;
+        assert!(waited >= std::time::Duration::from_millis(50));
+        assert!(waited < std::time::Duration::from_secs(5));
     }
 }

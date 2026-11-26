@@ -17,26 +17,222 @@ use crate::services::cluster_work::Claimed;
 /// jobs sit idle, not how long a scan may take.
 pub const CLAIM_TTL_SECS: f64 = 120.0;
 
-/// Priority bands. A client is parked on a fail-closed job, so it outranks
-/// fail-open backfill, which outranks work nobody waits on.
+/// Priority bands, claimed in this order (see [`ScanQueue::claim_filtered`]):
+///
+/// - [`PRIORITY_CLIENT_WAITING`] and above: a client is parked on a
+///   fail-closed job, so it always goes first.
+/// - [`PRIORITY_HOSTED`] up to the waiting band: hosted uploads, pushed images
+///   and manual scans, which a user, a promotion rule or a CI job waits on.
+/// - [`PRIORITY_BACKFILL`] up to the hosted band: fail-open proxy scans
+///   nobody waits on. They age into the hosted band (#6032): a backfill job is
+///   claimed as though it were a hosted job queued the aging window
+///   ([`backfill_aging`]) after it, so hosted work goes ahead of a backfill
+///   burst, and a backfill job still goes ahead of hosted work queued more
+///   than the window after it. Neither band can starve the other.
+/// - A non-rescan job below [`PRIORITY_BACKFILL`] is claimed as hosted: 1.12.0
+///   queued hosted scans at [`PRIORITY_HOSTED_1_12_0`], and those rows (and
+///   the ones a 1.12.0 pod still queues during a rolling upgrade) must not
+///   fall behind the backfill.
+/// - `rescan` jobs (#5947) and proxy re-grades ([`PRIORITY_REGRADE`], #6300),
+///   after everything else.
 pub const PRIORITY_CLIENT_WAITING: i16 = 100;
+pub const PRIORITY_HOSTED: i16 = 75;
 pub const PRIORITY_BACKFILL: i16 = 50;
-pub const PRIORITY_HOSTED: i16 = 10;
 /// Rescans after a vulnerability-database update (#5947): below everything a
 /// user or a pull is waiting on, so a backlog of them never delays those.
 pub const PRIORITY_RESCAN: i16 = 5;
+/// What 1.12.0 queued hosted scans at, below the backfill. The claim treats
+/// every non-rescan row between [`PRIORITY_RESCAN`] and [`PRIORITY_BACKFILL`]
+/// as hosted; the only non-rescan job at or below [`PRIORITY_RESCAN`] is a
+/// proxy re-grade ([`PRIORITY_REGRADE`]), claimed with the rescans.
+pub const PRIORITY_HOSTED_1_12_0: i16 = 10;
 
-/// The claim CTE sorts on these, and getting the order wrong is a silent
-/// latency regression rather than a failure, so assert it at compile time.
+/// A `proxy_file` re-grade after a vulnerability-database update (#6300): the
+/// pull that queued it was already decided by the verdict from the previous
+/// database build, so nobody waits on it. Claimed in the rescan band, within
+/// the worker's rescan slots, and raised like any `proxy_file` job if a pull
+/// that does wait queues the same digest. A replica from before 1.13.0 never
+/// claims one (its rescan band is `kind = 'rescan'` only), which leaves it for
+/// one that does.
+pub const PRIORITY_REGRADE: i16 = PRIORITY_RESCAN;
+
+/// The claim CTE splits the bands on these, and getting the order wrong is a
+/// silent latency regression rather than a failure, so assert it at compile
+/// time.
 const _: () = {
-    assert!(PRIORITY_CLIENT_WAITING > PRIORITY_BACKFILL);
-    assert!(PRIORITY_BACKFILL > PRIORITY_HOSTED);
-    assert!(PRIORITY_HOSTED > PRIORITY_RESCAN);
+    assert!(PRIORITY_CLIENT_WAITING > PRIORITY_HOSTED);
+    assert!(PRIORITY_HOSTED > PRIORITY_BACKFILL);
+    assert!(PRIORITY_BACKFILL > PRIORITY_RESCAN);
+    assert!(PRIORITY_BACKFILL > PRIORITY_HOSTED_1_12_0);
+    assert!(PRIORITY_HOSTED_1_12_0 > PRIORITY_RESCAN);
+    assert!(PRIORITY_REGRADE <= PRIORITY_RESCAN);
 };
+
+/// Default backfill aging window (#6032): how long a fail-open proxy scan
+/// waits before it competes with hosted scans on age alone.
+pub const DEFAULT_BACKFILL_AGING: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Env var overriding [`DEFAULT_BACKFILL_AGING`], in seconds. `0` claims the
+/// two bands in plain age order. Blank or unparsable keeps the default; more
+/// than [`MAX_BACKFILL_AGING`] is clamped to it.
+pub const BACKFILL_AGING_ENV: &str = "SCAN_QUEUE_BACKFILL_AGING_SECS";
+
+/// Ceiling for the aging window: 30 days is "hosted always first" in practice,
+/// and `created_at + window` past PostgreSQL's timestamp range would fail
+/// every claim, `fail_closed` pulls included.
+pub const MAX_BACKFILL_AGING: std::time::Duration =
+    std::time::Duration::from_secs(30 * 24 * 60 * 60);
+
+/// The backfill aging window this process claims with, from
+/// [`BACKFILL_AGING_ENV`].
+pub fn backfill_aging() -> std::time::Duration {
+    parse_backfill_aging(std::env::var(BACKFILL_AGING_ENV).ok().as_deref())
+}
+
+fn parse_backfill_aging(raw: Option<&str>) -> std::time::Duration {
+    raw.and_then(|v| v.trim().parse::<u64>().ok())
+        .map(std::time::Duration::from_secs)
+        .unwrap_or(DEFAULT_BACKFILL_AGING)
+        .min(MAX_BACKFILL_AGING)
+}
 
 tokio::task_local! {
     static BACKGROUND_BAND: ();
     static ENGINE_UNAVAILABLE: std::cell::Cell<bool>;
+    static JOB_BUDGET: JobBudget;
+    static JOB_CLAIM: JobClaim;
+}
+
+/// The queued job a scan runs in (#5942): when its budget ends, and whether a
+/// scanner was stopped by a time limit while it ran.
+struct JobBudget {
+    deadline: tokio::time::Instant,
+    budget: std::time::Duration,
+    timed_out: std::cell::Cell<bool>,
+}
+
+/// Run `fut` as a queued job that must finish by `deadline` (`budget` after it
+/// started), reporting whether a scanner was stopped by a time limit while it
+/// ran (#5942). Inside, [`within_job_deadline`] stops a scanner at the
+/// deadline, so the scanners of one job share its budget: however many hang,
+/// together they never run past it, and a stopped scanner's row is recorded
+/// `failed` instead of being dropped with the job.
+pub async fn with_job_deadline<F: std::future::Future>(
+    deadline: tokio::time::Instant,
+    budget: std::time::Duration,
+    fut: F,
+) -> (F::Output, bool) {
+    JOB_BUDGET
+        .scope(
+            JobBudget {
+                deadline,
+                budget,
+                timed_out: std::cell::Cell::new(false),
+            },
+            async {
+                let out = fut.await;
+                (out, JOB_BUDGET.with(|b| b.timed_out.get()))
+            },
+        )
+        .await
+}
+
+/// Note that a scanner of the current scan was stopped by a time limit (the
+/// job deadline or `SCANNER_PROCESS_TIMEOUT_SECS`). A no-op outside
+/// [`with_job_deadline`]: an in-process scan has no job to retry.
+pub fn note_scanner_timed_out() {
+    let _ = JOB_BUDGET.try_with(|b| b.timed_out.set(true));
+}
+
+/// Run one scanner, stopped at the queued job's deadline when there is one
+/// (#5942). Outside a job (an in-process scan) it runs unbounded, as before.
+/// Stopping drops the scanner's future, which kills a local child process
+/// (`kill_on_drop`).
+pub async fn within_job_deadline<T>(
+    scanner: &str,
+    fut: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    let Ok((deadline, budget)) = JOB_BUDGET.try_with(|b| (b.deadline, b.budget)) else {
+        return fut.await;
+    };
+    match tokio::time::timeout_at(deadline, fut).await {
+        Ok(out) => out,
+        Err(_) => {
+            note_scanner_timed_out();
+            Err(AppError::Internal(format!(
+                "scanner {scanner} was stopped at the end of the queued scan job's {}s budget; \
+                 the job will be retried",
+                budget.as_secs()
+            )))
+        }
+    }
+}
+
+/// The claim a queued job runs under (#6232): the job row and its token.
+#[derive(Clone, Copy)]
+struct JobClaim {
+    job_id: Uuid,
+    token: Uuid,
+}
+
+/// Run `fut` as the holder of one job claim (#6232). A `running` scan_results
+/// row created inside it records the claim token, so when the claim lapses
+/// [`ScanQueue::recover_expired_claims`] can close the rows that claim left
+/// behind, and only those. The scan's final writes to its rows check
+/// [`claim_still_held`] first, so a worker that was only slow, not dead,
+/// cannot overwrite what recovery recorded once the claim is gone.
+pub async fn under_claim<F: std::future::Future>(
+    job_id: Uuid,
+    claim_token: Uuid,
+    fut: F,
+) -> F::Output {
+    JOB_CLAIM
+        .scope(
+            JobClaim {
+                job_id,
+                token: claim_token,
+            },
+            fut,
+        )
+        .await
+}
+
+/// The claim token of the queued job the current task runs (see
+/// [`under_claim`]). `None` outside a queued job, so an in-process scan
+/// records none. Task-local: a task spawned from inside the scan does not
+/// inherit it.
+pub fn current_claim() -> Option<Uuid> {
+    JOB_CLAIM.try_with(|c| c.token).ok()
+}
+
+/// Whether the queued job the current task runs still holds its claim, taking
+/// a share lock on the job row for the rest of `conn`'s transaction (#6232).
+///
+/// Call it first in the transaction of a write that settles a scan row. While
+/// the lock is held, [`ScanQueue::recover_expired_claims`] (`FOR UPDATE SKIP
+/// LOCKED`) cannot revoke the claim, so the write lands before any recovery or
+/// not at all. `false` means recovery already revoked it: the job has been
+/// requeued, its rows were failed, and the caller must leave them alone.
+/// Always `true` outside a queued job (an in-process scan has no claim).
+pub async fn claim_still_held(conn: &mut sqlx::PgConnection) -> Result<bool> {
+    let Ok(claim) = JOB_CLAIM.try_with(|c| *c) else {
+        return Ok(true);
+    };
+    let held: Option<(i32,)> =
+        sqlx::query_as("SELECT 1 FROM scan_queue WHERE id = $1 AND claim_token = $2 FOR SHARE")
+            .bind(claim.job_id)
+            .bind(claim.token)
+            .fetch_optional(conn)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+    if held.is_none() {
+        tracing::warn!(
+            job_id = %claim.job_id,
+            "scan finished after its scan-job claim was recovered; leaving its rows as \
+             recovery recorded them for the rerun"
+        );
+    }
+    Ok(held.is_some())
 }
 
 /// Run `fut`, reporting whether a scanner engine said it was unavailable while
@@ -81,6 +277,11 @@ pub const BACKGROUND_PRIORITY_FIELD: (&str, &str) = ("priority", "background");
 /// `(name, value)` sent on an adapter filesystem upload for a background-band
 /// scan. Absent means interactive.
 pub const BACKGROUND_PRIORITY_HEADER: (&str, &str) = ("X-Scan-Priority", "background");
+
+/// `error_message` of a scan_results row whose queued job was recovered from a
+/// lapsed claim (#6232). The rerun records its verdict in a new row.
+pub const RECOVERED_SCAN_REASON: &str = "scan worker vanished mid-scan (its scan-job claim \
+     lapsed); the recovered job reruns the scan";
 
 /// Claim extension for one job. Binds `$1 = id`, `$2 = token`, `$3 = ttl`.
 pub const RENEW_CLAIM_SQL: &str = r#"
@@ -239,6 +440,13 @@ impl ScanJob {
         }
     }
 
+    /// Whether this job runs in the rescan band: a `rescan` (#5947) or a
+    /// proxy re-grade at [`PRIORITY_REGRADE`] (#6300). Such a job holds a
+    /// rescan slot and scans in the background band.
+    pub fn in_rescan_band(&self) -> bool {
+        self.job_kind() == Some(ScanJobKind::Rescan) || self.priority <= PRIORITY_RESCAN
+    }
+
     /// Any attempts left after the one about to be recorded.
     pub fn will_retry_after_failure(&self) -> bool {
         self.attempts + 1 < self.max_attempts
@@ -279,11 +487,35 @@ pub struct ScanQueueJobRow {
 #[derive(Clone)]
 pub struct ScanQueue {
     db: PgPool,
+    backfill_aging: std::time::Duration,
 }
 
 impl ScanQueue {
     pub fn new(db: PgPool) -> Self {
-        Self { db }
+        Self {
+            db,
+            backfill_aging: DEFAULT_BACKFILL_AGING,
+        }
+    }
+
+    /// Claim with this backfill aging window instead of
+    /// [`DEFAULT_BACKFILL_AGING`] (see [`PRIORITY_HOSTED`]).
+    pub fn with_backfill_aging(mut self, aging: std::time::Duration) -> Self {
+        self.backfill_aging = aging.min(MAX_BACKFILL_AGING);
+        self
+    }
+
+    /// Seconds the oldest pending proxy re-grade ([`PRIORITY_REGRADE`]) has
+    /// waited, `0` with none (#6300).
+    pub async fn oldest_pending_regrade_secs(&self) -> Result<f64> {
+        sqlx::query_scalar(
+            "SELECT COALESCE(EXTRACT(EPOCH FROM (NOW() - MIN(created_at)))::float8, 0) \
+             FROM scan_queue WHERE kind = 'proxy_file' AND state = 'pending' AND priority <= $1",
+        )
+        .bind(PRIORITY_REGRADE)
+        .fetch_one(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))
     }
 
     /// Queue a scan of the proxy object cached at `cache_path`. Returns
@@ -472,6 +704,14 @@ impl ScanQueue {
     /// [`Self::claim`], taking at most `max_rescans` of the `rescan` jobs: a
     /// worker claims no more rescans than it has free rescan slots (#5947),
     /// so it never claims one just to hand it back.
+    ///
+    /// Order (#6032, see [`PRIORITY_HOSTED`]): the waiting band first, then
+    /// the hosted band (and anything below the backfill) merged with the
+    /// backfill band on `created_at`, a backfill job's pushed back by the aging
+    /// window, then rescans. The key does not move
+    /// with `NOW()`, so each band is still a range of
+    /// `idx_scan_queue_pending_claim` read in index order: every band CTE
+    /// reads at most `limit` rows and the merge sorts at most five times that.
     pub async fn claim_filtered(
         &self,
         limit: i64,
@@ -483,32 +723,90 @@ impl ScanQueue {
 
         let rows = sqlx::query(
             r#"
-            WITH other AS (
-                SELECT q.id, q.priority, q.created_at
+            WITH waiting AS (
+                SELECT q.id, q.priority, q.created_at,
+                       0 AS band, q.created_at AS claim_at
                 FROM scan_queue q
                 WHERE q.state = 'pending'
                   AND q.next_attempt_at <= NOW()
                   AND q.kind <> 'rescan'
+                  AND q.priority >= $5
+                ORDER BY q.priority DESC, q.created_at ASC
+                LIMIT $1
+                FOR UPDATE OF q SKIP LOCKED
+            ),
+            hosted AS (
+                SELECT q.id, q.priority, q.created_at,
+                       1 AS band, q.created_at AS claim_at
+                FROM scan_queue q
+                WHERE q.state = 'pending'
+                  AND q.next_attempt_at <= NOW()
+                  AND q.kind <> 'rescan'
+                  AND q.priority < $5
+                  AND q.priority >= $6
+                ORDER BY q.priority DESC, q.created_at ASC
+                LIMIT $1
+                FOR UPDATE OF q SKIP LOCKED
+            ),
+            -- #6032: backfill ages into the hosted band. Same band as
+            -- `hosted`, keyed `aging` later than it was queued.
+            backfill AS (
+                SELECT q.id, q.priority, q.created_at,
+                       1 AS band, q.created_at + make_interval(secs => $7) AS claim_at
+                FROM scan_queue q
+                WHERE q.state = 'pending'
+                  AND q.next_attempt_at <= NOW()
+                  AND q.kind <> 'rescan'
+                  AND q.priority < $6
+                  AND q.priority >= $8
+                ORDER BY q.priority DESC, q.created_at ASC
+                LIMIT $1
+                FOR UPDATE OF q SKIP LOCKED
+            ),
+            -- Below the backfill: hosted scans 1.12.0 queued at 10. Claimed
+            -- as hosted, so an upgrade does not leave them behind the backfill.
+            -- Bounded above the rescans (5), so an empty range does not read
+            -- through a rescan backlog on every claim.
+            below AS (
+                SELECT q.id, q.priority, q.created_at,
+                       1 AS band, q.created_at AS claim_at
+                FROM scan_queue q
+                WHERE q.state = 'pending'
+                  AND q.next_attempt_at <= NOW()
+                  AND q.kind <> 'rescan'
+                  AND q.priority < $8
+                  AND q.priority > $9
                 ORDER BY q.priority DESC, q.created_at ASC
                 LIMIT $1
                 FOR UPDATE OF q SKIP LOCKED
             ),
             rescans AS (
-                SELECT q.id, q.priority, q.created_at
+                SELECT q.id, q.priority, q.created_at,
+                       2 AS band, q.created_at AS claim_at
                 FROM scan_queue q
                 WHERE q.state = 'pending'
                   AND q.next_attempt_at <= NOW()
-                  AND q.kind = 'rescan'
+                  -- #6300: proxy re-grades share the band.
+                  AND (q.kind = 'rescan' OR q.priority <= $9)
                 ORDER BY q.priority DESC, q.created_at ASC
                 LIMIT GREATEST($4, 0)
                 FOR UPDATE OF q SKIP LOCKED
             ),
-            -- The best `limit` of both, in the one claim order. A rescan row
+            -- The best `limit` of all four, in the one claim order. A row
             -- locked above but not chosen stays pending.
             candidate AS (
-                SELECT c.id
-                FROM (SELECT * FROM other UNION ALL SELECT * FROM rescans) c
-                ORDER BY c.priority DESC, c.created_at ASC
+                SELECT c.id,
+                       row_number() OVER (
+                           ORDER BY c.band, c.claim_at, c.priority DESC, c.created_at, c.id
+                       ) AS ord
+                FROM (
+                    SELECT * FROM waiting
+                    UNION ALL SELECT * FROM hosted
+                    UNION ALL SELECT * FROM backfill
+                    UNION ALL SELECT * FROM below
+                    UNION ALL SELECT * FROM rescans
+                ) c
+                ORDER BY ord
                 LIMIT $1
             ),
             claimed AS (
@@ -520,8 +818,9 @@ impl ScanQueue {
                     claim_token = gen_random_uuid(),
                     claim_expires_at = NOW() + make_interval(secs => $3),
                     updated_at = NOW()
-                FROM candidate
-                WHERE q.id = candidate.id
+                -- An id array, not a join: a generic plan cannot size
+                -- `LIMIT $1` and hash-joined the whole table.
+                WHERE q.id = ANY(ARRAY(SELECT id FROM candidate))
                 RETURNING q.*
             )
             SELECT
@@ -532,13 +831,19 @@ impl ScanQueue {
                 c.attempts, c.max_attempts, c.created_at,
                 c.claim_token, c.claimed_by, c.claim_expires_at
             FROM claimed c
-            ORDER BY c.priority DESC, c.created_at ASC
+            JOIN candidate ON candidate.id = c.id
+            ORDER BY candidate.ord
             "#,
         )
         .bind(limit)
         .bind(claimed_by)
         .bind(claim_ttl_secs)
         .bind(max_rescans)
+        .bind(PRIORITY_CLIENT_WAITING)
+        .bind(PRIORITY_HOSTED)
+        .bind(self.backfill_aging.as_secs_f64())
+        .bind(PRIORITY_BACKFILL)
+        .bind(PRIORITY_RESCAN)
         .fetch_all(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -750,31 +1055,79 @@ impl ScanQueue {
 
     /// Requeue work abandoned by a crashed replica, charging the lost attempt so a
     /// job that kills its worker cannot spin forever. Safe from every replica.
+    ///
+    /// The same statement fails each `running` scan_results row the lapsed
+    /// claim created (#6232), since the rerun writes rows of its own. Rows are
+    /// matched on the claim token, which this statement revokes, so a row a
+    /// live claim is writing, or one an in-process scan created, is never
+    /// touched. The lock skips a job another replica is recovering or
+    /// finalizing right now, and the `running` guard makes a repeat a no-op.
+    ///
+    /// A claim that lapses on the job's last attempt does not end the job
+    /// (#6423): its worker may only have been slow, and [`claim_still_held`]
+    /// refuses that worker's late verdict, so ending the job would leave its
+    /// rows `failed` with nothing to rerun them. Recovery grants it ONE more
+    /// run instead (`attempts` reaches `max_attempts`). That run is a last
+    /// attempt in every finalizer, and a second lapse ends the job, so a job
+    /// that kills its worker still stops, after at most one extra run.
     pub async fn recover_expired_claims(&self, backoff_secs: f64) -> Result<u64> {
-        let result = sqlx::query(
+        let (jobs, rows): (i64, i64) = sqlx::query_as(
             r#"
-            UPDATE scan_queue
-            SET attempts = CASE WHEN requeue THEN 0 ELSE attempts + 1 END,
-                state = CASE
-                    WHEN requeue OR attempts + 1 < max_attempts THEN 'pending'
-                    ELSE 'failed'
-                END,
-                requeue = false,
-                last_error = COALESCE(last_error, 'claim expired; worker vanished mid-scan'),
-                next_attempt_at = NOW() + make_interval(secs => $1),
-                claimed_by = NULL,
-                claim_token = NULL,
-                claim_expires_at = NULL,
-                updated_at = NOW()
-            WHERE state = 'running'
-              AND (claim_expires_at IS NULL OR claim_expires_at <= NOW())
+            WITH lapsed AS (
+                SELECT id, claim_token
+                FROM scan_queue
+                WHERE state = 'running'
+                  AND (claim_expires_at IS NULL OR claim_expires_at <= NOW())
+                FOR UPDATE SKIP LOCKED
+            ),
+            recovered AS (
+                UPDATE scan_queue q
+                SET attempts = CASE WHEN q.requeue THEN 0 ELSE q.attempts + 1 END,
+                    state = CASE
+                        WHEN q.requeue OR q.attempts + 1 < q.max_attempts THEN 'pending'
+                        -- #6423: a claim that lapses on the last attempt gets
+                        -- one more run, since the late finish is refused.
+                        WHEN q.attempts < q.max_attempts THEN 'pending'
+                        ELSE 'failed'
+                    END,
+                    requeue = false,
+                    last_error = COALESCE(q.last_error, 'claim expired; worker vanished mid-scan'),
+                    next_attempt_at = NOW() + make_interval(secs => $1),
+                    claimed_by = NULL,
+                    claim_token = NULL,
+                    claim_expires_at = NULL,
+                    updated_at = NOW()
+                FROM lapsed l
+                WHERE q.id = l.id
+                RETURNING q.id
+            ),
+            closed AS (
+                UPDATE scan_results r
+                SET status = 'failed',
+                    error_message = $2,
+                    completed_at = NOW()
+                WHERE r.status = 'running'
+                  AND r.queue_claim_token IN (
+                      SELECT claim_token FROM lapsed WHERE claim_token IS NOT NULL
+                  )
+                RETURNING r.id
+            )
+            SELECT (SELECT COUNT(*) FROM recovered), (SELECT COUNT(*) FROM closed)
             "#,
         )
         .bind(backoff_secs)
-        .execute(&self.db)
+        .bind(RECOVERED_SCAN_REASON)
+        .fetch_one(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
-        Ok(result.rows_affected())
+        if rows > 0 {
+            tracing::info!(
+                jobs,
+                scans = rows,
+                "failed the scans a lapsed scan-job claim left running; the recovered job reruns them"
+            );
+        }
+        Ok(jobs as u64)
     }
 
     /// One page of live queue rows. A completed job is deleted, so never history.
@@ -959,6 +1312,24 @@ mod tests {
         assert!(!job_with_attempts(0, 1).will_retry_after_failure());
     }
 
+    /// #6032: the aging window env var. Unset, blank or garbage keeps the
+    /// default; `0` is honoured (plain age order across the two bands).
+    #[test]
+    fn backfill_aging_parses_seconds_and_falls_back_to_the_default() {
+        use std::time::Duration;
+        assert_eq!(parse_backfill_aging(None), DEFAULT_BACKFILL_AGING);
+        assert_eq!(parse_backfill_aging(Some("")), DEFAULT_BACKFILL_AGING);
+        assert_eq!(parse_backfill_aging(Some("soon")), DEFAULT_BACKFILL_AGING);
+        assert_eq!(parse_backfill_aging(Some("-5")), DEFAULT_BACKFILL_AGING);
+        assert_eq!(parse_backfill_aging(Some(" 90 ")), Duration::from_secs(90));
+        assert_eq!(parse_backfill_aging(Some("0")), Duration::ZERO);
+        // Past the timestamp range every claim would fail: clamped.
+        assert_eq!(
+            parse_backfill_aging(Some("99999999999999")),
+            MAX_BACKFILL_AGING
+        );
+    }
+
     /// #5994: the unavailable signal is seen only inside a tracking scope,
     /// and noting it outside one (an in-process scan) does nothing.
     #[tokio::test]
@@ -970,6 +1341,56 @@ mod tests {
         assert!(seen);
         let ((), seen) = tracking_engine_unavailable(async {}).await;
         assert!(!seen, "each scope starts clear");
+    }
+
+    /// #5942: outside a job a scanner runs unbounded and a timeout note is a
+    /// no-op; inside one, a scanner still running at the deadline is stopped
+    /// with a retry message and the scope reports it, a scanner that answers
+    /// is untouched, and scanners after the deadline share the spent budget
+    /// rather than getting a fresh one each.
+    #[tokio::test(start_paused = true)]
+    async fn scanners_in_a_job_share_its_deadline() {
+        use std::time::Duration;
+        use tokio::time::Instant;
+
+        note_scanner_timed_out();
+        let slow = within_job_deadline("grype", async {
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+            Ok(7)
+        })
+        .await;
+        assert_eq!(slow.unwrap(), 7, "no job: no limit");
+
+        let budget = Duration::from_secs(10);
+        let started = Instant::now();
+        let ((first, second, quick), timed_out) =
+            with_job_deadline(started + budget, budget, async {
+                let first: Result<()> = within_job_deadline("grype", std::future::pending()).await;
+                let second: Result<()> = within_job_deadline("trivy", std::future::pending()).await;
+                let quick = within_job_deadline("dependency", async { Ok(1) }).await;
+                (first, second, quick)
+            })
+            .await;
+        assert!(timed_out);
+        assert_eq!(started.elapsed(), budget, "two hung scanners, one budget");
+        let first = first.unwrap_err().to_string();
+        assert!(
+            first.contains("scanner grype was stopped") && first.contains("10s budget"),
+            "{first}"
+        );
+        assert!(second.unwrap_err().to_string().contains("scanner trivy"));
+        assert_eq!(
+            quick.unwrap(),
+            1,
+            "a scanner that answers at once still runs"
+        );
+
+        let (ok, timed_out) = with_job_deadline(Instant::now() + budget, budget, async {
+            within_job_deadline("grype", async { Ok(2) }).await
+        })
+        .await;
+        assert_eq!(ok.unwrap(), 2);
+        assert!(!timed_out, "each scope starts clear");
     }
 
     // ── DB-backed queue semantics ───────────────────────────────────────────
@@ -1319,7 +1740,7 @@ mod tests {
         }
         assert_eq!(
             picked,
-            vec!["waiting01", "backfill1", "hosted01"],
+            vec!["waiting01", "hosted01", "backfill1"],
             "each single-slot claim must take the highest-priority job left"
         );
 
@@ -1908,6 +2329,616 @@ mod tests {
         drop_repo(&pool, repo).await;
     }
 
+    async fn scan_row(pool: &sqlx::PgPool, id: Uuid) -> (String, Option<String>) {
+        sqlx::query_as("SELECT status, error_message FROM scan_results WHERE id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .expect("scan row")
+    }
+
+    /// #6232: recovering a lapsed claim fails the `running` scan row that claim
+    /// created, at once, instead of leaving it for the 1800 s janitor. A row a
+    /// live claim is writing, and one an in-process scan created, stay
+    /// `running`, and a second sweep (another replica racing) changes nothing.
+    #[tokio::test]
+    async fn recovering_a_lapsed_claim_fails_the_scan_row_it_left_running() {
+        use crate::services::scan_result_service::ScanResultService;
+        let Some(pool) = try_pool().await else { return };
+        let repo = fresh_queue(&pool).await;
+        let q = ScanQueue::new(pool.clone());
+        let scans = ScanResultService::new(pool.clone());
+
+        let dead_art = seed_artifact(&pool, repo, "orphan-6232.jar").await;
+        let live_art = seed_artifact(&pool, repo, "live-6232.jar").await;
+        q.enqueue_hosted_upload(dead_art, PRIORITY_HOSTED)
+            .await
+            .expect("enqueue");
+        let dead = q
+            .claim(1, "doomed-pod", CLAIM_TTL_SECS)
+            .await
+            .expect("claim")
+            .pop()
+            .expect("one job");
+        q.enqueue_hosted_upload(live_art, PRIORITY_HOSTED)
+            .await
+            .expect("enqueue");
+        let live = q
+            .claim(1, "healthy-pod", CLAIM_TTL_SECS)
+            .await
+            .expect("claim")
+            .pop()
+            .expect("one job");
+
+        // Each worker opens its scan row under its own claim, as the worker does.
+        let orphan = under_claim(
+            dead.id,
+            dead.claim_token(),
+            scans.create_scan_result_with_checksum(dead_art, repo, "grype", None),
+        )
+        .await
+        .expect("orphan row");
+        let in_flight = under_claim(
+            live.id,
+            live.claim_token(),
+            scans.create_scan_result_with_checksum(live_art, repo, "grype", None),
+        )
+        .await
+        .expect("live row");
+        // An in-process scan of the same artifact: no claim, not the queue's.
+        let inline = scans
+            .create_scan_result_with_checksum(dead_art, repo, "grype", None)
+            .await
+            .expect("inline row");
+
+        // The doomed pod dies: its claim lapses.
+        sqlx::query(
+            "UPDATE scan_queue SET claim_expires_at = NOW() - INTERVAL '1 second' WHERE id = $1",
+        )
+        .bind(dead.id)
+        .execute(&pool)
+        .await
+        .expect("expire the claim");
+
+        assert_eq!(q.recover_expired_claims(0.0).await.expect("recover"), 1);
+        let (status, reason) = scan_row(&pool, orphan.id).await;
+        assert_eq!(
+            status, "failed",
+            "the dead claim's row is closed by recovery"
+        );
+        assert_eq!(reason.as_deref(), Some(RECOVERED_SCAN_REASON));
+        assert_eq!(
+            scan_row(&pool, in_flight.id).await.0,
+            "running",
+            "a live claim's row is never closed"
+        );
+        assert_eq!(
+            scan_row(&pool, inline.id).await.0,
+            "running",
+            "a row no queued job created is left to its writer"
+        );
+
+        // A racing or later sweep finds nothing left to do.
+        assert_eq!(q.recover_expired_claims(0.0).await.expect("recover"), 0);
+        assert_eq!(scan_row(&pool, in_flight.id).await.0, "running");
+        assert_eq!(scan_row(&pool, inline.id).await.0, "running");
+
+        drop_repo(&pool, repo).await;
+    }
+
+    /// #6232: a worker that was only slow, not dead, cannot overwrite what
+    /// recovery recorded. Its claim lapsed, recovery failed its row and
+    /// requeued the job, and another replica claimed the rerun; when the slow
+    /// worker finishes, every write that settles a scan row finds its claim
+    /// gone and leaves the row alone. A worker that still holds its claim
+    /// settles its row as before.
+    #[tokio::test]
+    async fn a_slow_worker_cannot_overwrite_the_row_recovery_failed() {
+        use crate::services::scan_result_service::ScanResultService;
+        let Some(pool) = try_pool().await else { return };
+        let repo = fresh_queue(&pool).await;
+        let q = ScanQueue::new(pool.clone());
+        let scans = ScanResultService::new(pool.clone());
+
+        let slow_art = seed_artifact(&pool, repo, "slow-6232.jar").await;
+        let ok_art = seed_artifact(&pool, repo, "ok-6232.jar").await;
+        q.enqueue_hosted_upload(slow_art, PRIORITY_HOSTED)
+            .await
+            .expect("enqueue");
+        let slow = q
+            .claim(1, "slow-pod", CLAIM_TTL_SECS)
+            .await
+            .expect("claim")
+            .pop()
+            .expect("one job");
+        q.enqueue_hosted_upload(ok_art, PRIORITY_HOSTED)
+            .await
+            .expect("enqueue");
+        let ok = q
+            .claim(1, "healthy-pod", CLAIM_TTL_SECS)
+            .await
+            .expect("claim")
+            .pop()
+            .expect("one job");
+        let (slow_id, slow_token) = (slow.id, slow.claim_token());
+        let row = under_claim(
+            slow_id,
+            slow_token,
+            scans.create_scan_result_with_checksum(slow_art, repo, "grype", None),
+        )
+        .await
+        .expect("slow row");
+        let ok_row = under_claim(
+            ok.id,
+            ok.claim_token(),
+            scans.create_scan_result_with_checksum(ok_art, repo, "grype", None),
+        )
+        .await
+        .expect("ok row");
+
+        // The slow pod misses its heartbeats: the claim lapses, recovery fails
+        // the row, and another replica claims the rerun.
+        sqlx::query(
+            "UPDATE scan_queue SET claim_expires_at = NOW() - INTERVAL '1 second' WHERE id = $1",
+        )
+        .bind(slow_id)
+        .execute(&pool)
+        .await
+        .expect("expire the claim");
+        assert_eq!(q.recover_expired_claims(0.0).await.expect("recover"), 1);
+        let rerun = q
+            .claim(1, "rescuer-pod", CLAIM_TTL_SECS)
+            .await
+            .expect("claim")
+            .pop()
+            .expect("the requeued job");
+        assert_eq!(rerun.id, slow_id);
+        assert_ne!(rerun.claim_token(), slow_token);
+
+        // The slow worker finishes now, with a verdict, a failure, a
+        // not-applicable, a retry reopen: none of them lands.
+        under_claim(slow_id, slow_token, async {
+            // #6423: and it says so, so the caller neither logs a completed
+            // scan nor grades quarantine on the discarded totals.
+            assert!(!scans
+                .complete_scan(
+                    row.id,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    Some("grype-slow"),
+                    chrono::Utc::now(),
+                    "complete",
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .expect("complete"));
+            scans
+                .fail_scan(row.id, "slow failure", None, chrono::Utc::now())
+                .await
+                .expect("fail");
+            scans
+                .mark_not_applicable(row.id, "slow n/a", chrono::Utc::now())
+                .await
+                .expect("n/a");
+            assert!(!scans.reopen_failed_scan(row.id).await.expect("reopen"));
+            assert_eq!(
+                scans
+                    .fail_scan_if_running(row.id, "slow failure")
+                    .await
+                    .expect("fail if running"),
+                None
+            );
+        })
+        .await;
+        assert_eq!(
+            scan_row(&pool, row.id).await,
+            (
+                "failed".to_string(),
+                Some(RECOVERED_SCAN_REASON.to_string())
+            ),
+            "the slow worker must not overwrite what recovery recorded"
+        );
+        let version: Option<String> =
+            sqlx::query_scalar("SELECT scanner_version FROM scan_results WHERE id = $1")
+                .bind(row.id)
+                .fetch_one(&pool)
+                .await
+                .expect("version");
+        assert_ne!(version.as_deref(), Some("grype-slow"));
+
+        // A worker that still holds its claim settles its row as before.
+        under_claim(
+            ok.id,
+            ok.claim_token(),
+            scans.complete_scan(
+                ok_row.id,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                Some("grype-ok"),
+                chrono::Utc::now(),
+                "complete",
+                None,
+                None,
+                None,
+            ),
+        )
+        .await
+        .expect("complete");
+        assert_eq!(scan_row(&pool, ok_row.id).await.0, "completed");
+
+        drop_repo(&pool, repo).await;
+    }
+
+    /// #6423: a claim that lapses on the job's LAST attempt no longer ends
+    /// the job. The worker may only have been slow, and the claim guard
+    /// refuses its late verdict, so recovery grants one more run: the job is
+    /// `pending` with `attempts = max_attempts`, the slow worker's late write
+    /// is still refused, and the rerun records the verdict in a row of its
+    /// own, stamped with its claim in the INSERT. A second lapse ends the job,
+    /// so a job that kills its worker stops after at most one extra run.
+    #[tokio::test]
+    async fn a_claim_lapsing_on_the_last_attempt_gets_one_more_run() {
+        use crate::services::scan_result_service::ScanResultService;
+        let Some(pool) = try_pool().await else { return };
+        let repo = fresh_queue(&pool).await;
+        let q = ScanQueue::new(pool.clone());
+        let scans = ScanResultService::new(pool.clone());
+        let complete = |id: Uuid| {
+            scans.complete_scan(
+                id,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                Some("grype-t"),
+                chrono::Utc::now(),
+                "complete",
+                None,
+                None,
+                None,
+            )
+        };
+        let lapse = |id: Uuid| {
+            sqlx::query(
+                "UPDATE scan_queue SET claim_expires_at = NOW() - INTERVAL '1 second' \
+                 WHERE id = $1",
+            )
+            .bind(id)
+            .execute(&pool)
+        };
+
+        let art = seed_artifact(&pool, repo, "last-6423.jar").await;
+        q.enqueue_hosted_upload(art, PRIORITY_HOSTED)
+            .await
+            .expect("enqueue");
+        sqlx::query("UPDATE scan_queue SET attempts = max_attempts - 1 WHERE artifact_id = $1")
+            .bind(art)
+            .execute(&pool)
+            .await
+            .expect("spend all but the last attempt");
+        let slow = q
+            .claim(1, "slow-pod", CLAIM_TTL_SECS)
+            .await
+            .expect("claim")
+            .pop()
+            .expect("one job");
+        assert!(!slow.will_retry_after_failure(), "this is the last attempt");
+        let row = under_claim(
+            slow.id,
+            slow.claim_token(),
+            scans.create_scan_result_with_checksum(art, repo, "grype", None),
+        )
+        .await
+        .expect("row");
+        let stamped: Option<Uuid> =
+            sqlx::query_scalar("SELECT queue_claim_token FROM scan_results WHERE id = $1")
+                .bind(row.id)
+                .fetch_one(&pool)
+                .await
+                .expect("token");
+        assert_eq!(
+            stamped,
+            Some(slow.claim_token()),
+            "the INSERT records the claim"
+        );
+
+        // The slow worker's claim lapses on the last attempt: the job is
+        // requeued once more, not ended, and the row is failed.
+        lapse(slow.id).await.expect("lapse");
+        assert_eq!(q.recover_expired_claims(0.0).await.expect("recover"), 1);
+        let (state, attempts, max): (String, i32, i32) =
+            sqlx::query_as("SELECT state, attempts, max_attempts FROM scan_queue WHERE id = $1")
+                .bind(slow.id)
+                .fetch_one(&pool)
+                .await
+                .expect("job");
+        assert_eq!((state.as_str(), attempts), ("pending", max));
+        assert_eq!(
+            scan_row(&pool, row.id).await,
+            (
+                "failed".to_string(),
+                Some(RECOVERED_SCAN_REASON.to_string())
+            )
+        );
+
+        // The slow worker finishes: still refused, before or after the rerun
+        // is claimed.
+        assert!(!under_claim(slow.id, slow.claim_token(), complete(row.id))
+            .await
+            .expect("late complete"));
+        let rerun = q
+            .claim(1, "rescuer-pod", CLAIM_TTL_SECS)
+            .await
+            .expect("claim")
+            .pop()
+            .expect("the extra run");
+        assert_eq!(rerun.id, slow.id);
+        assert!(
+            !rerun.will_retry_after_failure(),
+            "the extra run is a last attempt"
+        );
+        assert!(!under_claim(slow.id, slow.claim_token(), complete(row.id))
+            .await
+            .expect("late complete"));
+        assert_eq!(scan_row(&pool, row.id).await.0, "failed");
+
+        // The rerun records the verdict in its own row.
+        let fresh = under_claim(
+            rerun.id,
+            rerun.claim_token(),
+            scans.create_scan_result_with_checksum(art, repo, "grype", None),
+        )
+        .await
+        .expect("rerun row");
+        assert!(
+            under_claim(rerun.id, rerun.claim_token(), complete(fresh.id))
+                .await
+                .expect("rerun complete")
+        );
+        assert_eq!(
+            scan_row(&pool, fresh.id).await,
+            ("completed".to_string(), None)
+        );
+
+        // A second lapse ends the job: only one extra run.
+        lapse(rerun.id).await.expect("lapse again");
+        assert_eq!(q.recover_expired_claims(0.0).await.expect("recover"), 1);
+        let state: String = sqlx::query_scalar("SELECT state FROM scan_queue WHERE id = $1")
+            .bind(slow.id)
+            .fetch_one(&pool)
+            .await
+            .expect("job");
+        assert_eq!(
+            state, "failed",
+            "a job that keeps losing its worker still ends"
+        );
+
+        drop_repo(&pool, repo).await;
+    }
+
+    /// Seed one artifact row in `repo` for a `hosted_upload` job.
+    async fn seed_artifact(pool: &sqlx::PgPool, repo: Uuid, name: &str) -> Uuid {
+        let id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO artifacts (id, repository_id, path, name, size_bytes, \
+             checksum_sha256, content_type, storage_key) \
+             VALUES ($1, $2, $3, $4, 1, $5, 'application/java-archive', $3)",
+        )
+        .bind(id)
+        .bind(repo)
+        .bind(format!("p/{name}"))
+        .bind(name)
+        .bind(format!("sha-{id}"))
+        .execute(pool)
+        .await
+        .expect("seed artifact");
+        id
+    }
+
+    /// Queue `n` fail-open proxy scans, the oldest `oldest_secs` ago and one
+    /// second apart, as a cold-proxy burst leaves them.
+    async fn seed_backfill(
+        pool: &sqlx::PgPool,
+        repo: Uuid,
+        prefix: &str,
+        n: i32,
+        oldest_secs: i64,
+    ) {
+        sqlx::query(
+            "INSERT INTO scan_queue (kind, priority, repository_id, cache_path, digest, created_at) \
+             SELECT 'proxy_file', $1, $2, $3 || g, $3 || g, \
+                    NOW() - make_interval(secs => ($4 - g + 1)::float8) \
+             FROM generate_series(1, $5) g",
+        )
+        .bind(PRIORITY_BACKFILL)
+        .bind(repo)
+        .bind(prefix)
+        .bind(oldest_secs)
+        .bind(n)
+        .execute(pool)
+        .await
+        .expect("seed backfill");
+    }
+
+    async fn claim_one(q: &ScanQueue) -> ScanJob {
+        q.claim(1, "w", CLAIM_TTL_SECS)
+            .await
+            .expect("claim")
+            .pop()
+            .expect("a job is due")
+            .into_row()
+    }
+
+    /// #6032: a hosted upload and a pushed image queued behind a fail-open
+    /// proxy backlog are claimed before it, as long as the backlog is younger
+    /// than the aging window. The backlog then drains oldest first.
+    #[tokio::test]
+    async fn a_fresh_upload_is_claimed_before_an_older_proxy_backlog() {
+        let Some(pool) = try_pool().await else { return };
+        let repo = fresh_queue(&pool).await;
+        let q = ScanQueue::new(pool.clone());
+        // 200 backfill jobs, 1 to 200 seconds old: all inside the window.
+        seed_backfill(&pool, repo, "burst", 200, 200).await;
+        let upload = seed_artifact(&pool, repo, "fresh.jar").await;
+        assert!(q
+            .enqueue_hosted_upload(upload, PRIORITY_HOSTED)
+            .await
+            .expect("upload"));
+        assert!(q
+            .enqueue_hosted_image(repo, "img6032", PRIORITY_HOSTED)
+            .await
+            .expect("image"));
+
+        let first = claim_one(&q).await;
+        assert_eq!(first.kind, "hosted_upload");
+        assert_eq!(first.artifact_id, Some(upload));
+        let second = claim_one(&q).await;
+        assert_eq!(second.kind, "hosted_image");
+        // Then the backlog, oldest first.
+        let third = claim_one(&q).await;
+        assert_eq!(third.digest.as_deref(), Some("burst1"));
+
+        // A multi-slot claim takes the same order in one statement.
+        sqlx::query("DELETE FROM scan_queue")
+            .execute(&pool)
+            .await
+            .expect("reset");
+        seed_backfill(&pool, repo, "burst", 200, 200).await;
+        q.enqueue_hosted_upload(upload, PRIORITY_HOSTED)
+            .await
+            .expect("upload");
+        q.enqueue_hosted_image(repo, "img6032", PRIORITY_HOSTED)
+            .await
+            .expect("image");
+        let batch: Vec<String> = q
+            .claim(3, "w", CLAIM_TTL_SECS)
+            .await
+            .expect("claim")
+            .into_iter()
+            .map(|c| c.into_row().kind)
+            .collect();
+        assert_eq!(batch, vec!["hosted_upload", "hosted_image", "proxy_file"]);
+
+        drop_repo(&pool, repo).await;
+    }
+
+    /// #6032: aging. A proxy job queued more than the window before a new
+    /// upload is claimed ahead of it, so a steady stream of uploads cannot
+    /// starve the backlog; a proxy job inside the window still waits.
+    #[tokio::test]
+    async fn a_proxy_job_older_than_the_aging_window_is_claimed_before_a_new_upload() {
+        let Some(pool) = try_pool().await else { return };
+        let repo = fresh_queue(&pool).await;
+        let q = ScanQueue::new(pool.clone());
+        let window = DEFAULT_BACKFILL_AGING.as_secs() as i64;
+        // One job a minute past the window, one well inside it.
+        seed_backfill(&pool, repo, "aged", 1, window + 60).await;
+        seed_backfill(&pool, repo, "young", 1, 30).await;
+        let upload = seed_artifact(&pool, repo, "new.jar").await;
+        q.enqueue_hosted_upload(upload, PRIORITY_HOSTED)
+            .await
+            .expect("upload");
+
+        let picked: Vec<String> = [
+            claim_one(&q).await,
+            claim_one(&q).await,
+            claim_one(&q).await,
+        ]
+        .into_iter()
+        .map(|j| j.digest.unwrap_or(j.kind))
+        .collect();
+        assert_eq!(picked, vec!["aged1", "hosted_upload", "young1"]);
+
+        // The window is the knob: with none, plain age order.
+        sqlx::query("DELETE FROM scan_queue")
+            .execute(&pool)
+            .await
+            .unwrap();
+        seed_backfill(&pool, repo, "older", 1, 30).await;
+        let upload = seed_artifact(&pool, repo, "newer.jar").await;
+        q.enqueue_hosted_upload(upload, PRIORITY_HOSTED)
+            .await
+            .expect("upload");
+        let fifo = q.clone().with_backfill_aging(std::time::Duration::ZERO);
+        assert_eq!(claim_one(&fifo).await.digest.as_deref(), Some("older1"));
+
+        drop_repo(&pool, repo).await;
+    }
+
+    /// #6032 review: a hosted job 1.12.0 queued at priority 10 is claimed as
+    /// hosted, not behind the backfill, at every batch size.
+    #[tokio::test]
+    async fn a_hosted_job_queued_by_1_12_0_is_not_left_behind_the_backfill() {
+        let Some(pool) = try_pool().await else { return };
+        let repo = fresh_queue(&pool).await;
+        let q = ScanQueue::new(pool.clone());
+        seed_backfill(&pool, repo, "fresh", 5, 5).await;
+        q.enqueue_hosted_image(repo, "legacy01", PRIORITY_HOSTED_1_12_0)
+            .await
+            .expect("legacy hosted");
+        sqlx::query(
+            "UPDATE scan_queue SET created_at = NOW() - interval '1 minute' WHERE digest = 'legacy01'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(claim_one(&q).await.digest.as_deref(), Some("legacy01"));
+
+        sqlx::query("UPDATE scan_queue SET state = 'pending', claim_token = NULL, claimed_by = NULL, claim_expires_at = NULL WHERE digest = 'legacy01'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let batch = q.claim(6, "w", CLAIM_TTL_SECS).await.expect("claim");
+        assert_eq!(batch.len(), 6);
+        assert_eq!(batch[0].digest.as_deref(), Some("legacy01"));
+
+        drop_repo(&pool, repo).await;
+    }
+
+    /// #6032: a fail-closed pull still goes ahead of everything, however old
+    /// the hosted and backfill jobs are.
+    #[tokio::test]
+    async fn a_waiting_client_still_goes_ahead_of_aged_jobs() {
+        let Some(pool) = try_pool().await else { return };
+        let repo = fresh_queue(&pool).await;
+        let q = ScanQueue::new(pool.clone());
+        seed_backfill(&pool, repo, "ancient", 1, 86_400).await;
+        let upload = seed_artifact(&pool, repo, "old.jar").await;
+        q.enqueue_hosted_upload(upload, PRIORITY_HOSTED)
+            .await
+            .expect("upload");
+        sqlx::query("UPDATE scan_queue SET created_at = NOW() - interval '1 day' WHERE kind = 'hosted_upload'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        q.enqueue_proxy_file(
+            repo,
+            "w",
+            "wait6032",
+            None,
+            1,
+            None,
+            PRIORITY_CLIENT_WAITING,
+        )
+        .await
+        .expect("waiting");
+        assert_eq!(claim_one(&q).await.digest.as_deref(), Some("wait6032"));
+
+        drop_repo(&pool, repo).await;
+    }
+
     async fn enqueue_rescan(pool: &sqlx::PgPool, digest: &str) {
         sqlx::query("INSERT INTO scan_queue (kind, priority, digest) VALUES ('rescan', $1, $2)")
             .bind(PRIORITY_RESCAN)
@@ -1946,7 +2977,7 @@ mod tests {
                 .expect("due");
             picked.push(job.digest.clone().unwrap_or_default());
         }
-        assert_eq!(picked, vec!["wait01", "back01", "host01", "resc01"]);
+        assert_eq!(picked, vec!["wait01", "host01", "back01", "resc01"]);
 
         sqlx::query("DELETE FROM scan_queue")
             .execute(&pool)
@@ -2038,6 +3069,73 @@ mod tests {
             q.claim(10, "w", CLAIM_TTL_SECS).await.expect("claim").len(),
             2
         );
+        sqlx::query("DELETE FROM scan_queue")
+            .execute(&pool)
+            .await
+            .unwrap();
+        drop_repo(&pool, repo).await;
+    }
+
+    /// #6300: a proxy re-grade after a DB update is claimed in the rescan
+    /// band: after every other band, only within the free rescan slots, and
+    /// as a rescan-band job. A pull that waits for the same bytes raises it
+    /// into the waiting band.
+    #[tokio::test]
+    async fn a_proxy_regrade_is_claimed_in_the_rescan_band() {
+        let Some(pool) = try_pool().await else { return };
+        let repo = fresh_queue(&pool).await;
+        let q = ScanQueue::new(pool.clone());
+        // Oldest first, so age alone would pick it.
+        q.enqueue_proxy_file(repo, "r", "regr01", None, 1, None, PRIORITY_REGRADE)
+            .await
+            .expect("regrade");
+        sqlx::query("UPDATE scan_queue SET created_at = NOW() - interval '1 day'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        q.enqueue_proxy_file(repo, "b", "back02", None, 1, None, PRIORITY_BACKFILL)
+            .await
+            .expect("backfill");
+
+        let none_free = q
+            .claim_filtered(10, "w", CLAIM_TTL_SECS, 0)
+            .await
+            .expect("claim");
+        assert_eq!(
+            none_free
+                .iter()
+                .map(|j| j.digest.clone())
+                .collect::<Vec<_>>(),
+            vec![Some("back02".to_string())],
+            "no rescan slot free: the re-grade waits"
+        );
+        let one_free = q
+            .claim_filtered(10, "w", CLAIM_TTL_SECS, 1)
+            .await
+            .expect("claim");
+        assert_eq!(one_free.len(), 1);
+        assert_eq!(one_free[0].digest.as_deref(), Some("regr01"));
+        assert!(one_free[0].in_rescan_band());
+
+        // Raised by a waiting pull of the same digest, it is ordinary work.
+        sqlx::query("DELETE FROM scan_queue")
+            .execute(&pool)
+            .await
+            .unwrap();
+        q.enqueue_proxy_file(repo, "r", "regr02", None, 1, None, PRIORITY_REGRADE)
+            .await
+            .expect("regrade");
+        q.enqueue_proxy_file(repo, "r", "regr02", None, 1, None, PRIORITY_CLIENT_WAITING)
+            .await
+            .expect("waiting");
+        let raised = q
+            .claim_filtered(10, "w", CLAIM_TTL_SECS, 0)
+            .await
+            .expect("claim");
+        assert_eq!(raised.len(), 1);
+        assert_eq!(raised[0].priority, PRIORITY_CLIENT_WAITING);
+        assert!(!raised[0].in_rescan_band());
+
         sqlx::query("DELETE FROM scan_queue")
             .execute(&pool)
             .await

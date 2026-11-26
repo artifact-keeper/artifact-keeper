@@ -1181,6 +1181,29 @@ pub(crate) fn is_maven_sidecar(path: &str) -> bool {
             .any(|ext| file.ends_with(ext))
 }
 
+/// The catalog `(groupId:artifactId, version, version directory)` of a Maven
+/// or Gradle path, or `None` when the path is not a package file: a sidecar,
+/// a resolver file such as `_remote.repositories`, or a path too short for
+/// `groupId/artifactId/version/file`. Publish time and the backfill both use
+/// it, so neither can register a group directory as a package (#6271)
+pub(crate) fn maven_catalog_coordinates(path: &str) -> Option<(String, String, Option<&str>)> {
+    if is_maven_sidecar(path) {
+        return None;
+    }
+    let coords = crate::formats::maven::MavenHandler::parse_coordinates(path).ok()?;
+    let group_id = coords.group_id.trim();
+    let artifact_id = coords.artifact_id.trim();
+    let version = coords.version.trim();
+    if group_id.is_empty() || artifact_id.is_empty() || version.is_empty() {
+        return None;
+    }
+    Some((
+        format!("{group_id}:{artifact_id}"),
+        version.to_string(),
+        crate::api::handlers::maven::maven_version_directory(path),
+    ))
+}
+
 /// Derive the catalog `(name, version)` for one artifact row during the
 /// backfill (#3659).
 ///
@@ -1211,20 +1234,7 @@ pub fn backfill_catalog_coordinates(
             // as one. A checksum or signature beside a real asset is dropped
             // for the same reason — it is not a distributable in its own
             // right, and the asset it describes registers the version anyway.
-            if is_maven_sidecar(path) {
-                return None;
-            }
-            let coords = crate::formats::maven::MavenHandler::parse_coordinates(path).ok()?;
-            let group_id = coords.group_id.trim();
-            let artifact_id = coords.artifact_id.trim();
-            let path_version = coords.version.trim();
-            if group_id.is_empty() || artifact_id.is_empty() || path_version.is_empty() {
-                return None;
-            }
-            Some((
-                format!("{group_id}:{artifact_id}"),
-                path_version.to_string(),
-            ))
+            maven_catalog_coordinates(path).map(|(name, version, _)| (name, version))
         }
         // SBT/Ivy stores the filename stem (which embeds the revision) in
         // `artifacts.name`; the package coordinate is the Ivy `org/module`,
@@ -1583,6 +1593,55 @@ mod tests {
         assert_eq!(ver_rows.0, 3);
     }
 
+    /// #5641: `packages.version` / `package_versions.version` were
+    /// `VARCHAR(128)` (211). A PyPI PEP 440 local version longer than that
+    /// uploaded and served, but the best-effort catalog upsert failed with
+    /// `value too long for type character varying(128)`, so the version was
+    /// silently missing from `GET /api/v1/packages/{id}/versions`. Both
+    /// columns are `TEXT` now, so the version is cataloged whole.
+    #[tokio::test]
+    async fn test_long_version_is_cataloged_whole() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "pypi").await else {
+            return;
+        };
+
+        let service = PackageService::new(fx.pool.clone());
+        let package = "long-version-package";
+        // A local version segment is `[A-Za-z0-9._]`, so a long one is a valid
+        // version, not a malformed coordinate.
+        let version = format!("1.0.0+{}", "a".repeat(150));
+        assert!(version.len() > 128, "the fixture must exceed the old bound");
+        let checksum = "f".repeat(64);
+
+        service
+            .create_or_update_from_artifact(
+                fx.repo_id, package, &version, 512, &checksum, None, None,
+            )
+            .await
+            .expect("a version past the old VARCHAR(128) must still be cataloged");
+
+        let stored: (String, String) = sqlx::query_as(
+            r#"
+            SELECT p.version, pv.version
+            FROM packages p
+            JOIN package_versions pv ON pv.package_id = p.id
+            WHERE p.repository_id = $1 AND p.name = $2
+            "#,
+        )
+        .bind(fx.repo_id)
+        .bind(package)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("read the catalog row back");
+
+        fx.teardown().await;
+
+        assert_eq!(stored.0, version);
+        assert_eq!(stored.1, version);
+    }
+
     // -----------------------------------------------------------------------
     // Parameter validation concepts
     // -----------------------------------------------------------------------
@@ -1819,6 +1878,32 @@ mod catalog_maintenance_tests {
         ] {
             assert_eq!(
                 backfill_catalog_coordinates("maven", path, "widget", Some("1.2.3")),
+                None,
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn maven_catalog_coordinates_skip_files_outside_the_gav_layout_6271() {
+        assert_eq!(
+            maven_catalog_coordinates("com/acme/widget/1.2.3/widget-1.2.3.jar"),
+            Some((
+                "com.acme:widget".to_string(),
+                "1.2.3".to_string(),
+                Some("com/acme/widget/1.2.3/"),
+            ))
+        );
+        for path in [
+            "com/myDomain/notes.txt",
+            "com/acme/widget/1.2.3/_remote.repositories",
+            "com/acme/widget/resolver-status.properties",
+            "com/acme/widget/1.2.3/widget-1.2.3.jar.sha1",
+            "com/acme/widget/maven-metadata.xml",
+        ] {
+            assert_eq!(maven_catalog_coordinates(path), None, "{path}");
+            assert_eq!(
+                backfill_catalog_coordinates("maven", path, "com", Some("myDomain")),
                 None,
                 "{path}"
             );

@@ -2,6 +2,7 @@
 
 use crate::config::Config;
 use crate::error::{DeadlockError, Result};
+use futures::future::BoxFuture;
 use rand::RngExt;
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
 use std::str::FromStr;
@@ -126,24 +127,29 @@ fn connection_budget(config: &Config) -> String {
     format!(
         "connection budget: DATABASE_MAX_CONNECTIONS={} pool connections per replica \
          (DATABASE_ACQUIRE_TIMEOUT_SECS={}), plus single-flight lock/wait connections \
-         held outside the pool (capped per replica by PROXY_SINGLEFLIGHT_MAX_LOCK_WAITERS), \
+         held outside the pool (capped per replica by PROXY_SINGLEFLIGHT_LOCK_MAX_CONNECTIONS), \
+         plus DATABASE_PROBE_CONNECTIONS={} for health and readiness probes, \
          plus one rolling-update surge replica, must stay below Postgres max_connections \
          (see the Database section of .env.example)",
-        config.database_max_connections, config.database_acquire_timeout_secs
+        config.database_max_connections,
+        config.database_acquire_timeout_secs,
+        config.database_probe_connections
     )
 }
 
-/// One startup connect attempt: build the pool and establish its first
-/// connection(s). Kept separate from [`create_pool`] so the retry loop can be
-/// exercised without a live database.
-async fn build_pool(
+/// The pool options every pool this process opens shares: the idle-liveness
+/// probe (#1877), the keepalive hook (#4549), and the idle/lifetime recycling
+/// from `config`, with the size and acquire timeout given.
+fn pool_options(
     config: &Config,
-    options: &PgConnectOptions,
-) -> std::result::Result<PgPool, sqlx::Error> {
+    max_connections: u32,
+    min_connections: u32,
+    acquire_timeout: Duration,
+) -> PgPoolOptions {
     let mut pool_options = PgPoolOptions::new()
-        .max_connections(config.database_max_connections)
-        .min_connections(config.database_min_connections)
-        .acquire_timeout(Duration::from_secs(config.database_acquire_timeout_secs))
+        .max_connections(max_connections)
+        .min_connections(min_connections)
+        .acquire_timeout(acquire_timeout)
         .idle_timeout(Duration::from_secs(config.database_idle_timeout_secs))
         .max_lifetime(Duration::from_secs(config.database_max_lifetime_secs))
         .before_acquire(|conn, meta| {
@@ -177,7 +183,54 @@ async fn build_pool(
             })
         });
     }
-    pool_options.connect_with(options.clone()).await
+    pool_options
+}
+
+/// One startup connect attempt: build the pool and establish its first
+/// connection(s). Kept separate from [`create_pool`] so the retry loop can be
+/// exercised without a live database.
+async fn build_pool(
+    config: &Config,
+    options: &PgConnectOptions,
+) -> std::result::Result<PgPool, sqlx::Error> {
+    pool_options(
+        config,
+        config.database_max_connections,
+        config.database_min_connections,
+        Duration::from_secs(config.database_acquire_timeout_secs),
+    )
+    .connect_with(options.clone())
+    .await
+}
+
+/// How long a health or readiness probe waits for the probe pool's
+/// connection before reporting the database unhealthy. Shorter than the
+/// request pool's acquire timeout: the probe pool is only ever contended by
+/// other probes, each a single short query.
+const PROBE_POOL_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// The separate pool `/health` and `/readyz` read the database through
+/// (#4182), or `None` when `DATABASE_PROBE_CONNECTIONS=0` (probes share the
+/// request pool, as before 1.13).
+///
+/// Under a burst the request pool is fully in use by design, and the
+/// admission gate sheds what it cannot serve. A readiness probe queued on
+/// that pool waited out the acquire timeout and reported the database
+/// unhealthy, so the orchestrator took a replica that was merely busy out of
+/// service, moving its load onto the others. With its own connection the
+/// probe answers whether the database is reachable, which is the question it
+/// is asked. The connection is opened lazily on the first probe and then kept
+/// (`min_connections` = size), so it is not lost to a server whose
+/// `max_connections` fills up later. It counts toward the connection budget.
+pub fn create_probe_pool(config: &Config) -> Result<Option<PgPool>> {
+    let size = config.database_probe_connections;
+    if size == 0 {
+        return Ok(None);
+    }
+    let options = PgConnectOptions::from_str(&config.database_url)?;
+    Ok(Some(
+        pool_options(config, size, size, PROBE_POOL_ACQUIRE_TIMEOUT).connect_lazy_with(options),
+    ))
 }
 
 /// Run `connect` up to `attempts` times with the jittered doubling backoff of
@@ -255,6 +308,47 @@ pub async fn create_pool(config: &Config) -> Result<PgPool> {
     )
     .await?;
     Ok(pool)
+}
+
+/// Run `action` on a session dedicated to startup migrations (#6319).
+///
+/// Dropping a `PoolConnection` normally returns it to the pool, so
+/// session-level `SET`s made on it would leak into later application queries.
+/// Marking the connection `close_on_drop` before the `SET`s means it is never
+/// returned: it is closed with [`PoolConnection::close`] when `action`
+/// finishes, and by the drop handler if `action` panics or the future is
+/// cancelled. Unlike `detach()`, the connection keeps its pool slot until the
+/// socket is closed, so the pool cannot open a replacement for it (when
+/// `min_connections` > 0) and never holds more than `max_connections`
+/// sessions on the server during the migration.
+///
+/// [`PoolConnection::close`]: sqlx::pool::PoolConnection::close
+pub async fn with_migration_session<T, F>(pool: &PgPool, action: F) -> Result<T>
+where
+    F: for<'a> FnOnce(&'a mut sqlx::PgConnection) -> BoxFuture<'a, Result<T>>,
+{
+    let mut conn = pool.acquire().await?;
+    conn.close_on_drop();
+
+    let result = async {
+        sqlx::query("SET statement_timeout = '30min'")
+            .execute(&mut *conn)
+            .await?;
+        sqlx::query("SET lock_timeout = '5min'")
+            .execute(&mut *conn)
+            .await?;
+        action(&mut conn).await
+    }
+    .await;
+
+    // The migration error is the useful one when both fail. A close failure
+    // after a successful migration is not worth aborting startup over: the
+    // connection never goes back to the pool either way, so its settings
+    // cannot reach application queries.
+    if let Err(err) = sqlx::pool::PoolConnection::close(conn).await {
+        tracing::warn!(error = %err, "failed to close the startup migration connection");
+    }
+    result
 }
 
 /// How many times a transaction that can lose a lock-order race is attempted
@@ -517,7 +611,8 @@ mod tests {
         for needle in [
             "DATABASE_MAX_CONNECTIONS=20",
             "DATABASE_ACQUIRE_TIMEOUT_SECS=7",
-            "PROXY_SINGLEFLIGHT_MAX_LOCK_WAITERS",
+            "DATABASE_PROBE_CONNECTIONS=1",
+            "PROXY_SINGLEFLIGHT_LOCK_MAX_CONNECTIONS",
             "max_connections",
             "surge",
             ".env.example",
@@ -527,6 +622,35 @@ mod tests {
                 "the budget must name {needle:?}: {budget}"
             );
         }
+    }
+
+    /// #4182: health and readiness get their own pool, sized by
+    /// `DATABASE_PROBE_CONNECTIONS`, built lazily (no connect at startup) and
+    /// bounded by its own short acquire timeout; `0` means none (the probes
+    /// share the request pool).
+    #[tokio::test]
+    async fn probe_pool_is_separate_lazy_and_optional_4182() {
+        let config = Config {
+            database_url: "postgres://u:p@127.0.0.1:1/db".to_string(),
+            database_probe_connections: 2,
+            ..Config::default()
+        };
+        let pool = create_probe_pool(&config)
+            .expect("valid url")
+            .expect("2 connections build a pool");
+        assert_eq!(pool.options().get_max_connections(), 2);
+        assert_eq!(pool.options().get_min_connections(), 2);
+        assert_eq!(
+            pool.options().get_acquire_timeout(),
+            PROBE_POOL_ACQUIRE_TIMEOUT
+        );
+        assert_eq!(pool.size(), 0, "lazy: nothing opened at startup");
+
+        let off = Config {
+            database_probe_connections: 0,
+            ..config
+        };
+        assert!(create_probe_pool(&off).expect("valid url").is_none());
     }
 
     /// #4549: the initial connect is retried a bounded number of times, every
@@ -783,5 +907,239 @@ mod tests {
             source, "session",
             "with the hook disabled nothing sets tcp_keepalives_idle (now {idle})"
         );
+    }
+
+    /// #6319: startup migrations raise session timeouts on their connection.
+    /// Returning that connection to a single-connection pool made the next
+    /// application query inherit 30min/5min instead of the operator's default.
+    #[tokio::test]
+    async fn migration_session_timeouts_do_not_leak_into_pool_6319() {
+        async fn timeouts(conn: &mut sqlx::PgConnection) -> (String, String) {
+            sqlx::query_as(
+                "SELECT current_setting('statement_timeout'), current_setting('lock_timeout')",
+            )
+            .fetch_one(conn)
+            .await
+            .expect("read session timeouts")
+        }
+
+        let Some(pool) = crate::testing::try_pool_with(1).await else {
+            return;
+        };
+
+        let baseline = {
+            let mut conn = pool.acquire().await.expect("acquire baseline connection");
+            timeouts(&mut conn).await
+        };
+
+        let during = with_migration_session(&pool, |conn| {
+            Box::pin(async move { Ok(timeouts(conn).await) })
+        })
+        .await
+        .expect("run migration session");
+        assert_eq!(during, ("30min".to_string(), "5min".to_string()));
+
+        let after = {
+            let mut conn = pool
+                .acquire()
+                .await
+                .expect("acquire a connection after the migration session");
+            timeouts(&mut conn).await
+        };
+        pool.close().await;
+
+        assert_eq!(
+            after, baseline,
+            "migration-only timeouts must not survive in the application pool"
+        );
+    }
+
+    /// #6319 follow-up: the migration session must keep its pool slot while
+    /// it runs. `detach()` released the slot, so with `min_connections` > 0
+    /// the pool opened a replacement and a replica held `max_connections + 1`
+    /// sessions on the server for the whole migration. With max = min = 1,
+    /// count this pool's sessions server-side (tagged by `application_name`)
+    /// while the migration connection is held.
+    #[tokio::test]
+    async fn migration_session_keeps_its_pool_slot_6319() {
+        let Some(url) = crate::testing::require_db_url() else {
+            return;
+        };
+        let app_name = format!("ak-6319-slot-{}", uuid::Uuid::new_v4().simple());
+        let options = PgConnectOptions::from_str(&url)
+            .expect("parse DATABASE_URL")
+            .application_name(&app_name);
+        let Some(pool) = crate::testing::on_connect_result(
+            PgPoolOptions::new()
+                .max_connections(1)
+                .min_connections(1)
+                .acquire_timeout(std::time::Duration::from_secs(30))
+                .connect_with(options)
+                .await,
+        ) else {
+            return;
+        };
+
+        let (probe_pool, probe_name) = (pool.clone(), app_name.clone());
+        let (server_max, size_max, idle_max) = with_migration_session(&pool, move |conn| {
+            Box::pin(async move {
+                let (mut server_max, mut size_max, mut idle_max) = (0i64, 0u32, 0usize);
+                // Give the pool's min_connections maintenance ample time to
+                // open a replacement if the slot had been released.
+                for _ in 0..20 {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    let (n,): (i64,) = sqlx::query_as(
+                        "SELECT count(*) FROM pg_stat_activity WHERE application_name = $1",
+                    )
+                    .bind(&probe_name)
+                    .fetch_one(&mut *conn)
+                    .await?;
+                    server_max = server_max.max(n);
+                    size_max = size_max.max(probe_pool.size());
+                    idle_max = idle_max.max(probe_pool.num_idle());
+                }
+                Ok((server_max, size_max, idle_max))
+            })
+        })
+        .await
+        .expect("run migration session");
+
+        // The slot comes back once the session is closed.
+        let mut conn = pool
+            .acquire()
+            .await
+            .expect("acquire a connection after the migration session");
+        sqlx::query("SELECT 1")
+            .execute(&mut *conn)
+            .await
+            .expect("query after the migration session");
+        drop(conn);
+        pool.close().await;
+
+        assert_eq!(
+            server_max, 1,
+            "the pool must not open a replacement session while the migration holds its slot"
+        );
+        assert!(
+            size_max <= 1,
+            "pool size {size_max} exceeded max_connections = 1"
+        );
+        assert_eq!(
+            idle_max, 0,
+            "no idle replacement may exist during the migration"
+        );
+    }
+
+    /// #5084: the usage-ledger triggers (migration 182) lock a repository's
+    /// `repository_usage_ledger` row on its first counted write and hold it to
+    /// commit, so two transactions that write the same two repositories in
+    /// opposite order deadlock on those rows. Run as whole units through
+    /// [`retry_on_deadlock`] (as the strict backup restore now is), the
+    /// deadlock victim re-runs after the winner commits: both commit, and each
+    /// repository is charged both writes exactly once.
+    #[tokio::test]
+    async fn opposite_order_ledger_writes_both_commit_under_retry_5084() {
+        let Some(pool) = crate::testing::try_pool_with(4).await else {
+            return;
+        };
+        async fn seed(pool: &PgPool) -> Uuid {
+            let id = Uuid::new_v4();
+            let key = format!("ledger-5084-{}", &id.to_string()[..8]);
+            sqlx::query(
+                "INSERT INTO repositories (id, key, name, format, repo_type, storage_path) \
+                 VALUES ($1, $2, $2, 'generic'::repository_format, \
+                         'local'::repository_type, $3)",
+            )
+            .bind(id)
+            .bind(&key)
+            .bind(format!("/data/{key}"))
+            .execute(pool)
+            .await
+            .expect("seed fixture repository");
+            id
+        }
+        async fn charge(
+            conn: &mut sqlx::PgConnection,
+            repo: Uuid,
+            size: i64,
+        ) -> std::result::Result<(), sqlx::Error> {
+            let id = Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO artifacts \
+                   (id, repository_id, path, name, size_bytes, checksum_sha256, \
+                    content_type, storage_key, is_deleted) \
+                 VALUES ($1, $2, $3, $3, $4, repeat('a', 64), \
+                         'application/octet-stream', $3, false)",
+            )
+            .bind(id)
+            .bind(repo)
+            .bind(format!("ledger-5084/{id}"))
+            .bind(size)
+            .execute(conn)
+            .await
+            .map(|_| ())
+        }
+        // One whole transaction: `first` then `second`. On its first attempt
+        // it waits at `barrier` holding `first`'s ledger row, so both
+        // transactions hold one row each before reaching for the other's.
+        async fn write_pair(
+            pool: &PgPool,
+            (first, second): (Uuid, Uuid),
+            size: i64,
+            barrier: &tokio::sync::Barrier,
+            attempts: &AtomicU32,
+        ) -> std::result::Result<(), sqlx::Error> {
+            retry_on_deadlock("ledger pair (#5084 test)", || async move {
+                let attempt = attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                let mut tx = pool.begin().await?;
+                charge(&mut tx, first, size).await?;
+                if attempt == 1 {
+                    barrier.wait().await;
+                }
+                charge(&mut tx, second, size).await?;
+                tx.commit().await
+            })
+            .await
+        }
+
+        let (a, b) = (seed(&pool).await, seed(&pool).await);
+        let barrier = tokio::sync::Barrier::new(2);
+        let (attempts_ab, attempts_ba) = (AtomicU32::new(0), AtomicU32::new(0));
+        let (ab, ba) = tokio::join!(
+            write_pair(&pool, (a, b), 100, &barrier, &attempts_ab),
+            write_pair(&pool, (b, a), 1000, &barrier, &attempts_ba),
+        );
+        let ledger = |id: Uuid| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT hosted_bytes FROM repository_usage_ledger WHERE repository_id = $1",
+                )
+                .bind(id)
+                .fetch_optional(&pool)
+                .await
+                .expect("read ledger")
+            }
+        };
+        let (ledger_a, ledger_b) = (ledger(a).await, ledger(b).await);
+        let retried = attempts_ab.load(Ordering::SeqCst) + attempts_ba.load(Ordering::SeqCst);
+        for id in [a, b] {
+            for sql in [
+                "DELETE FROM artifacts WHERE repository_id = $1",
+                "DELETE FROM repository_usage_ledger WHERE repository_id = $1",
+                "DELETE FROM repositories WHERE id = $1",
+            ] {
+                let _ = sqlx::query(sql).bind(id).execute(&pool).await;
+            }
+        }
+
+        assert!(ab.is_ok(), "A-then-B did not commit: {ab:?}");
+        assert!(ba.is_ok(), "B-then-A did not commit: {ba:?}");
+        assert!(
+            retried >= 3,
+            "the two transactions never deadlocked ({retried} attempts), so the retry was not exercised"
+        );
+        assert_eq!(ledger_a, Some(1100), "repository A charged once per write");
+        assert_eq!(ledger_b, Some(1100), "repository B charged once per write");
     }
 }

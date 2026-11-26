@@ -222,7 +222,24 @@ where
 pub fn spawn_renewal_loop_with_cancellation<F, Fut>(
     label: impl Into<String>,
     ttl_secs: f64,
+    renew: F,
+) -> (RenewalGuard, CancellationToken)
+where
+    F: FnMut() -> Fut + Send + 'static,
+    Fut: Future<Output = std::result::Result<bool, String>> + Send + 'static,
+{
+    renewal_loop(label, ttl_secs, renew, None)
+}
+
+/// The renewal loop behind [`spawn_renewal_loop_with_cancellation`]. With
+/// `stop`, the returned token is also cancelled when `stop` is, while the
+/// heartbeat keeps running until the guard is dropped: a scheduler job told
+/// to stop for shutdown still owns its lease until it has stopped (#5921).
+fn renewal_loop<F, Fut>(
+    label: impl Into<String>,
+    ttl_secs: f64,
     mut renew: F,
+    mut stop: Option<CancellationToken>,
 ) -> (RenewalGuard, CancellationToken)
 where
     F: FnMut() -> Fut + Send + 'static,
@@ -238,7 +255,22 @@ where
         ticker.tick().await;
 
         loop {
-            ticker.tick().await;
+            let stopped = match stop.clone() {
+                Some(stop) => tokio::select! {
+                    _ = ticker.tick() => false,
+                    _ = stop.cancelled() => true,
+                },
+                None => {
+                    ticker.tick().await;
+                    false
+                }
+            };
+            if stopped {
+                tracing::info!(claim = %label, "shutdown: telling the job under this claim to stop");
+                on_loss.cancel();
+                stop = None;
+                continue;
+            }
             match renew().await {
                 Ok(true) => {}
                 Ok(false) => {
@@ -305,6 +337,58 @@ pub fn spawn_row_claim_renewal(
 // Singleton scheduler leases
 // ---------------------------------------------------------------------------
 
+/// The claim tokens of the [`SchedulerLease`]s alive in this process. A
+/// lease is alive while its job runs under it; shutdown waits for these
+/// before releasing the leases (#5921).
+fn live_scheduler_leases() -> &'static std::sync::Mutex<std::collections::HashSet<Uuid>> {
+    static LIVE: OnceLock<std::sync::Mutex<std::collections::HashSet<Uuid>>> = OnceLock::new();
+    LIVE.get_or_init(Default::default)
+}
+
+/// Woken whenever a [`SchedulerLease`] is dropped.
+fn live_scheduler_leases_changed() -> &'static tokio::sync::Notify {
+    static CHANGED: OnceLock<tokio::sync::Notify> = OnceLock::new();
+    CHANGED.get_or_init(tokio::sync::Notify::new)
+}
+
+/// Cancelled when shutdown begins: every job running under a scheduler lease
+/// with [`SchedulerLease::spawn_renewal_with_cancellation`] is told to stop.
+fn scheduler_jobs_stop() -> &'static CancellationToken {
+    static STOP: OnceLock<CancellationToken> = OnceLock::new();
+    STOP.get_or_init(CancellationToken::new)
+}
+
+/// Tell every job running under a scheduler lease in this process to stop
+/// (#5921): their lease-loss tokens are cancelled, their heartbeats go on
+/// until they have stopped. Called when shutdown begins.
+pub fn stop_scheduler_jobs() {
+    scheduler_jobs_stop().cancel();
+}
+
+/// Wait until no job runs under a scheduler lease in this process, or until
+/// `deadline`. Returns the claim tokens of the leases still held by a running
+/// job.
+pub async fn wait_for_scheduler_jobs(deadline: tokio::time::Instant) -> Vec<Uuid> {
+    let live = || -> Vec<Uuid> {
+        live_scheduler_leases()
+            .lock()
+            .map(|set| set.iter().copied().collect())
+            .unwrap_or_default()
+    };
+    loop {
+        let changed = live_scheduler_leases_changed().notified();
+        tokio::pin!(changed);
+        changed.as_mut().enable();
+        let running = live();
+        if running.is_empty() {
+            return running;
+        }
+        if tokio::time::timeout_at(deadline, changed).await.is_err() {
+            return live();
+        }
+    }
+}
+
 /// A held (or renewed) singleton job lease from `scheduler_leases`.
 ///
 /// Unlike [`crate::services::cluster_lock::ClusterLease`] this is durable
@@ -319,9 +403,31 @@ pub struct SchedulerLease {
     lease_expires_at: DateTime<Utc>,
 }
 
+impl Drop for SchedulerLease {
+    /// The job is no longer running under this lease (#5921). Releases
+    /// nothing in the database.
+    fn drop(&mut self) {
+        if let Ok(mut live) = live_scheduler_leases().lock() {
+            live.remove(&self.claim_token);
+        }
+        live_scheduler_leases_changed().notify_waiters();
+    }
+}
+
 impl SchedulerLease {
     pub fn lease_expires_at(&self) -> DateTime<Utc> {
         self.lease_expires_at
+    }
+
+    /// The job this lease is for.
+    pub fn job_name(&self) -> &str {
+        &self.job_name
+    }
+
+    /// This holder's claim on the lease row; a write tied to the lease
+    /// checks it is still the row's (#6429).
+    pub fn lease_claim_token(&self) -> Uuid {
+        self.claim_token
     }
 
     /// Keep this scheduler lease alive until the returned guard is dropped.
@@ -346,6 +452,8 @@ impl SchedulerLease {
     /// replica may already own the job and be doing the same work. The
     /// long-running worker must observe the token between items and abort
     /// rather than finish a cycle a second owner is redoing (#3084, #3502).
+    /// It is also cancelled when shutdown begins ([`stop_scheduler_jobs`]),
+    /// while the heartbeat goes on until the guard is dropped (#5921).
     pub fn spawn_renewal_with_cancellation(
         &self,
         db: PgPool,
@@ -353,7 +461,7 @@ impl SchedulerLease {
     ) -> (RenewalGuard, CancellationToken) {
         let job_name = self.job_name.clone();
         let claim_token = self.claim_token;
-        spawn_renewal_loop_with_cancellation(
+        renewal_loop(
             format!("scheduler lease {job_name}"),
             ttl_secs,
             move || {
@@ -366,6 +474,8 @@ impl SchedulerLease {
                         .map_err(|e| e.to_string())
                 }
             },
+            // Shutdown tells the job to stop through the same token (#5921).
+            Some(scheduler_jobs_stop().clone()),
         )
     }
 
@@ -408,12 +518,21 @@ impl SchedulerLease {
     }
 }
 
+/// Set by [`release_scheduler_leases_held_by`] before it releases anything:
+/// from then on every scheduler-lease heartbeat of this process reports the
+/// lease lost, which cancels the job running under it (#5921).
+static SCHEDULER_HEARTBEATS_STOPPED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 async fn renew_scheduler_lease_by_token(
     db: &PgPool,
     job_name: &str,
     claim_token: Uuid,
     ttl_secs: f64,
 ) -> Result<Option<DateTime<Utc>>> {
+    if SCHEDULER_HEARTBEATS_STOPPED.load(std::sync::atomic::Ordering::Acquire) {
+        return Ok(None);
+    }
     sqlx::query_scalar(
         r#"
         UPDATE scheduler_leases
@@ -439,12 +558,20 @@ async fn renew_scheduler_lease_by_token(
 /// which keeps a periodic job pinned to its current healthy holder). Returns
 /// `Ok(None)` when another live owner holds it; the caller should skip the
 /// tick, not error.
+///
+/// While the process is draining for shutdown (#5921) it claims no new
+/// lease and answers `Ok(None)`, so every singleton job skips its tick and
+/// another replica takes it over.
 pub async fn try_acquire_scheduler_lease(
     db: &PgPool,
     job_name: &str,
     owner_id: &str,
     ttl_secs: f64,
 ) -> Result<Option<SchedulerLease>> {
+    if crate::services::shutdown_drain::is_draining() {
+        tracing::debug!(job = %job_name, "draining for shutdown; not claiming the scheduler lease");
+        return Ok(None);
+    }
     let row: Option<(Uuid, DateTime<Utc>)> = sqlx::query_as(
         r#"
         INSERT INTO scheduler_leases (job_name, owner_id, claim_token, lease_expires_at)
@@ -466,10 +593,15 @@ pub async fn try_acquire_scheduler_lease(
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
-    Ok(row.map(|(claim_token, lease_expires_at)| SchedulerLease {
-        job_name: job_name.to_string(),
-        claim_token,
-        lease_expires_at,
+    Ok(row.map(|(claim_token, lease_expires_at)| {
+        if let Ok(mut live) = live_scheduler_leases().lock() {
+            live.insert(claim_token);
+        }
+        SchedulerLease {
+            job_name: job_name.to_string(),
+            claim_token,
+            lease_expires_at,
+        }
     }))
 }
 
@@ -493,6 +625,47 @@ pub async fn try_acquire_scheduler_lease_quiet(
         Err(e) => {
             tracing::warn!(job = %job_name, error = %e, "scheduler lease acquire failed; skipping tick");
             None
+        }
+    }
+}
+
+/// Release the scheduler leases `owner_id` still holds, at the end of a
+/// graceful shutdown (#5921), so the next replica claims those jobs on its
+/// next tick instead of waiting out each lease's TTL. The leases in
+/// `still_running` (claim tokens of jobs still running, from
+/// [`wait_for_scheduler_jobs`]) are left to lapse at their TTL, so no other
+/// replica starts a job while this one may still be doing it. Returns how
+/// many were released; a failure is logged and the leases simply lapse.
+///
+/// Heartbeats are stopped first, so no renewal by this process can extend a
+/// lease after the release: from this call on every renewal reports the
+/// lease lost and fires the job's lease-loss token (#3502). A renewal does
+/// not itself check the expiry: a job whose lease lapsed during a database
+/// stall keeps it as long as no other replica has claimed it.
+pub async fn release_scheduler_leases_held_by(
+    db: &PgPool,
+    owner_id: &str,
+    still_running: &[Uuid],
+) -> u64 {
+    SCHEDULER_HEARTBEATS_STOPPED.store(true, std::sync::atomic::Ordering::Release);
+    let result = sqlx::query(
+        r#"
+        UPDATE scheduler_leases
+        SET lease_expires_at = NOW(), updated_at = NOW()
+        WHERE owner_id = $1
+          AND lease_expires_at > NOW()
+          AND claim_token <> ALL($2)
+        "#,
+    )
+    .bind(owner_id)
+    .bind(still_running)
+    .execute(db)
+    .await;
+    match result {
+        Ok(done) => done.rows_affected(),
+        Err(e) => {
+            tracing::warn!(error = %e, "could not release this process's scheduler leases; they lapse at their TTL");
+            0
         }
     }
 }
@@ -703,6 +876,237 @@ mod tests {
             .bind(&job)
             .execute(&pool)
             .await;
+    }
+
+    /// Tier-2 (#5921): a draining process claims no lease, and at the end of
+    /// shutdown it releases only the leases it holds.
+    #[tokio::test]
+    async fn draining_claims_nothing_and_shutdown_releases_only_our_leases() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::shutdown_drain;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let ours = format!("owner-drain-{}", Uuid::new_v4());
+        let theirs = format!("owner-live-{}", Uuid::new_v4());
+        let jobs: Vec<String> = (0..3)
+            .map(|i| format!("test-drain-{i}-{}", Uuid::new_v4()))
+            .collect();
+        let mut held = Vec::new();
+        for job in &jobs[..2] {
+            held.push(
+                try_acquire_scheduler_lease(&pool, job, &ours, 600.0)
+                    .await
+                    .unwrap()
+                    .expect("claim"),
+            );
+        }
+        assert!(try_acquire_scheduler_lease(&pool, &jobs[2], &theirs, 600.0)
+            .await
+            .unwrap()
+            .is_some());
+
+        shutdown_drain::begin();
+        let fresh = format!("test-drain-fresh-{}", Uuid::new_v4());
+        let refused = try_acquire_scheduler_lease(&pool, &fresh, &ours, 600.0).await;
+        shutdown_drain::reset_for_test();
+        assert!(
+            refused.unwrap().is_none(),
+            "a draining process must not claim a new scheduler lease"
+        );
+
+        assert_eq!(release_scheduler_leases_held_by(&pool, &ours, &[]).await, 2);
+        assert_eq!(
+            release_scheduler_leases_held_by(&pool, &ours, &[]).await,
+            0,
+            "releasing again is a no-op"
+        );
+        for lease in &mut held {
+            assert!(
+                !lease.renew(&pool, 600.0).await.unwrap(),
+                "a heartbeat after the release reports the lease lost, stopping the job"
+            );
+        }
+        // The rest of this test acts as another replica, whose heartbeats run.
+        SCHEDULER_HEARTBEATS_STOPPED.store(false, std::sync::atomic::Ordering::Release);
+        for job in &jobs[..2] {
+            assert!(
+                try_acquire_scheduler_lease(&pool, job, &theirs, 600.0)
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "a released lease is claimable by another replica at once"
+            );
+        }
+        assert!(
+            try_acquire_scheduler_lease(&pool, &jobs[2], &ours, 600.0)
+                .await
+                .unwrap()
+                .is_none(),
+            "another replica's lease is untouched"
+        );
+
+        let _ = sqlx::query("DELETE FROM scheduler_leases WHERE job_name LIKE 'test-drain-%'")
+            .execute(&pool)
+            .await;
+    }
+
+    /// Tier-2 (#5921, review): a heartbeat renews a lease that lapsed while
+    /// the database was unreachable, as long as no other replica claimed it,
+    /// so a long stall does not abort a job nobody took over. Once another
+    /// replica has claimed it, the heartbeat reports it lost.
+    #[tokio::test]
+    async fn a_lapsed_lease_nobody_claimed_is_renewed_and_a_reclaimed_one_is_lost() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let job = format!("test-lapse-{}", Uuid::new_v4());
+        let mut lease = try_acquire_scheduler_lease(&pool, &job, "owner-stalled", 600.0)
+            .await
+            .unwrap()
+            .expect("claim");
+        sqlx::query("UPDATE scheduler_leases SET lease_expires_at = NOW() - INTERVAL '1 second' WHERE job_name = $1")
+            .bind(&job)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(
+            lease.renew(&pool, 600.0).await.unwrap(),
+            "a lapsed lease that no one claimed is renewed"
+        );
+        assert!(lease.lease_expires_at() > Utc::now());
+
+        sqlx::query("UPDATE scheduler_leases SET lease_expires_at = NOW() - INTERVAL '1 second' WHERE job_name = $1")
+            .bind(&job)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let _theirs = try_acquire_scheduler_lease(&pool, &job, "owner-next", 600.0)
+            .await
+            .unwrap()
+            .expect("another replica claims the lapsed lease");
+        assert!(
+            !lease.renew(&pool, 600.0).await.unwrap(),
+            "a lease another replica claimed is lost"
+        );
+        let _ = sqlx::query("DELETE FROM scheduler_leases WHERE job_name = $1")
+            .bind(&job)
+            .execute(&pool)
+            .await;
+    }
+
+    /// Tier-2 (#5921, review): shutdown waits for a job still running under
+    /// its lease, up to the deadline, and leaves that lease to lapse rather
+    /// than hand the job to another replica while it may still run. A lease
+    /// whose job finished during the wait is released.
+    #[tokio::test]
+    async fn shutdown_waits_for_running_jobs_and_keeps_their_leases() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let owner = format!("owner-jobs-{}", Uuid::new_v4());
+        let finishing = format!("test-jobs-finishing-{}", Uuid::new_v4());
+        let stuck = format!("test-jobs-stuck-{}", Uuid::new_v4());
+        let finishing_lease = try_acquire_scheduler_lease(&pool, &finishing, &owner, 600.0)
+            .await
+            .unwrap()
+            .expect("claim");
+        let stuck_lease = try_acquire_scheduler_lease(&pool, &stuck, &owner, 600.0)
+            .await
+            .unwrap()
+            .expect("claim");
+        let stuck_token = stuck_lease.lease_claim_token();
+        let finishing_token = finishing_lease.lease_claim_token();
+
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            drop(finishing_lease);
+        });
+        let started = tokio::time::Instant::now();
+        let running = wait_for_scheduler_jobs(started + Duration::from_millis(800)).await;
+        assert!(
+            started.elapsed() >= Duration::from_millis(800),
+            "the wait lasts until the deadline while a job still runs"
+        );
+        assert!(running.contains(&stuck_token), "{running:?}");
+        assert!(
+            !running.contains(&finishing_token),
+            "the job that finished is not still running"
+        );
+
+        assert_eq!(
+            release_scheduler_leases_held_by(&pool, &owner, &running).await,
+            1,
+            "only the finished job's lease is released"
+        );
+        SCHEDULER_HEARTBEATS_STOPPED.store(false, std::sync::atomic::Ordering::Release);
+        assert!(
+            try_acquire_scheduler_lease(&pool, &finishing, "owner-next", 600.0)
+                .await
+                .unwrap()
+                .is_some(),
+            "the finished job is handed over at once"
+        );
+        assert!(
+            try_acquire_scheduler_lease(&pool, &stuck, "owner-next", 600.0)
+                .await
+                .unwrap()
+                .is_none(),
+            "the job still running keeps its lease until the TTL"
+        );
+        drop(stuck_lease);
+        let started = tokio::time::Instant::now();
+        let leftover: Vec<Uuid> = wait_for_scheduler_jobs(started + Duration::from_secs(5))
+            .await
+            .into_iter()
+            .filter(|t| *t == stuck_token)
+            .collect();
+        assert!(
+            leftover.is_empty(),
+            "a dropped lease no longer counts as running"
+        );
+        let _ = sqlx::query("DELETE FROM scheduler_leases WHERE job_name LIKE 'test-jobs-%'")
+            .execute(&pool)
+            .await;
+    }
+
+    /// #5921 (review): the stop token cancels the job's lease-loss token at
+    /// once, and the heartbeat goes on until the guard is dropped, so the
+    /// job keeps its lease while it winds down.
+    #[tokio::test(start_paused = true)]
+    async fn the_shutdown_stop_cancels_the_job_and_the_heartbeat_continues() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let renewals = Arc::new(AtomicUsize::new(0));
+        let counted = renewals.clone();
+        let stop = CancellationToken::new();
+        let (guard, job) = renewal_loop(
+            "test",
+            15.0,
+            move || {
+                let counted = counted.clone();
+                async move {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    Ok(true)
+                }
+            },
+            Some(stop.clone()),
+        );
+        tokio::time::sleep(Duration::from_millis(5_500)).await;
+        assert_eq!(renewals.load(Ordering::SeqCst), 1);
+        assert!(!job.is_cancelled());
+        stop.cancel();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(job.is_cancelled(), "the job is told to stop at once");
+        tokio::time::sleep(Duration::from_millis(10_000)).await;
+        assert_eq!(
+            renewals.load(Ordering::SeqCst),
+            3,
+            "the heartbeat keeps the lease while the job winds down"
+        );
+        drop(guard);
     }
 
     /// Tier-2: an expired lease is reclaimed in place by a new owner.

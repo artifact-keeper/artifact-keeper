@@ -130,6 +130,24 @@ pub(crate) fn is_allowed_bsr_read_rpc(bsr_path: &str) -> bool {
     )
 }
 
+/// Every BSR RPC under `/proto/{repo_key}` that only reads: the proxied
+/// metadata reads above plus the two `Download`s and `GetOwners`, which
+/// hosted repositories answer locally. A Connect RPC is always a `POST`, so
+/// the repository visibility middleware asks this to tell a read from a
+/// write. Every write (`CreateModules`, `Upload`, `CreateOrUpdateLabels`) is
+/// absent and keeps requiring `write:artifacts` in its handler.
+pub(crate) fn is_bsr_read_only_rpc(bsr_path: &str) -> bool {
+    is_allowed_bsr_read_rpc(bsr_path)
+        || matches!(
+            parse_bsr_rpc(bsr_path),
+            Some((
+                "buf.registry.module.v1.DownloadService"
+                    | "buf.registry.module.v1beta1.DownloadService",
+                "Download"
+            )) | Some(("buf.registry.owner.v1.OwnerService", "GetOwners"))
+        )
+}
+
 pub(crate) use super::protobuf_wire::is_binary_protobuf;
 
 /// Join `{upstream}/` + `{Service}/{Method}` without doubling slashes.
@@ -477,6 +495,36 @@ mod tests {
             "buf.alpha.registry.v1alpha1.AuthnService/GetCurrentUser"
         ));
         assert!(!is_allowed_bsr_read_rpc("evil.Service/GetGraph"));
+    }
+
+    #[test]
+    fn test_is_bsr_read_only_rpc_covers_every_read_and_no_write() {
+        for read in [
+            "buf.registry.module.v1.ModuleService/GetModules",
+            "buf.registry.module.v1.CommitService/GetCommits",
+            "buf.registry.module.v1.CommitService/ListCommits",
+            "buf.registry.module.v1.LabelService/GetLabels",
+            "buf.registry.module.v1.GraphService/GetGraph",
+            "buf.registry.module.v1.ResourceService/GetResources",
+            "buf.registry.module.v1.DownloadService/Download",
+            "buf.registry.module.v1beta1.DownloadService/Download",
+            "buf.registry.owner.v1.OwnerService/GetOwners",
+        ] {
+            assert!(is_bsr_read_only_rpc(read), "{read}");
+        }
+        for not_read in [
+            "buf.registry.module.v1.ModuleService/CreateModules",
+            "buf.registry.module.v1.UploadService/Upload",
+            "buf.registry.module.v1beta1.UploadService/Upload",
+            "buf.registry.module.v1.LabelService/CreateOrUpdateLabels",
+            "buf.registry.module.v1.DownloadService/Download/extra",
+            "buf.registry.module.v1.DownloadService/../Upload",
+            "buf.registry.module.v1.DownloadService",
+            "evil.DownloadService/Download",
+            "",
+        ] {
+            assert!(!is_bsr_read_only_rpc(not_read), "{not_read}");
+        }
     }
 
     #[test]

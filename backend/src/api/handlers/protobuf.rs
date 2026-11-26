@@ -2223,6 +2223,17 @@ async fn download(
                 crate::api::handlers::db_err_message(&e),
             )
         })?;
+        // #6433: a proxy-cache row is read only after its cache sidecar is
+        // checked: one nothing vouches for is no row (a Remote fetches the
+        // bundle below), a held or refused one is the gate's answer.
+        let artifact_row = proxy_helpers::vouched_row(&state, repo.id, artifact_row, |r| {
+            use sqlx::Row;
+            proxy_helpers::ServedRowRef::new(
+                r.try_get::<&str, _>("storage_key").unwrap_or_default(),
+                None,
+            )
+        })
+        .await?;
 
         let artifact_row = match artifact_row {
             Some(row) => row,
@@ -2249,13 +2260,16 @@ async fn download(
                         )
                         .await?;
 
-                        // #2561: permit-scoped decode, fast-fail 503 on saturation.
+                        // #2561: permit-scoped decode; on saturation it waits briefly
+                        // for a slot, then sheds 503 (#6230).
                         #[allow(clippy::result_large_err)]
                         // Response-as-error matches this module's handler convention.
-                        let files = crate::util::bounded_archive::with_ingest_extraction(|| {
-                            extract_files_from_bundle(&bundle_data)
-                        })
-                        .map_err(|e| e.into_response())??;
+                        let files =
+                            crate::util::bounded_archive::with_ingest_extraction_waiting(|| {
+                                extract_files_from_bundle(&bundle_data)
+                            })
+                            .await
+                            .map_err(|e| e.into_response())??;
                         let commit = build_commit_info(
                             digest,
                             &chrono::Utc::now().to_rfc3339(),
@@ -2302,13 +2316,16 @@ async fn download(
 
                     let bundle_data = result.collect().await.map_err(|e| e.into_response())?;
 
-                    // #2561: permit-scoped decode, fast-fail 503 on saturation.
+                    // #2561: permit-scoped decode; on saturation it waits briefly
+                    // for a slot, then sheds 503 (#6230).
                     #[allow(clippy::result_large_err)]
                     // Response-as-error matches this module's handler convention.
-                    let files = crate::util::bounded_archive::with_ingest_extraction(|| {
-                        extract_files_from_bundle(&bundle_data)
-                    })
-                    .map_err(|e| e.into_response())??;
+                    let files =
+                        crate::util::bounded_archive::with_ingest_extraction_waiting(|| {
+                            extract_files_from_bundle(&bundle_data)
+                        })
+                        .await
+                        .map_err(|e| e.into_response())??;
                     let commit = build_commit_info(
                         &digest,
                         &chrono::Utc::now().to_rfc3339(),
@@ -2348,12 +2365,14 @@ async fn download(
             })
         })?;
 
-        // #2561: permit-scoped decode, fast-fail 503 on saturation.
+        // #2561: permit-scoped decode; on saturation it waits briefly
+        // for a slot, then sheds 503 (#6230).
         #[allow(clippy::result_large_err)]
         // Response-as-error matches this module's handler convention.
-        let files = crate::util::bounded_archive::with_ingest_extraction(|| {
+        let files = crate::util::bounded_archive::with_ingest_extraction_waiting(|| {
             extract_files_from_bundle(&bundle_data)
         })
+        .await
         .map_err(|e| e.into_response())??;
         let commit = build_commit_info_from_row(&artifact_row);
 
@@ -3415,11 +3434,13 @@ async fn commit_b5(
     })?;
 
     // The same permit-scoped decode as Download (#2561): this path inflates
-    // a whole stored bundle, and fails fast with 503 on saturation.
+    // a whole stored bundle; on saturation it waits briefly, then 503 (#6230).
     #[allow(clippy::result_large_err)]
-    let files =
-        crate::util::bounded_archive::with_ingest_extraction(|| extract_files_from_bundle(&bundle))
-            .map_err(|e| e.into_response())??;
+    let files = crate::util::bounded_archive::with_ingest_extraction_waiting(|| {
+        extract_files_from_bundle(&bundle)
+    })
+    .await
+    .map_err(|e| e.into_response())??;
     let decoded = decode_bundle_files(&files)?;
     let b5 = wire::b5_digest(&decoded, &dep_digests);
 

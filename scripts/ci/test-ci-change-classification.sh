@@ -88,11 +88,14 @@ open(f'{work}/integ_if.txt', 'w').write(integ_if + '\n')
 on = wf.get('on', wf.get(True, {}))
 facts = []
 facts.append('trigger_merge_group=' + str('merge_group' in (on or {})).lower())
-for j in ('check-rust', 'test-backend-integration', 'test-backend-unit', 'ci-complete'):
+for j in ('check-rust', 'windows-cross-check', 'test-backend-integration', 'test-backend-unit', 'ci-complete'):
     facts.append(f'runs_on_{j}=' + str(wf['jobs'][j].get('runs-on')))
 cc_needs = wf['jobs']['ci-complete'].get('needs', [])
-for j in ('smoke-e2e', 'build-backend-image', 'build-openscap-image'):
+for j in ('smoke-e2e', 'build-backend-image', 'build-openscap-image', 'windows-cross-check'):
     facts.append(f'cc_needs_{j}=' + str(j in cc_needs).lower())
+# The Windows cross-check (#6022) must run exactly when Check Rust does.
+facts.append('windows_if_matches_check_rust=' + str(
+    str(wf['jobs']['windows-cross-check'].get('if')) == str(wf['jobs']['check-rust'].get('if'))).lower())
 facts.append('ubuntu_latest=' + str('ubuntu-latest' in open(sys.argv[1]).read()).lower())
 # rust-cache entries saved under a PR or merge-group ref are never restored
 # by anyone else and push `main`'s own entries out of the 10 GiB quota.
@@ -156,7 +159,7 @@ open(f'{work}/readers.txt', 'w').write(''.join(f'{r}\t{p}\n' for r, p in sorted(
 PY
 
 grep -q . "$WORK/gated.txt" || { fail "no job in ci.yml is gated on needs.changes.outputs.rust"; }
-for required in check-rust test-backend-unit; do
+for required in check-rust windows-cross-check test-backend-unit; do
   grep -qx "$required" "$WORK/gated.txt" \
     || fail "required job $required is not gated on needs.changes.outputs.rust"
 done
@@ -264,6 +267,8 @@ expect "jscpd source prep (.py, coverage uses it)" "true false false true"   pul
 expect "CI-only file plus backend code"            "true true false true"    pull_request scripts/ci/test-foo.sh backend/src/main.rs
 expect "Cargo.lock"                                "true true true true"     pull_request Cargo.lock
 expect "nested Cargo.toml"                         "true true true true"     pull_request backend/Cargo.toml
+expect "cargo-audit ignore list"                   "true false true true"    pull_request .cargo/audit.toml
+expect "osv-scanner ignore list"                   "true false true true"    pull_request osv-scanner.toml
 expect "anything unrecognised is a Rust input"     "true false false true"   pull_request docker/Dockerfile.backend
 expect "a script in scripts/ but outside ci/"      "true false false true"   pull_request scripts/e2e-setup.sh
 FAKE_GH_FAIL=1 expect "file listing fails -> full CI" "true true true true"  pull_request whatever
@@ -481,7 +486,7 @@ complete() {
   if [ "$rc" = "$want" ]; then pass "$label"; else fail "$label: CI Complete exited $rc, want $want"; sed 's/^/        /' "$WORK/summary" >&2; fi
   : > "$WORK/summary"
 }
-SKIP_RUST=(RESULT_CHECK_RUST=skipped RESULT_UNIT=skipped RESULT_COVERAGE=skipped)
+SKIP_RUST=(RESULT_CHECK_RUST=skipped RESULT_WINDOWS_CHECK=skipped RESULT_UNIT=skipped RESULT_COVERAGE=skipped)
 complete "CI-only PR: skipped Rust jobs pass"                       0 pull_request true false false "${SKIP_RUST[@]}"
 complete "Rust inputs changed: a skipped Check Rust fails"          1 pull_request true false true  "${SKIP_RUST[@]}"
 complete "gate output missing: a skipped Check Rust fails"          1 pull_request true false ""    "${SKIP_RUST[@]}"
@@ -489,6 +494,89 @@ complete "CI-only PR: shell-tests must still succeed"               1 pull_reque
 complete "CI-only PR: a failed Rust job still fails"                1 pull_request true false false RESULT_CHECK_RUST=failure
 complete "proven push: skipped Rust jobs pass"                      0 push true true false "${SKIP_RUST[@]}" RESULT_VERSION_PIN=skipped
 complete "unproven push: a skipped unit job fails"                  1 push true true true RESULT_UNIT=skipped RESULT_VERSION_PIN=skipped
+
+echo "ci.yml CI Complete: the Windows cross-check (#6022)"
+complete "Rust inputs changed: Windows check red -> fails"          1 pull_request true true true RESULT_WINDOWS_CHECK=failure
+complete "Rust inputs changed: Windows check skipped -> fails"      1 pull_request true true true RESULT_WINDOWS_CHECK=skipped
+complete "Rust inputs changed: Windows check cancelled -> fails"    1 pull_request true true true RESULT_WINDOWS_CHECK=cancelled
+complete "gate output missing: Windows check skipped -> fails"      1 pull_request true false "" "${SKIP_RUST[@]}"
+complete "merge group: Windows check red -> fails"                  1 merge_group true true true RESULT_VERSION_PIN=skipped RESULT_COVERAGE=skipped RESULT_WINDOWS_CHECK=failure
+complete "unproven push: Windows check skipped -> fails"            1 push true true true RESULT_VERSION_PIN=skipped RESULT_WINDOWS_CHECK=skipped
+complete "CI-only PR: a failed Windows check still fails"           1 pull_request true false false "${SKIP_RUST[@]}" RESULT_WINDOWS_CHECK=failure
+complete "docs-only PR: Windows check skipped -> passes"            0 pull_request false false false "${SKIP_RUST[@]}" RESULT_SHELL=skipped RESULT_SECURITY=skipped
+if grep -qx RESULT_WINDOWS_CHECK "$WORK/results.txt"; then
+  pass "CI Complete reads the Windows cross-check's result"
+else
+  fail "CI Complete does not read RESULT_WINDOWS_CHECK"
+fi
+
+# The reason it was advisory (#6243) was its install step, not the check:
+# 20 of 66 runs on 2026-11-18/19 hit the 30-minute ceiling downloading the
+# 280 MB `mingw-w64` metapackage from a slow apt mirror (#6242). Required
+# again only while the install is the bounded x86_64-only one.
+win_job="$(awk '/^  windows-cross-check:$/{p=1; next} p && /^  [a-z][a-z0-9_-]*:$/{exit} p' "$WORKFLOW")"
+if grep -qE '(apt-get install|pkgs=\().* mingw-w64( |$|\))' <<< "$win_job"; then
+  fail "the Windows cross-check installs the whole mingw-w64 metapackage again (280 MB; #6242)"
+else
+  pass "the Windows cross-check does not install the mingw-w64 metapackage"
+fi
+if grep -qF 'gcc-mingw-w64-x86-64-posix' <<< "$win_job" && grep -qF 'sudo timeout 6m bash -c' <<< "$win_job" \
+   && grep -qF 'apt-get install --download-only' <<< "$win_job" \
+   && ! grep -qE 'timeout [0-9]+m apt-get install -y' <<< "$win_job"; then
+  pass "the Windows cross-check installs only x86_64 mingw; only the download is time-boxed, never the unpack"
+else
+  fail "the Windows cross-check's install is not the bounded x86_64-only one (#6242)"
+fi
+
+# Every protoc install, in every workflow, is bounded (#6272). An unbounded
+# `apt-get update && apt-get install protobuf-compiler` sat in Workflow
+# Contract Tests until its 45-minute ceiling (run 44478388591). Each step
+# that installs protoc (by name or by package) needs its own
+# `timeout-minutes`, and an apt one must go through
+# scripts/ci/apt-install-bounded.sh or cap its download itself.
+echo "workflows: every protoc install step is bounded (#6272)"
+protoc_report="$(python3 - "$ROOT/.github/workflows" <<'PY'
+import glob, os, re, sys, yaml
+found = 0
+for path in sorted(glob.glob(os.path.join(sys.argv[1], "*.yml"))):
+    doc = yaml.safe_load(open(path)) or {}
+    for job_id, job in (doc.get("jobs") or {}).items():
+        for step in (job or {}).get("steps") or []:
+            name = str(step.get("name", ""))
+            run = str(step.get("run", ""))
+            uses = str(step.get("uses", ""))
+            if not (re.search(r"protoc", name, re.I)
+                    or re.search(r"protobuf-compiler|brew install protobuf\b", run)
+                    or "setup-protoc" in uses):
+                continue
+            found += 1
+            where = f"{os.path.basename(path)} {job_id}: {name or uses or run.splitlines()[0]}"
+            if "timeout-minutes" not in step:
+                print(f"NOTIMEOUT {where}")
+            if "protobuf-compiler" in run and "apt-install-bounded.sh" not in run \
+                    and not ("--download-only" in run and re.search(r"\btimeout \d+m\b", run)):
+                print(f"UNBOUNDED {where}")
+print(f"FOUND {found}")
+PY
+)"
+protoc_found="$(sed -n 's/^FOUND //p' <<< "$protoc_report")"
+if [ "${protoc_found:-0}" -ge 8 ]; then
+  pass "found ${protoc_found} protoc install steps across the workflows"
+else
+  fail "found only ${protoc_found:-0} protoc install steps; the scan no longer matches them"
+fi
+if grep -q '^NOTIMEOUT' <<< "$protoc_report"; then
+  fail "protoc install steps without a step timeout-minutes (#6272):"
+  sed -n 's/^NOTIMEOUT /        /p' <<< "$protoc_report" >&2
+else
+  pass "every protoc install step has its own timeout-minutes"
+fi
+if grep -q '^UNBOUNDED' <<< "$protoc_report"; then
+  fail "apt protoc installs with an uncapped download; use scripts/ci/apt-install-bounded.sh (#6272):"
+  sed -n 's/^UNBOUNDED /        /p' <<< "$protoc_report" >&2
+else
+  pass "every apt protoc install caps its download and retries on another mirror"
+fi
 
 echo "ci.yml CI Complete: the Workflow Contract Tests (#6115)"
 complete "workflow-only PR: contract tests green -> passes"          0 pull_request true false false "${SKIP_RUST[@]}" WORKFLOW_CONTRACTS=true
@@ -569,12 +657,14 @@ want_fact() {
   if [ "$(fact "$1")" = "$2" ]; then pass "$3"; else fail "$3: $1=$(fact "$1"), want $2"; fi
 }
 want_fact trigger_merge_group true "ci.yml triggers on merge_group (required checks must report in the queue)"
-for j in check-rust test-backend-integration test-backend-unit ci-complete; do
+for j in check-rust windows-cross-check test-backend-integration test-backend-unit ci-complete; do
   want_fact "runs_on_$j" ubuntu-24.04 "$j runs on pinned GitHub-hosted ubuntu-24.04"
 done
 for j in smoke-e2e build-backend-image build-openscap-image; do
   want_fact "cc_needs_$j" false "CI Complete does not wait for advisory $j"
 done
+want_fact cc_needs_windows-cross-check true "CI Complete waits for the Windows cross-check (#6022)"
+want_fact windows_if_matches_check_rust true "the Windows cross-check's condition is Check Rust's, verbatim"
 want_fact ubuntu_latest false "no job floats on ubuntu-latest"
 want_fact cache_saves_off_main none "every rust-cache saves only outside pull requests and merge groups"
 # ci_test_surface reads every `--test <name>` in the workflow text, comments

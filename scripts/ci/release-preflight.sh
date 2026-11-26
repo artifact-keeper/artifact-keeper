@@ -404,21 +404,167 @@ else
   # Select the run for THIS commit, never "the latest run" (#3338): recency
   # is a proxy that diverges when main has moved, a publish is in flight, or
   # the list API answers stalely -- and the divergence produced a blocking
-  # false red on the v1.7.2 cut. head_sha resolves to at most one run and
-  # needs no new machinery.
-  if ! run_info="$(gh api "repos/$REPO/actions/workflows/docker-publish.yml/runs?head_sha=$head_sha&per_page=1" \
-                    --jq '.workflow_runs[0] // empty | "\(.id) \(.status)"' 2>/dev/null)"; then
+  # false red on the v1.7.2 cut.
+  #
+  # head_sha alone is NOT one run, though (#6168). release-promote.yml
+  # dispatches docker-publish.yml in PROMOTE mode on main, and a dispatch's
+  # head_sha is main's tip at that moment, so the promote of an older
+  # certified commit lands on HEAD's sha too. PROMOTE builds and scans
+  # nothing while its re-tag job is green; "the newest run for the sha" read
+  # it as HEAD's build and failed preflight permanently on e808fdac after the
+  # 1.11.14 promote (run 44116256357 over push run 44080746556).
+  #
+  # So: among the sha's runs ON THE AUDITED BRANCH, newest first by run id,
+  # the first run that BUILT decides, red or green; a run still in flight
+  # ABOVE it blocks (it cannot be classified until it ends), except a
+  # dispatch that has already skipped every image build job, which can build
+  # nothing and is passed over like a completed PROMOTE (#6166). Runs older than
+  # the deciding build do not matter, in flight or not. A completed dispatch "built nothing"
+  # when it lists no jobs (cancelled before starting) or when Security Scan
+  # skipped and no job failed (PROMOTE). Security Scan is also skipped when an
+  # earlier build job fails, and that failed build stays the verdict. A push
+  # run is always the commit's build: a branch push gets one run per commit.
+  # On main that run can be REPLACED while it waits (cancelled, zero jobs:
+  # main pushes coalesce, #6242); it then decides red here until it is
+  # re-run, which the Release Candidate does before dispatching this
+  # preflight (`gh run rerun <id>` by hand otherwise).
+  #
+  # The branch: PREFLIGHT_BRANCH, else a branch-shaped PREFLIGHT_REF. The
+  # Release Candidate passes the commit sha as PREFLIGHT_REF
+  # (release-candidate.yml, "Dispatch the Release Preflight"), and a detached
+  # checkout says HEAD; then the branch is the one the sha's push runs are
+  # on, and runs on several branches are INFRA (set PREFLIGHT_BRANCH) rather
+  # than a guess. The same sha pushed to another branch or tagged is another
+  # build that publishes other tags.
+  #
+  # `event=push` alone is not the fix: resolve-candidate-publish-run.sh
+  # documents how that filter deadlocked a re-tagged release (#3640).
+  # shellcheck disable=SC2016 # jq programs, not shell
+  if ! runs="$(gh api "repos/$REPO/actions/workflows/docker-publish.yml/runs?head_sha=$head_sha&per_page=50" \
+                 --jq '.workflow_runs[] | select(.event != "schedule") | "\(.id) \(.status) \(.event) \(.head_branch)"' 2>/dev/null)"; then
     # gh is present but the query failed (auth, network, API). We could not
     # measure, so we must not render a readiness verdict either way.
     echo "INFRA: could not query Docker Publish runs for $head_sha" >&2
     infra_exit
+  fi
+  # Newest first by run id, not by the API's answer order.
+  runs="$(sort -k1,1nr <<< "$runs")"
+  audit_branch="${PREFLIGHT_BRANCH:-${AUDIT_REF#refs/tags/}}"
+  audit_branch="${audit_branch#refs/heads/}"
+  sec_of() { # <run id> -> the Security Scan conclusion, "?" when unreadable
+    gh run view "$1" --repo "$REPO" --json jobs \
+      --jq '[.jobs[]|select(.name=="Security Scan")|(.conclusion//"?")]|first//"?"' 2>/dev/null || echo '?'
+  }
+  man_of() { # <run id> -> the backend manifest conclusion, "?" when unreadable
+    gh run view "$1" --repo "$REPO" --json jobs \
+      --jq '[.jobs[]|select(.name|test("Backend Multi-Arch Manifest"))|(.conclusion//"skipped")]|first//"?"' 2>/dev/null || echo '?'
+  }
+  green() { [[ "$(sec_of "$1")" == success && "$(man_of "$1")" == success ]]; }
+  # built | nothing | ?. A run BUILT when an image build job ran: "Backend (",
+  # "Backend Alpine (", "OpenSCAP (" or "Scanner Adapter (" with a conclusion
+  # other than skipped (a failed build counts). PROMOTE skips all of them,
+  # so a promote that fails in a re-tag job still built nothing. No jobs at
+  # all (cancelled before starting) is "nothing"; jobs but none of those
+  # names is a shape we don't know: "?" (INFRA), never a guess.
+  kind_of() {
+    local k
+    # shellcheck disable=SC2016 # a jq program, not shell
+    k="$(gh run view "$1" --repo "$REPO" --json jobs --jq '
+          if (.jobs | length) == 0 then "nothing" else
+          [.jobs[] | select(.name | test("^(Backend|Backend Alpine|OpenSCAP|Scanner Adapter) \\("))] as $b
+          | if ($b | length) == 0 then "?"
+            elif any($b[]; .conclusion != "skipped") then "built"
+            else "nothing" end
+          end' 2>/dev/null)" || k='?'
+    echo "${k:-?}"
+  }
+  # An IN-FLIGHT dispatch that has already skipped every image build job
+  # (#6166). A PROMOTE or floating-tag dispatch skips them the moment its
+  # publish-preflight job ends (run 44116256357: 36 s in, then ~2 min of
+  # re-tag jobs), and a skipped job never runs, so the run can build nothing
+  # whatever happens next. "nothing" only then: no build job listed yet
+  # (publish-preflight still running), any build job not completed-skipped,
+  # or an unreadable answer all keep the run blocking as before.
+  inflight_built_nothing() {
+    local k
+    # shellcheck disable=SC2016 # a jq program, not shell
+    k="$(gh run view "$1" --repo "$REPO" --json jobs --jq '
+          [.jobs[] | select(.name | test("^(Backend|Backend Alpine|OpenSCAP|Scanner Adapter) \\("))] as $b
+          | if ($b | length) > 0 and all($b[]; .status == "completed" and .conclusion == "skipped")
+            then "nothing" else "pending" end' 2>/dev/null)" || k=pending
+    [[ "$k" == nothing ]]
+  }
+  PICK=""
+  pick() { # stdin: runs on ONE branch, newest first -> PICK="<id> <status>" or ""
+    local c_id c_status c_event
+    PICK=""
+    while read -r c_id c_status c_event _; do
+      [[ -n "$c_id" ]] || continue
+      if [[ "$c_status" != "completed" ]]; then
+        # In flight: no verdict yet. Blocks below, unless it is a dispatch
+        # that has already skipped every build job (#6166): a PROMOTE or
+        # floating-tag run on HEAD's sha, which hid the push run's verdict
+        # for its two minutes (candidate 44116177519, preflight 44116420573).
+        # A push run in flight is always this commit's build and blocks.
+        if [[ "$c_event" != push ]] && inflight_built_nothing "$c_id"; then
+          note "run $c_id ($c_event, $c_status) has skipped every image build (a PROMOTE or re-tag run in flight); not this commit's build"
+          continue
+        fi
+        PICK="$c_id $c_status"; return
+      fi
+      if [[ "$c_event" != push ]]; then
+        case "$(kind_of "$c_id")" in
+          '?') echo "INFRA: could not read job conclusions from run $c_id" >&2
+               infra_exit ;;
+          nothing) note "run $c_id ($c_event) built nothing (a PROMOTE or re-tag run, or cancelled before any build); not this commit's build"
+                   continue ;;
+        esac
+      fi
+      note "run $c_id ($c_event) is the newest build of this sha${1:+ on $1}"
+      PICK="$c_id $c_status"; return
+    done
+  }
+  run_info=""
+  if [[ -z "$audit_branch" || "$audit_branch" == '?' || "$audit_branch" == HEAD || "$audit_branch" =~ ^[0-9a-f]{7,40}$ ]]; then
+    # No branch named. Branches from the push runs; with none (dispatches
+    # only), from all the runs.
+    inferred="$(awk '$3 == "push" { print $4 }' <<< "$runs" | sort -u)"
+    [[ -n "$inferred" ]] || inferred="$(awk 'NF { print $4 }' <<< "$runs" | sort -u)"
+    if [[ "$(grep -c . <<< "$inferred")" -le 1 ]]; then
+      audit_branch="$inferred"
+      [[ -z "$audit_branch" ]] || note "branch not named (ref '${AUDIT_REF}'); the sha's runs are on ${audit_branch}"
+    else
+      # Built on several branches (e.g. right after a release line is cut
+      # from this commit). Fail closed without guessing: READY only if the
+      # newest build on EVERY branch is green; otherwise the first one that
+      # is not decides. PREFLIGHT_BRANCH (workflow input `branch`) audits one.
+      note "branch not named (ref '${AUDIT_REF}') and the sha was built on several branches: $(tr '\n' ' ' <<< "$inferred")"
+      note "  -> every branch's newest build must be green; set PREFLIGHT_BRANCH to audit one branch"
+      first_bad=""
+      while read -r b; do
+        pick "$b" <<< "$(awk -v b="$b" '$4 == b' <<< "$runs")"
+        [[ -n "$PICK" ]] || continue
+        read -r i s <<< "$PICK"
+        if [[ "$s" != completed ]] || ! green "$i"; then first_bad="${first_bad:-$PICK}"; fi
+        run_info="${run_info:-$PICK}"
+      done <<< "$inferred"
+      [[ -z "$first_bad" ]] || run_info="$first_bad"
+      audit_branch="(several)"
+    fi
+  fi
+  if [[ "$audit_branch" != "(several)" ]]; then
+    if [[ -n "$audit_branch" ]]; then
+      runs="$(awk -v b="$audit_branch" '$4 == b' <<< "$runs")"
+    fi
+    pick "$audit_branch" <<< "$runs"
+    run_info="$PICK"
   fi
   if [[ -z "$run_info" ]]; then
     # A fourth outcome, distinct from "ran and failed" (#3338): the query
     # succeeded and there is NO run for this commit. The images a tag cut
     # would pin do not exist, so resolve-candidate-digest has nothing to
     # resolve. Not a pass; also not an infra retry.
-    bad "no Docker Publish run exists for HEAD ($(git rev-parse --short HEAD)) -- the images for this commit have NOT been built."
+    bad "no Docker Publish run built HEAD ($(git rev-parse --short HEAD)) -- the images for this commit have NOT been built."
     note "  -> a tag cut from this commit has no manifest to resolve a digest from."
     note "  -> docker-publish.yml skips a commit that touches only markdown other"
     note "     than CHANGELOG.md, or only .beads/** or LICENSE (#3629). A"
@@ -437,11 +583,18 @@ else
       bad "Docker Publish for HEAD is still '$run_status' (run $run_id) -- its verdict does not exist yet."
       note "  -> run: $(printf '%s/actions/runs/%s' "https://github.com/$REPO" "$run_id")"
       note "  -> wait for it to complete, then re-run preflight. Do not tag ahead of the gate."
+    elif [[ "$(gh run view "$run_id" --repo "$REPO" --json jobs --jq '.jobs | length' 2>/dev/null)" == 0 ]]; then
+      # The commit's push run never started a job: replaced while pending by
+      # a newer main push (main pushes coalesce, #6242) or cancelled before
+      # a runner took it. Not a failed build and not unmeasurable: there are
+      # simply no images yet, and re-running that run builds them.
+      bad "Docker Publish for HEAD was cancelled before it built anything (run $run_id) -- this commit has no images."
+      note "  -> run: $(printf '%s/actions/runs/%s' "https://github.com/$REPO" "$run_id")"
+      note "  -> re-run it (gh run rerun $run_id; a re-run is never replaced again), wait for it, then re-run preflight."
+      note "     The Release Candidate does this itself before it dispatches this preflight."
     else
-      sec="$(gh run view "$run_id" --repo "$REPO" --json jobs \
-              --jq '[.jobs[]|select(.name=="Security Scan")|(.conclusion//"?")]|first//"?"' 2>/dev/null || echo '?')"
-      man="$(gh run view "$run_id" --repo "$REPO" --json jobs \
-              --jq '[.jobs[]|select(.name|test("Backend Multi-Arch Manifest"))|(.conclusion//"skipped")]|first//"?"' 2>/dev/null || echo '?')"
+      sec="$(sec_of "$run_id")"
+      man="$(man_of "$run_id")"
       note "run $run_id: Security Scan=$sec, Backend Multi-Arch Manifest=$man"
       if [[ "$sec" == "?" || "$man" == "?" ]]; then
         echo "INFRA: could not read job conclusions from run $run_id" >&2
@@ -856,13 +1009,80 @@ else
       note "     shape), or its lead reference is wrong."
     fi
 
+    # -- a PR and its full revert, both in range, cancel out (#6363) --------
+    # Neither one ships: the tree at HEAD is as if both never merged, so
+    # neither can carry an entry, and every cut that held such a pair used to
+    # need a hand-written citation PR (#6251 for 1.12.2). A pair cancels only
+    # when the revert is the EXACT inverse of the reverted PR's diff, checked
+    # with `git patch-id`, so a partial back-out (#6235 shape) still needs its
+    # own entry. Candidates are the commit `git revert` names ("This reverts
+    # commit <sha>.") and, for a `Revert "..."` subject or a body that says
+    # revert / back out, every in-range PR number the commit cites.
+    #   cancelled: `<pr> <partner pr>` per line, both directions. A PR is in at
+    #   most one pair.
+    cancelled=""
+    patch_id() { # <from> <to>: the stable patch-id of `git diff <from> <to>`
+      git diff "$1" "$2" 2>/dev/null | git patch-id --stable 2>/dev/null | cut -d' ' -f1
+    }
+    while IFS= read -r rline; do
+      [[ -z "$rline" ]] && continue
+      rsha="${rline%% *}"
+      rsubj="${rline#* }"
+      [[ "$rsubj" =~ \(#([0-9]+)\)$ ]] || continue
+      rpr="${BASH_REMATCH[1]}"
+      rbody="$(git log -1 --format=%b "$rsha" 2>/dev/null || true)"
+      targets=""
+      while IFS= read -r tsha; do
+        [[ -z "$tsha" ]] && continue
+        tline="$(printf '%s\n' "$range_log" | grep -m1 "^${tsha}" || true)"
+        [[ -n "$tline" ]] && targets+="${tline%% *}"$'\n'
+      done < <(printf '%s\n' "$rbody" | grep -oE 'This reverts commit [0-9a-f]{7,40}' | awk '{print $4}')
+      # loud: the commit says it is a revert or back-out, so a near miss is
+      # worth reporting. A body that merely mentions a revert is checked, but
+      # a mismatch there is silent.
+      loud=0
+      if [[ -n "$targets" ]] || printf '%s\n' "$rsubj" | grep -qiE '^revert "|revert|back(ed|s|ing)?[ -]?out'; then
+        loud=1
+      fi
+      if [[ "$loud" -eq 1 ]] || printf '%s\n' "$rbody" | grep -qiE 'revert|back(ed|s|ing)?[ -]?out'; then
+        while IFS= read -r tpr; do
+          [[ -z "$tpr" || "$tpr" == "$rpr" ]] && continue
+          tline="$(printf '%s\n' "$range_log" | grep -m1 -E "\\(#${tpr}\\)\$" || true)"
+          [[ -n "$tline" ]] && targets+="${tline%% *}"$'\n'
+        done < <(printf '%s\n%s\n' "${rsubj% (#*}" "$rbody" | grep -oE '#[0-9]{2,6}' | tr -d '#' | sort -u)
+      fi
+      while IFS= read -r tsha; do
+        [[ -z "$tsha" || "$tsha" == "$rsha" ]] && continue
+        tsubj="$(printf '%s\n' "$range_log" | grep -m1 "^${tsha} " | cut -d' ' -f2-)"
+        [[ "$tsubj" =~ \(#([0-9]+)\)$ ]] || continue
+        tpr="${BASH_REMATCH[1]}"
+        fwd="$(patch_id "${tsha}^" "$tsha")"
+        inv="$(patch_id "$rsha" "${rsha}^")"
+        if [[ -n "$fwd" && "$fwd" == "$inv" ]]; then
+          # A PR pairs at most once. The log is newest first, so a reapply
+          # (a revert of the revert) pairs with the revert, and the original
+          # PR, whose change ships again, still needs its entry.
+          if printf '%s' "$cancelled" | grep -qE "^(${tpr}|${rpr}) "; then
+            continue
+          fi
+          cancelled+="${tpr} ${rpr}"$'\n'"${rpr} ${tpr}"$'\n'
+        elif [[ "$loud" -eq 1 ]]; then
+          note "  ! #${rpr} backs out #${tpr} only in part (its diff is not the exact inverse),"
+          note "    so both still need an entry."
+        fi
+      done < <(printf '%s' "$targets" | sort -u)
+    done <<< "$range_log"
+
     # -- backward: commits in the range that the section does not mention ----
     undocumented=0
     exempted=0
+    backed_out=0
     while IFS= read -r p; do
       [[ -z "$p" ]] && continue
-      subj="$(printf '%s\n' "$subjects" | grep -m1 -F "(#${p})" || true)"
-      sha="$(printf '%s\n' "$range_log" | grep -m1 -F "(#${p})" | cut -d' ' -f1 || true)"
+      # Anchored at the end: a revert's subject also holds the reverted PR's
+      # `(#N)` (`Revert "x (#107)" (#108)`), and must not be taken for #107.
+      subj="$(printf '%s\n' "$subjects" | grep -m1 -E "\\(#${p}\\)\$" || true)"
+      sha="$(printf '%s\n' "$range_log" | grep -m1 -E "\\(#${p}\\)\$" | cut -d' ' -f1 || true)"
       # Deliberately narrow, and identical to the release-branch gate's path C
       # (#3829): a release prep, a changelog-only commit, a dependency bump or
       # a CI/workflow-only commit -- each confined to its own path set -- are
@@ -876,6 +1096,22 @@ else
       # it. Writing one produces another such commit, and so on. The exemption
       # is safe for the same reason `chore(release):` is: the commit's content
       # IS the bookkeeping, so there is nothing it could omit.
+      partner="$(printf '%s' "$cancelled" | awk -v p="$p" '$1 == p { print $2; exit }')"
+      if [[ -n "$partner" ]]; then
+        backed_out=$((backed_out + 1))
+        note "  ~ #$p cancels out with #${partner} (a full revert, both in range; neither ships): $(printf '%s' "$subj" | cut -c1-60)"
+        # Not a failure: an entry for a change that does not ship is worth a
+        # look, but a hand-written note about the back-out is legitimate.
+        for candidate in "$p" $(printf '%s\n' "$closes_map" | grep -m1 "^${p}:" | cut -d: -f2 | tr ',' ' '); do
+          [[ -z "$candidate" ]] && continue
+          if printf '%s\n' "$primary_refs" | grep -qx "$candidate"; then
+            note "    ! warning: a pending entry still leads with #${candidate}, but #$p was backed out"
+            note "      in this range; drop the entry unless it describes the back-out."
+            break
+          fi
+        done
+        continue
+      fi
       exempt_detail=""
       if [[ -n "$sha" ]]; then
         # The verdict comes back in globals, never through a command
@@ -921,7 +1157,7 @@ else
     fi
 
     if [[ -z "$unresolved" && "$undocumented" -eq 0 ]]; then
-      ok "pending sections reconcile with ${prev_tag}..HEAD ($(printf '%s\n' "$primary_refs" | grep -c . || true) distinct entry references, $(printf '%s\n' "$range_prs" | grep -c . || true) merged PRs, $exempted exempt)"
+      ok "pending sections reconcile with ${prev_tag}..HEAD ($(printf '%s\n' "$primary_refs" | grep -c . || true) distinct entry references, $(printf '%s\n' "$range_prs" | grep -c . || true) merged PRs, $exempted exempt, $backed_out backed out)"
     fi
   fi
 fi

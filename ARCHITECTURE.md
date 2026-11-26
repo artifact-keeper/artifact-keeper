@@ -297,6 +297,16 @@ a failing build rather than a runtime surprise, which is the point.
 - **Auth surface asymmetry.** Keep the `/api/v1/*` versus format-endpoint auth
   rules intact: Basic-with-token is accepted on format endpoints only, never on
   `/api/v1/*`.
+- **A `GET` that writes must be visible to the read retry.** The read retry
+  (`api/middleware/db_read_retry.rs`, #5941) replays a bodiless `GET`/`HEAD`
+  that lost its database connection only if the request wrote nothing. It sees
+  every sqlx statement run by the request's own task, but not one run by a task
+  the request spawns: a `tokio::spawn` does not carry the request scope. A
+  request path that spawns a write which must not run twice calls
+  `db_read_retry::spawn_write` (or `note_write`) instead, as the download-event
+  queue and the proxy upstream fetch do. A spawned write left untracked must be
+  safe to repeat, like the debounced `api_tokens.last_used_at` update, and say
+  so at the spawn site. Tested in `db_read_retry::tests`.
 - **Fail-closed defaults.** `AuthExtension::default` and the plugin signature
   gate deny by default. Preserve that when refactoring.
 - **MSRV 1.75.0.** Set in `.clippy.toml`. Do not use language or standard-library

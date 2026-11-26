@@ -56,11 +56,16 @@
 //! `"download_name_checks": true` ([`checks_downloads`]); a rule without it
 //! is not evaluated on downloads at all. No download-count lookup happens on
 //! that path.
-//! There, `block_typosquat` blocks only homoglyph and mixed-script matches.
-//! Edit-distance and affix matches only flag, because a download has no
-//! review step to absorb their false positives: edit distance 2 from the
-//! seed list reaches real packages such as npm `preact`, `vite`, `chai` and
-//! `vuex`, and PyPI `numba`, `httpie`, `attr` and `pipx`.
+//! There, `block_typosquat` blocks only a homoglyph or mixed-script match on
+//! a name that holds a non-ASCII character (#5840). Edit-distance and affix
+//! matches only flag, because a download has no review step to absorb their
+//! false positives: edit distance 2 from the seed list reaches real packages
+//! such as npm `preact`, `vite`, `chai` and `vuex`, and PyPI `numba`,
+//! `httpie`, `attr` and `pipx`. An all-ASCII skeleton collision (`c1ick` for
+//! `click`) is the same kind of one- or two-character lexical difference, so
+//! it flags too unless the rule sets `"ascii_lookalikes": "block"`. Rules
+//! that existed before 1.13.0 with `block_typosquat: true` were stamped
+//! `"block"` by migration 421, so an upgrade changes no download.
 
 use crate::models::curation::CurationDecision;
 
@@ -81,6 +86,25 @@ pub fn applies_to(format: &str) -> bool {
 /// Config key that opts a `popularity` rule into the name checks on Remote
 /// and Virtual downloads (#5274). Off unless set to `true`.
 pub const DOWNLOAD_NAME_CHECKS_KEY: &str = "download_name_checks";
+
+/// Config key that decides what [`evaluate_name_only`] does with an all-ASCII
+/// confusable-skeleton collision under `block_typosquat` (#5840): `"block"`
+/// refuses the download, `"flag"` (the default for a rule without the key)
+/// serves it with a flag. The staging sync ignores it. Migration 421 sets
+/// `"block"` on every rule that had `block_typosquat: true` before 1.13.0.
+pub const ASCII_LOOKALIKES_KEY: &str = "ascii_lookalikes";
+
+/// The values [`ASCII_LOOKALIKES_KEY`] accepts.
+pub const ASCII_LOOKALIKES_VALUES: [&str; 2] = ["block", "flag"];
+
+/// Whether `config` sets [`ASCII_LOOKALIKES_KEY`] to something other than
+/// one of [`ASCII_LOOKALIKES_VALUES`] (the rule API refuses that with 400).
+pub fn invalid_ascii_lookalikes(config: &serde_json::Value) -> bool {
+    config.get(ASCII_LOOKALIKES_KEY).is_some_and(|v| {
+        !v.as_str()
+            .is_some_and(|s| ASCII_LOOKALIKES_VALUES.contains(&s))
+    })
+}
 
 /// Whether a `popularity` rule's config opts into [`evaluate_name_only`] on
 /// Remote and Virtual downloads (#5274).
@@ -124,6 +148,7 @@ const DEFAULT_AFFIX_MAX_DOWNLOADS: u64 = 1_000;
 ///   "block_unknown": false,
 ///   "block_typosquat": false,
 ///   "download_name_checks": false,
+///   "ascii_lookalikes": "flag",
 ///   "popular_packages": ["requests", "..."]
 /// }
 /// ```
@@ -150,7 +175,9 @@ const DEFAULT_AFFIX_MAX_DOWNLOADS: u64 = 1_000;
 ///
 /// `download_name_checks` (default `false`) does not affect this function:
 /// it opts the rule into [`evaluate_name_only`] on Remote and Virtual
-/// downloads (#5274); see [`checks_downloads`].
+/// downloads (#5274); see [`checks_downloads`]. Neither does
+/// `ascii_lookalikes` (default `"flag"`), which only changes what
+/// [`evaluate_name_only`] blocks (#5840).
 ///
 /// The #2956 sub-toggles (`homoglyph_check`, `affix_check`, both default
 /// `true`) sit under the `typosquat_check` master toggle: turning
@@ -272,7 +299,16 @@ pub async fn evaluate(
 /// * `min_downloads`, `action`, `block_unknown` and `window` have no effect,
 ///   and no "popularity unknown" flag is raised for every package.
 /// * `block_typosquat` escalates to `Block` only on a homoglyph or
-///   mixed-script match, the signals with essentially no legitimate cause.
+///   mixed-script match on a name that holds at least one non-ASCII
+///   character: a Unicode lookalike (Cyrillic `о` in `lodash`, a fullwidth
+///   letter, an invisible format character) has essentially no legitimate
+///   cause. An all-ASCII name whose UTS #39 skeleton collides with a popular
+///   one (`c1ick` for `click`: the skeleton folds `1` and `I` to `l`, `0` to
+///   `o` and `rn` to `m`) is only a `Flag` unless the rule sets
+///   `"ascii_lookalikes": "block"` (#5840). Such a name is one or two
+///   characters from the popular one, the lexical difference edit distance
+///   already measures, and real packages have such names. Mixed script
+///   always implies a non-ASCII character, so it always escalates.
 ///   Edit-distance and affix matches are only ever a `Flag` here. On the
 ///   staging sync a false positive lands in review; on a download it would
 ///   refuse a real package outright, and both signals have known ones:
@@ -305,7 +341,15 @@ pub fn evaluate_name_only(
     }
 
     let homoglyph = cfg.homoglyph_reasons(name);
-    let escalate = cfg.block_typosquat && !homoglyph.is_empty();
+    // #5840: an all-ASCII skeleton collision is a small lexical difference
+    // that real packages have, so it blocks only on the opt-in. `name` is the
+    // decoded name the download fetches (npm percent-decodes before this
+    // runs, and PyPI refuses non-PEP 508 names first), so a percent-encoded
+    // Unicode lookalike is never mistaken for ASCII here. Mixed script needs
+    // a non-ASCII letter, so it is never downgraded.
+    let escalate = cfg.block_typosquat
+        && !homoglyph.is_empty()
+        && (!name.is_ascii() || cfg.block_ascii_lookalikes);
     // Same order as `evaluate`: distance, homoglyph, affix.
     let mut reasons: Vec<String> = cfg.distance_reason(name).into_iter().collect();
     reasons.extend(homoglyph);
@@ -380,6 +424,8 @@ struct PopularityConfig {
     block_action: bool,
     block_unknown: bool,
     block_typosquat: bool,
+    /// `ascii_lookalikes: "block"` (#5840).
+    block_ascii_lookalikes: bool,
     homoglyph_check: bool,
     affix_check: bool,
     affix_max_downloads: u64,
@@ -427,6 +473,11 @@ impl PopularityConfig {
             // Opt-in hardening flags; both default false (see `evaluate`).
             block_unknown: flag("block_unknown", false),
             block_typosquat: flag("block_typosquat", false),
+            // #5840: download path only, opt-in.
+            block_ascii_lookalikes: config
+                .get(ASCII_LOOKALIKES_KEY)
+                .and_then(serde_json::Value::as_str)
+                == Some("block"),
             // #2956 sub-toggles, both under the typosquat_check master toggle.
             homoglyph_check: flag("homoglyph_check", true),
             affix_check: flag("affix_check", true),
@@ -455,9 +506,16 @@ impl PopularityConfig {
         let mut reasons = Vec::new();
         if self.homoglyph_check {
             if let Some(target) = is_homoglyph_squat(name, &self.popular) {
-                reasons.push(format!(
-                    "name '{name}' is a Unicode-confusable (homoglyph) lookalike of popular package '{target}'"
-                ));
+                reasons.push(if name.is_ascii() {
+                    // #5840: say what matched; there is no Unicode in it.
+                    format!(
+                        "name '{name}' is an ASCII lookalike (homoglyph skeleton, such as 1/l, 0/o or rn/m) of popular package '{target}'"
+                    )
+                } else {
+                    format!(
+                        "name '{name}' is a Unicode-confusable (homoglyph) lookalike of popular package '{target}'"
+                    )
+                });
             }
             // Mixed script alone is NOT impersonation (internationalized
             // names legitimately mix scripts); it only signals when the name
@@ -1022,7 +1080,7 @@ mod tests {
         ));
         assert!(matches!(
             evaluate_name_only(&cfg, "pypi", "c1ick"),
-            CurationDecision::Block(_)
+            CurationDecision::Flag(_)
         ));
         assert!(matches!(
             evaluate_name_only(&cfg, "npm", "@scope/preact"),
@@ -1233,18 +1291,98 @@ mod tests {
         }
     }
 
+    /// #5840: an all-ASCII skeleton collision flags on a download, even with
+    /// `block_typosquat`. `c1ick` (digit `1`), `cIick` (capital `I`), `c1lck`
+    /// and `requ3sts` style names are one or two characters from the popular
+    /// name, the difference edit distance already measures, and edit
+    /// distance only flags on downloads.
     #[test]
-    fn name_only_ascii_confusable_still_blocks() {
-        // `c1ick`: digit `1` is a UTS #39 confusable of `l`, so the skeleton
-        // collides with `click`. ASCII survives PEP 503 normalization, so a
-        // PyPI download can still be refused on a homoglyph.
+    fn name_only_ascii_confusable_flags_by_default_5840() {
         let cfg = config(serde_json::json!({"block_typosquat": true}));
+        for (format, name) in [("pypi", "c1ick"), ("npm", "c1ick"), ("npm", "1odash")] {
+            let popular = if name.contains("odash") {
+                "lodash"
+            } else {
+                "click"
+            };
+            let cfg = config(serde_json::json!({
+                "block_typosquat": true,
+                "popular_packages": [popular],
+            }));
+            match evaluate_name_only(&cfg, format, name) {
+                CurationDecision::Flag(reason) => {
+                    assert!(
+                        reason.contains("ASCII lookalike"),
+                        "{format}/{name}: {reason}"
+                    );
+                    assert!(!reason.contains("Unicode"), "{format}/{name}: {reason}");
+                    assert!(reason.contains("typo-squat"), "all reasons kept: {reason}");
+                }
+                other => panic!("{format}/{name}: expected Flag, got {other:?}"),
+            }
+        }
+        // The seed list too.
+        assert!(matches!(
+            evaluate_name_only(&cfg, "pypi", "c1ick"),
+            CurationDecision::Flag(_)
+        ));
+    }
+
+    /// #5840: the stricter behaviour is one config key away.
+    #[test]
+    fn name_only_ascii_confusable_blocks_with_the_opt_in_5840() {
+        let cfg = config(serde_json::json!({
+            "block_typosquat": true,
+            "ascii_lookalikes": "block",
+        }));
         match evaluate_name_only(&cfg, "pypi", "c1ick") {
             CurationDecision::Block(reason) => {
-                assert!(reason.contains("homoglyph"), "{reason}");
+                assert!(reason.contains("ASCII lookalike"), "{reason}");
                 assert!(reason.contains("typo-squat"), "all reasons kept: {reason}");
             }
             other => panic!("expected Block, got {other:?}"),
+        }
+        // The opt-in alone does not block: `block_typosquat` still decides.
+        let cfg = config(serde_json::json!({"ascii_lookalikes": "block"}));
+        assert!(matches!(
+            evaluate_name_only(&cfg, "pypi", "c1ick"),
+            CurationDecision::Flag(_)
+        ));
+    }
+
+    /// #5840 must not weaken the Unicode protection: every lookalike that
+    /// holds a non-ASCII character still blocks under `block_typosquat`,
+    /// whatever `ascii_lookalikes` says. That covers a Cyrillic
+    /// letter, a fullwidth letter (NFKC folds it), Greek, a mixed-script name
+    /// many edits away, and an ASCII confusable with one non-ASCII letter
+    /// added (the ASCII part does not buy a downgrade).
+    #[test]
+    fn name_only_non_ascii_lookalikes_still_block_5840() {
+        for extra in [
+            serde_json::json!({}),
+            serde_json::json!({"ascii_lookalikes": "flag"}),
+            serde_json::json!({"ascii_lookalikes": "block"}),
+        ] {
+            let mut cfg = serde_json::json!({"block_typosquat": true});
+            cfg.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            for (name, popular) in [
+                (LODASH_HOMOGLYPH, "lodash"),
+                ("\u{ff4c}odash", "lodash"),
+                ("l\u{03bf}dash", "lodash"),
+                ("r\u{0435}\u{0430}ct", "react"),
+                ("1\u{043e}dash", "lodash"),
+            ] {
+                let mut cfg = cfg.clone();
+                cfg["popular_packages"] = serde_json::json!([popular]);
+                match evaluate_name_only(&cfg, "npm", name) {
+                    CurationDecision::Block(reason) => {
+                        assert!(!reason.contains("ASCII lookalike"), "{name:?}: {reason}")
+                    }
+                    other => panic!("{name:?} ({extra}): expected Block, got {other:?}"),
+                }
+            }
         }
     }
 }

@@ -69,6 +69,10 @@ fails, the breaker opens for another period.
 - `AK_VIRTUAL_MEMBER_BREAKER_OPEN_SECS=0` disables the breaker.
 - `ak_virtual_member_breaker_open{member}` is `1` while a member's breaker is
   open and `0` once it closes. Opening is logged at `WARN`, closing at `INFO`.
+- Below this breaker, every upstream request of a Remote also goes through
+  its [upstream circuit breaker](operations/upstream-circuit-breaker.md),
+  which covers metadata and direct Remote requests too. A download that
+  circuit refuses does not count against the member breaker.
 
 ## Strict member fallback
 
@@ -110,8 +114,13 @@ that member answers again.
   through.
 - With nested virtual repositories, the setting of the virtual named in the
   request governs the whole walk, including the members of nested virtuals.
-- Metadata merges are not affected. They have their own policy,
-  [`virtual_metadata_partial`](virtual-metadata-merges.md#virtual_metadata_partial).
+- Metadata merges keep their own `virtual_metadata_partial` policy for a
+  member that answered with an unreadable document
+  ([virtual metadata merges](virtual-metadata-merges.md#virtual_metadata_partial)).
+  A Maven `maven-metadata.xml` merge also follows this setting: when an
+  unavailable member leaves it incomplete, `strict` answers the retryable
+  `503` instead of a partial merge
+  ([Maven virtual metadata](virtual-metadata-merges.md#maven-virtual-metadata)).
 - Docker/OCI manifest pulls by tag follow the setting too: while a
   higher-priority member is unavailable (an upstream `5xx`, a transport
   failure or timeout, or a database or storage fault on that member's

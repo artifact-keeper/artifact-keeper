@@ -351,6 +351,29 @@ pub fn create_router(state: SharedState) -> Router {
     // covers every surface at once.
     router = router.layer(middleware::from_fn(nul_path_guard));
 
+    // #5941: replay a bodiless GET/HEAD once when it answered 5xx after
+    // losing its database connection (a switchover or failover). Outside the
+    // setup, guest-access and auth layers, so a credential lookup that lost
+    // its connection is replayed too; inside correlation-id and client-IP, so
+    // the replay keeps the request's id and address. DATABASE_READ_RETRY=false
+    // leaves it out.
+    //
+    // It is inside the database admission gate (#4182), so a replayed request
+    // keeps its admission slot through the 250-500 ms pause and the replay.
+    // Deliberately: it bounds a request to one slot for at most one replay,
+    // and the gate's permit is held by the outer layer's future, so handing
+    // it back would mean moving the admission gate inside correlation-id and
+    // client-IP, which changes what a shed request has done. Re-acquiring
+    // after the pause would also put the replay behind the burst of new
+    // requests a failover causes, where it would most likely be shed with
+    // 503 POOL_EXHAUSTED. The slot sits idle for the pause only during a
+    // failover, when the pool itself is reconnecting.
+    if crate::api::middleware::db_read_retry::enabled_from_env() {
+        router = router.layer(middleware::from_fn(
+            crate::api::middleware::db_read_retry::db_read_retry,
+        ));
+    }
+
     // Correlation ID middleware (runs first on every request after the global
     // backstop below). Extracts or generates a correlation ID and sets the
     // X-Correlation-ID response header. A gateway's `x-request-id` becomes the
@@ -375,6 +398,33 @@ pub fn create_router(state: SharedState) -> Router {
         client_ip_config,
         client_ip_context_middleware,
     ));
+
+    // Database admission gate (#4182). At most DATABASE_REQUEST_CONCURRENCY
+    // requests run their handler phase while the pool is busy; past it a
+    // request waits at most DATABASE_REQUEST_ACQUIRE_WAIT_MS for a permit
+    // and is otherwise answered 503 POOL_EXHAUSTED + Retry-After at once,
+    // instead of queueing on the pool with the whole burst. Outside every
+    // middleware that reads the database (setup, guest access, visibility,
+    // auth), so a shed request has done no work; probes are never gated.
+    // Fairness (#6344): a share of the slots is kept for requests presenting
+    // a credential, and a client at its share yields to a waiting one.
+    if let Some(gate) = crate::api::middleware::db_admission::DbAdmission::new(
+        state.db.clone(),
+        state.config.database_request_wait_ms(),
+        state.config.database_request_slots(),
+        crate::api::middleware::db_admission::Fairness {
+            credentialed_reserve_percent: state
+                .config
+                .database_request_credentialed_reserve_percent,
+            client_share_percent: state.config.database_request_client_share_percent,
+            trusted_proxies: state.config.rate_limit_trusted_proxy_cidrs.clone(),
+        },
+    ) {
+        router = router.layer(middleware::from_fn_with_state(
+            gate,
+            crate::api::middleware::db_admission::db_admission_gate,
+        ));
+    }
 
     // Defense-in-depth backstop (outermost layer). A router-wide load-shed +
     // concurrency limit (+ optional request timeout) so that NO request path —
@@ -426,7 +476,7 @@ fn overloaded_response() -> Response {
 /// global concurrency backstop (GHSA-9f9r-c4w8-rjv9).
 const PROBE_PATHS: &[&str] = &["/health", "/healthz", "/ready", "/readyz", "/livez"];
 
-fn is_probe_path(path: &str) -> bool {
+pub(crate) fn is_probe_path(path: &str) -> bool {
     PROBE_PATHS.contains(&path)
 }
 
@@ -1576,6 +1626,16 @@ fn api_v1_routes(
                 auth_middleware,
             )),
         )
+        // Warm a conda Remote's proxy cache from a stored environment
+        // (#4184): POST/GET /conda/{repo}/warm, GET/DELETE
+        // /conda/{repo}/warm/{id}. Repository write (or admin) on {repo}.
+        .nest(
+            "/conda",
+            handlers::conda_warm::router().layer(middleware::from_fn_with_state(
+                auth_service.clone(),
+                auth_middleware,
+            )),
+        )
         // Stored-environment reverse index (#4054):
         // GET /environments/lookup?purl=... answers "which stored
         // environments contain this component" across every repository the
@@ -1768,6 +1828,7 @@ fn api_v1_routes(
                     auth_middleware,
                 )),
         )
+        .fallback(api_v1_not_found)
         // Web-UI CSRF contract (#3065): a state-changing request authenticated
         // by the session cookie must carry the `X-Requested-With` header the
         // web UI sends. Applied to the whole nest so it also covers the
@@ -1780,6 +1841,12 @@ fn api_v1_routes(
             api_rate_limit_state,
             rate_limit_middleware,
         ))
+}
+
+/// Unknown `/api/v1` paths. Without it they fell through to the format
+/// routes and answered `Repository not found` (#5656)
+async fn api_v1_not_found() -> AppError {
+    AppError::NotFound("Not found".to_string())
 }
 
 #[cfg(ak_test_shard = "router")]
@@ -2959,5 +3026,40 @@ mod tests {
         );
         let (list_status, _) = tdh::send(app, tdh::get("/api/v1/webhooks".to_string())).await;
         assert_eq!(list_status, axum::http::StatusCode::UNAUTHORIZED);
+    }
+
+    /// #5656: an unknown `/api/v1` path answers a plain `Not found`, not the
+    /// format routes' `Repository not found`, for a signed-in caller and an
+    /// anonymous one
+    #[tokio::test]
+    async fn unknown_api_v1_path_is_not_found_without_repository_5656() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let state = tdh::build_state(pool.clone(), "/tmp/api-not-found-5656");
+        let (user_id, _) = tdh::create_user(&pool).await;
+        let bearer = tdh::bearer_for(&state, user_id).await;
+        let app = super::create_router(state);
+
+        let mut signed_in = tdh::get("/api/v1/nonexistent".to_string());
+        signed_in.headers_mut().insert(
+            axum::http::header::AUTHORIZATION,
+            bearer.parse().expect("header value"),
+        );
+        let anonymous = tdh::get("/api/v1/nonexistent".to_string());
+        for (who, request) in [("signed in", signed_in), ("anonymous", anonymous)] {
+            let (status, body) = tdh::send(app.clone(), request).await;
+            let body = String::from_utf8_lossy(&body);
+            assert_eq!(status, axum::http::StatusCode::NOT_FOUND, "{who}: {body}");
+            assert!(!body.contains("Repository"), "{who}: {body}");
+            assert!(body.contains("Not found"), "{who}: {body}");
+        }
+
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("delete user");
     }
 }

@@ -72,8 +72,40 @@ async fn index_cache_set(cache: &IndexCache, key: String, bytes: Bytes) {
     c.insert(key, (bytes, Instant::now()));
 }
 
+#[cfg(test)]
 async fn index_cache_invalidate(cache: &IndexCache, key: &str) {
     cache.write().await.remove(key);
+}
+
+/// Drop the cached sparse-index entries of `crates` (lowercased names) in
+/// the repository keyed `repo_key` and in every virtual repository that
+/// includes it, recursively (#3840). Run whenever a crate's version set
+/// changes: on publish, and on every delete path, the REST delete and the
+/// lifecycle sweep (#6469), which otherwise left the index listing a removed
+/// version for up to [`INDEX_CACHE_TTL_SECS`]. The ancestors are looked up
+/// once for all crates, and the cache lock is taken once.
+pub(crate) async fn invalidate_crate_index_caches(
+    db: &sqlx::PgPool,
+    cache: &IndexCache,
+    repo_id: uuid::Uuid,
+    repo_key: &str,
+    crates: &[String],
+) {
+    if crates.is_empty() {
+        return;
+    }
+    let virtual_keys: Vec<String> =
+        crate::services::repository_service::RepositoryService::new(db.clone())
+            .virtual_ancestor_keys(repo_id)
+            .await;
+    let mut c = cache.write().await;
+    for name in crates {
+        let name = name.to_lowercase();
+        c.remove(&format!("{repo_key}:{name}"));
+        for vkey in &virtual_keys {
+            c.remove(&format!("{vkey}:{name}"));
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1084,7 +1116,11 @@ async fn fetch_index_upstream_overrides(
 ///
 /// Fail-closed, member-scoped: a fetch that fails, or a body this build cannot
 /// decode, yields `None` — the member contributes nothing rather than
-/// contributing lines whose age was never evaluated. That matches
+/// contributing lines whose age was never evaluated. A fetch that failed
+/// because the member could not answer (an upstream `5xx`, a transport
+/// failure, a timeout, an open circuit) also sets `*unavailable`, so a walk no
+/// member contributed to answers the retryable `503` rather than a `404`, as
+/// the ungated arm does (#5620). That matches
 /// `npm::remote_member_packument_value`, which returns the member as a miss for
 /// a body it cannot parse, and matches this loop's pre-existing treatment of a
 /// failed member fetch. An age-gate EVALUATION failure is the opposite case and
@@ -1099,16 +1135,17 @@ async fn gated_member_index_contribution(
     base_url: &str,
     index_path: &str,
     name_lower: &str,
+    unavailable: &mut bool,
 ) -> Result<Option<Bytes>, Response> {
     let Some(proxy) = state.proxy_service.as_ref() else {
         return Ok(None);
     };
-    let Ok(proxy_helpers::CachedBody {
+    let proxy_helpers::CachedBody {
         content,
         content_type: _,
         content_encoding,
         ..
-    }) = proxy_helpers::proxy_fetch_capped_encoded(
+    } = match proxy_helpers::proxy_fetch_capped_encoded(
         proxy,
         member.id,
         &member.key,
@@ -1117,8 +1154,12 @@ async fn gated_member_index_contribution(
         proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
     )
     .await
-    else {
-        return Ok(None);
+    {
+        Ok(body) => body,
+        Err(e) => {
+            *unavailable |= proxy_helpers::is_member_unavailable_response(&e);
+            return Ok(None);
+        }
     };
     let Ok(decoded) = decode_cargo_index_body(&content, content_encoding.as_deref()) else {
         tracing::warn!(
@@ -1970,20 +2011,16 @@ async fn publish(
     )
     .await?;
 
-    // Invalidate the index cache for this crate so the next fetch sees the new version.
-    index_cache_invalidate(&state.index_cache, &format!("{}:{}", repo_key, name_lower)).await;
-
-    // Also invalidate every virtual repo that includes this hosted repo —
-    // recursively, so a virtual nesting the crate's direct parent converges
-    // too instead of serving a stale index entry (#3840).
-    let virtual_keys: Vec<String> =
-        crate::services::repository_service::RepositoryService::new(state.db.clone())
-            .virtual_ancestor_keys(repo.id)
-            .await;
-
-    for vkey in &virtual_keys {
-        index_cache_invalidate(&state.index_cache, &format!("{}:{}", vkey, name_lower)).await;
-    }
+    // Invalidate the index cache for this crate so the next fetch sees the new
+    // version, here and in every virtual repo that includes this one (#3840).
+    invalidate_crate_index_caches(
+        &state.db,
+        &state.index_cache,
+        repo.id,
+        &repo_key,
+        std::slice::from_ref(&name_lower),
+    )
+    .await;
 
     info!(
         "Cargo publish: {} {} ({} bytes) to repo {}",
@@ -2081,6 +2118,13 @@ async fn download(
     .fetch_optional(&state.db)
     .await
     .map_err(map_db_err)?;
+    // #6433: a proxy-cache row is served only after its cache sidecar is
+    // checked: one nothing vouches for is no row (a Remote resolves it through
+    // its proxy path below), a held or refused one is the gate's answer.
+    let artifact = proxy_helpers::vouched_row(&state, repo.id, artifact, |a| {
+        proxy_helpers::ServedRowRef::new(&a.storage_key, Some(a.size_bytes))
+    })
+    .await?;
 
     // If crate not found locally, try proxy for remote repos
     let artifact = match artifact {
@@ -2403,7 +2447,7 @@ async fn download(
 
                 // #5810: no member scans; the virtual's member-fallback policy.
                 let fallback = proxy_helpers::virtual_member_fallback(&state.db, repo.id).await;
-                let result = resolve_unscanned_crate_members(
+                return resolve_unscanned_crate_members(
                     &state,
                     members,
                     fallback,
@@ -2411,8 +2455,7 @@ async fn download(
                     &member_fetch_urls,
                     &coordinate,
                 )
-                .await?;
-                return Ok(virtual_crate_response(&filename, result));
+                .await;
             }
             return Err(AppError::NotFound("Crate not found".to_string()).into_response());
         }
@@ -2739,7 +2782,9 @@ async fn serve_scanned_crate(
 }
 
 /// One run of members through the shared priority-preserving resolver, each
-/// Remote member fetching from its resolved `dl` URL (#3952).
+/// Remote member fetching from its resolved `dl` URL (#3952). These members
+/// serve without an inline scan, so a Remote member's fresh cached crate may
+/// be answered with a presigned redirect (#5129).
 async fn resolve_unscanned_crate_members(
     state: &SharedState,
     members: Vec<crate::models::repository::Repository>,
@@ -2747,15 +2792,16 @@ async fn resolve_unscanned_crate_members(
     proxy: Option<&crate::services::proxy_service::ProxyService>,
     member_fetch_urls: &HashMap<uuid::Uuid, String>,
     coordinate: &CrateCoordinate<'_>,
-) -> Result<crate::services::proxy_service::StreamingFetchResult, Response> {
+) -> Result<Response, Response> {
     let (name, version) = (coordinate.name, coordinate.version);
-    proxy_helpers::resolve_virtual_download_from_members_with_fetch_urls(
+    let download = proxy_helpers::resolve_virtual_download_or_redirect(
+        state,
         members,
         fallback,
         proxy,
         coordinate.cache_path,
         member_fetch_urls,
-        Some(coordinate.ctx),
+        coordinate.ctx,
         |member_id, location| async move {
             proxy_helpers::local_fetch_by_name_version(
                 &state.db, state, member_id, &location, name, version,
@@ -2763,7 +2809,13 @@ async fn resolve_unscanned_crate_members(
             .await
         },
     )
-    .await
+    .await?;
+    Ok(match download {
+        proxy_helpers::VirtualDownload::Redirect(redirect) => redirect,
+        proxy_helpers::VirtualDownload::Stream(result) => {
+            virtual_crate_response(coordinate.filename, result)
+        }
+    })
 }
 
 /// The Virtual download walk with scan-on-proxy (#4101).
@@ -2901,7 +2953,7 @@ async fn resolve_unscanned_crate_run(
     )
     .await
     {
-        Ok(result) => Some(Ok(virtual_crate_response(coordinate.filename, result))),
+        Ok(resp) => Some(Ok(resp)),
         Err(resp) => proxy_helpers::unscanned_run_failure(resp),
     }
 }
@@ -3256,6 +3308,7 @@ async fn try_virtual_index(
     //   from their rows exactly as we do for the top-level hosted case.
     let mut aggregated: Vec<String> = Vec::new();
     let mut seen_versions: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut member_unavailable = false;
 
     // Visit non-Remote (Local/Staging) members before Remote members so a
     // locally-published crate version cannot be shadowed by an upstream
@@ -3295,6 +3348,7 @@ async fn try_virtual_index(
                         &base_url,
                         &index_path,
                         name_lower,
+                        &mut member_unavailable,
                     )
                     .await
                     {
@@ -3328,12 +3382,7 @@ async fn try_virtual_index(
                 // (matching `gated_member_index_contribution` and npm's
                 // `remote_member_packument_value`) rather than failing the
                 // whole aggregate.
-                if let Ok(proxy_helpers::CachedBody {
-                    content,
-                    content_type: _,
-                    content_encoding,
-                    ..
-                }) = proxy_helpers::proxy_fetch_capped_encoded(
+                let fetched = proxy_helpers::proxy_fetch_capped_encoded(
                     proxy,
                     member.id,
                     &member.key,
@@ -3341,7 +3390,19 @@ async fn try_virtual_index(
                     &index_path,
                     proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
                 )
-                .await
+                .await;
+                // #5620: a member that could not answer (as opposed to one
+                // that does not have the crate) is remembered, so an empty
+                // aggregate answers 503 + Retry-After instead of a 404.
+                if let Err(ref e) = fetched {
+                    member_unavailable |= proxy_helpers::is_member_unavailable_response(e);
+                }
+                if let Ok(proxy_helpers::CachedBody {
+                    content,
+                    content_type: _,
+                    content_encoding,
+                    ..
+                }) = fetched
                 {
                     match decode_cargo_index_body(&content, content_encoding.as_deref()) {
                         Ok(decoded) => {
@@ -3401,7 +3462,7 @@ async fn try_virtual_index(
         }
     }
 
-    match finalize_virtual_index_aggregation(aggregated) {
+    match finalize_virtual_index_aggregation(aggregated, member_unavailable) {
         Some(Ok(body)) => {
             // Only memoize a document that is the SAME for every caller
             // (#3323) AND is not a policy-dependent view (#3480). The index
@@ -3477,8 +3538,15 @@ fn resolve_remote_index_base_url(
 /// "skip the virtual path entirely" pre-check before aggregation; this
 /// helper does not produce it.
 #[allow(clippy::result_large_err)]
-fn finalize_virtual_index_aggregation(aggregated: Vec<String>) -> Option<Result<Bytes, Response>> {
+fn finalize_virtual_index_aggregation(
+    aggregated: Vec<String>,
+    member_unavailable: bool,
+) -> Option<Result<Bytes, Response>> {
     if aggregated.is_empty() {
+        // #5620: "not found" is unknowable while a member could not answer.
+        if member_unavailable {
+            return Some(Err(proxy_helpers::member_unavailable_response()));
+        }
         return Some(Err(AppError::NotFound(
             "Artifact not found in any member repository".to_string(),
         )
@@ -5070,7 +5138,7 @@ mod tests {
             r#"{"name":"foo","vers":"1.0.0"}"#.to_string(),
             r#"{"name":"foo","vers":"1.0.1"}"#.to_string(),
         ];
-        let out = finalize_virtual_index_aggregation(lines)
+        let out = finalize_virtual_index_aggregation(lines, true)
             .expect("Some(_) when called from aggregation path");
         let body = out.expect("Ok(body) when lines were aggregated");
         // Lines are joined with `\n` (no trailing newline added).
@@ -5082,9 +5150,21 @@ mod tests {
 
     #[test]
     fn test_finalize_virtual_index_aggregation_returns_404_when_empty() {
-        let out = finalize_virtual_index_aggregation(Vec::new()).expect("Some(_)");
+        let out = finalize_virtual_index_aggregation(Vec::new(), false).expect("Some(_)");
         let resp = out.expect_err("empty aggregation must surface as 404");
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// #5620: an empty aggregate with a member that could not answer is the
+    /// walk's retryable 503, not a 404 cargo reports as "no matching package".
+    #[test]
+    fn test_finalize_virtual_index_aggregation_returns_503_when_a_member_was_unavailable() {
+        let resp = finalize_virtual_index_aggregation(Vec::new(), true)
+            .expect("Some(_)")
+            .expect_err("an empty aggregate is an error");
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(proxy_helpers::is_member_unavailable_response(&resp));
+        assert!(resp.headers().contains_key(axum::http::header::RETRY_AFTER));
     }
 
     // -----------------------------------------------------------------------
@@ -9139,6 +9219,44 @@ mod age_gate_tests {
         rig.teardown().await;
     }
 
+    /// #5620: an age-gated Remote member that cannot answer (its upstream
+    /// answers `503`) is an unavailable member, not a miss, exactly as an
+    /// ungated one is: a walk no member contributed to answers the retryable
+    /// `503` with `Retry-After`, not a `404` cargo reports as "not found".
+    /// A gated member that genuinely lacks the crate (`404`) is still a miss.
+    #[tokio::test]
+    async fn test_gated_virtual_member_outage_answers_503_5620() {
+        let name = "gated-outage";
+        let Some(mut rig) = VirtualRig::new(true).await else {
+            return;
+        };
+        let gated = rig.add_remote(1, true, true).await;
+        rig.mount_index(gated, name, ResponseTemplate::new(503))
+            .await;
+        let (status, _body, headers) = rig.get(rig.index_uri(name)).await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a gated member that could not answer must not read as a miss"
+        );
+        assert!(
+            headers.get("retry-after").is_some(),
+            "503 without Retry-After"
+        );
+
+        let missing = "gated-missing";
+        rig.mount_index(gated, missing, ResponseTemplate::new(404))
+            .await;
+        let (status, _, _) = rig.get(rig.index_uri(missing)).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "a gated member's 404 is a miss"
+        );
+
+        rig.teardown().await;
+    }
+
     /// #3937: an UNGATED member whose index body arrives (or is stored)
     /// content-encoded must still contribute its versions to the merged
     /// sparse index.
@@ -9888,6 +10006,70 @@ mod age_gate_tests {
             assert_eq!(&served[..], &body[..]);
             assert_eq!(rig.recorded(name, version).await, 1);
             rig.teardown().await;
+        }
+
+        /// A crate whose `Cargo.toml` does not declare what it is served as
+        /// is never scanned or queued, so every pull lands on the same arm.
+        /// Each one is served pending under its own WARN, never fail-open's
+        /// "scanning async" line, and counted in
+        /// `ak_proxy_scan_unscannable_total`
+        #[test]
+        fn remote_unestablished_crate_is_served_and_counted_unscannable() {
+            let (name, version) = ("scan-unestablished", "0.4.0");
+            let logs = tdh::LogCapture::default();
+            let _guard = logs.install(tracing::Level::WARN);
+            let (keys, counted) =
+                crate::services::metrics_service::capture_counters_async(|| async {
+                    let mut keys = Vec::new();
+                    for action in ["fail_open", "record_only"] {
+                        let rig = RemoteRig::new(Some(action)).await?;
+                        let body = crate_bytes_declaring("evil-crate", version);
+                        rig.mount_download(name, version, &body, 1).await;
+                        for pull in 1..=2 {
+                            let (status, served, headers) =
+                                rig.get(rig.download_uri(name, version)).await;
+                            assert_eq!(status, StatusCode::OK, "{action} pull {pull}");
+                            assert_eq!(scan_header(&headers), Some("pending"), "{action}");
+                            assert_eq!(&served[..], &body[..]);
+                        }
+                        let queued: i64 = sqlx::query_scalar(
+                            "SELECT COUNT(*) FROM scan_queue WHERE repository_id = $1",
+                        )
+                        .bind(rig.fx.repo_id)
+                        .fetch_one(&rig.fx.pool)
+                        .await
+                        .unwrap();
+                        assert_eq!(queued, 0, "{action}: nothing queued");
+                        keys.push(rig.fx.repo_key.clone());
+                        rig.teardown().await;
+                    }
+                    Some(keys)
+                });
+            let Some(keys) = keys else {
+                return;
+            };
+            for key in &keys {
+                assert_eq!(
+                    counted.get(
+                        "ak_proxy_scan_unscannable_total",
+                        &[
+                            ("repository", key),
+                            ("format", "cargo"),
+                            ("reason", "identity_not_established"),
+                        ],
+                    ),
+                    2,
+                    "{key}: once per pull"
+                );
+            }
+            let text = logs.text();
+            assert_eq!(
+                text.matches("served, will not be scanned: identity not established")
+                    .count(),
+                4,
+                "{text}"
+            );
+            assert!(!text.contains("fail-open proxy scan"), "{text}");
         }
 
         /// The control: with scan-on-proxy off the crate still streams through

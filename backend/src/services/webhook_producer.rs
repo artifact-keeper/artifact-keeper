@@ -4,9 +4,9 @@
 //! every webhook whose `events` array contains the mapped event type and whose
 //! `repository_id` matches (or is NULL, meaning "global"). The row is enqueued
 //! with `next_retry_at = NOW()`, `attempts = 0`, `success = false`. The retry
-//! scheduler in `crate::api::handlers::webhooks::process_webhook_retries`
-//! (driven from `scheduler_service`) picks rows up on its 30-second tick and
-//! performs the actual HTTP POST.
+//! delivery worker in `crate::api::handlers::webhooks::run_webhook_delivery_worker`
+//! (spawned from `scheduler_service`) is woken once the rows are committed and
+//! performs the actual HTTP POST (#5195).
 //!
 //! This module is the missing producer in v1.1.9. Before it existed, the
 //! retry scheduler had nothing to retry: no code path inserted into
@@ -234,7 +234,7 @@ pub fn start_webhook_producer(
 /// type and whose `repository_id` is either NULL (global) or matches the
 /// event's `repository_id` field. For each match, INSERTs a row into
 /// `webhook_deliveries` with `attempts = 0`, `next_retry_at = NOW()`,
-/// `success = false`. The retry scheduler picks these up on its tick.
+/// `success = false`, then wakes the delivery worker on this replica.
 ///
 /// # Repository scoping (#948)
 ///
@@ -309,7 +309,10 @@ async fn enqueue_for_event(db: &PgPool, event: &DomainEvent) -> std::result::Res
         .await;
 
     match result {
-        Ok(_) => record_batch_enqueue_outcome(mapped_event, batch_size, true),
+        Ok(_) => {
+            record_batch_enqueue_outcome(mapped_event, batch_size, true);
+            crate::api::handlers::webhooks::wake_webhook_delivery_worker();
+        }
         Err(e) => {
             tracing::warn!(
                 event = mapped_event,

@@ -1,0 +1,5 @@
+---
+section: Security
+issues: [#6416]
+---
+- **A PyPI virtual serves a Remote member's cached file from its `artifacts` row only after checking the cache sidecar, with or without presigned downloads** (#6416). A Remote's cached file recorded as an `artifacts` row (rows written before 1.2.0) was served through a virtual with no look at its cache sidecar: on a presigned-download deployment it was signed after only an existence check, and on every other deployment (presigned downloads are off by default) it was streamed, a `HEAD` included. An entry past its TTL, one inside its Package Age Policy hold and one whose stored scan verdict refuses it were all served. The row now passes the same single-read gate as the proxy-cache redirects before it is redirected to, streamed or answered for a `HEAD`: a held entry answers the hold's 409 and a refusing verdict the scan gate's 403. An entry that is stale, has no readable sidecar, or is not this Remote's entry under this deployment's cache scope is not served from the row; the virtual resolves it through the member's own Remote path, which revalidates or refetches it under every gate.

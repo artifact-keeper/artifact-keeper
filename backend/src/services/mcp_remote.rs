@@ -533,6 +533,10 @@ pub enum SyncError {
     /// Scheduled upstream jobs are paused on this instance (#5288): a manual
     /// trigger starts no pass either (#5404).
     Paused,
+    /// The pass no longer holds the repository's sync lock (its lock session
+    /// ended), so it stopped, or its outcome was not stored because a newer
+    /// pass has started (#6390).
+    LeaseLost,
 }
 
 impl std::fmt::Display for SyncError {
@@ -547,6 +551,10 @@ impl std::fmt::Display for SyncError {
                 f,
                 "scheduled upstream jobs are paused on this instance (upstream_jobs_paused); \
                  no sync starts until the switch is off"
+            ),
+            SyncError::LeaseLost => write!(
+                f,
+                "the sync pass lost its repository sync lock (its lock session ended) and stopped"
             ),
         }
     }
@@ -658,6 +666,10 @@ pub struct RunCtx<'a> {
     /// carry only recently updated versions, so a name newly ingestible on
     /// one of them is ingested from its per-server version list.
     pub incremental: bool,
+    /// The `last_started_at` this pass stored when it began. Its later state
+    /// writes match on it, so a pass that lost its lock cannot overwrite the
+    /// state of a pass that started after it (#6390).
+    pub started_at: Option<DateTime<Utc>>,
 }
 
 impl<'a> RunCtx<'a> {
@@ -691,6 +703,7 @@ impl<'a> RunCtx<'a> {
             packages,
             protected,
             incremental: false,
+            started_at: None,
         })
     }
 
@@ -2018,25 +2031,36 @@ pub async fn load_state(db: &PgPool, repo_id: Uuid) -> Result<SyncState, String>
     }))
 }
 
-async fn mark_started(db: &PgPool, repo_id: Uuid) -> Result<(), String> {
-    sqlx::query(
+/// Stamp this pass's start; returns the stored `last_started_at`, the
+/// pass's identity for its later writes (#6390).
+async fn mark_started(db: &PgPool, repo_id: Uuid) -> Result<DateTime<Utc>, String> {
+    sqlx::query_scalar(
         "INSERT INTO mcp_remote_sync_state (repository_id, last_started_at) VALUES ($1, now()) \
-         ON CONFLICT (repository_id) DO UPDATE SET last_started_at = now()",
+         ON CONFLICT (repository_id) DO UPDATE SET last_started_at = now() \
+         RETURNING last_started_at",
     )
     .bind(repo_id)
-    .execute(db)
+    .fetch_one(db)
     .await
-    .map_err(db_err)?;
-    Ok(())
+    .map_err(db_err)
 }
 
-async fn save_state(db: &PgPool, repo_id: Uuid, s: &SyncState, ok: bool) -> Result<(), String> {
-    sqlx::query(
+/// Store the pass's outcome, only while the row still records this pass's
+/// start (`started`): `false` when a newer pass has started meanwhile, whose
+/// state is then left alone (#6390).
+async fn save_state(
+    db: &PgPool,
+    repo_id: Uuid,
+    started: DateTime<Utc>,
+    s: &SyncState,
+    ok: bool,
+) -> Result<bool, String> {
+    let done = sqlx::query(
         "UPDATE mcp_remote_sync_state SET updated_since = $2, resume_cursor = $3, \
              resume_since = $4, last_finished_at = now(), \
              last_succeeded_at = CASE WHEN $5 THEN now() ELSE last_succeeded_at END, \
              last_error = $6, last_summary = $7 \
-         WHERE repository_id = $1",
+         WHERE repository_id = $1 AND last_started_at = $8",
     )
     .bind(repo_id)
     .bind(s.updated_since)
@@ -2045,14 +2069,15 @@ async fn save_state(db: &PgPool, repo_id: Uuid, s: &SyncState, ok: bool) -> Resu
     .bind(ok)
     .bind(&s.last_error)
     .bind(&s.last_summary)
+    .bind(started)
     .execute(db)
     .await
     .map_err(db_err)?;
-    Ok(())
+    Ok(done.rows_affected() > 0)
 }
 
 /// The advisory-lock object id of a repository's sync lock.
-fn lock_object_id(repo_id: Uuid) -> i32 {
+pub(crate) fn lock_object_id(repo_id: Uuid) -> i32 {
     crate::services::cluster_lock::lease_object_id(&format!("mcp-remote-sync/{repo_id}"))
 }
 
@@ -2084,27 +2109,160 @@ pub async fn sync_running(db: &PgPool, repo_id: Uuid) -> Result<bool, String> {
     .map_err(db_err)
 }
 
-/// Record a background pass that ended before it stored its own outcome
-/// (a database error, or the repository changed under it), so its poller
-/// sees it end instead of an unchanged state. An unreadable first page is
-/// already stored by the pass itself.
-async fn record_failure(db: &PgPool, repo_id: Uuid, e: &SyncError) {
+/// Record a pass (manual or scheduled) that ended before it stored its own
+/// outcome (a database error, a lost lock, or the repository changed under
+/// it), so its poller sees it end instead of an unchanged state. An
+/// unreadable first page is already stored by the pass itself (#6249,
+/// #6390).
+///
+/// `started` is the pass's own start. With it, the record is written only
+/// while the row still holds that start, so it never lands on a newer pass.
+/// Without it (the pass failed before stamping its start) the caller has
+/// checked that it still holds the sync lock.
+async fn record_failure(db: &PgPool, repo_id: Uuid, e: &SyncError, started: Option<DateTime<Utc>>) {
     if matches!(e, SyncError::Upstream(_)) {
         return;
     }
-    let stored = sqlx::query(
-        "INSERT INTO mcp_remote_sync_state (repository_id, last_started_at, last_finished_at, last_error) \
-         VALUES ($1, now(), now(), $2) \
-         ON CONFLICT (repository_id) DO UPDATE SET \
-             last_started_at = COALESCE(mcp_remote_sync_state.last_started_at, now()), \
-             last_finished_at = now(), last_error = $2",
-    )
-    .bind(repo_id)
-    .bind(e.to_string())
-    .execute(db)
-    .await;
+    let stored = match started {
+        Some(started) => sqlx::query(
+            "UPDATE mcp_remote_sync_state SET last_finished_at = now(), last_error = $2 \
+             WHERE repository_id = $1 AND last_started_at = $3",
+        )
+        .bind(repo_id)
+        .bind(e.to_string())
+        .bind(started)
+        .execute(db)
+        .await,
+        None => sqlx::query(
+            "INSERT INTO mcp_remote_sync_state (repository_id, last_started_at, last_finished_at, last_error) \
+             VALUES ($1, now(), now(), $2) \
+             ON CONFLICT (repository_id) DO UPDATE SET \
+                 last_started_at = COALESCE(mcp_remote_sync_state.last_started_at, now()), \
+                 last_finished_at = now(), last_error = $2",
+        )
+        .bind(repo_id)
+        .bind(e.to_string())
+        .execute(db)
+        .await,
+    };
     if let Err(err) = stored {
         tracing::warn!(repository_id = %repo_id, error = %err, "MCP remote sync failure not recorded");
+    }
+}
+
+/// `lastError` of a pass that ended without recording an outcome (#6390).
+pub const INTERRUPTED_PASS_ERROR: &str = "the sync pass ended without recording an outcome: \
+     its sync lock was released while it ran (its process exited or its lock session was lost)";
+
+/// How often a running pass checks that it still holds its sync lock; a pass
+/// that lost it stops (#6390).
+const LEASE_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+#[cfg(test)]
+static LEASE_CHECK_OVERRIDE_SECS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Test hook: check the lease every `secs` (0 restores the default). Each
+/// nextest test runs in its own process.
+#[cfg(test)]
+pub(crate) fn set_lease_check_interval_for_tests(secs: u64) {
+    LEASE_CHECK_OVERRIDE_SECS.store(secs, std::sync::atomic::Ordering::SeqCst);
+}
+
+fn lease_check_interval() -> std::time::Duration {
+    #[cfg(test)]
+    {
+        let secs = LEASE_CHECK_OVERRIDE_SECS.load(std::sync::atomic::Ordering::SeqCst);
+        if secs > 0 {
+            return std::time::Duration::from_secs(secs);
+        }
+    }
+    LEASE_CHECK_INTERVAL
+}
+
+/// Run a pass under `lease`, stopping it with [`SyncError::LeaseLost`] as
+/// soon as the lease is found lost (checked every [`LEASE_CHECK_INTERVAL`]),
+/// then record a failure (guarded by the pass's own start) and release.
+async fn run_under_lease(
+    run: &mut RunCtx<'_>,
+    mut lease: crate::services::cluster_lock::ClusterLease,
+) -> Result<SyncSummary, SyncError> {
+    let db = run.state.db.clone();
+    let repo_id = run.repo.id;
+    let result = {
+        let pass = run_locked(run);
+        tokio::pin!(pass);
+        let mut check = tokio::time::interval(lease_check_interval());
+        check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        check.tick().await;
+        loop {
+            tokio::select! {
+                r = &mut pass => break r,
+                _ = check.tick() => {
+                    if !lease.is_held().await {
+                        tracing::warn!(repository_id = %repo_id, "MCP remote sync pass lost its sync lock; stopping it");
+                        break Err(SyncError::LeaseLost);
+                    }
+                }
+            }
+        }
+    };
+    // Record the failure before releasing the lock, so a poller that sees
+    // `running: false` also sees this pass's outcome (#6249). The record
+    // matches this pass's own start, so it never lands on a newer pass.
+    if let Err(e) = &result {
+        let started = run.started_at;
+        if started.is_some() || lease.is_held().await {
+            record_failure(&db, repo_id, e, started).await;
+        }
+    }
+    lease.release().await;
+    result
+}
+
+/// Record the pass that started at `started` as ended, when it holds no
+/// sync lock but stored no outcome (#6390). That is a pass killed by a
+/// panic, a cancellation or the loss of its process: its lock went with
+/// its connection, and nothing wrote `last_finished_at`, so a poll would
+/// otherwise pair `running: false` with the previous pass's outcome.
+///
+/// One conditional UPDATE, so it cannot overwrite a pass that started
+/// meanwhile: the lock is checked in the statement, and a pass that took it
+/// and stamped `last_started_at` first no longer matches `started`. `true`
+/// when the row was written.
+pub async fn record_interrupted_pass(
+    db: &PgPool,
+    repo_id: Uuid,
+    started: DateTime<Utc>,
+) -> Result<bool, String> {
+    let done = sqlx::query(
+        "UPDATE mcp_remote_sync_state SET last_finished_at = now(), last_error = $3 \
+         WHERE repository_id = $1 AND last_started_at = $2 \
+           AND (last_finished_at IS NULL OR last_finished_at < last_started_at) \
+           AND NOT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'advisory' \
+               AND classid::bigint = $4 AND objid::bigint = $5 AND objsubid = 2 AND granted)",
+    )
+    .bind(repo_id)
+    .bind(started)
+    .bind(INTERRUPTED_PASS_ERROR)
+    .bind(i64::from(SYNC_LOCK_CLASS))
+    .bind(i64::from(lock_object_id(repo_id) as u32))
+    .execute(db)
+    .await
+    .map_err(db_err)?;
+    if done.rows_affected() > 0 {
+        tracing::warn!(repository_id = %repo_id, started_at = %started, "MCP remote sync pass ended without recording an outcome");
+    }
+    Ok(done.rows_affected() > 0)
+}
+
+/// The start of the last pass `st` records, when that pass never recorded
+/// how it ended (no `last_finished_at` at or after its `last_started_at`).
+pub fn pass_unfinished(st: &SyncState) -> Option<DateTime<Utc>> {
+    let started = st.last_started_at?;
+    match st.last_finished_at {
+        Some(finished) if finished >= started => None,
+        _ => Some(started),
     }
 }
 
@@ -2129,13 +2287,17 @@ pub async fn start_sync(state: &SharedState, repo: RepoInfo) -> Result<(), SyncE
     let state = state.clone();
     tokio::spawn(async move {
         let result = match RunCtx::load(&state, &repo).await {
-            Ok(mut run) => run_locked(&mut run).await,
-            Err(e) => Err(e),
+            Ok(mut run) => run_under_lease(&mut run, lease).await,
+            Err(e) => {
+                // Nothing started; the lock is still ours (#6249).
+                let mut lease = lease;
+                if lease.is_held().await {
+                    record_failure(&state.db, repo.id, &e, None).await;
+                }
+                lease.release().await;
+                Err(e)
+            }
         };
-        lease.release().await;
-        if let Err(e) = &result {
-            record_failure(&state.db, repo.id, e).await;
-        }
         match result {
             Ok(s) => tracing::info!(
                 repository = %repo.key,
@@ -2161,9 +2323,10 @@ pub async fn sync_repo(state: &SharedState, repo: &RepoInfo) -> Result<SyncSumma
     }
     let mut run = RunCtx::load(state, repo).await?;
     let lease = lock_repo(&state.db, repo.id).await?;
-    let result = run_locked(&mut run).await;
-    lease.release().await;
-    result
+    // As the manual trigger does (#6249): a failure is recorded while the
+    // lock is still held, so a poll during a scheduled pass that ends on a
+    // database error sees it end (#6390).
+    run_under_lease(&mut run, lease).await
 }
 
 async fn run_locked(run: &mut RunCtx<'_>) -> Result<SyncSummary, SyncError> {
@@ -2173,9 +2336,10 @@ async fn run_locked(run: &mut RunCtx<'_>) -> Result<SyncSummary, SyncError> {
     let mut st = load_state(&db, repo.id)
         .await
         .map_err(SyncError::Database)?;
-    mark_started(&db, repo.id)
+    let pass_start = mark_started(&db, repo.id)
         .await
         .map_err(SyncError::Database)?;
+    run.started_at = Some(pass_start);
     let since = if st.resume_cursor.is_some() {
         st.resume_since
     } else {
@@ -2196,7 +2360,7 @@ async fn run_locked(run: &mut RunCtx<'_>) -> Result<SyncSummary, SyncError> {
             Err(e) if summary.pages == 0 => {
                 st.last_error = Some(e.clone());
                 st.last_summary = serde_json::to_value(&summary).unwrap_or_default();
-                let _ = save_state(&db, repo.id, &st, false).await;
+                let _ = save_state(&db, repo.id, pass_start, &st, false).await;
                 return Err(SyncError::Upstream(e));
             }
             Err(e) => {
@@ -2248,9 +2412,14 @@ async fn run_locked(run: &mut RunCtx<'_>) -> Result<SyncSummary, SyncError> {
     }
     st.last_error = summary.errors.first().cloned();
     st.last_summary = serde_json::to_value(&summary).unwrap_or_default();
-    save_state(&db, repo.id, &st, summary.errors.is_empty())
+    if !save_state(&db, repo.id, pass_start, &st, summary.errors.is_empty())
         .await
-        .map_err(SyncError::Database)?;
+        .map_err(SyncError::Database)?
+    {
+        // A newer pass started after this one lost its lock: its state
+        // stands (#6390).
+        return Err(SyncError::LeaseLost);
+    }
     audit(
         &db,
         AuditAction::McpMirrorSynced,
@@ -3067,6 +3236,7 @@ mod tests {
             (SyncError::Upstream("x".into()), "upstream"),
             (SyncError::Database("x".into()), "database"),
             (SyncError::Paused, "paused"),
+            (SyncError::LeaseLost, "lost its repository sync lock"),
         ] {
             assert!(e.to_string().contains(needle));
         }

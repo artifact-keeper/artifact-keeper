@@ -1617,7 +1617,10 @@ async fn a_failed_carry_leaves_nothing_behind() {
     .expect("install failure");
     let result = carry(&fx, source, target).await;
     sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
-        "DROP TRIGGER {trigger} ON scan_findings; DROP FUNCTION {trigger}();"
+        // Exclusive lock first: a bare DROP TRIGGER upgrades from a weak lock
+        // and can deadlock against another drop on the table (#5647).
+        "BEGIN; LOCK TABLE scan_findings IN ACCESS EXCLUSIVE MODE; \
+         DROP TRIGGER {trigger} ON scan_findings; DROP FUNCTION {trigger}(); COMMIT;"
     )))
     .execute(&fx.pool)
     .await

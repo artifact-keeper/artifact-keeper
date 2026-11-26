@@ -1575,6 +1575,29 @@ fn manifest_digest_reference_matches(reference: &str, computed_digest: &str) -> 
     !reference.starts_with("sha256:") || reference.eq_ignore_ascii_case(computed_digest)
 }
 
+/// An OCI tag, per the distribution spec: `[a-zA-Z0-9_][a-zA-Z0-9._-]{0,127}`.
+///
+/// Checked against the raw reference text, so a percent-escape (`a%20b`) is
+/// not a tag: this registry does not percent-decode references, so accepting
+/// one would store a name no conforming client can address (#5869).
+fn is_valid_oci_tag(tag: &str) -> bool {
+    let bytes = tag.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 128
+        && (bytes[0].is_ascii_alphanumeric() || bytes[0] == b'_')
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+/// Whether a manifest PUT reference may be stored: a `sha256:` digest (whose
+/// hash [`manifest_digest_reference_matches`] verifies against the body) or a
+/// valid tag. Anything else, such as `bad!tag`, `-lead`, a 129-character name
+/// or a non-sha256 digest, answers `400 TAG_INVALID` instead of `201` (#5869).
+fn manifest_put_reference_is_valid(reference: &str) -> bool {
+    reference.starts_with("sha256:") || is_valid_oci_tag(reference)
+}
+
 fn upload_storage_key(uuid: &Uuid) -> String {
     format!("oci-uploads/{}", uuid)
 }
@@ -4314,6 +4337,11 @@ async fn try_resolve_virtual_blob(
     // upstream is not evidence that the blob does not exist, and recording it
     // as a negative makes the next request fail without asking anyone.
     let mut indeterminate = false;
+    // #6417: a member that could not answer at all (an upstream 5xx or 429, a
+    // transport failure, the download deadline, an open circuit). A walk no
+    // member served then answers `503 UNAVAILABLE` + `Retry-After`, not the
+    // `404 BLOB_UNKNOWN` a client reports as a missing layer (#5504).
+    let mut unavailable = false;
 
     for member in &members {
         let local = match sqlx::query!(
@@ -4379,6 +4407,7 @@ async fn try_resolve_virtual_blob(
                 let breaker = proxy.member_breaker();
                 let Some(_admission) = breaker.admit(member.id) else {
                     indeterminate = true;
+                    unavailable = true;
                     continue;
                 };
                 for image in candidate_upstream_images(image_name, upstream_url) {
@@ -4409,20 +4438,27 @@ async fn try_resolve_virtual_blob(
                     let fetched = match proxy_helpers::virtual_member_download_deadline(
                         proxy.upstream_read_timeout(),
                     ) {
-                        Some(deadline) => match tokio::time::timeout(deadline, fetch).await {
-                            Ok(fetched) => fetched,
-                            Err(_) => {
-                                proxy_helpers::record_virtual_member_download_deadline_miss(
-                                    &member.key,
-                                    &upstream_path,
-                                    deadline,
-                                );
-                                breaker.record(member.id, &member.key, true);
-                                // Not evidence the blob is absent (#3836).
-                                indeterminate = true;
-                                break;
+                        Some(deadline) => {
+                            match crate::services::upstream_circuit::within_own_deadline(
+                                deadline, fetch,
+                            )
+                            .await
+                            {
+                                Ok(fetched) => fetched,
+                                Err(_) => {
+                                    proxy_helpers::record_virtual_member_download_deadline_miss(
+                                        &member.key,
+                                        &upstream_path,
+                                        deadline,
+                                    );
+                                    breaker.record(member.id, &member.key, true);
+                                    // Not evidence the blob is absent (#3836).
+                                    indeterminate = true;
+                                    unavailable = true;
+                                    break;
+                                }
                             }
-                        },
+                        }
                         None => fetch.await,
                     };
                     // Only a deadline miss trips the breaker here: the error
@@ -4441,6 +4477,7 @@ async fn try_resolve_virtual_blob(
                         }
                         Err(error) => {
                             indeterminate |= !upstream_error_is_definitive_miss(&error);
+                            unavailable |= upstream_error_is_unavailable(&error);
                             continue;
                         }
                     }
@@ -4451,6 +4488,9 @@ async fn try_resolve_virtual_blob(
 
     if let Some(resp) = lookup_failed {
         return Err(resp);
+    }
+    if unavailable {
+        return Err(oci_member_unavailable());
     }
     if cacheable && !indeterminate {
         virtual_negative_cache_insert(
@@ -4572,6 +4612,11 @@ async fn try_resolve_virtual_manifest(
     // failing upstream, or a digest mismatch we refused to serve). A walk that
     // ends empty is only a NEGATIVE when every member gave a definitive answer.
     let mut indeterminate = false;
+    // #6417: set when a member could not answer at all
+    // ([`UpstreamFetchOutcome::Unavailable`]). A walk no member served then
+    // answers `503 UNAVAILABLE` + `Retry-After` rather than the
+    // `404 MANIFEST_UNKNOWN` docker and containerd report as "not found".
+    let mut any_unavailable = false;
 
     // The `Accept` a Remote member's upstream is asked with: the client's,
     // supplemented with the canonical manifest media types as on the direct
@@ -4720,6 +4765,7 @@ async fn try_resolve_virtual_manifest(
             .await;
             indeterminate |= outcome.is_indeterminate();
             upstream_unavailable = matches!(outcome, UpstreamFetchOutcome::Unavailable);
+            any_unavailable |= upstream_unavailable;
             if let Some((content, content_type)) = outcome.into_fetched() {
                 // #1348 round 1, concern #3 (CRITICAL):
                 // When the manifest reference is itself a digest
@@ -4787,6 +4833,9 @@ async fn try_resolve_virtual_manifest(
     if let Some(resp) = lookup_failed {
         return Err(resp);
     }
+    if any_unavailable {
+        return Err(oci_member_unavailable());
+    }
     if cacheable && !indeterminate {
         virtual_negative_cache_insert(
             cache_key,
@@ -4816,6 +4865,10 @@ async fn cache_manifest_reference_locally(
     // without caching it (the caller falls back to the computed digest).
     if crate::services::quota::storage::at_quota(&state.db).await {
         return Err("instance storage quota reached; not caching".to_string());
+    }
+    // Likewise at the disk block threshold (#5191).
+    if crate::services::quota::disk::cache_fills_blocked() {
+        return Err("storage volume at its disk threshold; not caching".to_string());
     }
     let digest = compute_sha256(content);
     let storage = state
@@ -5469,6 +5522,17 @@ fn upstream_error_is_definitive_miss(error: &Response) -> bool {
     error.status() == StatusCode::NOT_FOUND
 }
 
+/// Whether a `proxy_helpers` error [`Response`] says the upstream could not
+/// answer at all (#5504's [`proxy_helpers::MemberUnavailable`]: a 5xx or 429,
+/// a transport failure or timeout), so "not found" is unknowable (#6417). A
+/// permanent refusal from the token endpoint (the anonymous `401`/`403`
+/// #4527 reads as a miss) carries the marker too and is excluded, as in
+/// [`try_upstream_fetch_with_accept`].
+fn upstream_error_is_unavailable(error: &Response) -> bool {
+    proxy_helpers::is_member_unavailable_response(error)
+        && !proxy_helpers::is_token_endpoint_refusal(error)
+}
+
 /// Blob fetches pass `None` and exercise the unchanged code path.
 async fn try_upstream_fetch_with_accept(
     repo: &OciRepoInfo,
@@ -5514,12 +5578,7 @@ async fn try_upstream_fetch_with_accept(
         }
         // #4527: a permanent refusal from the token endpoint (an anonymous
         // 401/403) is a miss, though it carries `MemberUnavailable`.
-        Err(error)
-            if proxy_helpers::is_member_unavailable_response(&error)
-                && !proxy_helpers::is_token_endpoint_refusal(&error) =>
-        {
-            UpstreamFetchOutcome::Unavailable
-        }
+        Err(error) if upstream_error_is_unavailable(&error) => UpstreamFetchOutcome::Unavailable,
         Err(_) => UpstreamFetchOutcome::Indeterminate,
     }
 }
@@ -5545,10 +5604,14 @@ async fn fetch_remote_manifest(
         Some(accept),
     )
     .await;
-    match outcome.upstream_auth_error() {
-        Some(resp) => Err(resp),
-        None => Ok(outcome.into_fetched()),
+    if let Some(resp) = outcome.upstream_auth_error() {
+        return Err(resp);
     }
+    // #6417: an upstream that could not answer is not a missing manifest.
+    if matches!(outcome, UpstreamFetchOutcome::Unavailable) {
+        return Err(oci_member_unavailable());
+    }
+    Ok(outcome.into_fetched())
 }
 
 /// Canonical set of manifest media types we always advertise to an OCI
@@ -5731,8 +5794,16 @@ async fn try_upstream_fetch_streaming_blob_with_range(
         RepositoryFormat::Docker,
         is_head,
     )
-    .await
-    .ok()?;
+    .await;
+    // #6417: an upstream that could not answer is the retryable 503, not the
+    // caller's `404 BLOB_UNKNOWN`; any other failure stays a miss.
+    let result = match result {
+        Ok(result) => result,
+        Err(error) if upstream_error_is_unavailable(&error) => {
+            return Some(oci_member_unavailable());
+        }
+        Err(_) => return None,
+    };
     Some(build_oci_streaming_proxy_response_with_range(
         result,
         digest,
@@ -7291,7 +7362,9 @@ async fn handle_head_blob(
 /// STORED_OBJECT_INTEGRITY` with no body, a larger one is cut short before
 /// its last chunk, so a client never receives a complete-looking corrupt
 /// layer. A range pull is served unverified (only the whole object can be
-/// checked). `DOWNLOAD_VERIFY_CHECKSUMS=false` turns the check off.
+/// checked). `DOWNLOAD_VERIFY_CHECKSUMS=false` turns the check off, and so
+/// does `DOWNLOAD_VERIFY_SKIP_CLIENT_VERIFIED=oci` for this route only (#6468):
+/// every OCI client checks a blob against the digest it pulled.
 ///
 /// The `502` carries [`crate::storage::verify::IntegrityFailure`];
 /// `on_stream_mismatch` runs when a larger blob is the one found corrupt, after
@@ -7311,7 +7384,7 @@ async fn serve_stored_blob(
         ),
         (CONTENT_TYPE, "application/octet-stream".to_string()),
     ];
-    let verify = crate::storage::verify::serve_verification_enabled()
+    let verify = crate::storage::verify::serve_verification_enabled_for("oci")
         .then(|| crate::storage::verify::advertised_sha256(&base_headers))
         .flatten()
         .map(
@@ -7701,17 +7774,16 @@ async fn handle_get_blob(
             // #2894: offload the transfer to the object store with a 307 to a
             // presigned URL when enabled. A remote repo probes for the object
             // first, because a missing one is re-fetched from upstream below.
-            if let Some(mut redirect) = oci_blob_redirect::try_stored_blob_redirect(
+            if let Some(redirect) = oci_blob_redirect::try_stored_blob_redirect(
                 state,
                 storage.as_ref(),
                 &b.storage_key,
                 digest,
                 repo.repo_type == RepositoryType::Remote,
+                b.size_bytes,
             )
             .await
             {
-                // The transfer quota counts the blob when the URL is issued.
-                crate::services::quota::http::tag_presigned_download(&mut redirect, b.size_bytes);
                 return redirect;
             }
             // Stream the blob straight from the backend instead of buffering the
@@ -7792,6 +7864,7 @@ async fn handle_get_blob(
                         &storage_key,
                         digest,
                         false,
+                        size_bytes,
                     )
                     .await
                     {
@@ -12147,8 +12220,7 @@ pub(crate) fn manifest_gate_serves_referrer(
     now: chrono::DateTime<chrono::Utc>,
 ) -> bool {
     use crate::services::proxy_scan_service::{
-        decide_serve, verdict_is_reusable, ProxyScanAction, ProxyScanRow, ServeDecision,
-        VERDICT_CLEAN,
+        decide_serve, ProxyScanAction, ProxyScanRow, ServeDecision, VERDICT_CLEAN,
     };
     let ttl = crate::services::scanner_service::DEDUP_TTL_DAYS as i64;
     let row = match (&referrer.verdict, referrer.scanned_at) {
@@ -12169,9 +12241,11 @@ pub(crate) fn manifest_gate_serves_referrer(
     };
     match posture {
         ReferrerPosture::Unknown => false,
+        // No DB-update grace (#6300) for hosted content: nothing queues a
+        // re-grade of it, so only a verdict from the live build counts.
         ReferrerPosture::Hosted => row.is_some_and(|r| {
             r.verdict == VERDICT_CLEAN
-                && verdict_is_reusable(
+                && crate::services::proxy_scan_service::verdict_is_reusable_under(
                     &r.verdict,
                     r.scanned_at,
                     r.scanner_version.as_deref(),
@@ -12179,6 +12253,8 @@ pub(crate) fn manifest_gate_serves_referrer(
                     ProxyScanAction::FailClosed,
                     ttl,
                     now,
+                    None,
+                    false,
                 )
         }),
         ReferrerPosture::Proxy(action) => {
@@ -12350,10 +12426,19 @@ fn oci_manifest_synthetic_artifact(
 ///   what `spec.md` provides that member for — parity with the `reason` every
 ///   non-OCI format already reports.
 ///
-/// The status is fixed at 403: the shared seam's only block verdict is
-/// `curation_blocked_response`, which is unconditionally `FORBIDDEN`.
+/// A rule verdict is 403. An unreadable policy is not a verdict: the shared
+/// seam fails closed with `CurationBlock::unavailable`, rendered here as a
+/// retryable 503 so a `docker pull` during a database error is told to retry
+/// instead of reading a permanent denial
 /// Sibling of [`oci_scan_deny_response`].
 fn oci_curation_deny_response(block: &proxy_helpers::CurationBlock) -> Response {
+    if block.unavailable {
+        return oci_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "UNAVAILABLE",
+            "curation policy temporarily unavailable, retry shortly",
+        );
+    }
     oci_error_detail(
         StatusCode::FORBIDDEN,
         "DENIED",
@@ -13348,6 +13433,14 @@ fn mount_quota_refusal(
 ) -> Result<(), Option<Response>> {
     match decision {
         Ok(None) => Ok(()),
+        // A mount writes no bytes, so the disk threshold (#5191) does not
+        // refuse it. The disk check runs after every quota, so a disk denial
+        // means the mount fits them all.
+        Ok(Some(denial))
+            if denial.scope == crate::services::repository_service::QuotaScope::Disk =>
+        {
+            Ok(())
+        }
         Ok(Some(denial)) => Err(oci_quota_refusal(Ok(Some(denial)))),
         Err(e) => {
             tracing::warn!("blob mount quota check failed; falling back to an upload: {e}");
@@ -13598,16 +13691,7 @@ fn is_valid_replication_image_name(name: &str) -> bool {
 /// own digest (a by-digest child), or an OCI tag
 /// (`[A-Za-z0-9_][A-Za-z0-9._-]{0,127}`).
 fn is_valid_replication_reference(reference: &str, digest: &str) -> bool {
-    if reference == digest {
-        return true;
-    }
-    let bytes = reference.as_bytes();
-    !bytes.is_empty()
-        && bytes.len() <= 128
-        && (bytes[0].is_ascii_alphanumeric() || bytes[0] == b'_')
-        && bytes
-            .iter()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    reference == digest || is_valid_oci_tag(reference)
 }
 
 /// Receive one image blob from a replication peer (#4790).
@@ -14022,6 +14106,17 @@ async fn handle_put_manifest(
             StatusCode::CONFLICT,
             "DENIED",
             "Direct uploads are disabled for this repository; publish via promotion",
+        );
+    }
+    // #5869: a reference that is neither a digest nor a valid tag is refused
+    // before anything is read or stored, so `tags/list` never advertises a
+    // name no conforming client can pull or delete.
+    if !manifest_put_reference_is_valid(reference) {
+        return oci_error(
+            StatusCode::BAD_REQUEST,
+            "TAG_INVALID",
+            "manifest reference must be a digest or a tag matching \
+             [a-zA-Z0-9_][a-zA-Z0-9._-]{0,127}",
         );
     }
     let repo_id = repo.id;
@@ -14627,6 +14722,15 @@ async fn fetch_upstream_tags_page(
             "NAME_UNKNOWN",
             "repository not found upstream",
         ),
+        // #6417: an upstream that could not answer is the retryable 503,
+        // marked so a virtual's tag walk can tell it from a refusal.
+        _ if upstream_error_is_unavailable(&resp) => {
+            let mut unavailable = oci_member_unavailable();
+            unavailable
+                .extensions_mut()
+                .insert(proxy_helpers::MemberUnavailable);
+            unavailable
+        }
         _ => oci_error(
             StatusCode::BAD_GATEWAY,
             "UNKNOWN",
@@ -14782,14 +14886,12 @@ async fn tags_list_remote(
 ///
 /// `auth` is the CALLER. Members are narrowed through the same member
 /// visibility filter `resolve_virtual_manifest` and `resolve_virtual_blob`
-/// apply (#3268 review F2): a member contributes its tags when it is public
-/// or the caller holds *any* grant on it (a role assignment or any
-/// fine-grained rule, regardless of the actions it carries), and it passes
-/// the token-scope ceiling. That is deliberately the shared predicate, not a
-/// new one — note it is coarser than the direct read gate, which requires the
-/// `read` action: a principal holding only a write-scoped rule on a private
-/// member is refused a direct tags/list of it but does see its tags here.
-/// Anonymous and ungranted callers see public members only. A denied member
+/// apply (#3268 review F2): a member contributes its tags when it is public,
+/// or when the caller may READ it (the same `check_repository_action` `read`
+/// decision the direct `/v2` read gate makes, #3325) and it passes the
+/// token-scope ceiling. A principal holding only a write-scoped rule on a
+/// private member sees none of its tags here, exactly as a direct tags/list
+/// of it is refused. Anonymous and ungranted callers see public members only. A denied member
 /// contributes nothing, which reads as "no tags there" and leaks neither tag
 /// names nor member existence. Tag pages are computed per request and never
 /// enter the shared negative cache, so there is no principal-independence
@@ -14841,25 +14943,50 @@ async fn tags_list_virtual(
                     )
                     .await
                 } else {
+                    // #6417: a member whose own lookup failed could not
+                    // answer; it is not a member without the image.
                     tags_list_local(&state.db, member_id, &image, member_cursor, member_limit)
                         .await
-                        .ok()
                         .map(|page| page.tags)
+                        .map_err(|_| true)
                 }
             }
         })
         .collect();
 
-    let tag_sets: Vec<Vec<String>> = futures::future::join_all(handles)
-        .await
-        .into_iter()
-        .flatten()
-        .collect();
+    let mut tag_sets: Vec<Vec<String>> = Vec::new();
+    let mut unavailable = false;
+    for contribution in futures::future::join_all(handles).await {
+        match contribution {
+            Ok(tags) => tag_sets.push(tags),
+            Err(member_unavailable) => unavailable |= member_unavailable,
+        }
+    }
+    let merged = merge_and_dedup_tags(tag_sets);
+    virtual_tags_walk_result(merged, unavailable)
+}
 
-    Ok(merge_and_dedup_tags(tag_sets))
+/// The tag list of a virtual walk (#6417): the merged tags, or, when no
+/// member contributed one and a member could not answer, the retryable
+/// `503 UNAVAILABLE` + `Retry-After` instead of the empty page the caller
+/// answers `404 NAME_UNKNOWN` (#5504). A member that answered keeps the
+/// merge: its tags are served.
+#[allow(clippy::result_large_err)]
+fn virtual_tags_walk_result(
+    merged: Vec<String>,
+    unavailable: bool,
+) -> Result<Vec<String>, Response> {
+    if merged.is_empty() && unavailable {
+        return Err(oci_member_unavailable());
+    }
+    Ok(merged)
 }
 
 /// Fetch tags from a single remote virtual member via upstream proxy.
+///
+/// `Err(true)` when the member could not answer (#6417: an upstream 5xx or
+/// 429, a transport failure), `Err(false)` for any other failure (a 404, a
+/// refusal, an unparseable page), which reads as "no tags there".
 async fn fetch_tags_from_remote_member(
     state: &SharedState,
     member_id: Uuid,
@@ -14868,8 +14995,8 @@ async fn fetch_tags_from_remote_member(
     image_name: &str,
     n_limit: usize,
     last: Option<&str>,
-) -> Option<Vec<String>> {
-    let upstream_url = upstream_url?;
+) -> Result<Vec<String>, bool> {
+    let upstream_url = upstream_url.ok_or(false)?;
     let image = normalize_docker_image(image_name, upstream_url);
     let ctx = TagsFetchCtx {
         state,
@@ -14878,15 +15005,16 @@ async fn fetch_tags_from_remote_member(
         upstream_url,
         image: &image,
     };
-    let (tags, upstream_has_more) = collect_upstream_tags(&ctx, n_limit, last)
-        .await
-        .map_err(|_| {
-            tracing::debug!(
-                "Virtual member '{}': upstream tags/list failed, skipping",
-                member_key
-            );
-        })
-        .ok()?;
+    let (tags, upstream_has_more) =
+        collect_upstream_tags(&ctx, n_limit, last)
+            .await
+            .map_err(|resp| {
+                tracing::debug!(
+                    "Virtual member '{}': upstream tags/list failed, skipping",
+                    member_key
+                );
+                proxy_helpers::is_member_unavailable_response(&resp)
+            })?;
 
     tracing::debug!(
         "Virtual member '{}': fetched {} tags from upstream (has_more={})",
@@ -14894,7 +15022,7 @@ async fn fetch_tags_from_remote_member(
         tags.len(),
         upstream_has_more
     );
-    Some(tags)
+    Ok(tags)
 }
 
 // ---------------------------------------------------------------------------
@@ -15002,6 +15130,77 @@ const REFERRERS_SQL: &str = r#"
     ORDER BY s.created_at, s.manifest_digest
 "#;
 
+/// The referrers of `digest` in one non-virtual repository, as a direct
+/// `referrers` request on it lists them.
+async fn repo_referrer_rows(
+    state: &SharedState,
+    repo: &OciRepoInfo,
+    digest: &str,
+) -> Result<Vec<ReferrerRow>, sqlx::Error> {
+    let rows = sqlx::query_as::<_, ReferrerRow>(REFERRERS_SQL)
+        .bind(repo.id)
+        .bind(digest)
+        .fetch_all(&state.db)
+        .await?;
+    // #5793: on a hosted repository a referrer is listed under `<name>` only
+    // when it resolves under that image, as a pull of it by digest would.
+    if !stores_own_manifests(&repo.repo_type) {
+        return Ok(rows);
+    }
+    let mut scoped = Vec::with_capacity(rows.len());
+    for row in rows {
+        if resolve_hosted_digest(state, repo, &row.manifest_digest)
+            .await?
+            .is_some()
+        {
+            scoped.push(row);
+        }
+    }
+    Ok(scoped)
+}
+
+/// The referrers of `digest` through a Virtual repository (#5792): the
+/// referrers of every member the CALLER may read, in member priority order,
+/// each descriptor listed once (the first member that lists a digest wins).
+///
+/// `auth` is the CALLER. Members are narrowed through the same
+/// [`proxy_helpers::try_authorize_virtual_members`] filter the manifest, blob
+/// and tags walks apply (#3268 review F2), so a member the caller may not read
+/// contributes nothing and its existence is not leaked. The fallible form is
+/// used because the result is aggregated: a failed member query is answered
+/// as a server error, not as an empty index. Each member is read exactly as a
+/// direct `referrers` request on it would be ([`repo_referrer_rows`]); the
+/// expansion already flattens nested Virtual members into their leaves.
+async fn virtual_referrer_rows(
+    state: &SharedState,
+    repo: &OciRepoInfo,
+    auth: Option<&crate::api::middleware::auth::AuthExtension>,
+    digest: &str,
+) -> Result<Vec<ReferrerRow>, Response> {
+    let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id)
+        .await
+        .map_err(|resp| oci_db_error_from(&resp))?;
+    let members = proxy_helpers::try_authorize_virtual_members(&state.db, auth, repo.id, members)
+        .await
+        .map_err(|resp| oci_db_error_from(&resp))?;
+    let mut seen = std::collections::HashSet::new();
+    let mut merged = Vec::new();
+    for member in &members {
+        if member.repo_type == RepositoryType::Virtual {
+            continue;
+        }
+        let member_repo = oci_repo_info_from_member(member, &repo.image);
+        let rows = repo_referrer_rows(state, &member_repo, digest)
+            .await
+            .map_err(|e| oci_db_error(&e))?;
+        merged.extend(
+            rows.into_iter()
+                .filter(|row| seen.insert(row.manifest_digest.clone())),
+        );
+    }
+    Ok(merged)
+}
+
 /// `GET /v2/<name>/referrers/<digest>` (distribution-spec 1.1, #3108).
 ///
 /// Returns an image index whose `manifests` are descriptors of every manifest
@@ -15012,8 +15211,10 @@ const REFERRERS_SQL: &str = r#"
 /// principals.
 ///
 /// Subject edges are recorded at manifest-PUT time (hosted repos, the only
-/// ones that accept pushes), so Remote/Virtual repositories answer from the
-/// same local table — typically the empty index.
+/// ones that accept pushes), so a Remote repository answers from the same
+/// local table — typically the empty index. A Virtual repository owns no
+/// rows: it answers the merged referrers of its members (#5792), see
+/// [`virtual_referrer_rows`].
 async fn handle_referrers(
     state: &SharedState,
     headers: &HeaderMap,
@@ -15022,8 +15223,7 @@ async fn handle_referrers(
     digest: &str,
     query: &std::collections::HashMap<String, String>,
 ) -> Response {
-    let (repo, _claims) = match authorize_oci_repo_read(state, headers, base_url, image_name).await
-    {
+    let (repo, claims) = match authorize_oci_repo_read(state, headers, base_url, image_name).await {
         Ok(v) => v,
         Err(resp) => return resp,
     };
@@ -15036,29 +15236,19 @@ async fn handle_referrers(
         );
     }
 
-    let rows = match sqlx::query_as::<_, ReferrerRow>(REFERRERS_SQL)
-        .bind(repo.id)
-        .bind(digest)
-        .fetch_all(&state.db)
-        .await
-    {
-        Ok(rows) => rows,
-        Err(e) => return oci_db_error(&e),
-    };
-    // #5793: on a hosted repository a referrer is listed under `<name>` only
-    // when it resolves under that image, as a pull of it by digest would.
-    let rows = if stores_own_manifests(&repo.repo_type) {
-        let mut scoped = Vec::with_capacity(rows.len());
-        for row in rows {
-            match resolve_hosted_digest(state, &repo, &row.manifest_digest).await {
-                Ok(Some(_)) => scoped.push(row),
-                Ok(None) => {}
-                Err(e) => return oci_db_error(&e),
-            }
+    let rows = if repo.repo_type == RepositoryType::Virtual {
+        // The read gate above authorizes the Virtual PARENT only; the member
+        // set is narrowed to what this caller may read (#3268 review F2).
+        let auth = virtual_caller_auth(claims.as_ref());
+        match virtual_referrer_rows(state, &repo, auth.as_ref(), digest).await {
+            Ok(rows) => rows,
+            Err(resp) => return resp,
         }
-        scoped
     } else {
-        rows
+        match repo_referrer_rows(state, &repo, digest).await {
+            Ok(rows) => rows,
+            Err(e) => return oci_db_error(&e),
+        }
     };
 
     let filter = query.get("artifactType").map(|s| s.as_str());
@@ -16952,6 +17142,7 @@ mod tests {
         let resp = oci_curation_deny_response(&proxy_helpers::CurationBlock {
             package: "someimage".to_string(),
             reason: "blocked by test rule".to_string(),
+            unavailable: false,
         });
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
         let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
@@ -16981,6 +17172,24 @@ mod tests {
             parsed["errors"][0]["detail"]["package"].as_str(),
             Some("someimage"),
             "detail must carry the blocked package: {parsed}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_oci_curation_unavailable_is_a_retryable_503() {
+        // docker and containerd treat 403 as final, so an unreadable policy
+        // must not look like a rule verdict. It is not an allow either
+        let resp =
+            oci_curation_deny_response(&proxy_helpers::CurationBlock::unavailable("someimage"));
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(resp.headers().contains_key(axum::http::header::RETRY_AFTER));
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&body).expect("OCI error body must be valid JSON");
+        assert_eq!(parsed["errors"][0]["code"].as_str(), Some("UNAVAILABLE"));
+        assert!(
+            parsed["errors"][0]["detail"].is_null(),
+            "no rule fired, so no rule detail: {parsed}"
         );
     }
 
@@ -19552,6 +19761,44 @@ mod tests {
         let sets: Vec<Vec<String>> = vec![vec![], vec![]];
         let merged = merge_and_dedup_tags(sets);
         assert!(merged.is_empty());
+    }
+
+    /// #6417: a virtual tag walk with no tags and an unavailable member is
+    /// the retryable 503, not the empty page answered `404 NAME_UNKNOWN`; a
+    /// member that answered keeps the merge, and an empty walk with every
+    /// member answering stays empty.
+    #[test]
+    fn test_virtual_tags_walk_result_6417() {
+        let down = virtual_tags_walk_result(vec![], true).expect_err("an outage is an error");
+        assert_eq!(down.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(down.headers().contains_key(axum::http::header::RETRY_AFTER));
+        assert_eq!(
+            virtual_tags_walk_result(vec!["v1".to_string()], true).unwrap(),
+            vec!["v1".to_string()]
+        );
+        assert!(virtual_tags_walk_result(vec![], false).unwrap().is_empty());
+    }
+
+    /// #6417: only an upstream that could not answer is unavailable: not a
+    /// 404, not an unmarked failure, and not the token endpoint's permanent
+    /// refusal (#4527) though it carries the marker.
+    #[test]
+    fn test_upstream_error_is_unavailable_6417() {
+        assert!(upstream_error_is_unavailable(
+            &proxy_helpers::member_unavailable_response()
+        ));
+        let miss = (StatusCode::NOT_FOUND, "miss").into_response();
+        assert!(!upstream_error_is_unavailable(&miss));
+        let refused = (StatusCode::BAD_GATEWAY, "refused").into_response();
+        assert!(!upstream_error_is_unavailable(&refused));
+        let mut token = (StatusCode::BAD_GATEWAY, "token").into_response();
+        token
+            .extensions_mut()
+            .insert(proxy_helpers::MemberUnavailable);
+        token
+            .extensions_mut()
+            .insert(proxy_helpers::TokenEndpointRefusal);
+        assert!(!upstream_error_is_unavailable(&token));
     }
 
     #[test]
@@ -25293,15 +25540,12 @@ mod manifest_digest_db_tests {
         .await
         .expect("count refs");
 
-        let _ = sqlx::query(sqlx::AssertSqlSafe(&*format!(
-            "DROP TRIGGER IF EXISTS {trigger_name} ON manifest_blob_refs"
-        )))
-        .execute(&fx.pool)
-        .await;
-        let _ = sqlx::query(sqlx::AssertSqlSafe(&*format!(
-            "DROP FUNCTION IF EXISTS {function_name}()"
-        )))
-        .execute(&fx.pool)
+        crate::api::handlers::test_db_helpers::drop_test_trigger(
+            &fx.pool,
+            "manifest_blob_refs",
+            &trigger_name,
+            &function_name,
+        )
         .await;
         cleanup(&fx).await;
 
@@ -26929,18 +27173,13 @@ mod oci_blob_upload_streaming_tests {
         }
 
         async fn drop(self, pool: &PgPool) {
-            let drop_trigger = format!(
-                "DROP TRIGGER IF EXISTS {} ON {}",
-                self.trigger_name, self.table
-            );
-            let _ = sqlx::query(sqlx::AssertSqlSafe(&*drop_trigger))
-                .execute(pool)
-                .await;
-
-            let drop_function = format!("DROP FUNCTION IF EXISTS {}()", self.function_name);
-            let _ = sqlx::query(sqlx::AssertSqlSafe(&*drop_function))
-                .execute(pool)
-                .await;
+            crate::api::handlers::test_db_helpers::drop_test_trigger(
+                pool,
+                self.table,
+                &self.trigger_name,
+                &self.function_name,
+            )
+            .await;
         }
 
         async fn create(pool: &PgPool, table: &'static str) -> Self {
@@ -27521,18 +27760,13 @@ mod oci_blob_upload_streaming_tests {
     }
 
     async fn drop_reject_blob_insert_trigger(pool: &PgPool, trigger_name: &str) {
-        sqlx::query(sqlx::AssertSqlSafe(&*format!(
-            "DROP TRIGGER IF EXISTS {trigger_name} ON oci_blobs"
-        )))
-        .execute(pool)
-        .await
-        .expect("drop reject-blob trigger");
-        sqlx::query(sqlx::AssertSqlSafe(&*format!(
-            "DROP FUNCTION IF EXISTS {trigger_name}_fn()"
-        )))
-        .execute(pool)
-        .await
-        .expect("drop reject-blob function");
+        crate::api::handlers::test_db_helpers::drop_test_trigger(
+            pool,
+            "oci_blobs",
+            trigger_name,
+            &format!("{trigger_name}_fn"),
+        )
+        .await;
     }
 
     /// Storage backend whose `copy` succeeds (so the `oci-blobs/<digest>`
@@ -29352,20 +29586,7 @@ mod oci_blob_upload_streaming_tests {
 
         // Drop the injected trigger so it cannot affect other tests sharing the
         // `oci_blobs` table.
-        sqlx::query(sqlx::AssertSqlSafe(&*format!(
-            "DROP TRIGGER IF EXISTS {trig} ON oci_blobs",
-            trig = storage.trigger_name
-        )))
-        .execute(&f.inner.pool)
-        .await
-        .expect("drop injected trigger");
-        sqlx::query(sqlx::AssertSqlSafe(&*format!(
-            "DROP FUNCTION IF EXISTS {trig}_fn()",
-            trig = storage.trigger_name
-        )))
-        .execute(&f.inner.pool)
-        .await
-        .expect("drop injected trigger function");
+        drop_reject_blob_insert_trigger(&f.inner.pool, &storage.trigger_name).await;
 
         f.teardown().await;
     }
@@ -35239,15 +35460,12 @@ mod proxy_manifest_artifact_indexing_tests {
                 .expect("count refs");
 
         // Cleanup (trigger first, so the cascade delete on repositories works).
-        let _ = sqlx::query(sqlx::AssertSqlSafe(&*format!(
-            "DROP TRIGGER IF EXISTS {trigger_name} ON manifest_blob_refs"
-        )))
-        .execute(&pool)
-        .await;
-        let _ = sqlx::query(sqlx::AssertSqlSafe(&*format!(
-            "DROP FUNCTION IF EXISTS {function_name}()"
-        )))
-        .execute(&pool)
+        crate::api::handlers::test_db_helpers::drop_test_trigger(
+            &pool,
+            "manifest_blob_refs",
+            &trigger_name,
+            &function_name,
+        )
         .await;
         let _ = sqlx::query("DELETE FROM oci_tags WHERE repository_id = $1")
             .bind(repo_id)
@@ -37045,6 +37263,54 @@ mod cross_repo_session_regression_tests {
             .bind(repo_id)
             .execute(&pool)
             .await;
+        cleanup_all(&pool, &[repo_id], user_id, &[storage_dir]).await;
+    }
+
+    /// #5869: a manifest PUT whose reference is neither a digest nor a valid
+    /// tag is refused with 400 `TAG_INVALID` and stores nothing, instead of
+    /// answering 201 and advertising a name no conforming client can address.
+    #[tokio::test]
+    async fn manifest_put_with_an_invalid_tag_is_refused_5869() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username, password) = create_pushable_user(&pool).await;
+        let (repo_id, repo_key, storage_dir) =
+            create_typed_oci_repo(&pool, "local", "tag5869").await;
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let auth = basic_auth(&username, &password);
+
+        let too_long = "x".repeat(129);
+        for bad in [
+            "bad%21tag",
+            "-lead",
+            ".lead",
+            "a%20b",
+            "Spatny%3ATag",
+            too_long.as_str(),
+        ] {
+            let manifest = br#"{"config":{"digest":"sha256:cfg"},"layers":[]}"#.to_vec();
+            let req = Request::builder()
+                .method("PUT")
+                .uri(format!("/{}/myimage/manifests/{}", repo_key, bad))
+                .header("Authorization", &auth)
+                .header("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+                .body(Body::from(manifest))
+                .unwrap();
+            let (status, body) = tdh::send(router(None).with_state(state.clone()), req).await;
+            let body = String::from_utf8_lossy(&body);
+            assert_eq!(status, StatusCode::BAD_REQUEST, "tag {bad:?}: {body}");
+            assert!(body.contains("TAG_INVALID"), "tag {bad:?}: {body}");
+        }
+
+        let tag_rows: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM oci_tags WHERE repository_id = $1")
+                .bind(repo_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(tag_rows, 0, "an invalid tag must not be stored");
+
         cleanup_all(&pool, &[repo_id], user_id, &[storage_dir]).await;
     }
 
@@ -46611,6 +46877,62 @@ mod virtual_scan_gate_tests {
 
     // Review: the manifest push-by-digest integrity guard (previously untested).
     #[test]
+    fn test_oci_tag_grammar_5869() {
+        for ok in [
+            "latest",
+            "v1.0.0",
+            "_private",
+            "0",
+            "a",
+            "UPPER",
+            "my-tag_1.2",
+            &"x".repeat(128),
+        ] {
+            assert!(is_valid_oci_tag(ok), "{ok} is a valid tag");
+        }
+        for bad in [
+            "",
+            "-lead",
+            ".lead",
+            "bad!tag",
+            "a b",
+            "a%20b",
+            "bad%21tag",
+            "Spatny%3ATag",
+            "a:b",
+            "a/b",
+            "tag+plus",
+            &"x".repeat(129),
+        ] {
+            assert!(!is_valid_oci_tag(bad), "{bad:?} is not a valid tag");
+        }
+    }
+
+    #[test]
+    fn test_manifest_put_reference_is_valid_5869() {
+        assert!(manifest_put_reference_is_valid("latest"));
+        assert!(manifest_put_reference_is_valid(&format!(
+            "sha256:{}",
+            "a".repeat(64)
+        )));
+        // A mismatching sha256 reference is refused later with DIGEST_INVALID,
+        // so it is not a TAG_INVALID here.
+        assert!(manifest_put_reference_is_valid("sha256:deadbeef"));
+        for bad in ["-lead", "bad!tag", "sha512:abc", "a:b", ""] {
+            assert!(!manifest_put_reference_is_valid(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn test_replication_reference_still_accepts_its_digest_and_tags_5869() {
+        let d = "sha256:abc";
+        assert!(is_valid_replication_reference(d, d));
+        assert!(is_valid_replication_reference("v1", d));
+        assert!(!is_valid_replication_reference("-bad", d));
+        assert!(!is_valid_replication_reference("", d));
+    }
+
+    #[test]
     fn test_manifest_digest_reference_matches() {
         let d = "sha256:abcdef";
         assert!(
@@ -49631,6 +49953,222 @@ mod oci_read_authz_tests {
              members' tags through the virtual — the filter narrows to the \
              caller's visible members, it does not deny everyone; got {granted_tags:?}"
         );
+    }
+
+    /// #5792: `GET /v2/<virtual>/<image>/referrers/<digest>` answered an empty
+    /// index, because the Virtual itself owns no `oci_manifest_subjects`
+    /// rows and its members were never consulted, so `oras discover` listed
+    /// nothing and cosign v3 (new bundle format) found no signature through
+    /// the Virtual. It now merges the referrers of the members the caller may
+    /// read, in member order, each digest once, with the `artifactType` filter
+    /// and `OCI-Filters-Applied` applied to the merged list.
+    ///
+    /// Fixture: a PUBLIC Virtual over the PRIVATE fixture repo (priority 1)
+    /// and a PUBLIC hosted repo (priority 2). The same signature referrer is
+    /// pushed into both (dedupe), an SBOM only into the private member, and a
+    /// second SBOM only into the public member.
+    #[tokio::test]
+    async fn virtual_referrers_merge_readable_members_5792() {
+        const SIG_TYPE: &str = "application/vnd.example.sig";
+        const SBOM_TYPE: &str = "application/vnd.example.sbom";
+
+        fn referrer(artifact_type: &str, subject: &str, marker: &str) -> Vec<u8> {
+            serde_json::to_vec(&serde_json::json!({
+                "schemaVersion": 2,
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "artifactType": artifact_type,
+                "config": {"mediaType": "application/vnd.oci.empty.v1+json",
+                           "digest": format!("sha256:{}", "6".repeat(64)), "size": 2},
+                "layers": [{"mediaType": "application/vnd.example.layer",
+                            "digest": format!("sha256:{}", "7".repeat(64)), "size": 2}],
+                "subject": {"mediaType": "application/vnd.oci.image.manifest.v1+json",
+                            "digest": subject, "size": 100},
+                "annotations": {"org.example.marker": marker},
+            }))
+            .unwrap()
+        }
+
+        fn digests(body: &Bytes) -> Vec<String> {
+            let index: serde_json::Value = serde_json::from_slice(body).expect("index json");
+            index["manifests"]
+                .as_array()
+                .expect("manifests array")
+                .iter()
+                .map(|d| d["digest"].as_str().unwrap().to_string())
+                .collect()
+        }
+
+        let Some(mut f) = ReadFixture::setup().await else {
+            return;
+        };
+        let (public_id, public_key, public_dir) =
+            tdh::create_repo(&f.pool, "local", "docker").await;
+        let (virt_id, virt_key, virt_dir) = tdh::create_repo(&f.pool, "virtual", "docker").await;
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = ANY($1)")
+            .bind(vec![public_id, virt_id])
+            .execute(&f.pool)
+            .await
+            .expect("publish member + virtual");
+        for (member, priority) in [(f.repo_id, 1i32), (public_id, 2i32)] {
+            sqlx::query(
+                "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+                 VALUES ($1, $2, $3)",
+            )
+            .bind(virt_id)
+            .bind(member)
+            .bind(priority)
+            .execute(&f.pool)
+            .await
+            .expect("link virtual member");
+        }
+
+        let subject = format!("sha256:{}", "5".repeat(64));
+        let sig = referrer(SIG_TYPE, &subject, "shared-sig");
+        let private_sbom = referrer(SBOM_TYPE, &subject, "private-sbom");
+        let public_sbom = referrer(SBOM_TYPE, &subject, "public-sbom");
+        let (sig_d, private_sbom_d, public_sbom_d) = (
+            compute_sha256(&sig),
+            compute_sha256(&private_sbom),
+            compute_sha256(&public_sbom),
+        );
+
+        let admin = f.add_user(true).await;
+        let admin_bearer = f.bearer(admin).await;
+        for (key, body) in [
+            (&f.repo_key, &sig),
+            (&f.repo_key, &private_sbom),
+            (&public_key, &sig),
+            (&public_key, &public_sbom),
+        ] {
+            let req = Request::builder()
+                .method("PUT")
+                .uri(format!(
+                    "/{}/{}/manifests/{}",
+                    key,
+                    IMAGE,
+                    compute_sha256(body)
+                ))
+                .header(AUTHORIZATION, &admin_bearer)
+                .header(CONTENT_TYPE, "application/vnd.oci.image.manifest.v1+json")
+                .body(Body::from(body.clone()))
+                .unwrap();
+            let (status, resp_body) =
+                tdh::send(router(None).with_state(f.state.clone()), req).await;
+            assert_eq!(
+                status,
+                StatusCode::CREATED,
+                "push referrer into {key}: {}",
+                String::from_utf8_lossy(&resp_body)
+            );
+        }
+
+        let path = format!("/{}/{}/referrers/{}", virt_key, IMAGE, subject);
+        let filtered_path = format!("{path}?artifactType=application%2Fvnd.example.sbom");
+        let anon = format!("Bearer {ANONYMOUS_TOKEN}");
+        let outsider = f.add_user(false).await;
+        let outsider_bearer = f.bearer(outsider).await;
+        let member_bearer = f.bearer(f.member_id).await;
+        // A grant without `read` on the private member (#3325).
+        let write_only = f.add_user(false).await;
+        tdh::grant_repo_actions(&f.pool, f.repo_id, write_only, &["write"]).await;
+        let write_only_bearer = f.bearer(write_only).await;
+
+        let (granted, granted_body, granted_headers) = f
+            .call_with_headers("GET", path.clone(), &member_bearer)
+            .await;
+        let (filtered, filtered_body, filtered_headers) = f
+            .call_with_headers("GET", filtered_path, &member_bearer)
+            .await;
+        let (anon_status, anon_body, _) = f.call_with_headers("GET", path.clone(), &anon).await;
+        let (outsider_status, outsider_body, _) = f
+            .call_with_headers("GET", path.clone(), &outsider_bearer)
+            .await;
+        let (write_only_status, write_only_body, _) = f
+            .call_with_headers("GET", path.clone(), &write_only_bearer)
+            .await;
+        let (direct, direct_body, _) = f
+            .call_with_headers(
+                "GET",
+                format!("/{}/{}/referrers/{}", public_key, IMAGE, subject),
+                &anon,
+            )
+            .await;
+
+        let _ = sqlx::query("DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1")
+            .bind(virt_id)
+            .execute(&f.pool)
+            .await;
+        for repo in [f.repo_id, public_id] {
+            for table in ["oci_manifest_subjects", "manifest_blob_refs", "artifacts"] {
+                let _ = sqlx::query(sqlx::AssertSqlSafe(&*format!(
+                    "DELETE FROM {table} WHERE repository_id = $1"
+                )))
+                .bind(repo)
+                .execute(&f.pool)
+                .await;
+            }
+        }
+        let _ = sqlx::query("DELETE FROM oci_tags WHERE repository_id = $1")
+            .bind(public_id)
+            .execute(&f.pool)
+            .await;
+        for repo in [public_id, virt_id] {
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(repo)
+                .execute(&f.pool)
+                .await;
+        }
+        let _ = std::fs::remove_dir_all(&public_dir);
+        let _ = std::fs::remove_dir_all(&virt_dir);
+        f.teardown().await;
+
+        assert_eq!(direct, StatusCode::OK);
+        assert_eq!(
+            digests(&direct_body),
+            vec![sig_d.clone(), public_sbom_d.clone()],
+            "control: the hosted member lists its referrers directly"
+        );
+
+        assert_eq!(granted, StatusCode::OK);
+        assert_eq!(
+            granted_headers.get(CONTENT_TYPE).unwrap(),
+            OCI_INDEX_MEDIA_TYPE
+        );
+        assert!(
+            granted_headers.get("OCI-Filters-Applied").is_none(),
+            "no artifactType param, no OCI-Filters-Applied header"
+        );
+        assert_eq!(
+            digests(&granted_body),
+            vec![sig_d.clone(), private_sbom_d.clone(), public_sbom_d.clone()],
+            "the Virtual must list its members' referrers in member order, the \
+             signature both members hold once (#5792)"
+        );
+
+        assert_eq!(filtered, StatusCode::OK);
+        assert_eq!(
+            filtered_headers.get("OCI-Filters-Applied").unwrap(),
+            "artifactType"
+        );
+        assert_eq!(
+            digests(&filtered_body),
+            vec![private_sbom_d.clone(), public_sbom_d.clone()],
+            "the artifactType filter applies to the merged list"
+        );
+
+        for (who, status, body) in [
+            ("anonymous", anon_status, &anon_body),
+            ("ungranted", outsider_status, &outsider_body),
+            ("write-only", write_only_status, &write_only_body),
+        ] {
+            assert_eq!(status, StatusCode::OK, "{who} lists the public Virtual");
+            assert_eq!(
+                digests(body),
+                vec![sig_d.clone(), public_sbom_d.clone()],
+                "a {who} caller sees only the public member's referrers, never \
+                 the private member's"
+            );
+        }
     }
 
     /// #3325, driven end-to-end through the real `tags/list` route: a grant

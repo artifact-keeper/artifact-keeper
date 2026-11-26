@@ -92,6 +92,15 @@ The legacy migration-repair routines (`repair_legacy_073_checksum` and friends)
 run *ahead* of the `SKIP_MIGRATIONS` gate and still run. They no-op on a healthy
 database, which is what makes running them unconditionally safe.
 
+### Rolling back without skipping migrations (1.13 and later)
+
+From 1.13 an older binary can also start with `MIGRATIONS_IGNORE_MISSING=true`
+instead. It still applies its own pending migrations and checks its ledger,
+ignores newer expand migrations and newer contracts of expands it already has,
+and refuses to start on a newer contract migration
+(`NNN_contract_of_MMM_<what>.sql`) whose expand MMM is newer than it. See "Rolling deploys: expand,
+then contract" in `docs/operations/online-migrations.md`.
+
 ### Rolling forward again
 
 Remove the flag and start the newer image. The migrations the newer binary
@@ -162,6 +171,18 @@ line.
 | Migration | Introduced in | Older binaries affected | What breaks | Way back |
 |---|---|---|---|---|
 | `243_oci_cleanup_keys_per_repository` (#3851) | 1.11.0 | 1.10.x and older | Every OCI and Docker push (upload POST, PATCH and PUT). The migration replaced `UNIQUE (storage_key)` on `oci_upload_cleanup_keys` with `UNIQUE (repository_id, storage_key)`; the 1.10.x upload path registers cleanup keys with `ON CONFLICT (storage_key)` and fails with `there is no unique or exclusion constraint matching the ON CONFLICT specification`. Pulls and the other formats are not affected. | Stay on 1.11.x, or restore a pre-1.11.0 backup. Re-adding the old constraint is not a fix: it fails once two repositories hold rows for one key, and where it succeeds it brings back the cross-repository push failure #3851 fixed (#4915). |
+
+### Rolling back across `414_row_count_deltas` (1.13.0)
+
+This rollback is not broken, but it needs upkeep. The migration's triggers keep appending one row to `row_count_deltas` per write statement on `artifacts`, `proxy_cache_artifacts`, `download_statistics` and `proxy_download_statistics`. Only a 1.13.0+ binary compacts that table, so on an older release it grows without limit. Fold it periodically, for example daily:
+
+```sql
+WITH gone AS (DELETE FROM row_count_deltas RETURNING table_name, delta)
+INSERT INTO row_count_deltas (table_name, delta)
+SELECT table_name, SUM(delta) FROM gone GROUP BY table_name;
+```
+
+Every count stays exact. Do not drop the triggers: rolling forward again does not re-run the migration, and without them `/admin/stats` would be correct only right after each daily true-up.
 
 When a later migration is found to break a rollback, add a row here and a line
 to that release's upgrade notes in `CHANGELOG.md`.

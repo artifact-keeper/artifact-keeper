@@ -305,6 +305,14 @@ names the same commit.
    PR merged failed on "Docker Publish for HEAD is still 'pending'" (run
    36862392025, v1.10.2).
 
+   Main pushes coalesce in Docker Publish (#6242): if another PR merges
+   while the prep commit's run is still waiting, GitHub replaces that run
+   (cancelled, no jobs) and only the newest commit builds. You need not
+   freeze main for this. The candidate sees the cancelled run, re-runs it
+   (`gh run rerun`: the same push run, so the same signing identity), and
+   waits for it; a re-run is never replaced. To get the images without a
+   candidate, `gh run rerun <id>` does the same by hand.
+
    ```bash
    gh workflow run release-candidate.yml --repo artifact-keeper/artifact-keeper \
      --ref main                       # -f sha=<40-hex> to pick a commit that is not the tip
@@ -365,11 +373,13 @@ names the same commit.
    tag), the verifier anchors the adapter at that tag, and the promote's tag
    message and summary print the certified adapter digest and decision.
 
-   Until artifact-keeper-test#380 lands (tracked here as #4439), the
-   adapter's attestation is **provenance of what ships, not proof that the
-   gate exercised those bytes**: the Release Gate takes no adapter input and deploys the chart's
-   pinned adapter, for "new" and "stays" alike. The candidate exposes the
-   value to pass (`needs.images.outputs.adapter_image_ref`) for when it can.
+   The Release Gate runs **that** adapter, for "new" and "stays" alike
+   (#4439, artifact-keeper-test#380). The candidate passes the certified
+   tag and digest (`scanner_adapter_tag`, `scanner_adapter_digest`). The
+   gate's k8s stack deploys `<tag>@<digest>` in place of the chart's pinned
+   adapter and asserts that the adapter pod runs that digest. Its
+   candidate-adapter DTF tiers pull it by digest. The adapter's attestation
+   is therefore proof that the gate exercised those bytes.
 
    **Maintenance lines need the #4076 verifier before their next cut.**
    `release.yml` runs the *tagged* commit's copy of
@@ -380,8 +390,7 @@ names the same commit.
    predates #4076, with an error naming the line. To cut a patch on a
    `release/X.Y.x` whose adapter version is already published, first backport
    #4076 to that line (`scripts/ci/assert-candidate-certified.sh`, its
-   self-test, and main's current `release-candidate.yml`, which the line
-   needs byte-identical anyway), then certify the backport commit. A
+   self-test), then certify the backport commit. A
    `release-candidate-<sha>` artifact and a `release-candidate/certified`
    status on the commit are written for humans; the release path verifies
    the attestation (`scripts/ci/assert-candidate-certified.sh`, pinned to
@@ -430,7 +439,8 @@ names the same commit.
      Publish): there is nothing to rerun, and the rerun says so;
    - Docker Publish has rebuilt the commit's images since (the digests
      differ), the line's test branch moved with `tests=same`, or
-     `release-candidate.yml` changed on main since;
+     `release-candidate.yml` changed on main since (the record carries the
+     blob of the candidate workflow that ran, compared on the rerun);
    - the original started more than 72 hours ago (`RERUN_MAX_AGE_HOURS`):
      the gate's chart (`iac@main`), web image (`:latest`) and runners are not
      pinned between runs, so two runs' results only add up while they are
@@ -528,6 +538,26 @@ names the same commit.
    floating tags, #3770) at the manifest-list digest `:X.Y.Z` already names,
    and the job then asserts that both tags, on both registries, resolve to
    the digest the gate tested.
+
+   **The `publish/vX.Y.Z` branch (#6338).** `GITHUB_TOKEN` is refused
+   (`403 Resource not accessible by integration`) on Create Release when the
+   release commit is not the tip of any branch, which it stops being as soon
+   as anything merges to the line after certification (1.12.3). So the
+   promote creates `publish/vX.Y.Z` at the commit just before the tag,
+   `release.yml` re-creates it before Create Release if it is missing, and
+   removes it once the Release exists. A failed Create Release keeps the
+   branch for the re-run. If Create Release still gets a 403 (both pin
+   attempts warned), create the branch by hand and re-run the failed jobs:
+
+   ```bash
+   gh api -X POST repos/artifact-keeper/artifact-keeper/git/refs \
+     -f ref=refs/heads/publish/vX.Y.Z -f sha=<the release commit>
+   gh run rerun <release.yml run id> --failed
+   ```
+
+   Then delete the branch after the Release is published. A release from a
+   line whose `release.yml` predates #6338 (`release/1.11.x` until it is
+   backported) does not remove the branch: delete it by hand.
 
    Until the GitHub Release exists, `:latest` and `:X.Y` still point at the
    PREVIOUS release, and that is correct. A failure in a post-gate job
@@ -642,8 +672,12 @@ time a commit met that gate, so drift merged since the last cut (stale tests,
 timing races in tiers, runner tooling gaps) showed up one red candidate at a
 time: 8 of 10 candidates went red on 2026-11-15/16 (#6081). The **Nightly
 Release Gate** (`.github/workflows/nightly-release-gate.yml`, #6073) runs the
-same gate every night at 08:00 UTC on `main` and on every `release/X.Y.x`
-with a commit in the last 30 days, against the newest Docker Publish image
+same gate once a night on `main` and on every `release/X.Y.x` with a commit
+in the last 30 days (#6155: three scheduled triggers, 23:17, 03:17 and
+07:17 UTC, the first to arrive runs the gate and the others are backstops;
+GitHub has been starting them 7-9 hours late, so the gate usually starts
+around 07:00-08:40 UTC; a whole night took 52-71 minutes on 2026-11-17..21
+and a slow one runs about 4 hours), against the newest Docker Publish image
 of each, with the tests ref a candidate would use (`switch-tests-ref.sh`:
 the tests' `release/X.Y.x` when it exists, else the tests' `main`). Each red
 tier has one open issue (label `release-gate`, title `Nightly gate [<line>]:
@@ -690,7 +724,9 @@ either as one. Only the candidate's signed attestation certifies.
 - *No result.* Either the commit is newer than the last nightly run (cut
   from the commit check 8 names, or wait a night), or the nightly was
   pre-empted that night. The nightly gives way to any Release Candidate in
-  flight and records nothing for a night it did not finish.
+  flight and records nothing for a trigger it did not finish; the night's
+  next trigger, if any is left, tries again. Each scheduled run's `resolve`
+  job summary says how late GitHub started it.
 - To get a result sooner, dispatch the nightly by hand once no candidate is
   in flight: `gh workflow run nightly-release-gate.yml -f lines=<main|X.Y.x>
   -f track_issues=true`. It writes the status only for `test_suite=all`.
@@ -719,7 +755,8 @@ asked for the line. An **existing** line needs none of this — only creating
 one, and deleting one, do.
 
 **A line is created in both repositories (#4372).** The Release Gate is
-`artifact-keeper-test`'s `release-gate.yml@main`, and every job in it runs
+`artifact-keeper-test`'s `release-gate.yml`, pinned to one `main` commit
+(#6170), and every job in it runs
 that repository's `scripts/switch-tests-ref.sh` (artifact-keeper-test#420):
 when `artifact-keeper-test` has a `release/X.Y.x` for the candidate's
 version, the suite runs from that branch, otherwise from `main`. Without it,
@@ -750,12 +787,12 @@ test-branch creation is retried and how an older line gets one.
 ### Why the push is refused, and why that is not a bug
 
 Ruleset 20038606 ("Release branch protection") governs
-`refs/heads/release/[0-9]*.[0-9]*.x` with `pull_request`,
-`required_status_checks` — `✅ CI Complete` and `Verify commits trace back to
-main`, both pinned to app 15368, with `do_not_enforce_on_create: false` —
-`non_fast_forward`, `deletion`, and **no bypass actors**. A required status
-check cannot exist on a ref that does not exist yet, so the very push that
-would create the line is rejected:
+`refs/heads/release/[0-9]*.[0-9]*.x` with `pull_request` — currently requiring
+zero approvals, which #6216 proposes to raise — `required_status_checks` —
+`✅ CI Complete` and `Verify commits trace back to main`, both pinned to app
+15368, with `do_not_enforce_on_create: false` — `non_fast_forward`, `deletion`,
+and **no bypass actors**. A required status check cannot exist on a ref that
+does not exist yet, so the very push that would create the line is rejected:
 
 ```
 remote: error: GH013: Repository rule violations found for refs/heads/release/1.10.x.
@@ -786,7 +823,8 @@ same toggle every time, rather than a hand-typed improvisation during a cut.
 1. Refuses unless `gh` is authenticated as an **admin** of the repository and
    `git fetch origin` succeeds — every ancestry answer below is read from
    local refs, so a stale `origin/main` would make them lies rather than
-   checks.
+   checks — and warns, without stopping, when ruleset 20038606 has no second
+   approver (#6216). Raising that requirement is a maintainer decision.
 2. Derives the branch name as `release/<X.Y>.x` and refuses any other shape
    (see the next subsection), and refuses if it already exists.
 3. Resolves the root commit: by default the commit tagged `v<X.Y>.0`, and if
@@ -816,10 +854,11 @@ same toggle every time, rather than a hand-typed improvisation during a cut.
    seconds the ruleset spent in `evaluate`, and the test branch.
 
 `scripts/ci/test-create-release-line.sh` (in the `shell-tests` job) pins the
-refusals, the "`--dry-run` issues no PUT/POST" property, the restore-on-
-failure trap and the test-branch cases (created at the run's gate commit,
-left alone when it exists, created alone for an existing line), because none
-of them is exercised by a normal CI run.
+refusals, the warning for a ruleset with zero required approvals, the
+"`--dry-run` issues no PUT/POST" property, the restore-on-failure trap and the
+test-branch cases (created at the run's gate commit, left alone when it exists,
+created alone for an existing line), because none of them is exercised by a
+normal CI run.
 
 ### `release/1.9.1-prep` is not a release line
 
@@ -915,7 +954,7 @@ for at all, rather than being bounded by argument.
 
 Nothing in the workflow depended on the dispatched ref for this to work: the
 reusable Release Gate is an absolute cross-repository reference
-(`artifact-keeper-test/.../release-gate.yml@main`) that takes the images by
+(`artifact-keeper-test/.../release-gate.yml@<sha>`) that takes the images by
 digest, and no job needs the certified commit on disk (see "What runs from the
 certified commit" below — the answer is nothing).
 
@@ -935,25 +974,25 @@ records the resolved line as `certified_ref`, and the verifier asks the
 repository the same question again at promote time — a disagreement is never
 promoted.
 
-For a commit on a maintenance line the candidate also **blesses the content**
-of `release-candidate.yml` once, at certification time: it must be
-byte-identical (same git blob id) to the copy `main` carries then. The blob is
-recorded in the signed predicate, and every later consumer compares against
-**that record**, never against main's tip — otherwise any merge to main that
-touched the workflow would strand an already-certified commit permanently, and
-recovery would mean a new commit and a full gate re-run. Not to the copy at the merge base — the merge
-base is a function of the commit's own ancestry, so whoever chooses the
-commit's parent would be choosing which historical copy gets blessed,
-including one from before a guard existed, permanently. Main's current copy is
-the only copy nobody but main can choose, and cherry-picking it forward was
-already the documented remedy. So: if the candidate refuses with "not main's
-current copy", do **not** edit the workflow on the branch — cherry-pick main's
-copy across and dispatch a new candidate. (Nothing is demanded, explicitly,
-for a commit on `main`, where comparing main to itself decides nothing.)
+The candidate also **records** the git blob id of `release-candidate.yml` at
+the certified commit in the signed predicate (`certified_workflow_blob`), and
+the verifier compares the commit against that record, never against main's
+tip. It is **not** required to match main's copy (#6122), and an edit to
+`release-candidate.yml` on main needs **no backport** to any `release/X.Y.x`.
+A line's copy lags main's after every such edit, and the candidate prints a
+notice saying so. That is expected: the copy is inert. The candidate is
+dispatched on main (its guard refuses any other ref), every checkout in it is
+`refs/heads/main` (next section), and only main's signing identity is
+accepted, so nothing ever runs a release branch's copy.
 
-The blessing is no longer load-bearing for the identity; it backstops the
-window in which an admin has the release ruleset toggled off to create a
-line.
+Until #6122 the candidate demanded that a maintenance commit carry main's
+**current** copy byte for byte (#3821). It was meant as a backstop for the
+window in which an admin has the release ruleset toggled off to create a line.
+It protected nothing that runs. An attacker with a commit on the line passed
+it for free by copying main's file, while the files the tag side really runs
+(`scripts/ci/*`, `release.yml`, `docker-publish.yml`) were never pinned by it.
+What it did do was refuse every maintenance candidate after each main edit to
+the file, until someone backported the edit by hand.
 
 ### What runs from the certified commit
 
@@ -1031,12 +1070,12 @@ certification depends on it:
 
 | write path | `main` | `refs/heads/release/X.Y.x` |
 |---|---|---|
-| direct push | **refused** — a pull request is required (`required_pull_request_reviews`, 0 approvals) | **refused** — a pull request is required |
+| direct push | **refused** — a pull request is required (`required_pull_request_reviews`, 0 approvals) | **refused** — a pull request is required (`pull_request`, currently 0 approvals; #6216 proposes 1) |
 | force push / rewrite | blocked (`allow_force_pushes: false`) | blocked (`non_fast_forward`) |
 | deletion | blocked (`allow_deletions: false`) | blocked (`deletion`) |
 | ref creation | n/a (it exists) | **refused** — by the required-status-check rule (`do_not_enforce_on_create: false`, no bypass actor); there is no separate `creation` rule. Use `scripts/release/create-release-line.sh` ("Creating a release line") |
 | required checks | 3 | 2, incl. `Verify commits trace back to main` |
-| required approvals | none configured | none configured |
+| required approvals | none configured | none configured today; #6216 proposes 1, dismissed on push, by someone other than the pusher |
 | admin bypass | **no** — `enforce_admins: true` | **no** — `bypass_actors: []` |
 
 Every required context on both branches is pinned to the GitHub Actions app
@@ -1045,13 +1084,16 @@ and `🦀 Check Rust` on `main`, `✅ CI Complete` and `Verify commits trace bac
 to main` on `release/*` — so a same-named status posted by any other app or by
 a token does not satisfy them.
 
-One thing to fix, and it is bigger than the release flow: on **both**
-branches, a pull request's required checks are defined by workflows the pull
-request itself can edit, and neither branch requires an approval. The real
-floor under a release is therefore *write access*, not review. Raising
-`required_approving_review_count` above 0 on ruleset 20038606, and requiring
-code-owner review on the gate files themselves, would raise it; both are
-deferred to #4071.
+A pull request's required checks are still defined by workflows the pull
+request itself can edit, and neither branch requires an approval today: a
+single writer can land a change to `release.yml`, `scripts/ci/**` or
+`release-candidate.yml` on a maintenance line. #6216 proposes one approving
+review on `release/*`, with stale approvals dismissed and the last push
+approved by someone else; enabling it is a maintainer decision and needs a
+second active maintainer or a bypass actor, since the ruleset has none today.
+Code-owner review on the gate files remains #4071. `create-release-line.sh`
+warns when that protection is missing but does not block a cut, so
+`release/1.13.x` can still be created.
 
 ## Supply chain: what the release job signs, and what it refuses
 
@@ -1167,8 +1209,8 @@ scanned bytes; deleting it breaks every chart that pins it.
   Candidate is always
   dispatched on `main`, including for a maintenance release, so the signing
   identity is always `...release-candidate.yml@refs/heads/main` and never
-  widens; `release-candidate.yml` at the certified commit must additionally be
-  byte-identical to a copy that lives on `main`. See "Patch releases from a
+  widens. The copy of `release-candidate.yml` on a release branch never runs
+  and needs no backport (#6122). See "Patch releases from a
   `release/X.Y.x` branch".
 - Floating tags (`:latest`, `:X.Y`) are applied ONLY after the release gate
   and the GitHub Release, by a build-free promotion that re-points them at the

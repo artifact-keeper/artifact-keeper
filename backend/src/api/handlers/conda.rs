@@ -25,6 +25,11 @@
 //! All read routes are also available with URL path token authentication:
 //!   GET  /conda/t/{token}/{repo_key}/...                     - Token-authenticated access
 //!   GET  /t/{token}/conda/{repo_key}/...                     - rattler/pixi `--conda-token` layout
+//!
+//! Classic conda cannot carry the `_` in an Artifact Keeper token (its URL
+//! token regex is `[a-zA-Z0-9-]*`), so on these routes it writes the token
+//! without the separator; both spellings are accepted (#5642). See
+//! [`token_router`] for the full caveat.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{Read, Write};
@@ -780,6 +785,16 @@ fn privatize_cache_control(headers: &mut HeaderMap) {
 /// This is configured in `.condarc` as:
 ///   channels:
 ///     - https://host/conda/t/<TOKEN>/my-channel
+///
+/// **Classic conda:** its URL-token regex, `re.search(r"/t/([a-zA-Z0-9-]*)",
+/// url)` (`conda/common/url.py`), has no `_` in its alphabet, so it stops at
+/// the separator inside an Artifact Keeper token (`<8 hex>_<32 hex>`), drops
+/// the rest of the credential into the channel path and the read 401s
+/// (#5642). Classic conda users must write the token **without** the
+/// separator, `<8 hex><32 hex>`; the route accepts that spelling and restores
+/// the canonical form before validation. micromamba and rattler/pixi handle
+/// the canonical spelling as-is. A client that can only attach a header (or
+/// that prefers Basic) uses the canonical token unchanged.
 pub fn token_router() -> Router<SharedState> {
     token_routes("")
 }
@@ -1587,17 +1602,18 @@ async fn render_hosted_channeldata(
     let artifacts = list_conda_artifacts_at(db, repo_id, now).await?;
 
     // Query for the latest version of each package (ordered by created_at DESC,
-    // so the first row per name is the latest).
+    // so the first row per name is the latest). Package rows only: a
+    // non-package row marks no revision, so it must not move the document
+    // kept under one (#6090).
     let latest_versions: BTreeMap<String, String> = {
-        let rows = sqlx::query!(
-            r#"
-            SELECT DISTINCT ON (a.name) a.name, a.version
-            FROM artifacts a
-            WHERE a.repository_id = $1 AND a.is_deleted = false
-            ORDER BY a.name, a.created_at DESC
-            "#,
-            repo_id
+        let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+            "SELECT DISTINCT ON (a.name) a.name, a.version \
+               FROM artifacts a \
+              WHERE a.repository_id = $1 AND a.is_deleted = false \
+                AND (a.path LIKE '%.conda' OR a.path LIKE '%.tar.bz2') \
+              ORDER BY a.name, a.created_at DESC",
         )
+        .bind(repo_id)
         .fetch_all(db)
         .await
         .map_err(|e| {
@@ -1606,7 +1622,7 @@ async fn render_hosted_channeldata(
         })?;
 
         rows.into_iter()
-            .filter_map(|r| r.version.map(|v| (r.name, v)))
+            .filter_map(|(name, version)| version.map(|v| (name, v)))
             .collect()
     };
 
@@ -5442,7 +5458,11 @@ fn repodata_document(
     // If latest_only, keep only the latest version per package name
     let filtered: Vec<&CondaArtifact> = if latest_only {
         let mut latest: BTreeMap<String, &CondaArtifact> = BTreeMap::new();
-        for a in subdir_artifacts {
+        // Only a package can be the newest record of its name (#6090).
+        for a in subdir_artifacts
+            .iter()
+            .filter(|a| is_conda_package(a.path.rsplit('/').next().unwrap_or(&a.path)))
+        {
             let pkg_name = a
                 .metadata
                 .as_ref()
@@ -5511,8 +5531,10 @@ fn conda_name_from_filename(filename: &str) -> Option<&str> {
 /// Like the other shadowing guards this is an ENFORCEMENT walk, so it reads
 /// the unfiltered member list rather than the caller-authorized one: a caller
 /// who cannot read the hosted member must still not be offered the upstream
-/// impostor. Every non-deleted row counts, including withdrawn ones, because a
-/// withdrawn internal package must not hand its name to the upstream either.
+/// impostor. Every non-deleted package row counts, including withdrawn ones,
+/// because a withdrawn internal package must not hand its name to the
+/// upstream either. Only package rows reach a conda client, and only they
+/// mark the revisions the set is kept under (#6090).
 /// Fails closed: a database error is a 500, never an unguarded merge.
 ///
 /// The set is kept per virtual under its hosted members' revisions (#4978
@@ -5594,6 +5616,11 @@ fn owned_names_cache() -> &'static moka::future::Cache<uuid::Uuid, std::sync::Ar
 }
 
 /// [`virtual_hosted_owned_names`]' read of the hosted members' rows.
+///
+/// Only package rows (`.conda`, `.tar.bz2`) count, the rows every conda output
+/// reads: the catalog triggers mark only those (#6090), so a non-package
+/// row's write moves no revision, and counting it would leave the kept set
+/// stale.
 async fn query_hosted_owned_names(
     db: &sqlx::PgPool,
     virtual_repo_id: uuid::Uuid,
@@ -5603,7 +5630,8 @@ async fn query_hosted_owned_names(
         "SELECT DISTINCT LOWER(COALESCE(am.metadata->>'name', a.name)) \
          FROM artifacts a \
          LEFT JOIN artifact_metadata am ON am.artifact_id = a.id \
-         WHERE a.repository_id = ANY($1) AND a.is_deleted = false",
+         WHERE a.repository_id = ANY($1) AND a.is_deleted = false \
+           AND (a.path LIKE '%.conda' OR a.path LIKE '%.tar.bz2')",
     )
     .bind(hosted_ids)
     .fetch_all(db)
@@ -6932,6 +6960,13 @@ async fn download_package(
         return serve_sidecar(&state, auth.as_ref(), &repo, &subdir, &filename, request).await;
     }
 
+    // #6433: a proxy-cache row is served only after its cache sidecar is
+    // checked; one nothing vouches for is no row, so a Remote resolves the
+    // package through its proxy path below.
+    let artifact = proxy_helpers::vouched_row(&state, repo.id, artifact, |a| {
+        proxy_helpers::ServedRowRef::new(&a.storage_key, Some(a.size_bytes))
+    })
+    .await?;
     let not_found = || (StatusCode::NOT_FOUND, "Package not found").into_response();
     let artifact = match artifact {
         Some(a) => a,
@@ -7322,6 +7357,151 @@ async fn serve_scanned_conda_package(
         upstream_url,
     };
     proxy_helpers::serve_scanned_proxy_file(state, proxy, &req, &file).await
+}
+
+/// The proxy-cache key a Remote's `<subdir>/<filename>` package is cached
+/// under: the key [`download_package`] serves and fills (#4184).
+pub(crate) fn conda_package_cache_key(subdir: &str, filename: &str) -> String {
+    conda_package_serve_key(subdir, filename).cache_key
+}
+
+/// The package name a conda file name carries, if it parses (#4184).
+pub(crate) fn conda_package_name(filename: &str) -> Option<&str> {
+    conda_name_from_filename(filename)
+}
+
+/// Whether a Virtual's conda allowlist admits `<subdir>/<filename>` (#4184):
+/// `Ok(true)` with no allowlist. A Virtual does not serve a package its
+/// allowlist refuses, so warming one into a member's cache would be wasted.
+pub(crate) async fn virtual_allowlist_admits(
+    db: &sqlx::PgPool,
+    virtual_repo_id: uuid::Uuid,
+    subdir: &str,
+    filename: &str,
+) -> Result<bool, Response> {
+    Ok(virtual_allowlist(db, virtual_repo_id)
+        .await?
+        .is_none_or(|a| a.admits_filename(subdir, filename)))
+}
+
+/// Fetch one package through a Remote exactly as a client download of
+/// `/conda/<remote>/<subdir>/<filename>` would (#4184), and drain the body so
+/// the proxy cache commits it. Nothing is served and no download is counted.
+///
+/// The fetch takes the same arm [`download_package`] takes: the inline scan
+/// gate when the Remote scans this file, the streaming tee otherwise. Every
+/// gate therefore applies as on a client's cold miss (the Package Age Policy
+/// hold, the origin policy, the scan verdict), and a warmed entry is a
+/// proxy-cache entry like any other: a later serve still passes
+/// [`proxy_helpers::proxy_cache_row_gate`] and the cache-hit gates. Returns
+/// the status the route would have answered, plus the sha256 and size of the
+/// bytes it would have served on a 2xx.
+///
+/// `via_virtual` is the Virtual the warm was asked for, when it was: the scan
+/// policy is then [`warm_scan_policy`]'s stricter of the Virtual's and the
+/// member's, the policy a download through that Virtual is served under. A
+/// warm through a scanning Virtual therefore scans (or answers `403`) instead
+/// of caching the member's bytes unscanned.
+pub(crate) async fn warm_remote_package(
+    state: &SharedState,
+    proxy: &crate::services::proxy_service::ProxyService,
+    remote: &crate::models::repository::Repository,
+    via_virtual: Option<uuid::Uuid>,
+    subdir: &str,
+    filename: &str,
+) -> (StatusCode, Option<(String, u64)>) {
+    use futures::StreamExt;
+    use sha2::{Digest, Sha256};
+
+    let Some(upstream_url) = remote.upstream_url.as_deref() else {
+        return (StatusCode::NOT_FOUND, None);
+    };
+    if !is_conda_package(filename)
+        || proxy_helpers::reject_ambiguous_client_segments(true, &[subdir, filename]).is_err()
+    {
+        return (StatusCode::BAD_REQUEST, None);
+    }
+    let serve_key = conda_package_serve_key(subdir, filename);
+    let fetched = async {
+        if serve_key.scannable {
+            if let Some((action, severity_gate)) =
+                warm_scan_policy(&state.db, remote.id, via_virtual).await?
+            {
+                let req = proxy_helpers::ScannedProxyRequest {
+                    repo_id: remote.id,
+                    repo_key: &remote.key,
+                    fetch_base: upstream_url,
+                    format: crate::models::repository::RepositoryFormat::Conda,
+                    source_path: &serve_key.cache_key,
+                    cache_path: &serve_key.cache_key,
+                    filename,
+                    action,
+                    severity_gate,
+                    // No context: a warm is not a download.
+                    ctx: None,
+                };
+                let file = CondaScannedPackage {
+                    proxy,
+                    upstream_url,
+                };
+                return proxy_helpers::serve_scanned_proxy_file(state, proxy, &req, &file).await;
+            }
+        }
+        proxy_helpers::proxy_fetch_streaming_with_disposition_and_format(
+            proxy,
+            remote.id,
+            &remote.key,
+            upstream_url,
+            &serve_key.cache_key,
+            conda_package_content_type(filename),
+            Some(filename),
+            crate::models::repository::RepositoryFormat::Conda,
+            false,
+        )
+        .await
+    }
+    .await;
+    let response = match fetched {
+        Ok(r) | Err(r) => r,
+    };
+    let status = response.status();
+    if !status.is_success() {
+        return (status, None);
+    }
+    let mut body = response.into_body().into_data_stream();
+    let mut hasher = Sha256::new();
+    let mut size = 0u64;
+    while let Some(chunk) = body.next().await {
+        match chunk {
+            Ok(bytes) => {
+                size += bytes.len() as u64;
+                hasher.update(&bytes);
+            }
+            // A body cut mid-stream is an upstream fault; the tee does not
+            // commit it, and the item is retried.
+            Err(_) => return (StatusCode::BAD_GATEWAY, None),
+        }
+    }
+    (status, Some((format!("{:x}", hasher.finalize()), size)))
+}
+
+/// The scan-on-proxy policy a warm of `remote` fills its cache under
+/// (#4184): the Remote's own for a direct warm, and for a warm through
+/// `via_virtual` the stricter of the Virtual's and the member's
+/// ([`proxy_helpers::effective_virtual_scan_policy`]), as a client download
+/// through that Virtual is. `None` when neither scans; an unreadable config
+/// fails closed with the 503 the download path answers.
+pub(crate) async fn warm_scan_policy(
+    db: &sqlx::PgPool,
+    remote_id: uuid::Uuid,
+    via_virtual: Option<uuid::Uuid>,
+) -> Result<Option<proxy_helpers::MemberScanPolicy>, Response> {
+    match via_virtual {
+        Some(virtual_id) => {
+            proxy_helpers::effective_virtual_scan_policy(db, virtual_id, remote_id).await
+        }
+        None => proxy_helpers::remote_scan_policy(db, remote_id).await,
+    }
 }
 
 /// The conda half of the generic proxy scan gate.
@@ -9758,6 +9938,9 @@ async fn serve_sidecar(
         // #5810: in strict mode a Remote member that could not answer ends
         // the walk with the retryable 503, as it does for the package.
         let fallback = proxy_helpers::virtual_member_fallback(&state.db, repo.id).await;
+        // #6426: set when a Remote member could not answer (#5504), so an
+        // empty walk is the retryable 503 rather than a 404.
+        let mut unavailable = false;
         for (member, policy) in members.iter().zip(policies) {
             if member.repo_type == RepositoryType::Remote {
                 if !remote_admitted {
@@ -9787,11 +9970,11 @@ async fn serve_sidecar(
                 .await
                 {
                     Ok(response) => return Ok(response),
-                    Err(resp)
-                        if fallback.is_strict()
-                            && proxy_helpers::is_member_unavailable_response(&resp) =>
-                    {
-                        return Err(proxy_helpers::member_unavailable_response());
+                    Err(resp) if proxy_helpers::is_member_unavailable_response(&resp) => {
+                        if fallback.is_strict() {
+                            return Err(proxy_helpers::member_unavailable_response());
+                        }
+                        unavailable = true;
                     }
                     Err(_) => {}
                 }
@@ -9803,13 +9986,23 @@ async fn serve_sidecar(
                 return sidecar_response(&request, text, &sha);
             }
         }
-        return Err(not_found());
+        return Err(sidecar_walk_miss(unavailable));
     }
 
     let (text, sha) = load_hosted_sidecar(&state.db, repo.id, subdir, request.package())
         .await?
         .ok_or_else(not_found)?;
     sidecar_response(&request, text, &sha)
+}
+
+/// What a Virtual's sidecar walk that no member served answers (#6426): the
+/// retryable 503 when a Remote member could not answer, else the 404.
+fn sidecar_walk_miss(unavailable: bool) -> Response {
+    if unavailable {
+        proxy_helpers::member_unavailable_response()
+    } else {
+        (StatusCode::NOT_FOUND, "Attestation sidecar not found").into_response()
+    }
 }
 
 /// Core logic for retrieving a CEP-27 attestation.
@@ -10154,12 +10347,20 @@ async fn store_conda_package(
     content: Bytes,
     user_id: uuid::Uuid,
 ) -> Result<Response, Response> {
-    // The subdir the package itself declares (#2561: permit-scoped decode).
-    let declared_subdir = crate::util::bounded_archive::with_ingest_extraction(|| {
-        extract_conda_metadata(&content, filename)
-            .and_then(|m| m.get("subdir").and_then(|v| v.as_str()).map(str::to_string))
-    })
-    .map_err(|e| e.into_response())?;
+    // #2561: the archive reads below (the declared subdir, the structure
+    // check and the metadata/install-script enrichment) run under ONE ingest
+    // permit, taken before the first and dropped after the last, before any
+    // storage or DB work. On saturation it waits briefly for a slot, then
+    // sheds 503 (#6230): a fast-fail acquire always lost to queued uploads.
+    let ingest_permit = crate::util::bounded_archive::acquire_ingest_extraction_waiting()
+        .await
+        .map_err(|e| e.into_response())?;
+    // The package's own metadata: the subdir it declares, and the
+    // best-effort enrichment recorded after the artifact row commits.
+    let extracted = extract_conda_metadata(&content, filename);
+    let declared_subdir = extracted
+        .as_ref()
+        .and_then(|m| m.get("subdir").and_then(|v| v.as_str()).map(str::to_string));
     let subdir = resolve_upload_subdir(requested_subdir, declared_subdir.as_deref())?;
     let subdir = subdir.as_str();
     // Parse the filename using the existing conda_native handler
@@ -10191,13 +10392,16 @@ async fn store_conda_package(
         },
     )?;
 
-    // Validate package structure before storing.
-    // #2561: permit-scoped decode, fast-fail 503 on saturation.
-    crate::util::bounded_archive::with_ingest_extraction(|| {
-        validate_conda_package(&content, filename)
-    })
-    .map_err(|e| e.into_response())?
-    .map_err(|e| (StatusCode::BAD_REQUEST, e).into_response())?;
+    // Validate package structure before storing (under `ingest_permit`).
+    validate_conda_package(&content, filename)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e).into_response())?;
+
+    // The install scripts, still under `ingest_permit`, so this best-effort
+    // analysis neither queues for a second slot nor is skipped during a
+    // burst. They come out of the payload, which the metadata walk never
+    // opens, so they need a second pass over the same bytes.
+    let install_scripts = collect_conda_install_scripts(&content, filename);
+    drop(ingest_permit);
 
     // Compute SHA256 and MD5
     let mut sha256_hasher = Sha256::new();
@@ -10312,31 +10516,6 @@ async fn store_conda_package(
     crate::services::quarantine_service::apply_upload_hold_hosted(&state.db, repo.id, artifact_id)
         .await;
 
-    // #4159: scan_on_upload trigger — format-native upload paths bypass
-    // `ArtifactService::upload`'s auto-scan gate, so mirror it here. No-op when
-    // the scanner_service is None or `scan_on_upload`/`scan_enabled` is false.
-    crate::services::scanner_service::trigger_scan_on_upload(
-        &state.db,
-        state.scanner_service.clone(),
-        repo.id,
-        artifact_id,
-    )
-    .await;
-
-    // Extract metadata from package contents. #2561: permit-scoped decode; the
-    // artifact row is already committed, so a saturated server skips this
-    // best-effort enrichment rather than failing the stored upload.
-    // The install scripts come out of the payload, which the metadata walk
-    // never opens, so they need a second pass over the same bytes — inside the
-    // same permit, since it is the same class of bounded decode work.
-    let (extracted, install_scripts) = crate::util::bounded_archive::with_ingest_extraction(|| {
-        (
-            extract_conda_metadata(&content, filename),
-            collect_conda_install_scripts(&content, filename),
-        )
-    })
-    .unwrap_or_default();
-
     // #4041/#4042: the identity the advisory path queries with. `pkg:conda/<name>`
     // on its own matches nothing — OSV and the GitHub Advisory Database have no
     // conda ecosystem — so what is recorded here is a purl that names *this*
@@ -10398,6 +10577,19 @@ async fn store_conda_package(
 
     count_conda_install_script_findings(&repo.key, &install_scripts);
     record_conda_package_analysis(state, artifact_id, extracted.as_ref(), install_scripts).await;
+
+    // #4159: scan_on_upload trigger — format-native upload paths bypass
+    // `ArtifactService::upload`'s auto-scan gate, so mirror it here. #5692: it
+    // must come after the metadata and analysis writes above, because the
+    // dependency scanner reads the stored identity to query PyPI aliases.
+    // No-op when the scanner_service is None or `scan_on_upload` is false.
+    crate::services::scanner_service::trigger_scan_on_upload(
+        &state.db,
+        state.scanner_service.clone(),
+        repo.id,
+        artifact_id,
+    )
+    .await;
 
     // Surface the package on the Packages page (#3659), keyed on the conda
     // package's own name/version (the build string stays in metadata), with
@@ -18828,6 +19020,16 @@ mod tests {
     // CEP-50 sidecar helpers
     // -----------------------------------------------------------------------
 
+    /// #6426: a Virtual's sidecar walk that no member served answers the
+    /// retryable 503 when a Remote member could not answer, else the 404.
+    #[test]
+    fn sidecar_walk_miss_reports_an_unavailable_member_6426() {
+        let down = sidecar_walk_miss(true);
+        assert_eq!(down.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(down.headers().contains_key(axum::http::header::RETRY_AFTER));
+        assert_eq!(sidecar_walk_miss(false).status(), StatusCode::NOT_FOUND);
+    }
+
     #[test]
     fn sidecar_request_recognizes_both_cep50_forms() {
         let h = "a".repeat(64);
@@ -19054,6 +19256,46 @@ mod catalog_registration_tests {
         assert_eq!(
             row.description.as_deref(),
             Some("a catalogued conda package")
+        );
+    }
+
+    /// #6230: a conda upload whose repository's ingest bucket is full waits
+    /// for a permit instead of shedding 503 at once, succeeds once one frees,
+    /// and its post-commit enrichment (read under the same permit) is not
+    /// skipped: the catalog row carries the package's description.
+    #[tokio::test]
+    async fn conda_upload_waits_for_ingest_permit_6230() {
+        let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
+            return;
+        };
+        let body = conda_v1_package("queuedpkg", "1.0.0", "py39_0");
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/{}/upload", fx.repo_key))
+            .header("X-Conda-Subdir", "noarch")
+            .header("X-Package-Filename", "queuedpkg-1.0.0-py39_0.tar.bz2")
+            .body(axum::body::Body::from(body))
+            .unwrap();
+        let ((status, resp), queued) =
+            crate::util::bounded_archive::test_support::run_queued_behind_full_tenant(
+                crate::util::bounded_archive::TenantKey::Repo(fx.repo_id),
+                tdh::send(fx.router_with_auth(super::router()), req),
+            )
+            .await;
+        let row = tdh::catalog_row(&fx.pool, fx.repo_id, "queuedpkg").await;
+        fx.teardown().await;
+
+        assert!(queued, "the upload must have waited for a permit");
+        assert!(
+            status.is_success(),
+            "a queued conda upload must succeed once a permit frees: {status} {}",
+            String::from_utf8_lossy(&resp)
+        );
+        let row = row.expect("a conda upload must write a packages row");
+        assert_eq!(
+            row.description.as_deref(),
+            Some("a catalogued conda package"),
+            "the enrichment must run under the upload's permit, not be skipped"
         );
     }
 }
@@ -21207,9 +21449,9 @@ mod repodata_byte_stability_tests {
         let mut zip_buf = Vec::new();
         {
             let mut writer = zip::ZipWriter::new(std::io::Cursor::new(&mut zip_buf));
-            // Pin the entry timestamp: the zip default is the wall clock,
-            // which would make the fixture's checksums nondeterministic and
-            // the golden assertion below impossible.
+            // Pin the entry timestamp: the zip default is the wall clock.
+            // The golden takes its checksums from these bytes, but a
+            // deterministic fixture keeps a failure reproducible.
             let options = zip::write::SimpleFileOptions::default()
                 .compression_method(zip::CompressionMethod::Stored)
                 .last_modified_time(zip::DateTime::default());
@@ -21251,11 +21493,16 @@ mod repodata_byte_stability_tests {
     }
 
     /// Golden documents captured from the PRE-MIGRATION implementation
-    /// (#4040). `{key}` is interpolated with the fixture's random repo key;
-    /// every other byte — pretty-print layout, key order, field presence,
-    /// value spelling, the stored checksums of the deterministic fixture
-    /// packages — is asserted exactly. A migration that changes served
-    /// repodata bytes trips this test and must be justified in the PR.
+    /// (#4040). `{key}` is interpolated with the fixture's random repo key,
+    /// and `{md5}`, `{sha256}` and `{size}` with the digests and length of
+    /// the package bytes this run built and uploaded: those bytes come from
+    /// the compression crates (bzip2, zstd, zip), whose output may change
+    /// with a dependency bump without the server changing at all (zstd
+    /// 0.14.4 started recording the frame content size). Every other byte —
+    /// pretty-print layout, key order, field presence, value spelling — is
+    /// asserted exactly, and the checksums must still be the ones of the
+    /// uploaded bytes. A migration that changes served repodata bytes trips
+    /// this test and must be justified in the PR.
     const GOLDEN_NOARCH: &str = r#"{
   "info": {
     "subdir": "noarch"
@@ -21271,10 +21518,10 @@ mod repodata_byte_stability_tests {
       "fn": "zlib-1.2.13-hd590300_5.tar.bz2",
       "indexed_timestamp": {ts},
       "license": "MIT",
-      "md5": "171767ec5672ea594e1ef29d1211f3d7",
+      "md5": "{md5}",
       "name": "zlib",
-      "sha256": "2afa994d506a49f05cbbe00fd76c42992f7f26f66520d5083ecb7459cbcfac27",
-      "size": 222,
+      "sha256": "{sha256}",
+      "size": {size},
       "subdir": "noarch",
       "version": "1.2.13"
     }
@@ -21303,10 +21550,10 @@ mod repodata_byte_stability_tests {
       "fn": "rattlerpy-0.4.1-py312h02b7e37_1.conda",
       "indexed_timestamp": {ts},
       "license": "BSD-3-Clause",
-      "md5": "9f2993fb3eeeebbb9128a5c6b6b537d4",
+      "md5": "{md5}",
       "name": "rattlerpy",
-      "sha256": "ca5792b5733e64ca5de5776440792fd6b531ed9b2ded6a928a82682646d71a55",
-      "size": 523,
+      "sha256": "{sha256}",
+      "size": {size},
       "subdir": "linux-64",
       "version": "0.4.1"
     }
@@ -21317,11 +21564,23 @@ mod repodata_byte_stability_tests {
 
     /// `{ts}` is the record's CEP-47 `indexed_timestamp`: the artifact row's
     /// `created_at` in milliseconds, which differs per run but is fixed for a
-    /// stored package.
-    fn golden(template: &str, key: &str, ts: i64) -> Vec<u8> {
+    /// stored package. `package` is the uploaded package's bytes, whose md5,
+    /// sha256 and length the record must carry.
+    fn golden(template: &str, key: &str, ts: i64, package: &[u8]) -> Vec<u8> {
+        use sha2::{Digest, Sha256};
+        let md5 = {
+            use md5::Md5;
+            let mut hasher = Md5::new();
+            md5::Digest::update(&mut hasher, package);
+            format!("{:x}", md5::Digest::finalize(hasher))
+        };
+        let sha256 = format!("{:x}", Sha256::digest(package));
         template
             .replace("{key}", key)
             .replace("{ts}", &ts.to_string())
+            .replace("{md5}", &md5)
+            .replace("{sha256}", &sha256)
+            .replace("{size}", &package.len().to_string())
             .into_bytes()
     }
 
@@ -21343,18 +21602,20 @@ mod repodata_byte_stability_tests {
             return;
         };
 
+        let zlib_pkg = conda_v1_package("zlib", "1.2.13", "hd590300_5");
+        let rattler_pkg = conda_v2_package("rattlerpy", "0.4.1", "py312h02b7e37_1");
         upload(
             &fx,
             "noarch",
             "zlib-1.2.13-hd590300_5.tar.bz2",
-            conda_v1_package("zlib", "1.2.13", "hd590300_5"),
+            zlib_pkg.clone(),
         )
         .await;
         upload(
             &fx,
             "linux-64",
             "rattlerpy-0.4.1-py312h02b7e37_1.conda",
-            conda_v2_package("rattlerpy", "0.4.1", "py312h02b7e37_1"),
+            rattler_pkg.clone(),
         )
         .await;
 
@@ -21385,18 +21646,18 @@ mod repodata_byte_stability_tests {
 
         assert_eq!(
             noarch,
-            golden(GOLDEN_NOARCH, &key, zlib_ts),
+            golden(GOLDEN_NOARCH, &key, zlib_ts, &zlib_pkg),
             "noarch/repodata.json bytes changed"
         );
         assert_eq!(
             linux64,
-            golden(GOLDEN_LINUX64, &key, rattler_ts),
+            golden(GOLDEN_LINUX64, &key, rattler_ts, &rattler_pkg),
             "linux-64/repodata.json bytes changed"
         );
         // One version per name here, so current_repodata is the same document.
         assert_eq!(
             current,
-            golden(GOLDEN_LINUX64, &key, rattler_ts),
+            golden(GOLDEN_LINUX64, &key, rattler_ts, &rattler_pkg),
             "linux-64/current_repodata.json bytes changed"
         );
     }
@@ -21409,8 +21670,14 @@ mod repodata_byte_stability_tests {
 #[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod scan_on_upload_tests {
+    use std::sync::{Arc, Mutex};
+
+    use bytes::Bytes;
+
     use crate::api::handlers::test_db_helpers as tdh;
+    use crate::models::artifact::{Artifact, ArtifactMetadata};
     use crate::services::scanner_service::test_helpers::{MockCveRescan, VersionedCveScanner};
+    use crate::services::scanner_service::{ScanOutput, Scanner};
 
     /// Build a minimal but valid conda v1 package: a bzip2 tar carrying
     /// `info/index.json` whose fields agree with the filename.
@@ -21550,6 +21817,116 @@ mod scan_on_upload_tests {
         assert_eq!(
             count, 0,
             "scan_on_upload is disabled, so the upload must not enqueue a scan"
+        );
+    }
+
+    /// Captures the metadata snapshot a scan was handed at its start (#5692).
+    #[derive(Clone, Default)]
+    struct MetadataRecorder {
+        seen: Arc<Mutex<Vec<Option<ArtifactMetadata>>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Scanner for MetadataRecorder {
+        fn name(&self) -> &str {
+            "conda-metadata-recorder"
+        }
+
+        fn scan_type(&self) -> &str {
+            "dependency"
+        }
+
+        async fn scan(
+            &self,
+            _artifact: &Artifact,
+            metadata: Option<&ArtifactMetadata>,
+            _content: &Bytes,
+        ) -> crate::error::Result<ScanOutput> {
+            self.seen
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(metadata.cloned());
+            Ok(ScanOutput::default())
+        }
+    }
+
+    /// Runs the upload's scan inside the trigger, so what the recorder sees is
+    /// the handler's state at that exact point rather than a race with the
+    /// metadata write that follows it.
+    struct InlineScanGuard;
+
+    impl InlineScanGuard {
+        fn install() -> Self {
+            crate::services::scanner_service::TEST_INLINE_SCAN_ON_UPLOAD
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Self
+        }
+    }
+
+    impl Drop for InlineScanGuard {
+        fn drop(&mut self) {
+            crate::services::scanner_service::TEST_INLINE_SCAN_ON_UPLOAD
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// #5692: the trigger used to run before the metadata upsert, so a scan
+    /// could start before the conda identity was stored and grade the package
+    /// as uncataloged. An inline scan makes the snapshot deterministic: on the
+    /// fixed handler the identity is already in `artifact_metadata`.
+    #[tokio::test]
+    async fn native_put_upload_scan_sees_stored_conda_identity() {
+        let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
+            return;
+        };
+        set_scan_on_upload(&fx.pool, fx.repo_id, true).await;
+
+        let recorder = Arc::new(MetadataRecorder::default());
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let state =
+            tdh::build_scan_state_with_leaf_scanners(&fx, &storage_path, vec![recorder.clone()]);
+        let router = tdh::router_with_auth(
+            super::router(),
+            state,
+            tdh::make_auth(fx.user_id, &fx.username),
+        );
+
+        let _inline = InlineScanGuard::install();
+        let body = conda_v1_package("py-opencv", "4.9.0", "py_0");
+        let (status, resp) = tdh::send(
+            router,
+            tdh::put(
+                format!("/{}/noarch/py-opencv-4.9.0-py_0.tar.bz2", fx.repo_key),
+                Bytes::from(body),
+            ),
+        )
+        .await;
+        assert!(
+            status.is_success(),
+            "conda PUT upload failed: {status} {}",
+            String::from_utf8_lossy(&resp)
+        );
+
+        let seen = recorder
+            .seen
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        fx.teardown().await;
+
+        assert_eq!(seen.len(), 1, "the upload must trigger exactly one scan");
+        let metadata = seen
+            .into_iter()
+            .next()
+            .flatten()
+            .expect("the first scan must see the stored artifact metadata");
+        assert_eq!(metadata.format, "conda");
+        let identity = crate::services::conda_identity::read_identity(&metadata.metadata)
+            .expect("the scan-time metadata must carry the conda identity");
+        assert_eq!(identity.status(), "mapped");
+        assert_eq!(
+            identity.pypi_advisory_targets(),
+            vec![("opencv-python".to_string(), "4.9.0".to_string())]
         );
     }
 }
@@ -24488,6 +24865,77 @@ mod rattler_token_layout_tests {
             assert_eq!(package_status, StatusCode::OK, "{package_path}");
             assert_eq!(&package_body[..], &content[..]);
             assert_eq!(shard_status, StatusCode::OK, "{prefix} shard");
+        }
+    }
+
+    /// #5642: classic conda reads a channel token with
+    /// `re.search(r"/t/([a-zA-Z0-9-]*)", url)`, whose alphabet has no `_`, so
+    /// it cannot carry the canonical `<8 hex>_<32 hex>` spelling: it stops at
+    /// the separator, drops the rest of the credential into the channel path
+    /// and the read 401s. A classic-conda user writes the token without the
+    /// separator, and the token channel must resolve it to the same private
+    /// channel. The canonical spelling keeps working.
+    #[tokio::test]
+    async fn conda_token_url_accepts_the_separator_less_spelling_5642() {
+        let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
+            return;
+        };
+        let repo = fx.repo_info("local", None);
+        let filename = "pkg-1.0-0.tar.bz2";
+        let path = format!("noarch/{filename}");
+        tdh::seed_artifact(
+            &fx.state,
+            &fx.pool,
+            &repo,
+            &format!("conda/{}/{path}", fx.repo_id),
+            &path,
+            "pkg",
+            "1.0",
+            "application/x-tar",
+            Bytes::from_static(b"fake-conda-package-bytes"),
+            fx.user_id,
+        )
+        .await;
+        let auth_service = AuthService::new(fx.pool.clone(), Arc::new(fx.state.config.clone()));
+        let (token, _id) = auth_service
+            .generate_api_token(
+                fx.user_id,
+                "conda-5642",
+                vec!["read:artifacts".to_string()],
+                None,
+            )
+            .await
+            .expect("mint API token");
+        let conda_token = format!("{}{}", &token[..8], &token[9..]);
+        assert!(!conda_token.contains('_'));
+
+        let app = crate::api::routes::create_router(fx.state.clone());
+        let key = fx.repo_key.clone();
+        let mut results = Vec::new();
+        for credential in [&token, &conda_token] {
+            // The `.condarc` layout and rattler's `--conda-token` layout both
+            // carry the credential in the path.
+            for uri in [
+                format!("/conda/t/{credential}/{key}/noarch/repodata.json"),
+                format!("/t/{credential}/conda/{key}/noarch/repodata.json"),
+            ] {
+                let response = tdh::send(app.clone(), tdh::get(uri.clone())).await;
+                results.push((uri, response));
+            }
+        }
+        fx.teardown().await;
+
+        for (uri, (status, body)) in results {
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "{}: {}",
+                uri.replace(&token, "<token>")
+                    .replace(&conda_token, "<token>"),
+                String::from_utf8_lossy(&body)
+            );
+            let doc: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert!(doc["packages"].get(filename).is_some(), "{doc}");
         }
     }
 }

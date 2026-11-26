@@ -1,9 +1,9 @@
 [workspace]
 resolver = "2"
-members = ["backend"]
+members = ["backend", "backend/crates/ak-build-info"]
 
 [workspace.package]
-version = "1.12.0"
+version = "1.12.4"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/yourorg/artifact-keeper"
@@ -192,8 +192,8 @@ bytes = "1.5"
 clap = { version = "4.5", features = ["derive", "env"] }
 
 # WASM runtime
-wasmtime = { version = "36.0.20", features = ["component-model", "async"] }
-wasmtime-wasi = "36.0.20"
+wasmtime = { version = "48.0.10", features = ["component-model", "async"] }
+wasmtime-wasi = "48.0.10"
 
 # Git operations
 git2 = "0.21"

@@ -15,11 +15,14 @@
 //!   own answer (401, 403, or the unknown-key 404), never quota figures.
 //! * [`transfer_meter`] runs on the routers that serve artifact bytes. It
 //!   counts the body bytes of every successful `GET` (and the object size of
-//!   a presigned redirect when it is issued), and once the monthly transfer
+//!   a presigned redirect when it is issued: every redirect is built by
+//!   [`DownloadResponse::redirect`](crate::api::download_response::DownloadResponse::redirect),
+//!   which takes the size, #6035), and once the monthly transfer
 //!   quota's hard limit is reached it answers `429` instead of an artifact
 //!   download. Metadata responses (JSON, XML, HTML, text and YAML indexes)
 //!   are still served, so publishing clients that read metadata first keep
-//!   working.
+//!   working. A redirected `GET` with `Range` counts the whole object,
+//!   since the object store, not the backend, answers the range.
 //! * [`quota_envelope`] wraps the whole router. It re-renders a refusal in
 //!   the OCI error envelope on `/v2` and with npm's `error` field on `/npm`,
 //!   and turns the plain-text `413` of a body limit into the JSON refusal.
@@ -180,14 +183,45 @@ async fn repository_refusal(
     Ok(RepositoryService::new(db.clone())
         .quota_preflight(repo_id, additional)
         .await?
-        .map(|denial| denial.refusal()))
+        .map(|denial| denial.refusal().with_content_length(Some(declared))))
+}
+
+/// The quota lookups of [`admission_refusal`], both on the database.
+async fn quota_refusal(
+    db: &sqlx::PgPool,
+    target: &WriteTarget,
+    declared: Option<u64>,
+) -> Option<QuotaRefusal> {
+    // A failed lookup admits the request: the publish admission after the
+    // body is read still enforces every quota.
+    match storage::admit_declared(db, declared).await {
+        Ok(Some(refusal)) => return Some(refusal),
+        Ok(None) => {}
+        Err(e) => tracing::warn!(error = %e, "storage quota pre-check failed; admitting"),
+    }
+    let (Some(key), Some(length)) = (&target.repo_key, declared.filter(|d| *d > 0)) else {
+        return None;
+    };
+    match repository_refusal(db, key, length).await {
+        Ok(refusal) => refusal,
+        Err(e) => {
+            tracing::warn!(error = %e, "repository quota pre-check failed; admitting");
+            None
+        }
+    }
 }
 
 /// The refusal, if any, of a write that declares `declared` bytes.
+///
+/// The database lookups share one budget (`QUOTA_PRECHECK_BUDGET_MS`). When
+/// the pool is exhausted they would each wait the full acquire timeout and
+/// then admit anyway (#6316), so once the budget runs out the request is
+/// admitted unchecked and the publish admission decides.
 async fn admission_refusal(
     state: &SharedState,
     target: &WriteTarget,
     declared: Option<u64>,
+    stores_bytes: bool,
 ) -> Option<QuotaRefusal> {
     let max = state.config.max_upload_size_bytes;
     if target.size_limited && max > 0 {
@@ -198,23 +232,34 @@ async fn admission_refusal(
     if !target.storage {
         return None;
     }
-    // A failed lookup admits the request: the publish admission after the
-    // body is read still enforces every quota.
-    match storage::admit_declared(&state.db, declared).await {
-        Ok(Some(refusal)) => return Some(refusal),
-        Ok(None) => {}
-        Err(e) => tracing::warn!(error = %e, "storage quota pre-check failed; admitting"),
+    // The disk threshold (#5191) reads a cached reading: no query, so it
+    // runs before the database budget and is never skipped by it. An OCI
+    // cross-repository blob mount writes no bytes and is not refused.
+    if stores_bytes {
+        if let Some(refusal) = super::disk::refusal(declared) {
+            return Some(refusal);
+        }
     }
-    let (Some(key), Some(length)) = (&target.repo_key, declared.filter(|d| *d > 0)) else {
-        return None;
-    };
-    match repository_refusal(&state.db, key, length).await {
+    let budget = std::time::Duration::from_millis(state.config.quotas.precheck_budget_ms);
+    match tokio::time::timeout(budget, quota_refusal(&state.db, target, declared)).await {
         Ok(refusal) => refusal,
-        Err(e) => {
-            tracing::warn!(error = %e, "repository quota pre-check failed; admitting");
+        Err(_) => {
+            metrics::counter!("ak_quota_precheck_skipped_total").increment(1);
+            tracing::warn!(
+                budget_ms = state.config.quotas.precheck_budget_ms,
+                "quota pre-check ran out of time; admitting"
+            );
             None
         }
     }
+}
+
+/// An OCI cross-repository blob mount (`POST /v2/.../blobs/uploads/?mount=`):
+/// it links a blob the instance already stores and writes no bytes.
+pub(crate) fn is_oci_blob_mount(path: &str, query: Option<&str>) -> bool {
+    path.starts_with("/v2/")
+        && path.trim_end_matches('/').ends_with("/blobs/uploads")
+        && query.is_some_and(|q| q.split('&').any(|kv| kv.starts_with("mount=")))
 }
 
 /// The `/v2` name a blob or manifest write targets: the path between `/v2/`
@@ -302,7 +347,8 @@ pub async fn upload_admission(
         return next.run(req).await;
     };
     let declared = declared_length(req.headers());
-    let Some(refusal) = admission_refusal(&state, &target, declared).await else {
+    let stores_bytes = !is_oci_blob_mount(&path, req.uri().query());
+    let Some(refusal) = admission_refusal(&state, &target, declared, stores_bytes).await else {
         return next.run(req).await;
     };
     // A write that names no repository (the chunked upload API) runs behind
@@ -638,6 +684,26 @@ mod tests {
     }
 
     #[test]
+    fn oci_blob_mounts_are_told_apart_from_uploads_5191() {
+        let p = "/v2/docker/app/blobs/uploads/";
+        assert!(is_oci_blob_mount(p, Some("mount=sha256:aa&from=other/app")));
+        assert!(is_oci_blob_mount(
+            "/v2/docker/app/blobs/uploads",
+            Some("from=x&mount=sha256:aa")
+        ));
+        assert!(!is_oci_blob_mount(p, None));
+        assert!(!is_oci_blob_mount(p, Some("digest=sha256:aa")));
+        assert!(!is_oci_blob_mount(
+            "/v2/docker/app/blobs/uploads/0b1c",
+            Some("mount=sha256:aa")
+        ));
+        assert!(!is_oci_blob_mount(
+            "/maven/m/blobs/uploads",
+            Some("mount=x")
+        ));
+    }
+
+    #[test]
     fn artifact_downloads_are_told_apart_from_metadata() {
         let with_type = |ct: &str| {
             let mut r = Response::new(Body::empty());
@@ -879,5 +945,122 @@ mod tests {
         let (status, _, body) = call(&app, Method::PUT, "/proto/p/big").await;
         assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
         assert_eq!(&body[..], b"length limit exceeded");
+    }
+
+    /// A state over `pool` with an instance storage quota of `quota` bytes,
+    /// so the storage pre-check reads the database.
+    fn quota_state(
+        pool: sqlx::PgPool,
+        quota: u64,
+        budget_ms: Option<u64>,
+    ) -> (SharedState, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = crate::api::handlers::test_db_helpers::build_state_with(
+            pool,
+            dir.path().to_str().unwrap(),
+            |c| {
+                c.max_upload_size_bytes = 0;
+                c.quotas.storage_quota_bytes = quota;
+                if let Some(ms) = budget_ms {
+                    c.quotas.precheck_budget_ms = ms;
+                }
+            },
+        );
+        (state, dir)
+    }
+
+    /// One `PUT` of 1 KiB with its `Content-Length` through
+    /// [`upload_admission`] on a one-connection pool whose connection is held,
+    /// with `DATABASE_ACQUIRE_TIMEOUT_SECS` at its default of 5 s. Returns the
+    /// status and how long the request took, `None` without a database.
+    async fn put_on_exhausted_pool(
+        budget_ms: Option<u64>,
+    ) -> Option<(StatusCode, std::time::Duration)> {
+        let url = crate::testing::require_db_url()?;
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(std::time::Duration::from_secs(5))
+            .connect(&url)
+            .await
+            .expect("one-slot pool");
+        let held = pool.acquire().await.expect("the only connection");
+        let (state, _dir) = quota_state(pool.clone(), 1 << 50, budget_ms);
+        let app = Router::new()
+            .route(
+                "/maven/libs/a/b/1/b-1.jar",
+                put(|| async { StatusCode::CREATED }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                state,
+                upload_admission,
+            ));
+        let started = std::time::Instant::now();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri("/maven/libs/a/b/1/b-1.jar")
+                    .header(header::CONTENT_LENGTH, "1024")
+                    .body(Body::from(vec![0u8; 1024]))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+        drop(held);
+        super::storage::install(&QuotaSettings::default());
+        Some((response.status(), elapsed))
+    }
+
+    /// #6316: with the pool exhausted, the pre-check gives up within its
+    /// budget and admits, instead of waiting the acquire timeout once per
+    /// lookup (about 10 s here), and counts the skip.
+    #[test]
+    fn exhausted_pool_skips_the_precheck_within_its_budget_6316() {
+        let (outcome, counters) = crate::services::metrics_service::capture_counters_async(|| {
+            put_on_exhausted_pool(None)
+        });
+        let Some((status, elapsed)) = outcome else {
+            return;
+        };
+        assert_eq!(status, StatusCode::CREATED);
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "pre-check took {elapsed:?}"
+        );
+        assert_eq!(counters.get("ak_quota_precheck_skipped_total", &[]), 1);
+    }
+
+    /// `QUOTA_PRECHECK_BUDGET_MS` sets how long the pre-check may wait.
+    #[tokio::test]
+    async fn precheck_budget_follows_its_setting_6316() {
+        let Some((status, elapsed)) = put_on_exhausted_pool(Some(1500)).await else {
+            return;
+        };
+        assert_eq!(status, StatusCode::CREATED);
+        assert!(
+            elapsed >= std::time::Duration::from_millis(1500)
+                && elapsed < std::time::Duration::from_secs(4),
+            "pre-check took {elapsed:?}"
+        );
+    }
+
+    /// The budget only bounds the wait: with a free pool a declared length
+    /// over the storage quota is still refused before the body is read.
+    #[tokio::test]
+    async fn free_pool_still_refuses_an_over_quota_declared_length_6316() {
+        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+            return;
+        };
+        let used = super::storage::instance_used_bytes(&pool).await.unwrap();
+        let gib = 1u64 << 30;
+        let (state, _dir) = quota_state(pool, used + 4 * gib, None);
+        let write = target(true, true, Some("libs")).unwrap();
+        let refusal = admission_refusal(&state, &write, Some(16 * gib), true).await;
+        let admitted = admission_refusal(&state, &write, Some(1024), true).await;
+        super::storage::install(&QuotaSettings::default());
+        let refusal = refusal.expect("over the storage quota");
+        assert_eq!(refusal.into_response().status(), StatusCode::FORBIDDEN);
+        assert!(admitted.is_none(), "1 KiB fits");
     }
 }

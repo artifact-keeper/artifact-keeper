@@ -71,15 +71,17 @@ jobs:
           sh -n deploy/mcp-introspector/k8s/k8s-launcher.sh
           sh -n backend/tests/fixtures/mcp_sandbox/echo-mcp-server.sh
 
+      # Bounded (#6272): the apt download (runsc, protoc) is capped per
+      # attempt and retried on azure.archive.ubuntu.com.
       - name: Install gVisor (runsc) and register it with Docker
+        timeout-minutes: 15
         run: |
           set -eux
-          curl -fsSL https://gvisor.dev/archive.key \
+          curl -fsSL --retry 3 --max-time 60 https://gvisor.dev/archive.key \
             | sudo gpg --dearmor -o /usr/share/keyrings/gvisor-archive-keyring.gpg
           echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/gvisor-archive-keyring.gpg] https://storage.googleapis.com/gvisor/releases release main" \
             | sudo tee /etc/apt/sources.list.d/gvisor.list
-          sudo apt-get update
-          sudo apt-get install -y runsc protobuf-compiler
+          bash scripts/ci/apt-install-bounded.sh runsc protobuf-compiler
           sudo runsc install
           sudo systemctl restart docker
           docker info --format '{{json .Runtimes}}' | grep -q runsc
@@ -87,7 +89,9 @@ jobs:
           guest="$(docker run --rm --runtime=runsc docker.io/library/alpine:3.20 uname -r)"
           test "$guest" != "$(uname -r)"
 
-      - uses: dtolnay/rust-toolchain@1.98.0
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master 2026-11-15; the toolchain input picks the compiler
+        with:
+          toolchain: 1.98.0
 
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
@@ -96,7 +100,7 @@ jobs:
           save-if: ${{ github.event_name != 'pull_request' && github.event_name != 'merge_group' }}
 
       - name: Build ak-mcp-introspector
-        run: cargo build --bin ak-mcp-introspector
+        run: cargo build --locked --bin ak-mcp-introspector
 
       - name: Publish the guest image to a stand-in OCI registry
         id: guest

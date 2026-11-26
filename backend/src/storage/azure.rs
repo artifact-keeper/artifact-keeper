@@ -572,6 +572,9 @@ fn put_blob_from_url_timeout(size: u64, floor: Duration) -> Duration {
     .max(floor)
 }
 
+/// The most blobs one List Blobs request returns (the service maximum).
+const AZURE_LIST_MAX_RESULTS: usize = 5000;
+
 /// One page of a List Blobs response (#4320).
 #[derive(Debug, Default, PartialEq)]
 struct ListBlobsPage {
@@ -1699,31 +1702,9 @@ impl AzureBackend {
         let mut keys = Vec::new();
         let mut marker: Option<String> = None;
         loop {
-            let mut query = String::from("restype=container&comp=list&maxresults=5000");
-            if let Some(prefix) = prefix.filter(|p| !p.is_empty()) {
-                query.push_str("&prefix=");
-                query.push_str(&urlencoding::encode(prefix));
-            }
-            if let Some(marker) = marker.as_deref() {
-                query.push_str("&marker=");
-                query.push_str(&urlencoding::encode(marker));
-            }
-            let url = self.list_url(&query)?;
-            let response = self.authorized_get(&url).await?;
-            if !response.status().is_success() {
-                let status = response.status();
-                let detail = azure_error_detail(response).await;
-                return Err(crate::storage::failure::status_storage_error(
-                    status.as_u16(),
-                    azure_error_code(&detail),
-                    format!("Azure List Blobs failed with status {}: {}", status, detail),
-                ));
-            }
-            let body = response
-                .text()
-                .await
-                .map_err(|e| request_error("Azure List Blobs body", e))?;
-            let page = parse_list_blobs_result(&body)?;
+            let page = self
+                .list_blobs_page(prefix, marker.as_deref(), AZURE_LIST_MAX_RESULTS)
+                .await?;
             keys.extend(page.keys);
             match page.next_marker {
                 Some(next) => marker = Some(next),
@@ -1731,6 +1712,58 @@ impl AzureBackend {
             }
         }
         Ok(keys)
+    }
+
+    /// One bounded page of [`Self::list`] (#6429): one List Blobs request with
+    /// `maxresults` set to the page size. The cursor is the service's
+    /// `NextMarker`, passed back as `marker`.
+    pub async fn list_page(
+        &self,
+        prefix: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<crate::services::storage_service::KeyPage> {
+        let limit = limit.clamp(1, AZURE_LIST_MAX_RESULTS);
+        let page = self.list_blobs_page(Some(prefix), cursor, limit).await?;
+        Ok(crate::services::storage_service::KeyPage {
+            keys: page.keys.into_iter().map(|k| k.key).collect(),
+            next: page.next_marker,
+        })
+    }
+
+    /// One List Blobs request: at most `max_results` blobs under `prefix`,
+    /// from `marker` on.
+    async fn list_blobs_page(
+        &self,
+        prefix: Option<&str>,
+        marker: Option<&str>,
+        max_results: usize,
+    ) -> Result<ListBlobsPage> {
+        let mut query = format!("restype=container&comp=list&maxresults={max_results}");
+        if let Some(prefix) = prefix.filter(|p| !p.is_empty()) {
+            query.push_str("&prefix=");
+            query.push_str(&urlencoding::encode(prefix));
+        }
+        if let Some(marker) = marker {
+            query.push_str("&marker=");
+            query.push_str(&urlencoding::encode(marker));
+        }
+        let url = self.list_url(&query)?;
+        let response = self.authorized_get(&url).await?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let detail = azure_error_detail(response).await;
+            return Err(crate::storage::failure::status_storage_error(
+                status.as_u16(),
+                azure_error_code(&detail),
+                format!("Azure List Blobs failed with status {}: {}", status, detail),
+            ));
+        }
+        let body = response
+            .text()
+            .await
+            .map_err(|e| request_error("Azure List Blobs body", e))?;
+        parse_list_blobs_result(&body)
     }
 
     /// URL of a List Blobs request carrying `query` (`restype=container&...`).
@@ -2251,85 +2284,33 @@ impl StorageBackend for AzureBackend {
         }))
     }
 
-    /// Stream a file on disk into Azure Blob Storage as a single BlockBlob
-    /// without buffering the whole body in memory.
+    /// Upload a file on disk through [`Self::put_stream`]'s block upload.
     ///
-    /// The default trait implementation opens the file as a `ReaderStream`
-    /// and delegates to `put_stream`, but Azure has no streaming
-    /// `put_stream` override (single-PUT requires Content-Length, and a
-    /// staged-block implementation is non-trivial). For migration (#1422)
-    /// we know the file size from `fs::metadata`, so we can sign a single
-    /// PUT BlockBlob request and let `reqwest::Body::wrap_stream` pump the
-    /// file chunk-by-chunk over the wire. Peak heap usage is O(chunk_size),
-    /// not O(file_size).
+    /// This used to send the whole file as one Put Blob request. That fails
+    /// twice over for large files: Put Blob accepts at most 5000 MiB (413
+    /// `RequestBodyTooLarge`), and Azure sends no response byte before it has
+    /// the whole body, so the large-object client's 30 s `read_timeout`
+    /// aborts any upload that takes longer than that ("error sending
+    /// request"). Staged 4 MiB Put Block
+    /// requests each answer within the timeout, have no 5000 MiB limit, and
+    /// reuse `put_stream`'s per-upload block-ID nonce and lost-commit-race
+    /// handling (#3920). Peak heap stays O(block size).
     #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "client", storage.system = "azure", storage.operation = "put_file"))]
     async fn put_file(&self, key: &str, path: &std::path::Path) -> Result<()> {
         use futures::StreamExt;
         use tokio::io::BufReader;
         use tokio_util::io::ReaderStream;
 
-        let metadata = tokio::fs::metadata(path).await.map_err(|e| {
-            AppError::Storage(format!("Failed to stat file for Azure upload: {}", e))
-        })?;
-        let content_length = metadata.len();
-
         let file = tokio::fs::File::open(path).await.map_err(|e| {
             AppError::Storage(format!("Failed to open file for Azure upload: {}", e))
         })?;
         let reader = BufReader::with_capacity(256 * 1024, file);
-        let stream = ReaderStream::with_capacity(reader, 256 * 1024)
-            .map(|r| r.map_err(|e| std::io::Error::other(format!("Read error: {}", e))));
-
-        let url = self.blob_url(key);
-        let date_str = Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string();
-
-        let response = match &self.auth {
-            AzureAuthMode::SharedKey { decoded_key } => {
-                let string_to_sign = self.put_blob_string_to_sign(content_length, &date_str, key);
-                let auth_header =
-                    Self::shared_key_auth(decoded_key, &self.config.account_name, &string_to_sign)?;
-
-                self.client
-                    .put(&url)
-                    .header("Authorization", auth_header)
-                    .header("x-ms-date", &date_str)
-                    .header("x-ms-version", "2021-06-08")
-                    .header("x-ms-blob-type", "BlockBlob")
-                    .header("Content-Type", "application/octet-stream")
-                    .header("Content-Length", content_length)
-                    .body(reqwest::Body::wrap_stream(stream))
-                    .send()
-                    .await
-                    .map_err(|e| request_error("Azure upload failed", e))?
-            }
-            AzureAuthMode::TokenCredential { provider } => {
-                let token = provider.get_token().await?;
-                self.client
-                    .put(&url)
-                    .header("Authorization", format!("Bearer {}", token))
-                    .header("x-ms-date", &date_str)
-                    .header("x-ms-version", "2021-06-08")
-                    .header("x-ms-blob-type", "BlockBlob")
-                    .header("Content-Type", "application/octet-stream")
-                    .header("Content-Length", content_length)
-                    .body(reqwest::Body::wrap_stream(stream))
-                    .send()
-                    .await
-                    .map_err(|e| request_error("Azure upload failed", e))?
-            }
-        };
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let detail = azure_error_detail(response).await;
-            return Err(crate::storage::failure::status_storage_error(
-                status.as_u16(),
-                azure_error_code(&detail),
-                format!("Azure upload failed with status {}: {}", status, detail),
-            ));
-        }
-
-        Ok(())
+        let stream = ReaderStream::with_capacity(reader, 256 * 1024).map(|r| {
+            r.map_err(|e| AppError::Storage(format!("Failed to read file for Azure upload: {}", e)))
+        });
+        StorageBackend::put_stream(self, key, Box::pin(stream))
+            .await
+            .map(|_| ())
     }
 
     #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "client", storage.system = "azure", storage.operation = "health_check"))]
@@ -3066,6 +3047,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_put_file_uses_block_upload_instead_of_single_put_blob() {
+        use crate::storage::StorageBackend as StorageBackendTrait;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(201))
+            .mount(&server)
+            .await;
+
+        // Two full blocks and a partial third.
+        let len = 2 * AZURE_BLOCK_CHUNK_SIZE + 17;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("artifact.bin");
+        tokio::fs::write(&path, vec![0x5au8; len]).await.unwrap();
+
+        let backend = create_cached_rbac_backend_with_endpoint(server.uri());
+        StorageBackendTrait::put_file(&backend, "files/artifact.bin", &path)
+            .await
+            .expect("file upload should succeed");
+
+        let requests = server.received_requests().await.unwrap_or_default();
+        let comp = |request: &wiremock::Request, wanted: &str| {
+            request
+                .url
+                .query_pairs()
+                .any(|(key, value)| key == "comp" && value == wanted)
+        };
+        let blocks: Vec<_> = requests.iter().filter(|r| comp(r, "block")).collect();
+        assert_eq!(
+            blocks.len(),
+            3,
+            "a file of 2 blocks + 17 bytes stages 3 blocks"
+        );
+        assert_eq!(
+            blocks.iter().map(|r| r.body.len()).sum::<usize>(),
+            len,
+            "the staged blocks carry the whole file"
+        );
+        assert!(
+            blocks
+                .iter()
+                .all(|r| r.body.len() <= AZURE_BLOCK_CHUNK_SIZE),
+            "no staged block exceeds the block size"
+        );
+        assert_eq!(
+            requests.iter().filter(|r| comp(r, "blocklist")).count(),
+            1,
+            "the blocks are committed with one Put Block List"
+        );
+        assert!(
+            !requests.iter().any(|request| request
+                .headers
+                .get("x-ms-blob-type")
+                .is_some_and(|value| value == "BlockBlob")),
+            "put_file must not send the file as a single Put Blob"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_put_file_reports_a_missing_file() {
+        use crate::storage::StorageBackend as StorageBackendTrait;
+
+        let backend = create_cached_rbac_backend_with_endpoint("http://127.0.0.1:9".into());
+        let dir = tempfile::tempdir().unwrap();
+        let err = StorageBackendTrait::put_file(&backend, "k", &dir.path().join("missing"))
+            .await
+            .expect_err("a missing file cannot be uploaded");
+        assert!(
+            err.to_string()
+                .contains("Failed to open file for Azure upload"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_exists_returns_false_only_for_a_primary_404() {
         use crate::storage::StorageBackend as StorageBackendTrait;
         use wiremock::matchers::method;
@@ -3189,6 +3247,49 @@ mod tests {
             .expect("list_keys")
             .expect("Azure can enumerate its blobs");
         assert_eq!(listed.len(), 2);
+    }
+
+    /// #6429: `list_page` is one List Blobs request with `maxresults` set to
+    /// the page size, resumed from the marker it returned.
+    #[tokio::test]
+    async fn test_list_page_is_one_bounded_request_6429() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/testcontainer"))
+            .and(query_param("prefix", "proxy-cache/r/"))
+            .and(query_param("maxresults", "2"))
+            .and(query_param("marker", "m2"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<EnumerationResults><Blobs><Blob><Name>proxy-cache/r/c</Name></Blob></Blobs>\
+                 <NextMarker/></EnumerationResults>",
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/testcontainer"))
+            .and(query_param("prefix", "proxy-cache/r/"))
+            .and(query_param("maxresults", "2"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<EnumerationResults><Blobs><Blob><Name>proxy-cache/r/a</Name></Blob>\
+                 <Blob><Name>proxy-cache/r/b</Name></Blob></Blobs>\
+                 <NextMarker>m2</NextMarker></EnumerationResults>",
+            ))
+            .mount(&server)
+            .await;
+
+        let backend = create_cached_rbac_backend_with_endpoint(server.uri());
+        let first = backend.list_page("proxy-cache/r/", None, 2).await.unwrap();
+        assert_eq!(first.keys, vec!["proxy-cache/r/a", "proxy-cache/r/b"]);
+        assert_eq!(first.next.as_deref(), Some("m2"));
+        let last = backend
+            .list_page("proxy-cache/r/", first.next.as_deref(), 2)
+            .await
+            .unwrap();
+        assert_eq!(last.keys, vec!["proxy-cache/r/c"]);
+        assert_eq!(last.next, None);
     }
 
     /// #4320: a Shared Key List Blobs request carries a container SAS

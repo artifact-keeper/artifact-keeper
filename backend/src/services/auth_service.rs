@@ -1127,6 +1127,70 @@ fn api_token_user_invalidation_map() -> &'static RwLock<HashMap<Uuid, Instant>> 
 /// Type alias for an entry in the per-instance API-token cache map.
 type TokenCacheMap = RwLock<HashMap<String, (CachedApiTokenEntry, Instant)>>;
 
+/// A validated API token and the id of its row: what one validation yields.
+type ApiTokenOutcome = Result<(ApiTokenValidation, Uuid)>;
+
+/// How a finished in-flight validation left its slot for the requests that
+/// waited on it (#6215). An empty slot (`None`) means the leader was cancelled
+/// before finishing; the next waiter then runs the validation in its place.
+#[derive(Clone)]
+enum TokenFlightState {
+    /// The token validated. `started` is when the leader began, before its
+    /// DB read: a waiter re-validates if the token was revoked, its user
+    /// invalidated after `started`, or it expired since.
+    Valid {
+        validation: Box<ApiTokenValidation>,
+        token_id: Uuid,
+        started: Instant,
+    },
+    /// The token was refused. Shared, never cached.
+    Refused(String),
+    /// The leader hit an error that is not a verdict on the token (a database
+    /// error, an internal error or a `503` from the auth cap). Waiters
+    /// validate on their own, in parallel, as they would without the flight,
+    /// rather than inheriting a transient failure or queueing one by one.
+    Bypass,
+}
+
+impl TokenFlightState {
+    fn from_outcome(outcome: &ApiTokenOutcome, started: Instant) -> Self {
+        match outcome {
+            Ok((validation, token_id)) => Self::Valid {
+                validation: Box::new(validation.clone()),
+                token_id: *token_id,
+                started,
+            },
+            Err(AppError::Authentication(msg)) => Self::Refused(msg.clone()),
+            Err(_) => Self::Bypass,
+        }
+    }
+}
+
+/// Whether a `Valid` verdict a leader reached, starting at `started`, may no
+/// longer be handed to a waiter as is (#6215). The same checks the cache path
+/// applies, so a revocation, deactivation or expiry that landed while the
+/// leader was still validating is not missed by requests that joined it.
+fn shared_validation_is_stale(
+    validation: &ApiTokenValidation,
+    token_id: Uuid,
+    started: Instant,
+) -> bool {
+    is_api_token_revoked_in_cache(token_id)
+        || is_user_api_tokens_invalidated_after(validation.user.id, started)
+        || validation.expires_at.is_some_and(|exp| exp < Utc::now())
+}
+
+/// One in-flight API-token validation (#6215). The first request to lock it
+/// runs the validation while holding the lock and leaves a
+/// [`TokenFlightState`] in the slot; requests for the same token that arrived
+/// meanwhile queue on the lock and act on it instead of running their own
+/// bcrypt. If the leader is cancelled the slot stays empty and the next
+/// waiter runs the validation in its place.
+type TokenFlight = tokio::sync::Mutex<Option<TokenFlightState>>;
+
+/// Per-instance map of in-flight API-token validations, keyed like the cache.
+type TokenFlightMap = std::sync::Mutex<HashMap<String, Arc<TokenFlight>>>;
+
 /// Registry of long-lived `AuthService` token caches that should be flushed
 /// when a user is invalidated. Each entry is a `Weak` reference so dropped
 /// services don't pin memory; dead weaks are pruned during invalidation.
@@ -1755,6 +1819,9 @@ pub struct AuthService {
     /// and have entries flushed by [`invalidate_user_token_cache_entries`]
     /// without holding a strong reference to the whole `AuthService`.
     token_cache: Arc<TokenCacheMap>,
+    /// Validations currently running, so a burst of requests carrying the
+    /// same uncached token runs one bcrypt rather than one each (#6215).
+    token_flights: Arc<TokenFlightMap>,
 }
 
 impl AuthService {
@@ -1823,6 +1890,7 @@ impl AuthService {
             encoding_key: EncodingKey::from_secret(secret.as_bytes()),
             decoding_key: DecodingKey::from_secret(secret.as_bytes()),
             token_cache: Arc::new(RwLock::new(HashMap::new())),
+            token_flights: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -3493,47 +3561,168 @@ impl AuthService {
 
     /// Validate API token and return user with scopes and repository restrictions.
     pub async fn validate_api_token(&self, token: &str) -> Result<ApiTokenValidation> {
+        // Accept the separator-less token spelling classic conda's URL regex
+        // can carry (#5642). Restoring the canonical form here, before the
+        // shape check, the cache key and the bcrypt comparison, means both
+        // spellings resolve to the same row and share one cache entry.
+        let canonical;
+        let token = match canonical_api_token(token) {
+            Some(token) => {
+                canonical = token;
+                canonical.as_str()
+            }
+            None => token,
+        };
         // Hash the raw token before using it as cache key so plaintext tokens
         // are never stored in memory.
         let cache_key = format!("{:x}", Sha256::digest(token.as_bytes()));
 
+        if let Some(hit) = self.cached_api_token(&cache_key) {
+            return Self::record_validated_api_token(hit);
+        }
+
+        // #6215: single-flight the validation per token. Without it, every
+        // request that arrives while the first validation is still running
+        // misses the cache and runs its own bcrypt under
+        // `AUTH_MAX_CONCURRENCY`, so a burst larger than the cap carrying one
+        // valid token is partly answered `503 at capacity`. Requests for the
+        // same token now queue behind the first one and share its verdict.
+        // Each request still returns its own `Result`, so the callers'
+        // failure and lockout accounting sees one outcome per request, as
+        // before; the cap still bounds every bcrypt that does run.
+        //
+        // Refuse a malformed credential before joining a flight: it costs no
+        // bcrypt, so there is nothing to share.
+        if !is_api_token_shape(token) {
+            return Err(AppError::Authentication("Invalid API token".to_string()));
+        }
+        let flight = self.join_token_flight(&cache_key);
+        let mut slot = flight.lock().await;
+        match slot.clone() {
+            Some(TokenFlightState::Valid {
+                validation,
+                token_id,
+                started,
+            }) => {
+                drop(slot);
+                if shared_validation_is_stale(&validation, token_id, started) {
+                    // Revoked, deactivated or expired while the leader was
+                    // validating: decide from the DB, as without the flight.
+                    let outcome = self.validate_api_token_uncached(token, &cache_key).await;
+                    return Self::record_validated_api_token(outcome);
+                }
+                return Self::record_validated_api_token(Ok((*validation, token_id)));
+            }
+            Some(TokenFlightState::Refused(msg)) => {
+                return Err(AppError::Authentication(msg));
+            }
+            Some(TokenFlightState::Bypass) => {
+                drop(slot);
+                let outcome = match self.cached_api_token(&cache_key) {
+                    Some(hit) => hit,
+                    None => self.validate_api_token_uncached(token, &cache_key).await,
+                };
+                return Self::record_validated_api_token(outcome);
+            }
+            None => {}
+        }
+        // The leader. `started` precedes the DB read, so any revocation or
+        // deactivation the read could have missed lands after it.
+        let started = Instant::now();
+        // Look again: a flight that finished between our cache miss and
+        // joining has already cached its success.
+        let outcome = match self.cached_api_token(&cache_key) {
+            Some(hit) => hit,
+            None => self.validate_api_token_uncached(token, &cache_key).await,
+        };
+        *slot = Some(TokenFlightState::from_outcome(&outcome, started));
+        // Requests arriving from now on start a new flight: a success is in
+        // the cache, a refusal is shared only with the requests that were
+        // already waiting, and after a bypass they validate on their own.
+        self.leave_token_flight(&cache_key, &flight);
+        drop(slot);
+        Self::record_validated_api_token(outcome)
+    }
+
+    /// The cached validation for `cache_key`, if one is fresh. `Some(Err)`
+    /// when the entry shows the token expired or its user deactivated.
+    fn cached_api_token(&self, cache_key: &str) -> Option<ApiTokenOutcome> {
         // Check in-memory cache before the expensive bcrypt verification.
         // Package managers like cargo send credentials on every request (index
         // lookups, downloads, etc.), so without caching every request pays the
         // full bcrypt cost (~100-500 ms), which compounds across the many
         // parallel requests in a single build.
-        if let Ok(cache) = self.token_cache.read() {
-            if let Some((entry, cached_at)) = cache.get(&cache_key) {
-                // A revoked entry (Bug #1) goes back to the DB: a re-minted
-                // token may carry the same caller-supplied value.
-                if cached_at.elapsed().as_secs() < API_TOKEN_CACHE_TTL_SECS
-                    && !is_api_token_revoked_in_cache(entry.token_id)
-                {
-                    // Reject if the token has since expired (Bug #2).
-                    if let Some(exp) = entry.expires_at {
-                        if exp < Utc::now() {
-                            return Err(AppError::Authentication("API token expired".to_string()));
-                        }
-                    }
-                    // Reject if the user has been deactivated (or hard-deleted)
-                    // since this entry was cached. Without this check, a cached
-                    // validation would keep accepting requests for up to
-                    // `API_TOKEN_CACHE_TTL_SECS` (5 min) after `is_active`
-                    // flipped to false, even though the SQL filter
-                    // `WHERE id = $1 AND is_active = true` would now reject.
-                    if is_user_api_tokens_invalidated_after(entry.validation.user.id, *cached_at) {
-                        return Err(AppError::Authentication(
-                            "User account is deactivated".to_string(),
-                        ));
-                    }
-                    // #4987: audit rows written for this request name the token.
-                    crate::api::middleware::request_span::record_api_token(entry.token_id);
-                    return Ok(entry.validation.clone());
-                }
+        let cache = self.token_cache.read().ok()?;
+        let (entry, cached_at) = cache.get(cache_key)?;
+        // A revoked entry (Bug #1) goes back to the DB: a re-minted
+        // token may carry the same caller-supplied value.
+        if cached_at.elapsed().as_secs() >= API_TOKEN_CACHE_TTL_SECS
+            || is_api_token_revoked_in_cache(entry.token_id)
+        {
+            return None;
+        }
+        // Reject if the token has since expired (Bug #2).
+        if let Some(exp) = entry.expires_at {
+            if exp < Utc::now() {
+                return Some(Err(AppError::Authentication(
+                    "API token expired".to_string(),
+                )));
             }
         }
+        // Reject if the user has been deactivated (or hard-deleted)
+        // since this entry was cached. Without this check, a cached
+        // validation would keep accepting requests for up to
+        // `API_TOKEN_CACHE_TTL_SECS` (5 min) after `is_active`
+        // flipped to false, even though the SQL filter
+        // `WHERE id = $1 AND is_active = true` would now reject.
+        if is_user_api_tokens_invalidated_after(entry.validation.user.id, *cached_at) {
+            return Some(Err(AppError::Authentication(
+                "User account is deactivated".to_string(),
+            )));
+        }
+        Some(Ok((entry.validation.clone(), entry.token_id)))
+    }
 
-        // API tokens have format: prefix_secret
+    /// #4987: audit rows written for this request name the token.
+    fn record_validated_api_token(outcome: ApiTokenOutcome) -> Result<ApiTokenValidation> {
+        outcome.map(|(validation, token_id)| {
+            crate::api::middleware::request_span::record_api_token(token_id);
+            validation
+        })
+    }
+
+    /// The in-flight validation for `cache_key`, joined or started (#6215).
+    fn join_token_flight(&self, cache_key: &str) -> Arc<TokenFlight> {
+        let mut flights = self
+            .token_flights
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Drop flights nobody holds any more (every request on them was
+        // cancelled before a leader finished). Clones
+        // are only taken under this lock, so a count of 1 cannot grow back.
+        flights.retain(|_, flight| Arc::strong_count(flight) > 1);
+        flights.entry(cache_key.to_string()).or_default().clone()
+    }
+
+    /// Retire `flight` so later requests for `cache_key` start afresh.
+    fn leave_token_flight(&self, cache_key: &str, flight: &Arc<TokenFlight>) {
+        let mut flights = self
+            .token_flights
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if flights
+            .get(cache_key)
+            .is_some_and(|current| Arc::ptr_eq(current, flight))
+        {
+            flights.remove(cache_key);
+        }
+    }
+
+    /// The full validation of a token the cache did not answer: DB lookup,
+    /// bcrypt, user and repository scope. Caches a success.
+    async fn validate_api_token_uncached(&self, token: &str, cache_key: &str) -> ApiTokenOutcome {
+        // API tokens have format: prefix_secret (or the separator-less
+        // spelling conda can carry, restored above).
         // We store hash of full token and prefix for lookup.
         //
         // Every rejection that can be decided without the secret is decided
@@ -3613,6 +3802,12 @@ impl AuthService {
         if should_update {
             let token_id = stored_token.id;
             let db = self.db.clone();
+            // Deliberately not `db_read_retry::spawn_write`: the read retry
+            // does not see this spawned write, and a replayed GET may run it
+            // twice, which is harmless (it only sets last_used_at to now).
+            // Counting it as a write would stop a GET authenticated with an
+            // API token from being replayed whenever the debounce lets the
+            // update through.
             tokio::spawn(async move {
                 let _ = sqlx::query("UPDATE api_tokens SET last_used_at = NOW() WHERE id = $1")
                     .bind(token_id)
@@ -3715,11 +3910,10 @@ impl AuthService {
                 token_id: stored_token.id,
                 expires_at: stored_token.expires_at,
             };
-            cache.insert(cache_key, (entry, Instant::now()));
+            cache.insert(cache_key.to_string(), (entry, Instant::now()));
         }
 
-        crate::api::middleware::request_span::record_api_token(stored_token.id);
-        Ok(validation)
+        Ok((validation, stored_token.id))
     }
 
     /// Generate a new API token
@@ -4670,6 +4864,31 @@ pub(crate) fn is_api_token_shape(value: &str) -> bool {
         && bytes[9..].iter().all(u8::is_ascii_hexdigit)
 }
 
+/// The canonical `<8 hex>_<32 hex>` spelling of a token carried without its
+/// separator, or `None` for every other value.
+///
+/// Classic conda reads a channel token out of the URL path with
+/// `re.search(r"/t/([a-zA-Z0-9-]*)", url)` (`conda/common/url.py`). `_` is not
+/// in that alphabet, so conda stops at the separator inside an Artifact Keeper
+/// token, drops the rest of the credential into the channel path, and the
+/// request 401s (#5642). A conda user therefore writes the token without the
+/// separator (`/conda/t/<40 hex>/<repo>`); those 40 hex digits are the same
+/// 8-digit prefix and 32-digit secret, so re-inserting the separator yields
+/// exactly the token Artifact Keeper minted.
+///
+/// The mapping is bijective: a canonical token has `_` at index 8, which is
+/// never a hex digit, so a 40-hex-digit value can only be the separator-less
+/// spelling. The credential space is unchanged, so accepting it widens no
+/// secret.
+pub(crate) fn canonical_api_token(token: &str) -> Option<String> {
+    let bytes = token.as_bytes();
+    if bytes.len() == 40 && bytes.iter().all(u8::is_ascii_hexdigit) {
+        Some(format!("{}_{}", &token[..8], &token[8..]))
+    } else {
+        None
+    }
+}
+
 /// Three non-empty base64url segments with a JSON header: a compact JWS.
 pub(crate) fn is_jwt_shape(value: &str) -> bool {
     let mut segments = value.split('.');
@@ -4774,6 +4993,30 @@ mod tests {
         assert_eq!(AuthService::api_token_prefix(&token), Some("0123abcd"));
     }
 
+    /// #5642: classic conda's URL-token regex has no `_` in its alphabet, so a
+    /// conda token channel carries the token without the separator. Restoring
+    /// it must reproduce the minted token, and every other value (including a
+    /// canonical token) must be left to the caller untouched.
+    #[test]
+    fn canonical_api_token_restores_condas_separator_less_spelling_5642() {
+        let secret = "0123456789abcdef0123456789abcdef";
+        // The separator-less spelling conda can carry, 40 hex digits.
+        assert_eq!(
+            canonical_api_token(&format!("0123abcd{secret}")),
+            Some(format!("0123abcd_{secret}"))
+        );
+        // The canonical spelling is already canonical: no rewrite.
+        assert_eq!(canonical_api_token(&format!("0123abcd_{secret}")), None);
+        // Not a token: wrong length, non-hex digits, or a separator elsewhere.
+        assert_eq!(canonical_api_token("0123abcd"), None);
+        assert_eq!(canonical_api_token(&"f".repeat(41)), None);
+        assert_eq!(canonical_api_token(&"z".repeat(40)), None);
+        assert_eq!(
+            canonical_api_token("0123456_0123456789abcdef0123456789abcdef"),
+            None
+        );
+    }
+
     /// The real path: the credential from #5485 finding 2 used to panic in
     /// `validate_api_token` before any lookup; it is now a plain 401.
     #[tokio::test]
@@ -4802,6 +5045,325 @@ mod tests {
             .await
             .expect_err("has_scope refuses the same credential");
         assert!(matches!(err, AppError::Authentication(_)), "{err:?}");
+    }
+
+    /// #5642: a token minted in the canonical `<8 hex>_<32 hex>` shape also
+    /// validates with the separator removed, the spelling classic conda's
+    /// URL-token regex can carry. Both spellings resolve to the same row.
+    #[tokio::test]
+    async fn validate_api_token_accepts_condas_separator_less_spelling_5642() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _username) = tdh::create_user(&pool).await;
+        let svc = AuthService::new(pool.clone(), Arc::new(Config::test_config()));
+        let (token, _id) = svc
+            .generate_api_token(
+                user_id,
+                "conda-5642",
+                vec!["read:artifacts".to_string()],
+                None,
+            )
+            .await
+            .expect("mint API token");
+
+        let canonical = svc
+            .validate_api_token(&token)
+            .await
+            .expect("the canonical token validates");
+        let conda_spelling = format!("{}{}", &token[..8], &token[9..]);
+        assert!(!conda_spelling.contains('_'));
+        let via_conda = svc
+            .validate_api_token(&conda_spelling)
+            .await
+            .expect("the separator-less token validates");
+        assert_eq!(canonical.user.id, user_id);
+        assert_eq!(via_conda.user.id, user_id);
+    }
+
+    /// #6215: a burst of requests carrying one valid token, larger than the
+    /// auth cap, all succeed on a cold cache. Each request used to miss the
+    /// cache and run its own bcrypt under `AUTH_MAX_CONCURRENCY`, so with a
+    /// production-cost hash the tail of the queue waited out
+    /// `AUTH_PERMIT_WAIT` and was shed with `503 at capacity`. The burst now
+    /// runs one bcrypt and every request shares its result.
+    ///
+    /// Installs a one-slot cap; nextest's process-per-test isolation keeps
+    /// the `OnceLock` (and `bcrypt_verify_counter`) private to this test.
+    #[tokio::test]
+    async fn burst_with_one_valid_token_beyond_the_cap_all_succeed_6215() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use std::sync::atomic::Ordering;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let sem = Arc::new(Semaphore::new(1));
+        install_global_auth_semaphore(Some(sem.clone()));
+        let installed = installed_global_auth_semaphore().expect("a cap is installed");
+        assert!(
+            Arc::ptr_eq(&installed, &sem),
+            "another cap was installed first in this process"
+        );
+
+        let (user_id, _username) = tdh::create_user(&pool).await;
+        let minter = AuthService::new(pool.clone(), Arc::new(Config::test_config()));
+        let (token, token_id) = minter
+            .generate_api_token(user_id, "burst-6215", vec!["read:artifacts".into()], None)
+            .await
+            .expect("mint API token");
+        // A production-cost hash, so a burst that verified once per request
+        // would queue for longer than `AUTH_PERMIT_WAIT` behind the cap.
+        let slow_hash = bcrypt::hash(&token, bcrypt::DEFAULT_COST).expect("hash");
+        sqlx::query("UPDATE api_tokens SET token_hash = $1 WHERE id = $2")
+            .bind(&slow_hash)
+            .bind(token_id)
+            .execute(&pool)
+            .await
+            .expect("store the production-cost hash");
+
+        // A fresh service: its token cache is cold.
+        let svc = AuthService::new(pool.clone(), Arc::new(Config::test_config()));
+        const BURST: usize = 32;
+        let before = bcrypt_verify_counter().load(Ordering::Relaxed);
+        let results =
+            futures::future::join_all((0..BURST).map(|_| svc.validate_api_token(&token))).await;
+        let verifies = bcrypt_verify_counter().load(Ordering::Relaxed) - before;
+
+        for (i, result) in results.into_iter().enumerate() {
+            let validation = result.unwrap_or_else(|e| panic!("request {i} failed: {e:?}"));
+            assert_eq!(validation.user.id, user_id);
+        }
+        assert_eq!(
+            verifies, 1,
+            "one valid token must cost one bcrypt per cache period, whatever the fan-out"
+        );
+        assert_eq!(sem.available_permits(), 1, "the cap is intact afterwards");
+    }
+
+    /// #6215: a refusal is shared only with the requests already waiting on
+    /// the validation that produced it, and is never cached: each request
+    /// still gets its own `Err` (so per-request failure accounting is
+    /// unchanged), and a later attempt verifies afresh.
+    #[tokio::test]
+    async fn burst_with_a_wrong_secret_shares_the_refusal_but_does_not_cache_it_6215() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use std::sync::atomic::Ordering;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _username) = tdh::create_user(&pool).await;
+        let svc = AuthService::new(pool.clone(), Arc::new(Config::test_config()));
+        let (token, _id) = svc
+            .generate_api_token(user_id, "wrong-6215", vec!["read:artifacts".into()], None)
+            .await
+            .expect("mint API token");
+        // Same live prefix, different secret: only bcrypt can refuse it.
+        let last = if token.ends_with('0') { "1" } else { "0" };
+        let wrong = format!("{}{last}", &token[..token.len() - 1]);
+        assert!(is_api_token_shape(&wrong));
+
+        let verifies = || bcrypt_verify_counter().load(Ordering::Relaxed);
+        let before = verifies();
+        let results =
+            futures::future::join_all((0..8).map(|_| svc.validate_api_token(&wrong))).await;
+        assert_eq!(
+            verifies() - before,
+            1,
+            "the in-flight burst shares one verify"
+        );
+        for result in results {
+            assert!(
+                matches!(result, Err(AppError::Authentication(_))),
+                "every request is refused on its own: {result:?}"
+            );
+        }
+
+        let before = verifies();
+        let again = svc.validate_api_token(&wrong).await;
+        assert!(matches!(again, Err(AppError::Authentication(_))));
+        assert_eq!(verifies() - before, 1, "a refusal is not cached");
+        assert!(
+            svc.token_flights.lock().unwrap().is_empty(),
+            "finished flights are retired"
+        );
+
+        // The valid token is unaffected and validates.
+        assert_eq!(
+            svc.validate_api_token(&token).await.unwrap().user.id,
+            user_id
+        );
+    }
+
+    /// #6215 review: a request that joined a flight must not take a `Valid`
+    /// verdict the leader reached before the token was revoked. The leader
+    /// reads the row, the token is revoked while it is still in bcrypt, and a
+    /// second request joins: it re-validates against the DB and is refused,
+    /// as its own lookup would have been without the flight.
+    #[tokio::test]
+    async fn waiter_refuses_a_token_revoked_mid_flight_6215() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use std::sync::atomic::Ordering;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _username) = tdh::create_user(&pool).await;
+        let svc = AuthService::new(pool.clone(), Arc::new(Config::test_config()));
+        let (token, token_id) = svc
+            .generate_api_token(user_id, "revoke-6215", vec!["read:artifacts".into()], None)
+            .await
+            .expect("mint API token");
+        // A production-cost hash keeps the leader in bcrypt long enough to
+        // revoke and join behind it.
+        let slow_hash = bcrypt::hash(&token, bcrypt::DEFAULT_COST).expect("hash");
+        sqlx::query("UPDATE api_tokens SET token_hash = $1 WHERE id = $2")
+            .bind(&slow_hash)
+            .bind(token_id)
+            .execute(&pool)
+            .await
+            .expect("store the production-cost hash");
+
+        let verifies = || bcrypt_verify_counter().load(Ordering::Relaxed);
+        let before = verifies();
+        let leader = svc.validate_api_token(&token);
+        let late = async {
+            // The leader has read the row and is in bcrypt.
+            while verifies() == before {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+            svc.revoke_api_token(token_id, user_id)
+                .await
+                .expect("revoke");
+            assert_eq!(
+                svc.token_flights.lock().unwrap().len(),
+                1,
+                "the leader is still in flight, so this request joins it"
+            );
+            svc.validate_api_token(&token).await
+        };
+        let (leader_result, late_result) = tokio::join!(leader, late);
+
+        assert!(
+            leader_result.is_ok(),
+            "the leader read the row before the revocation: {leader_result:?}"
+        );
+        // The DB lookup's revoked-row refusal, exactly what this request got
+        // on main.
+        assert!(
+            matches!(&late_result, Err(AppError::Unauthorized(msg)) if msg.contains("revoked")),
+            "a request that joined after the revocation is refused: {late_result:?}"
+        );
+        assert_eq!(
+            verifies() - before,
+            1,
+            "the re-validation refuses the revoked row before bcrypt"
+        );
+    }
+
+    /// #6215 review: the checks a waiter applies to a shared `Valid` verdict
+    /// are the cache path's: revocation, user invalidation after the leader
+    /// started, and expiry.
+    #[test]
+    fn shared_validation_staleness_mirrors_the_cache_checks_6215() {
+        let validation = |expires_at| ApiTokenValidation {
+            user: make_test_user(),
+            scopes: vec!["read:artifacts".to_string()],
+            allowed_repo_ids: AccessScope::from(None::<Vec<Uuid>>),
+            expires_at,
+        };
+
+        let fresh = validation(None);
+        let started = Instant::now();
+        assert!(!shared_validation_is_stale(&fresh, Uuid::new_v4(), started));
+
+        let revoked_id = Uuid::new_v4();
+        mark_api_token_revoked(revoked_id);
+        assert!(shared_validation_is_stale(&fresh, revoked_id, started));
+
+        let deactivated = validation(None);
+        let started = Instant::now();
+        invalidate_user_token_cache_entries(deactivated.user.id);
+        assert!(shared_validation_is_stale(
+            &deactivated,
+            Uuid::new_v4(),
+            started
+        ));
+
+        let expired = validation(Some(Utc::now() - Duration::seconds(1)));
+        assert!(shared_validation_is_stale(
+            &expired,
+            Uuid::new_v4(),
+            Instant::now()
+        ));
+        let unexpired = validation(Some(Utc::now() + Duration::hours(1)));
+        assert!(!shared_validation_is_stale(
+            &unexpired,
+            Uuid::new_v4(),
+            Instant::now()
+        ));
+    }
+
+    /// #6215 review: when the leader fails with an error that is not a
+    /// verdict on the token (here a `503` from a saturated auth cap), the
+    /// requests that waited on it validate in parallel, as without the flight,
+    /// instead of taking the lock one by one and each waiting out
+    /// `AUTH_PERMIT_WAIT` in turn.
+    ///
+    /// Installs a one-slot cap; nextest's process-per-test isolation keeps
+    /// the `OnceLock` private to this test.
+    #[tokio::test]
+    async fn waiters_bypass_a_leader_shed_by_the_cap_in_parallel_6215() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let sem = Arc::new(Semaphore::new(1));
+        install_global_auth_semaphore(Some(sem.clone()));
+        let installed = installed_global_auth_semaphore().expect("a cap is installed");
+        assert!(
+            Arc::ptr_eq(&installed, &sem),
+            "another cap was installed first in this process"
+        );
+
+        let (user_id, _username) = tdh::create_user(&pool).await;
+        let minter = AuthService::new(pool.clone(), Arc::new(Config::test_config()));
+        let (token, _id) = minter
+            .generate_api_token(user_id, "bypass-6215", vec!["read:artifacts".into()], None)
+            .await
+            .expect("mint API token");
+
+        // Saturate the cap for the whole burst.
+        let held = sem.clone().acquire_owned().await.expect("permit");
+        let svc = AuthService::new(pool.clone(), Arc::new(Config::test_config()));
+        const BURST: usize = 9;
+        let t0 = Instant::now();
+        let results =
+            futures::future::join_all((0..BURST).map(|_| svc.validate_api_token(&token))).await;
+        let elapsed = t0.elapsed();
+        drop(held);
+
+        for result in results {
+            assert!(
+                matches!(result, Err(AppError::ServiceUnavailable(_))),
+                "every request is shed by the saturated cap: {result:?}"
+            );
+        }
+        // The leader waits out one permit-wait, then the waiters wait out
+        // theirs side by side: two waits, where queueing one by one took
+        // BURST of them.
+        assert!(
+            elapsed < AUTH_PERMIT_WAIT * 3,
+            "waiters behind a failed leader must not serialize: {elapsed:?}"
+        );
+        assert!(
+            svc.token_flights.lock().unwrap().is_empty(),
+            "the bypassed flight is retired"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -5249,6 +5811,7 @@ mod tests {
             trivy_url: None,
             trivy_adapter_url: None,
             incus_scanner_enabled: true,
+            trivy_ignore_embedded_pom_declarations: false,
             openscap_url: None,
             openscap_profile: "standard".to_string(),
             opensearch_url: None,
@@ -5306,6 +5869,11 @@ mod tests {
             database_max_connections: 20,
             database_min_connections: 5,
             database_acquire_timeout_secs: 30,
+            database_request_acquire_wait_ms: None,
+            database_probe_connections: 1,
+            database_request_concurrency: None,
+            database_request_credentialed_reserve_percent: 25,
+            database_request_client_share_percent: 25,
             database_idle_timeout_secs: 600,
             database_max_lifetime_secs: 1800,
             database_tcp_keepalives: true,

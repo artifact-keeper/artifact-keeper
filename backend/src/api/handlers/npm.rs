@@ -52,6 +52,7 @@ use crate::services::npm_attestation_cache::{self as attestation_cache, CachedMe
 use crate::services::npm_packument_cache::{
     self as packument_cache, CachedPackument, NpmPackumentCache,
 };
+use crate::services::quarantine_service;
 use crate::services::upstream_tracing::send_upstream;
 
 // ---------------------------------------------------------------------------
@@ -488,6 +489,22 @@ async fn age_gate_bypasses_packument_cache(state: &SharedState, repo: &RepoInfo)
     }
 }
 
+/// Whether the Package Age Policy can leave versions out of this repo's
+/// packuments (#5933). Like the age gate's, that view moves with the clock (a
+/// held version comes back when its window ends), so it is computed per
+/// request rather than cached. A Virtual checks every member it can reach.
+async fn hold_bypasses_packument_cache(state: &SharedState, repo: &RepoInfo) -> bool {
+    if repo.repo_type == RepositoryType::Remote {
+        quarantine_service::should_quarantine(
+            &quarantine_service::resolve_config(&state.db, repo.id).await,
+        )
+    } else if repo.repo_type == RepositoryType::Virtual {
+        proxy_helpers::virtual_has_quarantine_member(&state.db, repo.id).await
+    } else {
+        false
+    }
+}
+
 /// Pure part of the packument cache-eligibility decision.
 ///
 /// The one remaining reason to bypass the computed-packument cache is the age
@@ -643,7 +660,8 @@ async fn get_package_metadata_cached(
     let repo = resolve_npm_repo(&state.db, repo_key).await?;
     let cache_eligible = packument_cache_eligible(
         repo.repo_type.as_str(),
-        age_gate_bypasses_packument_cache(state, &repo).await,
+        age_gate_bypasses_packument_cache(state, &repo).await
+            || hold_bypasses_packument_cache(state, &repo).await,
     );
     // Server-side caching is safe for Remote AND Virtual, because #2490's
     // LISTEN/NOTIFY fanout (`invalidate_package_and_virtuals`, which explicitly
@@ -957,6 +975,19 @@ pub(crate) fn npm_package_name_from_artifact_path(path: &str) -> Option<&str> {
     let _filename = segments.next().filter(|s| !s.is_empty())?;
     let _version = segments.next().filter(|s| !s.is_empty())?;
     segments.next().filter(|s| !s.is_empty())
+}
+
+/// The repository formats this handler serves: `yarn`, `pnpm` and `bower`
+/// repositories speak the npm wire format, publish through the same routes and
+/// serve their packuments through the same cache. A post-write step that must
+/// reach the packument (cache invalidation, dist-tag cleanup) has to match all
+/// four, not only `npm` (#5779).
+pub(crate) const NPM_FAMILY_FORMATS: &[&str] = &["npm", "yarn", "pnpm", "bower"];
+
+/// Whether a repository's `format` key is one this handler serves
+/// ([`NPM_FAMILY_FORMATS`]).
+pub(crate) fn is_npm_family_format_key(format: &str) -> bool {
+    NPM_FAMILY_FORMATS.contains(&format)
 }
 
 /// Invalidate the computed-packument cache for a package after a local write
@@ -1665,8 +1696,7 @@ async fn resolve_npm_tarball_upstream(
 // ---------------------------------------------------------------------------
 
 async fn resolve_npm_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Response> {
-    proxy_helpers::resolve_repo_by_key(db, repo_key, &["npm", "yarn", "pnpm", "bower"], "an npm")
-        .await
+    proxy_helpers::resolve_repo_by_key(db, repo_key, NPM_FAMILY_FORMATS, "an npm").await
 }
 
 /// Resolve the repository an npm WRITE (publish / dist-tag change) addressed
@@ -2339,7 +2369,7 @@ async fn remote_npm_audit(
             "the proxy service is not configured".to_string(),
         ));
     };
-    let sent = tokio::time::timeout(
+    let sent = crate::services::upstream_circuit::within_own_deadline(
         NPM_AUDIT_UPSTREAM_TIMEOUT,
         proxy.post_json_uncached_capped(remote, path, body, MAX_AUDIT_RESPONSE_BYTES),
     )
@@ -2772,7 +2802,12 @@ async fn attestation_cached_meta_fetch(
 ///
 /// Implements the npm registry `/-/<endpoint>` meta namespace:
 ///
-/// - **Remote / Virtual repos** — forwards the request transparently to the
+/// - **Every repository type** — `/-/ping` → `200 {}` and `/-/whoami` →
+///   `200 {"username":"<name>"}` when authenticated, `401
+///   {"error":"unauthenticated"}` otherwise. Both describe this registry and
+///   the caller, so they are never forwarded upstream (#5634).
+///
+/// - **Remote / Virtual repos** — forwards any other request transparently to the
 ///   configured upstream (or the first reachable Remote member, for Virtual).
 ///   This is the correct behaviour for proxy/group repos: the upstream already
 ///   handles these endpoints correctly, so AK acts as a pass-through.
@@ -2783,15 +2818,12 @@ async fn attestation_cached_meta_fetch(
 ///     a cached attestation answer exists, which is served instead;
 ///   - upstream unreachable → `503 upstream unreachable`.
 ///
-///   `/-/ping` and `/-/whoami` on an unreachable upstream (and on a Virtual
-///   whose members cannot answer) are still answered locally, as before.
-///
 /// - **Local / Staging repos** — the registry is self-contained; no upstream
-///   to forward to. Minimal built-in responses:
-///   - `/-/ping` → `200 {}` (standard liveness probe)
-///   - `/-/whoami` → `200 {"username":"<name>"}` when authenticated,
-///     `401 {"error":"unauthenticated"}` otherwise
-///   - All other `/-/` paths → `501 Not Implemented`
+///   to forward to:
+///   - `/-/npm/v1/attestations/{pkg}@{ver}` → `404` (hosted versions carry no
+///     attestations; also on a Virtual with no Remote member)
+///   - All other `/-/` paths → `501 Not Implemented`, an expected answer
+///     that is not logged as an error
 ///
 /// Without this route, the `/:package/:version` catch-all previously matched
 /// `/-/ping` with `package="-"` and `version="ping"`, producing a confusing
@@ -2806,13 +2838,19 @@ async fn npm_meta_get(
     let query = raw_query.0;
     let endpoint = rest.trim_start_matches('/');
 
+    // `/-/ping` and `/-/whoami` ask about this registry and the caller's
+    // identity here, on every repository type (#5634). Forwarded to a Remote's
+    // upstream they were sent anonymously: whoami answered the upstream's 401
+    // (or a username the client never logged in as) and each ping paid an
+    // upstream round trip.
+    if let Some(resp) = npm_meta_local_stub(endpoint, auth.as_ref()) {
+        return resp;
+    }
+
     // Remote: proxy the whole request to upstream, filtered by this repo's own
     // scope policy (#2424) so search cannot list out-of-scope packages.
     if repo.repo_type == RepositoryType::Remote {
         let Some(ref upstream_url) = repo.upstream_url else {
-            if let Some(resp) = npm_meta_local_stub(endpoint, auth.as_ref()) {
-                return resp;
-            }
             return Err(npm_meta_error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 format!(
@@ -2840,9 +2878,6 @@ async fn npm_meta_get(
                 return Err(npm_meta_error(StatusCode::NOT_FOUND, reason));
             }
             MetaUpstreamOutcome::Unreachable => {
-                if let Some(resp) = npm_meta_local_stub(endpoint, auth.as_ref()) {
-                    return resp;
-                }
                 return Err(npm_meta_error(
                     StatusCode::SERVICE_UNAVAILABLE,
                     format!(
@@ -2897,9 +2932,6 @@ async fn npm_meta_get(
                 MetaUpstreamOutcome::Unreachable => any_unreachable = true,
             }
         }
-        if let Some(resp) = npm_meta_local_stub(endpoint, auth.as_ref()) {
-            return resp;
-        }
         if tried_remote {
             return Err(virtual_meta_failure(
                 &repo_key,
@@ -2907,6 +2939,9 @@ async fn npm_meta_get(
                 any_unreachable,
                 &refusals,
             ));
+        }
+        if let Some(resp) = npm_meta_no_attestations(endpoint, &repo_key) {
+            return Err(resp);
         }
         // No Remote member: nothing could answer this endpoint.
         return Err(npm_meta_error(
@@ -2918,10 +2953,9 @@ async fn npm_meta_get(
         ));
     }
 
-    // Local / Staging: serve minimal built-in responses for the standard meta
-    // endpoints.
-    if let Some(resp) = npm_meta_local_stub(endpoint, auth.as_ref()) {
-        return resp;
+    // Local / Staging: `/-/ping` and `/-/whoami` were answered above.
+    if let Some(resp) = npm_meta_no_attestations(endpoint, &repo_key) {
+        return Err(resp);
     }
 
     // All other /-/ endpoints are not implemented for local repos.
@@ -2932,8 +2966,36 @@ async fn npm_meta_get(
 }
 
 /// The `{"error": ...}` body every `/-/` meta failure answers with.
+///
+/// A `501` is the documented answer for a `/-/` endpoint this repository
+/// cannot serve (search on a Local, say), not a server fault, so it is marked
+/// [`crate::error::ExpectedOutcome`] and the HTTP trace layer does not log it
+/// as an ERROR `response failed` line (#5634).
 fn npm_meta_error(status: StatusCode, message: String) -> Response {
-    (status, axum::Json(serde_json::json!({ "error": message }))).into_response()
+    let mut response =
+        (status, axum::Json(serde_json::json!({ "error": message }))).into_response();
+    if status == StatusCode::NOT_IMPLEMENTED {
+        response
+            .extensions_mut()
+            .insert(crate::error::ExpectedOutcome);
+    }
+    response
+}
+
+/// `/-/npm/v1/attestations/{pkg}@{ver}` on a repository with no upstream to
+/// ask: `404`, the answer registry.npmjs.org gives a version published
+/// without provenance. Hosted versions carry no attestations (AK does not keep
+/// publish-time `.sigstore` bundles), so this is the true answer, not a gap.
+///
+/// pnpm's `minimumReleaseAge` check probes this endpoint for every resolved
+/// version; a `501` here made each probe a server error logged at ERROR.
+/// `None` for every other endpoint.
+fn npm_meta_no_attestations(endpoint: &str, repo_key: &str) -> Option<Response> {
+    let spec = endpoint.strip_prefix("npm/v1/attestations/")?;
+    Some(npm_meta_error(
+        StatusCode::NOT_FOUND,
+        format!("no attestations for {spec} in repository '{repo_key}'"),
+    ))
 }
 
 /// The built-in answers for `/-/ping` and `/-/whoami`, which need no upstream.
@@ -3156,6 +3218,19 @@ async fn get_scoped_metadata(
 ) -> Result<Response, Response> {
     let scope = normalize_package_name(&scope);
     let package = normalize_package_name(&package);
+    if let Some((scope_part, name_part)) = encoded_scoped_version_parts(&scope) {
+        let full_name = build_scoped_package_name(scope_part, name_part);
+        validate_package_name(&full_name)?;
+        return get_package_version_metadata(
+            &state,
+            auth.as_ref(),
+            &repo_key,
+            &full_name,
+            &package,
+            base_url.as_str(),
+        )
+        .await;
+    }
     let full_name = build_scoped_package_name(&scope, &package);
     validate_package_name(&full_name)?;
     get_package_metadata_cached(
@@ -3234,6 +3309,7 @@ struct NpmMetadataArtifact {
     version: Option<String>,
     checksum_sha256: String,
     metadata: Option<serde_json::Value>,
+    created_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// Build an npm package metadata JSON response from a set of artifacts.
@@ -3259,6 +3335,30 @@ fn build_npm_metadata_response(
         ),
         want_abbreviated,
     ))
+}
+
+/// The packument `time` map, each live version's publish time plus `created` and `modified`
+/// Yarn's age gate and `npm install --before` read it (#5789)
+fn npm_packument_time(artifacts: &[NpmMetadataArtifact]) -> serde_json::Value {
+    let stamp = |t: &chrono::DateTime<chrono::Utc>| {
+        serde_json::Value::String(t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+    };
+    let mut time = serde_json::Map::new();
+    let mut created: Option<chrono::DateTime<chrono::Utc>> = None;
+    let mut modified: Option<chrono::DateTime<chrono::Utc>> = None;
+    for artifact in artifacts {
+        let Some(version) = &artifact.version else {
+            continue;
+        };
+        time.insert(version.clone(), stamp(&artifact.created_at));
+        created = Some(created.map_or(artifact.created_at, |c| c.min(artifact.created_at)));
+        modified = Some(modified.map_or(artifact.created_at, |m| m.max(artifact.created_at)));
+    }
+    if let (Some(created), Some(modified)) = (created, modified) {
+        time.insert("created".to_string(), stamp(&created));
+        time.insert("modified".to_string(), stamp(&modified));
+    }
+    serde_json::Value::Object(time)
 }
 
 /// Build the FULL packument JSON value from a set of stored artifacts — the
@@ -3321,6 +3421,7 @@ fn build_npm_metadata_value(
         "name": package_name,
         "versions": versions,
         "dist-tags": serde_json::Value::Object(dist_tags),
+        "time": npm_packument_time(artifacts),
     })
 }
 
@@ -3471,6 +3572,7 @@ async fn fetch_npm_artifacts(
             version: a.version,
             checksum_sha256: a.checksum_sha256,
             metadata: a.metadata,
+            created_at: a.created_at,
         })
         .collect())
 }
@@ -4112,28 +4214,35 @@ async fn npm_age_gated_tag_view(
     packument: &serde_json::Value,
 ) -> Result<Option<serde_json::Value>, Response> {
     if repo.repo_type == RepositoryType::Remote {
-        let Some(svc) = state.age_gate_service.as_ref() else {
-            return Ok(None);
-        };
-        if !AgeGateService::is_applicable(&proxy_helpers::age_gate_params(repo)) {
-            return Ok(None);
-        }
-        let params = crate::services::age_gate_service::resolve_repo_params(&state.db, repo.id)
-            .await
-            .map_err(IntoResponse::into_response)?;
-        if !AgeGateService::is_applicable(&params) {
-            return Ok(None);
-        }
-        let mut view = packument.clone();
-        svc.filter_npm_packument(&params, package_name, &mut view)
-            .await
-            .map_err(IntoResponse::into_response)?;
-        Ok(Some(view))
-    } else if repo.repo_type == RepositoryType::Virtual {
-        // Without a gated member the gated merge equals the one already built.
-        if state.age_gate_service.is_none()
-            || !proxy_helpers::virtual_has_age_gated_member(&state.db, repo.id).await
+        let mut view = None;
+        if let Some(svc) = state
+            .age_gate_service
+            .as_ref()
+            .filter(|_| AgeGateService::is_applicable(&proxy_helpers::age_gate_params(repo)))
         {
+            let params = crate::services::age_gate_service::resolve_repo_params(&state.db, repo.id)
+                .await
+                .map_err(IntoResponse::into_response)?;
+            if AgeGateService::is_applicable(&params) {
+                let mut gated = packument.clone();
+                svc.filter_npm_packument(&params, package_name, &mut gated)
+                    .await
+                    .map_err(IntoResponse::into_response)?;
+                view = Some(gated);
+            }
+        }
+        // The Package Age Policy leaves its held versions out too (#5933).
+        let hold = quarantine_service::resolve_config(&state.db, repo.id).await;
+        if quarantine_service::should_quarantine(&hold) {
+            let held = view.get_or_insert_with(|| packument.clone());
+            quarantine_service::hide_held_npm_versions(&hold, held, chrono::Utc::now());
+        }
+        Ok(view)
+    } else if repo.repo_type == RepositoryType::Virtual {
+        // Without a gated or held member the merge equals the one already built.
+        let gated = state.age_gate_service.is_some()
+            && proxy_helpers::virtual_has_age_gated_member(&state.db, repo.id).await;
+        if !gated && !proxy_helpers::virtual_has_quarantine_member(&state.db, repo.id).await {
             return Ok(None);
         }
         Ok(Some(
@@ -4239,6 +4348,12 @@ async fn remote_member_packument_value(
                     .map_err(|e| e.into_response())?;
             }
         }
+        // The member's Package Age Policy leaves its held versions out (#5933).
+        quarantine_service::hide_held_npm_versions(
+            &quarantine_service::resolve_config(&state.db, member_id).await,
+            &mut json,
+            chrono::Utc::now(),
+        );
     }
     rewrite_npm_tarball_urls(&mut json, base_url, repo_key, Some(upstream_url));
     Ok(Some(json))
@@ -4487,6 +4602,11 @@ async fn merge_virtual_member_packuments(
         .map_err(IntoResponse::into_response)?;
 
     let mut merged: Option<serde_json::Value> = None;
+    // #5620: a member that could not answer (upstream 5xx, transport failure,
+    // an open breaker) is passed over like a miss, but when no member
+    // contributes the packument is unknowable: 503 + Retry-After, as the
+    // tarball walk answers (#5504), not a 404 npm reports as E404.
+    let mut unavailable = false;
     for batch in members.chunks(packument_member_fanout()) {
         let contributions = futures::future::join_all(batch.iter().map(|member| {
             virtual_member_packument_contribution(
@@ -4501,18 +4621,31 @@ async fn merge_virtual_member_packuments(
         }))
         .await;
         for contribution in contributions {
-            if let Some(value) = contribution? {
-                match merged.as_mut() {
+            match contribution {
+                Ok(Some(value)) => match merged.as_mut() {
                     Some(acc) => merge_packument_into(acc, value),
                     None => merged = Some(value),
+                },
+                Ok(None) => {}
+                Err(resp) if proxy_helpers::is_member_unavailable_response(&resp) => {
+                    unavailable = true;
                 }
+                Err(resp) => return Err(resp),
             }
         }
     }
 
-    merged.ok_or_else(|| {
+    merged.ok_or_else(|| packument_walk_miss(unavailable))
+}
+
+/// The answer of a virtual packument walk no member contributed to (#5620):
+/// the retryable 503 when a member could not answer, the 404 otherwise.
+fn packument_walk_miss(unavailable: bool) -> Response {
+    if unavailable {
+        proxy_helpers::member_unavailable_response()
+    } else {
         AppError::NotFound("Package not found in any member repository".to_string()).into_response()
-    })
+    }
 }
 
 /// How many virtual members one npm packument request fetches at once (#4240).
@@ -4645,6 +4778,11 @@ async fn virtual_member_packument_contribution(
                 member_key = %member.key,
                 "npm metadata proxy fetch missed for virtual member"
             );
+            // #5620: an unavailable member is reported, so the merge can tell
+            // "nobody has it" from "a member could not say".
+            if proxy_helpers::is_member_unavailable_response(&e) {
+                return Err(e);
+            }
             Ok(None)
         }
     }
@@ -4912,14 +5050,21 @@ async fn rewrite_and_respond_with_age_gate_params(
     want_abbreviated: bool,
 ) -> Result<Response, Response> {
     let mut filtered = content.clone();
-    if let (Some(svc), Ok(mut json)) = (
-        state.age_gate_service.as_ref(),
-        serde_json::from_slice::<serde_json::Value>(&content),
-    ) {
-        if AgeGateService::is_applicable(params) {
-            svc.filter_npm_packument(params, package_name, &mut json)
-                .await
-                .map_err(|e| e.into_response())?;
+    let age_gate = state
+        .age_gate_service
+        .as_ref()
+        .filter(|_| AgeGateService::is_applicable(params));
+    // The Package Age Policy holds a young version's tarball, so the
+    // packument leaves that version out too (#5933).
+    let hold = quarantine_service::resolve_config(&state.db, params.id).await;
+    if age_gate.is_some() || quarantine_service::should_quarantine(&hold) {
+        if let Ok(mut json) = serde_json::from_slice::<serde_json::Value>(&content) {
+            if let Some(svc) = age_gate {
+                svc.filter_npm_packument(params, package_name, &mut json)
+                    .await
+                    .map_err(|e| e.into_response())?;
+            }
+            quarantine_service::hide_held_npm_versions(&hold, &mut json, chrono::Utc::now());
             filtered = Bytes::from(serde_json::to_vec(&json).unwrap_or_default());
         }
     }
@@ -5753,13 +5898,17 @@ async fn serve_tarball(
         let member_fetch_urls =
             npm_virtual_member_fetch_urls(proxy_for_virtual, &members, package_name, filename)
                 .await;
-        let result = proxy_helpers::resolve_virtual_download_from_members_with_fetch_urls(
+        // #5129: these members serve without the inline scan, so a Remote
+        // member's fresh cached tarball may be answered with a presigned
+        // redirect once every fast-path gate passes.
+        let download = proxy_helpers::resolve_virtual_download_or_redirect(
+            state,
             members,
             fallback,
             proxy_for_virtual,
             &upstream_path,
             &member_fetch_urls,
-            Some(ctx),
+            ctx,
             |member_id, location| {
                 let db = db.clone();
                 let state = state.clone();
@@ -5779,6 +5928,10 @@ async fn serve_tarball(
             }
             _ => resp,
         })?;
+        let result = match download {
+            proxy_helpers::VirtualDownload::Redirect(redirect) => return Ok(redirect),
+            proxy_helpers::VirtualDownload::Stream(result) => result,
+        };
 
         // Always serve npm virtual-repo tarballs as `application/gzip`,
         // overriding whatever content type the proxy-cache sidecar recorded
@@ -6139,7 +6292,10 @@ async fn npm_lookup_within<T>(
     limit: std::time::Duration,
     lookup: impl std::future::Future<Output = Option<T>>,
 ) -> Option<T> {
-    tokio::time::timeout(limit, lookup).await.ok().flatten()
+    crate::services::upstream_circuit::within_own_deadline(limit, lookup)
+        .await
+        .ok()
+        .flatten()
 }
 
 /// Cache-only sibling of [`resolve_npm_tarball_upstream`]'s source lookup:
@@ -7783,6 +7939,15 @@ fn build_npm_storage_key(
     scheme.write_key(storage_backend, "npm", repo_id, artifact_path)
 }
 
+/// Split the decoded scope of an encoded scoped version request (#5790)
+///
+/// `GET /{repo}/@scope%2fname/{version}` matches the scoped packument route
+/// with the decoded scope `scope/name` and the version as the package,
+/// so this returns `(scope, name)` for that shape and `None` for a plain `@scope/name`
+fn encoded_scoped_version_parts(decoded_scope: &str) -> Option<(&str, &str)> {
+    decoded_scope.split_once('/')
+}
+
 /// Build a scoped package name from scope and package.
 fn build_scoped_package_name(scope: &str, package: &str) -> String {
     format!("@{}/{}", scope, package)
@@ -9358,6 +9523,100 @@ mod tests {
         assert!(
             tarball.contains(&format!("/npm/{}/", fx.repo_key)),
             "proxied tarball must be rewritten to the virtual repo: {tarball}"
+        );
+    }
+
+    /// #5129 security: a virtual that scans on proxy over a Remote member
+    /// that does not still sends that member through the inline scan gate
+    /// (#3023, stricter of the two policies), so the member's fresh cached
+    /// tarball is never handed out as a presigned redirect. Control: with no
+    /// scan policy on either, the same request redirects. DB-backed.
+    #[tokio::test]
+    async fn test_virtual_tarball_never_redirects_when_the_virtual_scans_5129_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "npm").await else {
+            return;
+        };
+        let package = format!("redir5129-{}", uuid::Uuid::new_v4().simple());
+        let file = format!("{package}-1.0.0.tgz");
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/{package}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": package, "dist-tags": {"latest": "1.0.0"},
+                "versions": {"1.0.0": {"name": package, "version": "1.0.0",
+                    "dist": {"tarball": format!("{}/{package}/-/{file}", upstream.uri())}}}
+            })))
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/{package}/-/{file}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"cached-body".to_vec()))
+            .mount(&upstream)
+            .await;
+
+        let (remote_id, remote_key, _remote_dir) =
+            tdh::create_repo(&fx.pool, "remote", "npm").await;
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(upstream.uri())
+            .bind(remote_id)
+            .execute(&fx.pool)
+            .await
+            .expect("configure remote member");
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 1)",
+        )
+        .bind(fx.repo_id)
+        .bind(remote_id)
+        .execute(&fx.pool)
+        .await
+        .expect("attach member");
+        tdh::publish_repo(&fx.pool, remote_id).await;
+
+        // The member's fresh cache entry, on a backend that can presign.
+        let scope = crate::services::proxy_cache_scope::ProxyCacheScope::unscoped();
+        let (proxy, backend) = tdh::build_scoped_presign_proxy(fx.pool.clone(), scope.clone());
+        let cache_path = format!("{package}/-/{file}");
+        backend.seed_fresh_entry(
+            &crate::services::proxy_service::ProxyService::cache_storage_key(
+                &scope,
+                &remote_key,
+                &cache_path,
+            )
+            .unwrap(),
+            &crate::services::proxy_service::ProxyService::cache_metadata_key(
+                &scope,
+                &remote_key,
+                &cache_path,
+            )
+            .unwrap(),
+        );
+        let state = tdh::build_state_with_proxy_presigned(
+            fx.pool.clone(),
+            fx.storage_dir.to_str().unwrap(),
+            proxy,
+        );
+        let app = tdh::router_anon(super::router(), state);
+        let uri = format!("/{}/{package}/-/{file}", fx.repo_key);
+
+        let (status, body) = tdh::send(app.clone(), tdh::get(uri.clone())).await;
+        assert!(
+            status.is_redirection(),
+            "control: an unscanned member's fresh cached tarball redirects, got {status}: {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        // The virtual scans; the member does not.
+        tdh::enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
+        let (status, _) = tdh::send(app, tdh::get(uri)).await;
+        assert!(
+            !status.is_redirection(),
+            "a member the virtual scans must go through the scan gate, never a redirect \
+             (got {status})"
         );
     }
 
@@ -11471,6 +11730,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_encoded_scoped_version_parts_5790() {
+        assert_eq!(
+            encoded_scoped_version_parts("acme/lib"),
+            Some(("acme", "lib"))
+        );
+        assert_eq!(encoded_scoped_version_parts("acme"), None);
+        let (scope, name) = encoded_scoped_version_parts("acme/lib/x").unwrap();
+        assert!(validate_package_name(&build_scoped_package_name(scope, name)).is_err());
+        let (scope, name) = encoded_scoped_version_parts("../lib").unwrap();
+        assert!(validate_package_name(&build_scoped_package_name(scope, name)).is_err());
+    }
+
     // -----------------------------------------------------------------------
     // validate_npm_package_name
     // -----------------------------------------------------------------------
@@ -12203,6 +12475,7 @@ mod tests {
             version: Some(version.to_string()),
             checksum_sha256: sha256.to_string(),
             metadata: None,
+            created_at: chrono::DateTime::UNIX_EPOCH,
         }
     }
 
@@ -12332,6 +12605,7 @@ mod tests {
                     "main": "index.js"
                 }
             })),
+            created_at: chrono::DateTime::UNIX_EPOCH,
         }];
 
         let body =
@@ -12355,6 +12629,7 @@ mod tests {
                 version: None,
                 checksum_sha256: SHA256_ABCD.to_string(),
                 metadata: None,
+                created_at: chrono::DateTime::UNIX_EPOCH,
             },
         ];
 
@@ -12364,6 +12639,48 @@ mod tests {
         let versions = body["versions"].as_object().unwrap();
         assert_eq!(versions.len(), 1);
         assert!(versions.contains_key("1.0.0"));
+    }
+
+    #[test]
+    fn test_build_npm_metadata_value_emits_time_5789() {
+        let at = |s: &str| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .unwrap()
+                .with_timezone(&chrono::Utc)
+        };
+        let artifacts = vec![
+            NpmMetadataArtifact {
+                created_at: at("2024-03-01T10:00:00.123Z"),
+                ..make_artifact("pkg/1.0.0/pkg-1.0.0.tgz", "1.0.0", SHA256_ZEROS)
+            },
+            NpmMetadataArtifact {
+                created_at: at("2024-03-02T11:30:00Z"),
+                ..make_artifact("pkg/1.0.1/pkg-1.0.1.tgz", "1.0.1", SHA256_ABCD)
+            },
+            NpmMetadataArtifact {
+                version: None,
+                created_at: at("2025-01-01T00:00:00Z"),
+                ..make_artifact("pkg/x/pkg-x.tgz", "x", SHA256_ABCD)
+            },
+        ];
+
+        let full = build_npm_metadata_value(
+            &artifacts,
+            "pkg",
+            "http://localhost:8080",
+            "npm-hosted",
+            &serde_json::Map::new(),
+        );
+
+        assert_eq!(full["time"]["1.0.0"], "2024-03-01T10:00:00.123Z");
+        assert_eq!(full["time"]["1.0.1"], "2024-03-02T11:30:00.000Z");
+        assert_eq!(full["time"]["created"], "2024-03-01T10:00:00.123Z");
+        assert_eq!(full["time"]["modified"], "2024-03-02T11:30:00.000Z");
+        assert_eq!(full["time"].as_object().unwrap().len(), 4);
+        assert_eq!(
+            abbreviate_packument(&full)["modified"],
+            "2024-03-02T11:30:00.000Z"
+        );
     }
 
     // Integrity preservation tests (issue #745)
@@ -12578,6 +12895,7 @@ mod tests {
             checksum_sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                 .to_string(),
             metadata: None,
+            created_at: chrono::DateTime::UNIX_EPOCH,
         }];
         let scoped = vec![NpmMetadataArtifact {
             path: "@types/mdurl/2.0.0/mdurl-2.0.0.tgz".to_string(),
@@ -12585,6 +12903,7 @@ mod tests {
             checksum_sha256: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
                 .to_string(),
             metadata: None,
+            created_at: chrono::DateTime::UNIX_EPOCH,
         }];
 
         let resp_unscoped = build_npm_metadata_response(
@@ -13014,6 +13333,68 @@ mod tests {
                 (503, StatusCode::SERVICE_UNAVAILABLE),
                 (403, StatusCode::NOT_FOUND)
             ]
+        );
+    }
+
+    /// #5574: the hosted counterpart of the test above. A hosted npm member
+    /// whose stored tarball cannot be read is unavailable, so a Virtual tarball
+    /// nothing else serves answers a retryable 503 instead of the 404 a build
+    /// tool caches; a genuine missing row stays a 404.
+    #[tokio::test]
+    async fn test_virtual_tarball_503s_when_a_hosted_member_storage_fails_5574() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let path = "is-number5574/-/is-number5574-7.0.0.tgz";
+        let (local_id, _, local_dir) = tdh::create_repo(&pool, "local", "npm").await;
+        let (virtual_id, virtual_key, virtual_dir) =
+            tdh::create_repo(&pool, "virtual", "npm").await;
+        tdh::publish_repo(&pool, local_id).await;
+        tdh::publish_repo(&pool, virtual_id).await;
+        tdh::link_virtual_member(&pool, virtual_id, local_id, 0).await;
+        // The row names a storage key no object exists under: every read of
+        // the bytes fails, as on a storage outage.
+        sqlx::query(
+            "INSERT INTO artifacts \
+             (repository_id, path, name, version, size_bytes, checksum_sha256, \
+              content_type, storage_key) \
+             VALUES ($1, $2, 'is-number5574', '7.0.0', 3, $3, 'application/gzip', $4)",
+        )
+        .bind(local_id)
+        .bind(path)
+        .bind("ab".repeat(32))
+        .bind(format!("npm/{path}.unreadable"))
+        .execute(&pool)
+        .await
+        .expect("seed hosted tarball row");
+
+        let state = tdh::build_state(pool.clone(), virtual_dir.to_str().unwrap());
+        let request = || tdh::get(format!("/{virtual_key}/{path}"));
+        let (unreadable, _) = tdh::send(tdh::router_anon(router(), state.clone()), request()).await;
+
+        // A missing row is still a miss, not an outage.
+        sqlx::query("DELETE FROM artifacts WHERE repository_id = $1")
+            .bind(local_id)
+            .execute(&pool)
+            .await
+            .expect("drop hosted tarball row");
+        let (missing, _) = tdh::send(tdh::router_anon(router(), state.clone()), request()).await;
+
+        for id in [virtual_id, local_id] {
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await;
+        }
+        let _ = std::fs::remove_dir_all(&local_dir);
+        let _ = std::fs::remove_dir_all(&virtual_dir);
+
+        assert_eq!(
+            (unreadable, missing),
+            (StatusCode::SERVICE_UNAVAILABLE, StatusCode::NOT_FOUND),
+            "a hosted member's storage fault must answer 503, a missing row 404"
         );
     }
 
@@ -14393,6 +14774,295 @@ mod tests {
         // `.expect(1)` on the mock is verified on server drop.
         drop(mock_server);
         cleanup().await;
+    }
+
+    /// #5933: with the Package Age Policy on, a packument whose upstream
+    /// `Last-Modified` falls inside the window is served (the older version
+    /// stays installable), while the young version's tarball is still held.
+    #[tokio::test]
+    async fn test_age_policy_holds_the_young_tarball_not_the_packument_5933_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+            return;
+        };
+        let upstream = MockServer::start().await;
+        let now = chrono::Utc::now();
+        let released_now = now.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+        let packument = serde_json::json!({
+            "name": "agepkg",
+            "dist-tags": {"latest": "2.0.0"},
+            "versions": {
+                "1.0.0": {"name": "agepkg", "version": "1.0.0", "dist": {
+                    "tarball": format!("{}/agepkg/-/agepkg-1.0.0.tgz", upstream.uri())}},
+                "2.0.0": {"name": "agepkg", "version": "2.0.0", "dist": {
+                    "tarball": format!("{}/agepkg/-/agepkg-2.0.0.tgz", upstream.uri())}},
+            },
+            "time": {"1.0.0": "2015-10-21T07:28:00.000Z", "2.0.0": now.to_rfc3339()}
+        });
+        Mock::given(method("GET"))
+            .and(path("/agepkg"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("last-modified", released_now.as_str())
+                    .set_body_json(&packument),
+            )
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/agepkg/-/agepkg-2.0.0.tgz"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/octet-stream")
+                    .insert_header("last-modified", released_now.as_str())
+                    .set_body_bytes(b"young-tarball".as_ref()),
+            )
+            .mount(&upstream)
+            .await;
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(upstream.uri())
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("point the remote at wiremock");
+        sqlx::query(
+            "INSERT INTO repository_config (repository_id, key, value) \
+             VALUES ($1, 'quarantine_enabled', 'true'), \
+                    ($1, 'quarantine_duration_minutes', '1440')",
+        )
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .expect("enable the Package Age Policy");
+        crate::services::quarantine_service::invalidate_config_cache(fx.repo_id);
+
+        let storage = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), &storage);
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), &storage, proxy);
+        let auth = tdh::admin_auth_ext();
+
+        let listing = super::get_package_metadata(
+            &state,
+            auth.as_ref(),
+            &fx.repo_key,
+            "agepkg",
+            "http://localhost",
+            false,
+        )
+        .await;
+        let tarball = super::download_tarball(
+            axum::extract::State(state.clone()),
+            axum::Extension(auth.clone()),
+            axum::extract::Path((
+                fx.repo_key.clone(),
+                "agepkg".to_string(),
+                "agepkg-2.0.0.tgz".to_string(),
+            )),
+            Default::default(),
+        )
+        .await;
+
+        let _ = sqlx::query("DELETE FROM repository_config WHERE repository_id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await;
+        crate::services::quarantine_service::invalidate_config_cache(fx.repo_id);
+        tdh::cleanup(&fx.pool, fx.repo_id, fx.user_id).await;
+        let _ = std::fs::remove_dir_all(&fx.storage_dir);
+
+        let listing = match listing {
+            Ok(r) => r,
+            Err(r) => panic!(
+                "a packument with a young release must not be held, got {}",
+                r.status()
+            ),
+        };
+        assert_eq!(listing.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(listing.into_body(), 1 << 20)
+            .await
+            .expect("read packument");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("parse packument");
+        assert!(json["versions"].get("1.0.0").is_some(), "{json}");
+        let status = match tarball {
+            Ok(r) => r.status(),
+            Err(r) => r.status(),
+        };
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "the young version's tarball stays held"
+        );
+    }
+
+    /// The version `npm install <range>` picks from a served packument.
+    fn npm_range_pick(packument: &serde_json::Value, range: &str) -> Option<String> {
+        let req = semver::VersionReq::parse(range).expect("range");
+        packument["versions"]
+            .as_object()?
+            .keys()
+            .filter_map(|v| semver::Version::parse(v).ok())
+            .filter(|v| req.matches(v))
+            .max()
+            .map(|v| v.to_string())
+    }
+
+    /// #5933: with the Package Age Policy on, the packument leaves out the
+    /// version whose tarball is still held and moves `latest` back, so
+    /// `^1.21.0` resolves to 1.21.0 rather than stopping at 1.21.1's 409. When
+    /// the window ends the version is listed again, so the view is not cached.
+    #[tokio::test]
+    async fn test_age_policy_hides_the_held_version_from_the_packument_5933_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+            return;
+        };
+        let upstream = MockServer::start().await;
+        let released = chrono::Utc::now() - chrono::Duration::hours(2);
+        let released_http = released.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+        let packument = serde_json::json!({
+            "name": "heldpkg",
+            "dist-tags": {"latest": "1.21.1"},
+            "versions": {
+                "1.21.0": {"name": "heldpkg", "version": "1.21.0", "dist": {
+                    "tarball": format!("{}/heldpkg/-/heldpkg-1.21.0.tgz", upstream.uri())}},
+                "1.21.1": {"name": "heldpkg", "version": "1.21.1", "dist": {
+                    "tarball": format!("{}/heldpkg/-/heldpkg-1.21.1.tgz", upstream.uri())}},
+            },
+            "time": {
+                "created": "2015-10-21T07:28:00.000Z",
+                "modified": released.to_rfc3339(),
+                "1.21.0": "2015-10-21T07:28:00.000Z",
+                "1.21.1": released.to_rfc3339()
+            }
+        });
+        Mock::given(method("GET"))
+            .and(path("/heldpkg"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("last-modified", released_http.as_str())
+                    .set_body_json(&packument),
+            )
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/heldpkg/-/heldpkg-1.21.1.tgz"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/octet-stream")
+                    .insert_header("last-modified", released_http.as_str())
+                    .set_body_bytes(b"young-tarball".as_ref()),
+            )
+            .mount(&upstream)
+            .await;
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(upstream.uri())
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("point the remote at wiremock");
+        async fn set_window(pool: &PgPool, repo_id: uuid::Uuid, minutes: &str) {
+            sqlx::query("DELETE FROM repository_config WHERE repository_id = $1")
+                .bind(repo_id)
+                .execute(pool)
+                .await
+                .expect("clear the policy");
+            sqlx::query(
+                "INSERT INTO repository_config (repository_id, key, value) \
+                 VALUES ($1, 'quarantine_enabled', 'true'), \
+                        ($1, 'quarantine_duration_minutes', $2)",
+            )
+            .bind(repo_id)
+            .bind(minutes)
+            .execute(pool)
+            .await
+            .expect("set the Package Age Policy");
+            crate::services::quarantine_service::invalidate_config_cache(repo_id);
+        }
+        async fn serve(
+            state: &SharedState,
+            auth: Option<&AuthExtension>,
+            repo_key: &str,
+        ) -> (StatusCode, Option<serde_json::Value>) {
+            let response = super::get_package_metadata_cached(
+                state,
+                auth,
+                repo_key,
+                "heldpkg",
+                "http://localhost",
+                &HeaderMap::new(),
+            )
+            .await;
+            let response = match response {
+                Ok(r) => r,
+                Err(r) => r,
+            };
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+                .await
+                .expect("read packument");
+            (status, serde_json::from_slice(&body).ok())
+        }
+
+        let storage = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), &storage);
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), &storage, proxy);
+        assert!(
+            state.npm_packument_cache.is_some(),
+            "the packument cache is on"
+        );
+        let auth = tdh::admin_auth_ext();
+
+        // A day's window holds the 2 hour old 1.21.1.
+        set_window(&fx.pool, fx.repo_id, "1440").await;
+        let held = serve(&state, auth.as_ref(), &fx.repo_key).await;
+        let tarball = super::download_tarball(
+            axum::extract::State(state.clone()),
+            axum::Extension(auth.clone()),
+            axum::extract::Path((
+                fx.repo_key.clone(),
+                "heldpkg".to_string(),
+                "heldpkg-1.21.1.tgz".to_string(),
+            )),
+            Default::default(),
+        )
+        .await;
+        // An hour's window has passed for it.
+        set_window(&fx.pool, fx.repo_id, "60").await;
+        let after = serve(&state, auth.as_ref(), &fx.repo_key).await;
+
+        let _ = sqlx::query("DELETE FROM repository_config WHERE repository_id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await;
+        crate::services::quarantine_service::invalidate_config_cache(fx.repo_id);
+        tdh::cleanup(&fx.pool, fx.repo_id, fx.user_id).await;
+        let _ = std::fs::remove_dir_all(&fx.storage_dir);
+
+        let (status, held) = held;
+        assert_eq!(status, StatusCode::OK);
+        let held = held.expect("packument JSON");
+        assert!(held["versions"].get("1.21.1").is_none(), "{held}");
+        assert!(held["time"].get("1.21.1").is_none(), "{held}");
+        assert!(held["versions"].get("1.21.0").is_some(), "{held}");
+        assert_eq!(held["dist-tags"]["latest"], "1.21.0");
+        assert_eq!(npm_range_pick(&held, "^1.21.0").as_deref(), Some("1.21.0"));
+        let status = match tarball {
+            Ok(r) => r.status(),
+            Err(r) => r.status(),
+        };
+        assert_eq!(status, StatusCode::CONFLICT, "1.21.1's tarball stays held");
+
+        let (status, after) = after;
+        assert_eq!(status, StatusCode::OK);
+        let after = after.expect("packument JSON");
+        assert!(after["versions"].get("1.21.1").is_some(), "{after}");
+        assert_eq!(after["dist-tags"]["latest"], "1.21.1");
+        assert_eq!(npm_range_pick(&after, "^1.21.0").as_deref(), Some("1.21.1"));
     }
 
     /// GHSA-qxv7-p3mq-88fv: a remote npm tarball whose bytes disagree with
@@ -17085,10 +17755,80 @@ mod tests {
         );
     }
 
-    /// Remote repo: `/-/ping` is forwarded to the upstream registry and the
-    /// upstream response (200 `{}`) is returned verbatim to the client.
+    /// #5634: on a Remote, `/-/ping` and `/-/whoami` are answered here and
+    /// never sent upstream; whoami names the AK caller (or is 401 without
+    /// one), not whatever the upstream says about an anonymous request.
     #[tokio::test]
-    async fn test_remote_repo_meta_ping_proxied_to_upstream() {
+    async fn test_remote_repo_meta_ping_and_whoami_answered_locally_5634() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+            return;
+        };
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(401).set_body_string(r#"{"error":"upstream"}"#))
+            .mount(&mock_server)
+            .await;
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(mock_server.uri())
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("update upstream_url");
+
+        let anon = tdh::router_anon(super::router(), fx.state.clone());
+        let authed = fx.router_with_auth(super::router());
+        let (ping, ping_body) =
+            tdh::send(anon.clone(), tdh::get(format!("/{}/-/ping", fx.repo_key))).await;
+        let (anon_who, _) = tdh::send(anon, tdh::get(format!("/{}/-/whoami", fx.repo_key))).await;
+        let (who, who_body) =
+            tdh::send(authed, tdh::get(format!("/{}/-/whoami", fx.repo_key))).await;
+        let upstream_calls = mock_server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .len();
+        let username = fx.username.clone();
+        fx.teardown().await;
+
+        assert_eq!(ping, StatusCode::OK);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&ping_body).unwrap(),
+            serde_json::json!({})
+        );
+        assert_eq!(anon_who, StatusCode::UNAUTHORIZED);
+        assert_eq!(who, StatusCode::OK);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&who_body).unwrap(),
+            serde_json::json!({ "username": username })
+        );
+        assert_eq!(upstream_calls, 0, "ping/whoami must not reach the upstream");
+    }
+
+    /// #5634: the documented `501` for a `/-/` endpoint a Local cannot serve
+    /// is an expected answer, so the trace layer does not log it as an ERROR.
+    #[test]
+    fn test_meta_501_is_an_expected_outcome_5634() {
+        let r = npm_meta_error(StatusCode::NOT_IMPLEMENTED, "x".into());
+        assert!(r
+            .extensions()
+            .get::<crate::error::ExpectedOutcome>()
+            .is_some());
+        let r = npm_meta_error(StatusCode::SERVICE_UNAVAILABLE, "x".into());
+        assert!(r
+            .extensions()
+            .get::<crate::error::ExpectedOutcome>()
+            .is_none());
+    }
+
+    /// Remote repo: a `/-/` meta request other than ping/whoami is forwarded
+    /// to the upstream registry and the upstream response (200 `{}`) is
+    /// returned verbatim to the client.
+    #[tokio::test]
+    async fn test_remote_repo_meta_search_proxied_to_upstream() {
         use crate::api::handlers::test_db_helpers as tdh;
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -17102,7 +17842,7 @@ mod tests {
         // The `/-/` meta passthrough goes through `send_upstream` (#4455).
         let _otel = crate::testing::otel::trace_upstream_sends();
         Mock::given(method("GET"))
-            .and(path("/-/ping"))
+            .and(path("/-/v1/search"))
             .and(wiremock::matchers::header_exists("traceparent"))
             .respond_with(
                 ResponseTemplate::new(200)
@@ -17120,7 +17860,7 @@ mod tests {
             .expect("update upstream_url");
 
         let app = tdh::router_anon(super::router(), fx.state.clone());
-        let uri = format!("/{}/-/ping", fx.repo_key);
+        let uri = format!("/{}/-/v1/search?text=x", fx.repo_key);
         let req = tdh::get(uri);
         let (status, bytes) = tdh::send(app, req).await;
 
@@ -17129,13 +17869,13 @@ mod tests {
         assert_eq!(
             status,
             StatusCode::OK,
-            "Remote /-/ping must be proxied; got {status}"
+            "Remote /-/v1/search must be proxied; got {status}"
         );
         let parsed: serde_json::Value =
-            serde_json::from_slice(&bytes).expect("upstream ping body must be JSON");
+            serde_json::from_slice(&bytes).expect("upstream search body must be JSON");
         assert!(
             parsed.is_object() && parsed.as_object().unwrap().is_empty(),
-            "proxied /-/ping must return the upstream payload, got {parsed:?}"
+            "proxied /-/v1/search must return the upstream payload, got {parsed:?}"
         );
     }
 
@@ -17212,7 +17952,7 @@ mod tests {
             .await
             .unwrap_or_default()
             .len();
-        let (ping_status, _) = tdh::send(app, tdh::get(format!("/{}/-/ping", fx.repo_key))).await;
+        let (ping_status, _) = tdh::send(app, tdh::get(format!("/{}/-/all", fx.repo_key))).await;
         let after_ping = mock_server
             .received_requests()
             .await
@@ -17858,6 +18598,18 @@ mod tests {
         );
     }
 
+    /// #5620: a virtual packument no member contributed to is the walk's
+    /// retryable 503 when a member could not answer (so the cached packument
+    /// is not evicted either), and the 404 otherwise.
+    #[test]
+    fn test_packument_walk_miss_5620() {
+        let down = packument_walk_miss(true);
+        assert_eq!(down.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(down.headers().contains_key(axum::http::header::RETRY_AFTER));
+        assert!(!is_definitive_missing_status(down.status()));
+        assert_eq!(packument_walk_miss(false).status(), StatusCode::NOT_FOUND);
+    }
+
     #[test]
     fn test_is_definitive_missing_status() {
         assert!(is_definitive_missing_status(StatusCode::NOT_FOUND));
@@ -18327,6 +19079,50 @@ mod db_cov_tests {
         fx.teardown().await;
     }
 
+    /// #5790: `@scope%2fname/<version>` is a version document, not a 400
+    #[tokio::test]
+    async fn test_encoded_scoped_version_metadata_5790() {
+        use axum::http::{HeaderMap, StatusCode};
+
+        let Some(fx) = tdh::Fixture::setup("local", "npm").await else {
+            return;
+        };
+        let published = super::publish_package(
+            &fx.state,
+            Some(tdh::make_auth(fx.user_id, &fx.username)),
+            &fx.repo_key,
+            "@acme/lib",
+            &HeaderMap::new(),
+            publish_body("@acme/lib", "1.0.0"),
+        )
+        .await;
+        assert!(published.is_ok(), "publish must succeed");
+
+        let k = fx.repo_key.clone();
+        for uri in [
+            format!("/{k}/@acme%2flib/1.0.0"),
+            format!("/{k}/@acme%2Flib/latest"),
+            format!("/{k}/@acme/lib/1.0.0"),
+        ] {
+            let app = fx.router_with_auth(super::router());
+            let (status, body) = tdh::send(app, tdh::get(uri.clone())).await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "{uri}: {}",
+                String::from_utf8_lossy(&body)
+            );
+            let doc: serde_json::Value = serde_json::from_slice(&body).expect("version json");
+            assert_eq!(doc["name"], "@acme/lib", "{uri}");
+            assert_eq!(doc["version"], "1.0.0", "{uri}");
+        }
+
+        let app = fx.router_with_auth(super::router());
+        let (status, _) = tdh::send(app, tdh::get(format!("/{k}/@acme%2flib%2fx/1.0.0"))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        fx.teardown().await;
+    }
+
     // -----------------------------------------------------------------------
     // Age-gate packument-cache bypass: virtual member lookup
     // -----------------------------------------------------------------------
@@ -18401,6 +19197,55 @@ mod db_cov_tests {
             .expect("read packument body");
         let json = serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
         (status, cache_control, json)
+    }
+
+    /// #5789: a hosted packument carries `time`, so Yarn's age gate and
+    /// `npm install --before` can see when each version was published
+    #[tokio::test]
+    async fn test_local_packument_has_publish_time_5789() {
+        use axum::http::{HeaderMap, StatusCode};
+
+        let Some(fx) = tdh::Fixture::setup("local", "npm").await else {
+            return;
+        };
+        for version in ["1.0.0", "1.0.1"] {
+            let published = super::publish_package(
+                &fx.state,
+                Some(tdh::make_auth(fx.user_id, &fx.username)),
+                &fx.repo_key,
+                "timepkg",
+                &HeaderMap::new(),
+                publish_body("timepkg", version),
+            )
+            .await;
+            assert!(published.is_ok(), "publish {version} must succeed");
+        }
+        for (version, at) in [
+            ("1.0.0", "2024-03-01T10:00:00Z"),
+            ("1.0.1", "2024-03-02T11:30:00Z"),
+        ] {
+            sqlx::query(
+                "UPDATE artifacts SET created_at = $3::timestamptz \
+                 WHERE repository_id = $1 AND name = 'timepkg' AND version = $2",
+            )
+            .bind(fx.repo_id)
+            .bind(version)
+            .bind(at)
+            .execute(&fx.pool)
+            .await
+            .expect("pin created_at");
+        }
+
+        let (status, _, body) = fetch_packument_json(&fx.state, &fx.repo_key, "timepkg").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["time"]["1.0.0"], "2024-03-01T10:00:00.000Z",
+            "got {body:?}"
+        );
+        assert_eq!(body["time"]["1.0.1"], "2024-03-02T11:30:00.000Z");
+        assert_eq!(body["time"]["created"], "2024-03-01T10:00:00.000Z");
+        assert_eq!(body["time"]["modified"], "2024-03-02T11:30:00.000Z");
+        fx.teardown().await;
     }
 
     /// Minimal `npm publish` body for one version.
@@ -18824,7 +19669,15 @@ mod db_cov_tests {
     /// Attach a freshly created local npm repo as a member of the fixture's
     /// virtual repo. Returns the member's `(id, key, storage_dir)`.
     async fn attach_local_member(fx: &tdh::Fixture) -> (uuid::Uuid, String, std::path::PathBuf) {
-        let (member_id, member_key, member_dir) = tdh::create_repo(&fx.pool, "local", "npm").await;
+        attach_local_member_of(fx, "npm").await
+    }
+
+    /// [`attach_local_member`] for a Local of another npm-family `format`.
+    async fn attach_local_member_of(
+        fx: &tdh::Fixture,
+        format: &str,
+    ) -> (uuid::Uuid, String, std::path::PathBuf) {
+        let (member_id, member_key, member_dir) = tdh::create_repo(&fx.pool, "local", format).await;
         sqlx::query(
             "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
              VALUES ($1, $2, 1)",
@@ -19120,6 +19973,246 @@ mod db_cov_tests {
             .expect("update upstream_url");
         std::fs::remove_dir_all(&fx.storage_dir).expect("wipe proxy cache");
         std::fs::create_dir_all(&fx.storage_dir).expect("recreate storage dir");
+    }
+
+    /// Admin auth for the trash and lifecycle handlers
+    fn admin_auth(fx: &tdh::Fixture) -> crate::api::middleware::auth::AuthExtension {
+        let mut auth = tdh::make_auth(fx.user_id, &fx.username);
+        auth.is_admin = true;
+        auth
+    }
+
+    /// A Virtual over one published Local with `package` 1.0.0 and 2.0.0
+    async fn virtual_with_two_versions(
+        fx: &tdh::Fixture,
+        package: &str,
+    ) -> (uuid::Uuid, String, std::path::PathBuf) {
+        virtual_with_two_versions_of(fx, package, "npm").await
+    }
+
+    /// [`virtual_with_two_versions`] with a Local member of `format`.
+    async fn virtual_with_two_versions_of(
+        fx: &tdh::Fixture,
+        package: &str,
+        format: &str,
+    ) -> (uuid::Uuid, String, std::path::PathBuf) {
+        let (member_id, member_key, member_dir) = attach_local_member_of(fx, format).await;
+        for version in ["1.0.0", "2.0.0"] {
+            let published = super::publish_package(
+                &fx.state,
+                Some(tdh::make_auth(fx.user_id, &fx.username)),
+                &member_key,
+                package,
+                &axum::http::HeaderMap::new(),
+                publish_body(package, version),
+            )
+            .await;
+            assert!(published.is_ok(), "publish {version} must succeed");
+        }
+        (member_id, member_key, member_dir)
+    }
+
+    /// #5779. FAILS BEFORE THE FIX: a version restored from the trash stayed
+    /// out of the Virtual's cached packument until the entry expired
+    #[tokio::test]
+    async fn trash_restore_invalidates_the_virtual_packument_5779() {
+        use axum::extract::{Path, State};
+        use axum::Extension;
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "npm").await else {
+            return;
+        };
+        let package = "trash-restore-5779";
+        let (member_id, member_key, member_dir) = virtual_with_two_versions(&fx, package).await;
+
+        // Into the trash behind the handlers' back, then a fresh Virtual entry without it
+        let trashed: uuid::Uuid = sqlx::query_scalar(
+            "UPDATE artifacts SET is_deleted = true \
+             WHERE repository_id = $1 AND name = $2 AND version = '1.0.0' RETURNING id",
+        )
+        .bind(member_id)
+        .bind(package)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("trash 1.0.0");
+        super::invalidate_packument_caches(&fx.state, member_id, &member_key, package).await;
+        let (_, _, warm) = fetch_packument_json(&fx.state, &fx.repo_key, package).await;
+        assert!(warm["versions"]["1.0.0"].is_null(), "got {warm:?}");
+        assert!(warm["versions"]["2.0.0"].is_object(), "got {warm:?}");
+
+        let restored = crate::api::handlers::trash::restore_trashed_artifact(
+            State(fx.state.clone()),
+            Extension(admin_auth(&fx)),
+            Path(trashed),
+        )
+        .await;
+        assert!(restored.is_ok(), "trash restore must succeed");
+        let (_, _, after) = fetch_packument_json(&fx.state, &fx.repo_key, package).await;
+        assert!(
+            after["versions"]["1.0.0"].is_object(),
+            "a trash restore must invalidate the Virtual packument; got {after:?}"
+        );
+
+        cleanup_member(&fx, member_id, &member_dir).await;
+        fx.teardown().await;
+    }
+
+    /// #5779. FAILS BEFORE THE FIX: a retention sweep left the swept version
+    /// in the Virtual's cached packument until the entry expired
+    /// Age `version` of `package` in `repo_id` past a 7-day retention window
+    /// and run a `max_age_days` policy scoped to that repository through the
+    /// handler, as the lifecycle UI does. Returns the policy id.
+    async fn run_retention_on(
+        fx: &tdh::Fixture,
+        repo_id: uuid::Uuid,
+        package: &str,
+        version: &str,
+    ) -> uuid::Uuid {
+        use axum::extract::{Path, State};
+        use axum::Extension;
+        sqlx::query(
+            "UPDATE artifacts SET created_at = NOW() - INTERVAL '30 days', \
+             updated_at = NOW() - INTERVAL '30 days' \
+             WHERE repository_id = $1 AND name = $2 AND version = $3",
+        )
+        .bind(repo_id)
+        .bind(package)
+        .bind(version)
+        .execute(&fx.pool)
+        .await
+        .expect("age the version");
+        let policy = crate::services::lifecycle_service::LifecycleService::new(fx.pool.clone())
+            .create_policy(
+                crate::services::lifecycle_service::CreateLifecyclePolicyRequest {
+                    applies_to_all: false,
+                    repository_ids: None,
+                    repository_id: Some(repo_id),
+                    name: format!("expire-7d-{}", repo_id.simple()),
+                    description: None,
+                    policy_type: "max_age_days".to_string(),
+                    config: serde_json::json!({"days": 7}),
+                    priority: None,
+                    cron_schedule: None,
+                    enabled: None,
+                },
+            )
+            .await
+            .expect("create lifecycle policy");
+        let run = crate::api::handlers::lifecycle::execute_policy(
+            State(fx.state.clone()),
+            Extension(admin_auth(fx)),
+            Path(policy.id),
+        )
+        .await
+        .expect("execute policy");
+        assert_eq!(run.0.artifacts_removed, 1, "{:?}", run.0);
+        policy.id
+    }
+
+    #[test]
+    fn npm_family_formats_are_every_format_the_handler_serves_5779() {
+        for format in ["npm", "yarn", "pnpm", "bower"] {
+            assert!(super::is_npm_family_format_key(format), "{format}");
+        }
+        for format in ["maven", "pypi", "generic", "NPM", ""] {
+            assert!(!super::is_npm_family_format_key(format), "{format}");
+        }
+    }
+
+    /// A retention sweep of a `pnpm` Local (served by this handler and its
+    /// packument cache) must invalidate the Virtual's packument too; the
+    /// sweep used to match `format = 'npm'` only (#5779).
+    #[tokio::test]
+    async fn retention_sweep_of_a_pnpm_member_invalidates_the_virtual_packument_5779() {
+        let Some(fx) = tdh::Fixture::setup("virtual", "pnpm").await else {
+            return;
+        };
+        let package = "pnpm-retention-5779";
+        let (member_id, _, member_dir) = virtual_with_two_versions_of(&fx, package, "pnpm").await;
+        let (_, _, warm) = fetch_packument_json(&fx.state, &fx.repo_key, package).await;
+        assert!(warm["versions"]["1.0.0"].is_object(), "got {warm:?}");
+
+        let policy = run_retention_on(&fx, member_id, package, "1.0.0").await;
+        let (_, _, after) = fetch_packument_json(&fx.state, &fx.repo_key, package).await;
+
+        let _ = sqlx::query("DELETE FROM lifecycle_policies WHERE id = $1")
+            .bind(policy)
+            .execute(&fx.pool)
+            .await;
+        cleanup_member(&fx, member_id, &member_dir).await;
+        fx.teardown().await;
+        assert!(
+            after["versions"]["1.0.0"].is_null(),
+            "a retention sweep of a pnpm member must invalidate the Virtual packument; \
+             got {after:?}"
+        );
+        assert!(after["versions"]["2.0.0"].is_object(), "got {after:?}");
+    }
+
+    /// The REST artifact delete in a `yarn` Local must invalidate the Virtual
+    /// packument, as it does for an `npm` Local (#2162, #5779).
+    #[tokio::test]
+    async fn rest_delete_in_a_yarn_member_invalidates_the_virtual_packument_5779() {
+        use axum::extract::{Path, State};
+        use axum::http::HeaderMap;
+        use axum::Extension;
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "yarn").await else {
+            return;
+        };
+        let package = "yarn-rest-delete-5779";
+        let (member_id, member_key, member_dir) =
+            virtual_with_two_versions_of(&fx, package, "yarn").await;
+        let (_, _, warm) = fetch_packument_json(&fx.state, &fx.repo_key, package).await;
+        assert!(warm["versions"]["1.0.0"].is_object(), "got {warm:?}");
+
+        let deleted = crate::api::handlers::repositories::delete_artifact(
+            State(fx.state.clone()),
+            Extension(Some(admin_auth(&fx))),
+            Path((member_key, format!("{package}/1.0.0/{package}-1.0.0.tgz"))),
+            axum::extract::Query(
+                crate::api::handlers::repositories::DeleteArtifactQuery::default(),
+            ),
+            HeaderMap::new(),
+        )
+        .await;
+        let (_, _, after) = fetch_packument_json(&fx.state, &fx.repo_key, package).await;
+
+        cleanup_member(&fx, member_id, &member_dir).await;
+        fx.teardown().await;
+        assert!(deleted.is_ok(), "REST delete must succeed: {deleted:?}");
+        assert!(
+            after["versions"]["1.0.0"].is_null(),
+            "a REST delete in a yarn member must invalidate the Virtual packument; \
+             got {after:?}"
+        );
+        assert!(after["versions"]["2.0.0"].is_object(), "got {after:?}");
+    }
+
+    #[tokio::test]
+    async fn retention_sweep_invalidates_the_virtual_packument_5779() {
+        let Some(fx) = tdh::Fixture::setup("virtual", "npm").await else {
+            return;
+        };
+        let package = "retention-sweep-5779";
+        let (member_id, _, member_dir) = virtual_with_two_versions(&fx, package).await;
+        let (_, _, warm) = fetch_packument_json(&fx.state, &fx.repo_key, package).await;
+        assert!(warm["versions"]["1.0.0"].is_object(), "got {warm:?}");
+
+        let policy = run_retention_on(&fx, member_id, package, "1.0.0").await;
+        let (_, _, after) = fetch_packument_json(&fx.state, &fx.repo_key, package).await;
+        assert!(
+            after["versions"]["1.0.0"].is_null(),
+            "a retention sweep must invalidate the Virtual packument; got {after:?}"
+        );
+        assert!(after["versions"]["2.0.0"].is_object(), "got {after:?}");
+
+        let _ = sqlx::query("DELETE FROM lifecycle_policies WHERE id = $1")
+            .bind(policy)
+            .execute(&fx.pool)
+            .await;
+        cleanup_member(&fx, member_id, &member_dir).await;
+        fx.teardown().await;
     }
 
     /// End-to-end #2162 stale-while-revalidate on a remote repo: with a zero
@@ -23352,16 +24445,35 @@ mod meta_upstream_failure_5345_tests {
     }
 
     #[tokio::test]
-    async fn local_repository_keeps_its_501() {
+    async fn local_repository_answers_attestations_404_and_keeps_its_501() {
         let Some(fx) = tdh::Fixture::setup("local", "npm").await else {
             return;
         };
         let app = fx.router_anon(super::router());
+        let (status, error) = get_meta(app.clone(), &fx.repo_key, ATTESTATION).await;
+        let (keys_status, keys_error) = get_meta(app, &fx.repo_key, "npm/v1/keys").await;
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND, "{error}");
+        assert!(
+            error.contains("no attestations for lodash@4.17.21"),
+            "{error}"
+        );
+        assert_eq!(keys_status, StatusCode::NOT_IMPLEMENTED, "{keys_error}");
+        assert!(keys_error.contains(LOCAL_STUB), "{keys_error}");
+    }
+
+    #[tokio::test]
+    async fn virtual_without_remote_member_answers_attestations_404() {
+        let Some(fx) = tdh::Fixture::setup("virtual", "npm").await else {
+            return;
+        };
+        let app = fx.router_with_auth(super::router());
         let (status, error) = get_meta(app, &fx.repo_key, ATTESTATION).await;
         fx.teardown().await;
 
-        assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{error}");
-        assert!(error.contains(LOCAL_STUB), "{error}");
+        assert_eq!(status, StatusCode::NOT_FOUND, "{error}");
+        assert!(error.contains("no attestations"), "{error}");
     }
 
     #[test]
@@ -23841,7 +24953,7 @@ mod publish_race_5399_tests {
             .execute(&pool)
             .await
             .expect("create sequence");
-        let drop_sql = tdh::install_artifact_row_fault(
+        let fault = tdh::install_artifact_row_fault(
             &pool,
             &suffix,
             &sha_hex(&tarballs[0]),
@@ -23879,12 +24991,7 @@ mod publish_race_5399_tests {
             statuses.push(h.await.expect("join").expect("publish").status());
         }
 
-        for stmt in drop_sql.split("; ") {
-            sqlx::query(sqlx::AssertSqlSafe(stmt.to_string()))
-                .execute(&pool)
-                .await
-                .expect("drop fault");
-        }
+        tdh::drop_test_trigger(&pool, "artifacts", &fault, &fault).await;
         let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
             "DROP SEQUENCE IF EXISTS {seq}"
         )))

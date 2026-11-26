@@ -914,11 +914,11 @@ pub fn router() -> Router<SharedState> {
 
     Router::new()
         .route("/_/capabilities", get(repository_capabilities))
-        .route("/", get(list_repositories).post(create_repository))
+        .route("/", get(list_repositories).post(create_repository_route))
         .route(
             "/:key",
             get(get_repository)
-                .patch(update_repository)
+                .patch(update_repository_route)
                 .delete(delete_repository),
         )
         // Deduplicated storage accounting (logical/physical/unique/shared) (#2056)
@@ -1255,10 +1255,18 @@ pub struct CreateRepositoryRequest {
     pub virtual_metadata_partial: Option<bool>,
     /// Virtual repositories only: whether an artifact download may fall back
     /// to a lower-priority member while a higher-priority one is unavailable
-    /// (#5810); see `UpdateRepositoryRequest.virtual_member_fallback`.
-    /// Refused (400) on any other repository type.
+    /// (#5810), and whether a Maven `maven-metadata.xml` merge missing an
+    /// unavailable member answers `503` instead of a partial merge (#5777);
+    /// see `UpdateRepositoryRequest.virtual_member_fallback`. Refused (400)
+    /// on any other repository type.
     #[schema(nullable = false)]
     pub virtual_member_fallback: Option<proxy_helpers::VirtualMemberFallback>,
+    /// Composer Remote repositories only (#6332): forward `search.json` to the
+    /// upstream and merge its hits after the cached ones. Off by default, so no
+    /// search term leaves the instance unless an administrator turns it on for
+    /// this Remote. Stored in `repository_config` under
+    /// `composer_upstream_search`. Refused (400) on any other repository.
+    pub composer_upstream_search: Option<bool>,
     /// Remote repositories only: the upstream mode the repository is born
     /// with (#5402), `online` (the default) or `cache_only`. The same value
     /// `PUT /api/v1/repositories/{key}/upstream-mode` sets, stored before any
@@ -1538,13 +1546,21 @@ pub struct UpdateRepositoryRequest {
     /// member breaker). `available` (the default) serves the next member in
     /// priority order; `strict` answers 503 with `Retry-After` instead, so a
     /// lower member's copy is never served in place of a higher member's.
-    /// A 404 is a miss under both. Metadata merges are not affected (see
-    /// `virtual_metadata_partial`). Stored in `repository_config` under
-    /// `virtual_member_fallback`; read back in
+    /// A 404 is a miss under both. A Maven `maven-metadata.xml` merge that is
+    /// missing an unavailable member answers the same 503 under `strict`
+    /// rather than a partial merge (#5777); other metadata merges are not
+    /// affected (see `virtual_metadata_partial`). Stored in
+    /// `repository_config` under `virtual_member_fallback`; read back in
     /// `RepositoryResponse.virtual_member_fallback`. Refused (400) on any
     /// other repository type.
     #[schema(nullable = false)]
     pub virtual_member_fallback: Option<proxy_helpers::VirtualMemberFallback>,
+    /// Composer Remote repositories only (#6332): forward `search.json` to the
+    /// upstream and merge its hits after the cached ones. Off by default, so no
+    /// search term leaves the instance unless an administrator turns it on for
+    /// this Remote. Stored in `repository_config` under
+    /// `composer_upstream_search`. Refused (400) on any other repository.
+    pub composer_upstream_search: Option<bool>,
     /// Assign this repository to a project (#2472), or take it out of one
     /// (#4026). Three-way semantics via `Option<Option<Uuid>>`: omit the field
     /// to leave the assignment unchanged; send `null` to clear it; send a
@@ -1802,12 +1818,19 @@ pub struct RepositoryResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub virtual_metadata_partial: Option<bool>,
     /// Virtual repositories only (#5810): the member-fallback mode of the
-    /// virtual's artifact downloads; see
-    /// `UpdateRepositoryRequest.virtual_member_fallback`. Always present on a
-    /// virtual repository (`available` when never set), omitted on every
-    /// other type.
+    /// virtual's artifact downloads and Maven `maven-metadata.xml` merges
+    /// (#5777); see `UpdateRepositoryRequest.virtual_member_fallback`. Always
+    /// present on a virtual repository (`available` when never set), omitted
+    /// on every other type.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub virtual_member_fallback: Option<proxy_helpers::VirtualMemberFallback>,
+    /// Composer Remote repositories only (#6332): whether `search.json` is
+    /// forwarded to the upstream; see
+    /// `UpdateRepositoryRequest.composer_upstream_search`. Always present on a
+    /// Composer Remote (`false` when never set), omitted on every other
+    /// repository.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub composer_upstream_search: Option<bool>,
     /// Custom User-Agent used for outbound HTTP requests to the upstream,
     /// read back from `repository_config`. `None` when unset.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2341,6 +2364,7 @@ fn repo_to_response(
         quarantine_duration_minutes: None,
         virtual_metadata_partial: None,
         virtual_member_fallback: None,
+        composer_upstream_search: None,
         custom_user_agent: None,
         apt_origin: None,
         apt_label: None,
@@ -2404,8 +2428,8 @@ async fn with_quarantine_settings(
 /// Populate a virtual repository's own settings on `RepositoryResponse`:
 /// `virtual_metadata_partial` (#5621), the stored opt-in read exactly as the
 /// merges read it (`false` when unset), and `virtual_member_fallback`
-/// (#5810), read exactly as the download walks read it (`available` when
-/// unset). Both are left `None` on every other type.
+/// (#5810), read exactly as the download walks and Maven merges read it
+/// (`available` when unset). Both are left `None` on every other type.
 async fn with_virtual_settings(
     db: &sqlx::PgPool,
     repo_id: Uuid,
@@ -2416,6 +2440,14 @@ async fn with_virtual_settings(
             Some(proxy_helpers::virtual_metadata_partial_allowed(db, repo_id).await);
         response.virtual_member_fallback =
             Some(proxy_helpers::virtual_member_fallback(db, repo_id).await);
+    }
+    // #6332: a Composer Remote's search forwarding, read as search reads it.
+    if super::composer_upstream_search::applies_to(&response.repo_type, &response.format) {
+        response.composer_upstream_search = Some(
+            super::composer_upstream_search::enabled_for(db, &[repo_id])
+                .await
+                .contains(&repo_id),
+        );
     }
     response
 }
@@ -4695,19 +4727,26 @@ pub async fn list_repositories(
         std::collections::HashMap::new();
     let mut member_fallback: std::collections::HashMap<Uuid, proxy_helpers::VirtualMemberFallback> =
         std::collections::HashMap::new();
+    // #6332: the Composer Remotes that forward search upstream.
+    let mut upstream_search: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
     if !repo_ids.is_empty() {
         for (id, key, value) in sqlx::query_as::<_, (Uuid, String, Option<String>)>(
             "SELECT repository_id, key, value FROM repository_config \
-             WHERE repository_id = ANY($1) AND key IN ($2, $3)",
+             WHERE repository_id = ANY($1) AND key IN ($2, $3, $4)",
         )
         .bind(&repo_ids)
         .bind(proxy_helpers::VIRTUAL_METADATA_PARTIAL_CONFIG_KEY)
         .bind(proxy_helpers::VIRTUAL_MEMBER_FALLBACK_CONFIG_KEY)
+        .bind(super::composer_upstream_search::CONFIG_KEY)
         .fetch_all(&state.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?
         {
-            if key == proxy_helpers::VIRTUAL_MEMBER_FALLBACK_CONFIG_KEY {
+            if key == super::composer_upstream_search::CONFIG_KEY {
+                if super::composer_upstream_search::opted_in(value.as_deref()) {
+                    upstream_search.insert(id);
+                }
+            } else if key == proxy_helpers::VIRTUAL_MEMBER_FALLBACK_CONFIG_KEY {
                 member_fallback.insert(
                     id,
                     proxy_helpers::VirtualMemberFallback::from_stored(value.as_deref()),
@@ -4745,6 +4784,9 @@ pub async fn list_repositories(
                 resp.virtual_member_fallback =
                     Some(member_fallback.get(&resp.id).copied().unwrap_or_default());
             }
+            if super::composer_upstream_search::applies_to(&resp.repo_type, &resp.format) {
+                resp.composer_upstream_search = Some(upstream_search.contains(&resp.id));
+            }
             resp
         })
         .collect();
@@ -4758,6 +4800,85 @@ pub async fn list_repositories(
             total_pages,
         },
     }))
+}
+
+/// #6063 (1.12.4): `versioning_enabled` is stored for every format, but only
+/// the Generic and Mlmodel upload paths honour it
+/// ([`crate::services::artifact_service::versioning_applies`]). Refusing the
+/// flag elsewhere would break clients and IaC configs that send it today, so
+/// the patch release keeps the `200` and the stored value unchanged and only
+/// tells the caller: an RFC 7234 `Warning: 299` header on the create/update
+/// response, plus one server log line. Returns the header value when `true`
+/// was requested on a format whose uploads ignore it.
+fn versioning_noop_warning(format_key: &str, versioning_requested: bool) -> Option<String> {
+    if !versioning_requested {
+        return None;
+    }
+    let applies = RepositoryFormat::ALL
+        .iter()
+        .find(|f| f.as_key() == format_key)
+        .map(|f| crate::services::artifact_service::versioning_applies(f, true))
+        // A format key outside the built-in set (a WASM plugin format) is not
+        // versioned by any upload path either.
+        .unwrap_or(false);
+    if applies {
+        return None;
+    }
+    Some(format!(
+        "299 - \"versioning_enabled has no effect for format {format_key}\""
+    ))
+}
+
+/// Wraps a create/update result with the [`versioning_noop_warning`] header
+/// and log line. The body and status are unchanged.
+fn respond_with_versioning_warning(
+    repo: RepositoryResponse,
+    versioning_requested: bool,
+) -> Response {
+    let warning = versioning_noop_warning(&repo.format, versioning_requested);
+    if warning.is_some() {
+        tracing::warn!(
+            repository = %repo.key,
+            format = %repo.format,
+            "versioning_enabled=true was stored but has no effect for this format; \
+             only generic and mlmodel uploads are versioned (#6063)"
+        );
+    }
+    let mut response = Json(repo).into_response();
+    if let Some(value) = warning.and_then(|v| header::HeaderValue::from_str(&v).ok()) {
+        response.headers_mut().append(header::WARNING, value);
+    }
+    response
+}
+
+/// HTTP route for [`create_repository`]: the same handler, plus the #6063
+/// `Warning` header. Kept as a wrapper so in-process callers of
+/// `create_repository` (config-as-code, projects, tests) keep their
+/// `Json<RepositoryResponse>` return type.
+async fn create_repository_route(
+    state: State<SharedState>,
+    auth: Extension<Option<AuthExtension>>,
+    body: Bytes,
+) -> Result<Response> {
+    let Json(repo) = create_repository(state, auth, body).await?;
+    // Create stores exactly what was sent (default false), so the echoed
+    // value is the requested one.
+    let requested = repo.versioning_enabled;
+    Ok(respond_with_versioning_warning(repo, requested))
+}
+
+/// HTTP route for [`update_repository`]; see [`create_repository_route`]. Only
+/// a PATCH that sends `versioning_enabled: true` is warned about, not every
+/// PATCH of a repository that already holds it.
+async fn update_repository_route(
+    state: State<SharedState>,
+    auth: Extension<Option<AuthExtension>>,
+    key: Path<String>,
+    Json(payload): Json<UpdateRepositoryRequest>,
+) -> Result<Response> {
+    let requested = payload.versioning_enabled == Some(true);
+    let Json(repo) = update_repository(state, auth, key, Json(payload)).await?;
+    Ok(respond_with_versioning_warning(repo, requested))
 }
 
 /// Create a new repository
@@ -4846,6 +4967,7 @@ pub async fn create_repository(
     refuse_update_only_fields_on_create(&payload)?;
     let shared_config = SharedRepoConfigSettings::from(&payload);
     shared_config.validate(&repo_type)?;
+    shared_config.validate_for_format(&repo_type, &format)?;
     // #5402: the Remote's upstream mode and egress proxy, validated before
     // the row exists and stored right after it, before anything else.
     let born_remote = born_remote_settings(&payload, &repo_type)?;
@@ -6033,9 +6155,28 @@ struct SharedRepoConfigSettings {
     quarantine_duration_minutes: Option<i64>,
     virtual_metadata_partial: Option<bool>,
     virtual_member_fallback: Option<proxy_helpers::VirtualMemberFallback>,
+    composer_upstream_search: Option<bool>,
 }
 
 impl SharedRepoConfigSettings {
+    /// Reject a setting that does not apply to this repository's format
+    /// (400). Runs before any write, beside [`Self::validate`].
+    fn validate_for_format(
+        &self,
+        repo_type: &RepositoryType,
+        format: &RepositoryFormat,
+    ) -> Result<()> {
+        if self.composer_upstream_search.is_some()
+            && (*repo_type != RepositoryType::Remote || *format != RepositoryFormat::Composer)
+        {
+            return Err(AppError::Validation(
+                "composer_upstream_search is only valid for Composer remote repositories"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Reject a value that does not apply to `repo_type` (400). Runs before
     /// any write.
     fn validate(&self, repo_type: &RepositoryType) -> Result<()> {
@@ -6072,6 +6213,15 @@ impl SharedRepoConfigSettings {
         if let Some(allow) = self.virtual_metadata_partial {
             upsert_repo_config(db, repo_id, "virtual_metadata_partial", bool_str(allow)).await?;
         }
+        if let Some(forward) = self.composer_upstream_search {
+            upsert_repo_config(
+                db,
+                repo_id,
+                super::composer_upstream_search::CONFIG_KEY,
+                bool_str(forward),
+            )
+            .await?;
+        }
         if let Some(fallback) = self.virtual_member_fallback {
             upsert_repo_config(
                 db,
@@ -6106,6 +6256,7 @@ impl From<&UpdateRepositoryRequest> for SharedRepoConfigSettings {
             quarantine_duration_minutes: payload.quarantine_duration_minutes,
             virtual_metadata_partial: payload.virtual_metadata_partial,
             virtual_member_fallback: payload.virtual_member_fallback,
+            composer_upstream_search: payload.composer_upstream_search,
         }
     }
 }
@@ -6117,6 +6268,7 @@ impl From<&CreateRepositoryRequest> for SharedRepoConfigSettings {
             quarantine_duration_minutes: payload.quarantine_duration_minutes,
             virtual_metadata_partial: payload.virtual_metadata_partial,
             virtual_member_fallback: payload.virtual_member_fallback,
+            composer_upstream_search: payload.composer_upstream_search,
         }
     }
 }
@@ -6351,6 +6503,7 @@ fn validate_update_config_fields(
     // Quarantine and `virtual_metadata_partial`: the same rules as on create
     // (#3647, #5324).
     SharedRepoConfigSettings::from(payload).validate(repo_type)?;
+    SharedRepoConfigSettings::from(payload).validate_for_format(repo_type, format)?;
     if payload
         .release_repository_key
         .as_deref()
@@ -6393,6 +6546,17 @@ fn validate_update_config_fields(
     Ok(())
 }
 
+async fn may_rename_repository(
+    state: &SharedState,
+    auth: &AuthExtension,
+    project_id: Option<Uuid>,
+) -> Result<bool> {
+    match project_id {
+        Some(id) => projects::can_assign_to_project(state, auth, id).await,
+        None => projects::has_system_repo_admin(state, auth).await,
+    }
+}
+
 /// Update repository
 #[utoipa::path(
     patch,
@@ -6408,7 +6572,7 @@ fn validate_update_config_fields(
         (status = 200, description = "Repository updated", body = RepositoryResponse),
         (status = 400, description = "Invalid repository configuration, repodata_depth outside 0..1023, or a renamed/reassigned key using another project's `<project.key>-` prefix"),
         (status = 401, description = "Authentication required"),
-        (status = 403, description = "Insufficient permissions: needs repository admin, plus project admin of the destination project when changing project_id, or of the current project when clearing it with null"),
+        (status = 403, description = "Insufficient permissions: needs repository admin, plus project admin of the destination project when changing project_id, or of the current project when clearing it with null, and admin (or project admin of the project the repository ends up in) to change the key"),
         (status = 404, description = "Repository not found"),
         (status = 409, description = "Repository key conflict, nonempty repository depth change, concurrent layout change, or an upstream_url origin change while upstream-auth credentials are configured"),
         (status = 422, description = "Positive repodata_depth requires an eligible local RPM repository; repodata_mode requires a local RPM repository; a bare namespace in mcp_server_deny or mcp_auto_approve_namespaces (write `com.acme/*`); mutable on a repository other than a local or staging PyPI, Debian, RPM, Alpine, Pacman or Generic one"),
@@ -6507,6 +6671,15 @@ pub async fn update_repository(
         }
     }
     let key_changed = payload.key.as_deref().is_some_and(|k| k != existing.key);
+    // A rename claims a new key and frees the old one, so it needs the authority to create a repository there.
+    // That authority is judged against the project the repository ends up in, so a rename combined with
+    // `project_id: null` needs a system repository admin and a rename plus move needs the destination's admin.
+    let resulting_project = project_change.unwrap_or(existing.project_id);
+    if key_changed && !may_rename_repository(&state, &auth, resulting_project).await? {
+        return Err(AppError::Authorization(
+            "Renaming a repository requires an admin or the project admin".to_string(),
+        ));
+    }
     // The create-time format rules (#5251: an Agent Plugins repository may
     // not take the key `t`, which is its token route) hold for a rename too.
     if let Some(new_key) = payload.key.as_deref().filter(|_| key_changed) {
@@ -12555,9 +12728,50 @@ async fn persist_generic_staged_upload(
     // manual purge.
 
     let size_bytes = staged.size_bytes();
+    let checksum_sha256 = digests.sha256.clone();
+    // #6383: the format metadata a natively finalized package (or an `.rpm`
+    // whose header this path parsed) is served from commits in the same
+    // transaction as its artifact row, as on the native routes (#6317) and the
+    // chunked completion (#5002). Written after the commit with a failure only
+    // logged, a pool timeout there left a stored package out of its format's
+    // index.
+    let commit_document = if let Some(native) = &native {
+        let context = super::upload::format_finalize::FinalizeContext {
+            repository_id: repo.id,
+            repository_key: &key,
+            artifact_path: &path,
+            size_bytes,
+            checksum_sha256: &checksum_sha256,
+        };
+        match super::upload::format_finalize::metadata_document(
+            &native.staged,
+            &native.target,
+            &context,
+            rpm_metadata.as_ref(),
+        ) {
+            Ok(document) => document.map(|document| (document.format, document.metadata)),
+            Err(e) => {
+                tracing::warn!(path = %path, error = %e, "format metadata could not be derived");
+                None
+            }
+        }
+    } else {
+        rpm_metadata.clone().map(|metadata| ("rpm", metadata))
+    };
+    let rpm_document = commit_document
+        .as_ref()
+        .is_some_and(|(format, _)| *format == "rpm");
+    // #6346: a natively finalized package's catalog row is registered once,
+    // by `format_finalize::record` below, with what its parser read; the
+    // upload service writes none of its own.
+    let catalog = if native.is_some() {
+        crate::services::artifact_service::CatalogRegistration::Caller
+    } else {
+        crate::services::artifact_service::CatalogRegistration::Derive
+    };
     let content = staged.upload_content().await?;
     let artifact = artifact_service
-        .upload_content_with_sync_options(
+        .upload_content_with_commit_metadata(
             repo.id,
             &path,
             &name,
@@ -12568,8 +12782,11 @@ async fn persist_generic_staged_upload(
             size_bytes,
             Some(auth.user_id),
             !is_replication_request(headers),
-            None,
+            catalog,
             precondition.as_ref(),
+            commit_document.map(|(format, metadata)| {
+                crate::services::artifact_service::CommitMetadata { format, metadata }
+            }),
         )
         .await;
     // The staging copy is no longer needed once the service has consumed it,
@@ -12585,27 +12802,29 @@ async fn persist_generic_staged_upload(
         checksum_sha256: &artifact.checksum_sha256,
     };
     if let Some(native) = native {
-        record_generic_native_finalize(
-            state,
-            &artifact_service,
-            &context,
-            artifact.id,
-            native,
-            rpm_metadata.as_ref(),
-        )
-        .await;
-    } else if let Some(metadata) = &rpm_metadata {
-        if let Err(e) =
-            super::rpm::record_rpm_metadata(&state.db, artifact.id, repo.id, metadata).await
-        {
-            tracing::warn!(artifact_id = %artifact.id, error = %e, "RPM metadata could not be recorded");
-        }
+        record_generic_native_finalize(state, &context, artifact.id, native, rpm_metadata.as_ref())
+            .await;
+    }
+    if rpm_document {
+        // The repository timestamp every RPM metadata write bumps; after the
+        // commit, so concurrent uploads do not queue on the repository row.
+        let _ = sqlx::query("UPDATE repositories SET updated_at = NOW() WHERE id = $1")
+            .bind(repo.id)
+            .execute(&state.db)
+            .await;
     }
 
+    // #6317: the upload has committed. The reads below only fill the response
+    // body, so a failure (a pool timeout under load) falls back to a default
+    // instead of answering 503 for a stored artifact, whose retry would then
+    // be refused with 409.
     let downloads = artifact_service
         .get_download_stats(artifact.id)
         .await
-        .map_err(|e| e.into_response())?;
+        .unwrap_or_else(|e| {
+            tracing::warn!(artifact_id = %artifact.id, error = %e, "upload committed; download count for the response could not be read");
+            0
+        });
     let metadata_json = wasm_metadata.map(|m| m.to_json());
 
     // #2367: echo the revision this upload landed at for versioned repos.
@@ -12613,7 +12832,10 @@ async fn persist_generic_staged_upload(
         artifact_service
             .latest_version_info(repo.id, &artifact.path)
             .await
-            .map_err(|e| e.into_response())?
+            .unwrap_or_else(|e| {
+                tracing::warn!(artifact_id = %artifact.id, error = %e, "upload committed; revision for the response could not be read");
+                None
+            })
             .map(|(rev, label)| (Some(rev), label))
             .unwrap_or((None, None))
     } else {
@@ -12721,6 +12943,9 @@ async fn stage_generic_native_finalize(
     let staged_native = format_finalize::stage(&repo.format, path, &target, source)
         .await
         .map_err(|reason| AppError::Validation(reason).into_response())?;
+    format_finalize::ensure_unique_nuget(&state.db, repo.id, path, Some(&staged_native))
+        .await
+        .map_err(|e| e.into_response())?;
     drop(local);
     Ok(Some(GenericNativeFinalize {
         target: format_finalize::resolved_target(target, &staged_native),
@@ -12729,56 +12954,27 @@ async fn stage_generic_native_finalize(
 }
 
 /// Record a natively finalized generic upload's format rows against its
-/// committed artifact (#5254): the `artifact_metadata` document, then the
-/// catalog entry, install-script analysis and index cache invalidation the
-/// native route performs. The artifact is already committed, so a failure is
-/// logged rather than failing the upload, as the RPM metadata write on this
-/// path always was.
+/// committed artifact (#5254): the catalog entry, install-script analysis and
+/// index cache invalidation the native route performs. The `artifact_metadata`
+/// document committed with the row (#6383). The artifact is already
+/// committed, so a failure here is logged rather than failing the upload.
 async fn record_generic_native_finalize(
     state: &SharedState,
-    artifact_service: &ArtifactService,
     context: &super::upload::format_finalize::FinalizeContext<'_>,
     artifact_id: Uuid,
     native: GenericNativeFinalize,
     rpm_metadata: Option<&serde_json::Value>,
 ) {
-    use super::upload::format_finalize;
     let GenericNativeFinalize { target, staged } = native;
-    match format_finalize::metadata_document(&staged, &target, context, rpm_metadata) {
-        Ok(Some(document)) => {
-            let written = if document.format == "rpm" {
-                super::rpm::record_rpm_metadata(
-                    &state.db,
-                    artifact_id,
-                    context.repository_id,
-                    &document.metadata,
-                )
-                .await
-                .map(|_| ())
-                .map_err(|e| e.to_string())
-            } else {
-                artifact_service
-                    .set_metadata(
-                        artifact_id,
-                        document.format,
-                        document.metadata,
-                        document.properties,
-                    )
-                    .await
-                    .map(|_| ())
-                    .map_err(|e| e.to_string())
-            };
-            if let Err(e) = written {
-                tracing::warn!(artifact_id = %artifact_id, error = %e, "format metadata could not be recorded");
-            }
-        }
-        Ok(None) => {}
-        Err(e) => {
-            tracing::warn!(artifact_id = %artifact_id, error = %e, "format metadata could not be derived");
-        }
-    }
-    if let Err(e) =
-        format_finalize::record(state, context, artifact_id, &target, staged, rpm_metadata).await
+    if let Err(e) = super::upload::format_finalize::record(
+        state,
+        context,
+        artifact_id,
+        &target,
+        staged,
+        rpm_metadata,
+    )
+    .await
     {
         tracing::warn!(artifact_id = %artifact_id, error = %e, "format records could not be written");
     }
@@ -13266,6 +13462,25 @@ fn range_is_whole_object(range_header: Option<&str>, total: u64) -> bool {
     }
 }
 
+/// The byte length of the object stored at `key`, without holding it in
+/// memory (#6358): object metadata where the backend reports it
+/// (`StorageBackend::stored_size`: filesystem, S3, Azure, GCS), otherwise a
+/// read of the object that counts its bytes and drops each chunk.
+pub(crate) async fn stored_object_length(
+    storage: &dyn crate::storage::StorageBackend,
+    key: &str,
+) -> Result<u64> {
+    if let Some(len) = storage.stored_size(key).await? {
+        return Ok(len);
+    }
+    let mut stream = storage.get_stream(key).await?;
+    let mut len = 0u64;
+    while let Some(chunk) = futures::StreamExt::next(&mut stream).await {
+        len += chunk?.len() as u64;
+    }
+    Ok(len)
+}
+
 /// [`ranged_stream_response_verified`] that verifies a small whole-object
 /// serve BEFORE the status is chosen (#4323): an object of at most
 /// [`crate::storage::verify::VERIFY_BEFORE_HEADERS_MAX_BYTES`] that fails
@@ -13731,17 +13946,24 @@ pub async fn download_artifact(
     // #5457: an OCI manifest row (`v2/<name>/manifests/<ref>`) is gated with
     // every alias of its digest, as the native pull is, so a rejected image
     // is not downloadable here through a clean tag or digest alias.
+    //
+    // #6433: a proxy-cache row is served in no form (redirect, stream, range,
+    // HEAD) before its cache sidecar is checked: held is the 409, a refusal
+    // the 403, and a row nothing vouches for is not served from storage, so
+    // a Remote answers through its proxy path below as for a missing row.
+    let mut cache_row_declined = false;
     {
-        if let Some(artifact_id) = sqlx::query_scalar::<_, Uuid>(
-            "SELECT id \
-             FROM artifacts \
-             WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
-        )
-        .bind(repo.id)
-        .bind(&path)
-        .fetch_optional(&state.db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?
+        if let Some((artifact_id, storage_key, size_bytes)) =
+            sqlx::query_as::<_, (Uuid, String, i64)>(
+                "SELECT id, storage_key, size_bytes \
+                 FROM artifacts \
+                 WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
+            )
+            .bind(repo.id)
+            .bind(&path)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?
         {
             crate::services::oci_manifests::enforce_path_download_gate(
                 &state.db,
@@ -13749,6 +13971,16 @@ pub async fn download_artifact(
                 &path,
             )
             .await?;
+            let row = Some((storage_key, size_bytes));
+            cache_row_declined = match proxy_helpers::vouched_row(&state, repo.id, row, |(k, n)| {
+                proxy_helpers::ServedRowRef::new(k, Some(*n))
+            })
+            .await
+            {
+                Ok(vouched) => vouched.is_none(),
+                // The hold's 409, a refusal's 403.
+                Err(refusal) => return Ok(refusal),
+            };
             // #5076: a Remote that scans on proxy can hold rows of its own
             // (replication, a publish into the remote). This route cannot
             // grade them as their format route does, so, as for its Remote
@@ -13841,16 +14073,17 @@ pub async fn download_artifact(
     // GET-signed URL hands the client a URL it cannot use. Skip the redirect and
     // fall through to the streamed path below, which already builds the correct
     // headers with an empty body for a HEAD.
-    if presigned_enabled && !is_head {
+    if presigned_enabled && !is_head && !cache_row_declined {
         // Get artifact metadata first using query_as for runtime checking
         #[derive(sqlx::FromRow)]
         struct ArtifactRow {
             id: Uuid,
             storage_key: String,
+            size_bytes: i64,
         }
         if let Some(artifact) = sqlx::query_as::<_, ArtifactRow>(
             r#"
-            SELECT id, storage_key
+            SELECT id, storage_key, size_bytes
             FROM artifacts
             WHERE repository_id = $1 AND path = $2 AND is_deleted = false
             "#,
@@ -13889,25 +14122,129 @@ pub async fn download_artifact(
                     source = ?presigned.source,
                     "Serving artifact via redirect"
                 );
-                return Ok(DownloadResponse::redirect(presigned).into_response());
+                // #6035: the transfer meter counts the row's size when the
+                // URL is issued.
+                return Ok(
+                    DownloadResponse::redirect(presigned, artifact.size_bytes).into_response()
+                );
             }
         }
     }
 
     // Fall back to proxied download (filesystem or S3 without redirect)
-    let artifact_service = ArtifactService::new(state.db.clone(), storage);
+    let artifact_service = ArtifactService::new(state.db.clone(), storage.clone());
 
-    let download_result = artifact_service
-        .download_stream(
-            repo.id,
-            &path,
-            auth.as_ref().map(|a| a.user_id),
-            client_ip_str.clone(),
-            user_agent.as_deref(),
-            // #2260 §5: a HEAD serves no body, so it must not count.
-            !is_head,
-        )
-        .await;
+    // #5594: a Docker/OCI manifest's artifact row records the IMAGE size
+    // (config + layers) in `size_bytes`, not the byte length of the manifest
+    // stored at `storage_key`, while `checksum_sha256` is the manifest digest.
+    // Serving with `artifact.size_bytes` as the content length makes integrity
+    // verification fail (and would advertise a wrong Content-Length). Serve the
+    // actual manifest bytes with their real size instead. A GET still reads
+    // through `download_stream`, so the download gate, the statistics row, the
+    // ARTIFACT_DOWNLOADED audit event and the AfterDownload hooks all apply; a
+    // HEAD runs the same gate without opening the object.
+    //
+    // #6358: the length comes from object metadata, and the body is streamed.
+    // Nothing caps what is stored at a manifest path (the manifest PUT takes up
+    // to `max_upload_size_bytes`), so this used to buffer the whole object to
+    // learn its length, on a HEAD too.
+    if repo.repo_type != RepositoryType::Virtual
+        && !cache_row_declined
+        && repo.format == RepositoryFormat::Docker
+        && crate::services::oci_manifests::is_manifest_path(&path)
+    {
+        let opened = if is_head {
+            artifact_service
+                .prepare_head(repo.id, &path)
+                .await
+                .map(|artifact| (artifact, None))
+        } else {
+            artifact_service
+                .download_stream(
+                    repo.id,
+                    &path,
+                    auth.as_ref().map(|a| a.user_id),
+                    client_ip_str.clone(),
+                    user_agent.as_deref(),
+                    true,
+                )
+                .await
+                .map(|(artifact, stream)| (artifact, Some(stream)))
+        };
+        // A HEAD has not opened the object, so a missing one shows up here
+        // and falls through below like a failed open.
+        let opened = match opened {
+            Ok((artifact, stream)) => stored_object_length(storage.as_ref(), &artifact.storage_key)
+                .await
+                .map(|total| (artifact, stream, total)),
+            Err(e) => Err(e),
+        };
+        match opened {
+            Ok((artifact, stream, total)) => {
+                let body = stream.unwrap_or_else(|| Box::pin(futures::stream::empty()));
+                let range_header = request
+                    .headers()
+                    .get(header::RANGE)
+                    .and_then(|v| v.to_str().ok());
+                let checksum = artifact.checksum_sha256.trim().to_string();
+                let base_headers = vec![
+                    (header::CONTENT_TYPE, artifact.content_type),
+                    (
+                        header::CONTENT_DISPOSITION,
+                        format!("attachment; filename=\"{}\"", download_filename(&path)),
+                    ),
+                    (header::ETAG, artifact_etag(&checksum)),
+                    (
+                        header::HeaderName::from_static("x-checksum-sha256"),
+                        checksum,
+                    ),
+                    (
+                        header::HeaderName::from_static(X_ARTIFACT_STORAGE),
+                        "proxy".to_string(),
+                    ),
+                ];
+                let verify = serve_verification(
+                    state.config.download_verify_checksums
+                        && crate::storage::verify::checksum_is_content_digest(
+                            repo.format.as_key(),
+                            &path,
+                        ),
+                    &artifact.checksum_sha256,
+                    || format!("{key}/{path}"),
+                );
+                let response = ranged_stream_response_checked(
+                    range_header,
+                    total,
+                    body,
+                    base_headers,
+                    verify,
+                    is_head,
+                )
+                .await?;
+                return Ok(response);
+            }
+            // No row, or a cached remote manifest whose local bytes are gone:
+            // the normal path below answers it (404, or the remote fallback).
+            Err(AppError::NotFound(_)) => {}
+            Err(e) => return Err(e),
+        }
+    }
+
+    let download_result = if cache_row_declined {
+        Err(AppError::NotFound("Artifact not found".to_string()))
+    } else {
+        artifact_service
+            .download_stream(
+                repo.id,
+                &path,
+                auth.as_ref().map(|a| a.user_id),
+                client_ip_str.clone(),
+                user_agent.as_deref(),
+                // #2260 §5: a HEAD serves no body, so it must not count.
+                !is_head,
+            )
+            .await
+    };
 
     match download_result {
         Ok((artifact, body)) => {
@@ -14442,11 +14779,26 @@ pub async fn delete_artifact(
         .await;
     }
 
+    // Deleting a crate version changes its sparse-index file, which is cached
+    // for up to 300 s; drop it here and in every Virtual serving this
+    // repository, as publish does (#6469).
+    if repo.format == RepositoryFormat::Cargo {
+        crate::api::handlers::cargo::invalidate_crate_index_caches(
+            &state.db,
+            &state.index_cache,
+            repo.id,
+            &repo.key,
+            std::slice::from_ref(&artifact.name),
+        )
+        .await;
+    }
+
     // Deleting an npm artifact changes the packument, so drop the computed
     // packument cache for its package — including in every virtual repo that
     // serves this one; otherwise a warm virtual-repo GET keeps listing the
-    // just-removed version for the whole fresh window (#2162).
-    if repo.format == RepositoryFormat::Npm {
+    // just-removed version for the whole fresh window (#2162). Every
+    // npm-family format serves its packument through that cache (#5779).
+    if is_npm_family_format(&repo.format) {
         if let Some(package) = crate::api::handlers::npm::npm_package_name_from_artifact_path(&path)
         {
             crate::api::handlers::npm::invalidate_packument_caches(
@@ -18264,6 +18616,37 @@ mod tests {
         assert_eq!(&whole.1[..], &data[..]);
     }
 
+    /// #6433: the generic download route serves a Remote's proxy-cache row
+    /// in no form before its cache sidecar is checked. A held row answers the
+    /// hold's 409 to a GET and to a HEAD; a fresh one streams its bytes; a
+    /// stale one is not served from storage, and the Remote's proxy path
+    /// answers instead (here its upstream is unreachable). Before, all three
+    /// were streamed from the row.
+    #[tokio::test]
+    async fn generic_download_gates_proxy_cache_rows_6433() {
+        use tdh::{CacheRowRig, CacheRowSidecar as S};
+        let Some(rig) = CacheRowRig::setup("generic").await else {
+            return;
+        };
+        tdh::publish_repo(&rig.fx.pool, rig.fx.repo_id).await;
+        let fresh = rig.row("pkg/fresh.bin", "fresh", "1.0", S::Fresh).await;
+        let stale = rig.row("pkg/stale.bin", "stale", "1.0", S::Stale).await;
+        rig.row("pkg/held.bin", "held", "1.0", S::Held).await;
+        let key = rig.fx.repo_key.clone();
+        let app = || tdh::router_anon(download_router(), rig.state.clone());
+        let fresh_get = tdh::send(app(), tdh::get(format!("/{key}/download/pkg/fresh.bin"))).await;
+        let held_get = tdh::send(app(), tdh::get(format!("/{key}/download/pkg/held.bin"))).await;
+        let held_head = tdh::send(app(), tdh::head(format!("/{key}/download/pkg/held.bin"))).await;
+        let stale_get = tdh::send(app(), tdh::get(format!("/{key}/download/pkg/stale.bin"))).await;
+        rig.teardown().await;
+
+        assert_eq!(fresh_get, (StatusCode::OK, fresh), "a fresh row is served");
+        assert_eq!(held_get.0, StatusCode::CONFLICT, "a held row's GET");
+        assert_eq!(held_head.0, StatusCode::CONFLICT, "a held row's HEAD");
+        assert_ne!(stale_get.0, StatusCode::OK, "a stale row is not served");
+        assert_ne!(stale_get.1, stale, "a stale row's bytes are not served");
+    }
+
     #[tokio::test]
     async fn remote_download_honours_range_cold_and_cached_5502() {
         assert_remote_range_cold_and_cached_5502(download_router(), |key, path| {
@@ -20030,6 +20413,7 @@ mod tests {
             quarantine_duration_minutes: None,
             virtual_metadata_partial: None,
             virtual_member_fallback: None,
+            composer_upstream_search: None,
             custom_user_agent: None,
             project_id: None,
             apt_origin: None,
@@ -20115,6 +20499,7 @@ mod tests {
             quarantine_duration_minutes: None,
             virtual_metadata_partial: None,
             virtual_member_fallback: None,
+            composer_upstream_search: None,
             custom_user_agent: None,
             project_id: None,
             apt_origin: None,
@@ -21569,6 +21954,7 @@ mod tests {
             quarantine_duration_minutes: Some(525600),
             virtual_metadata_partial: None,
             virtual_member_fallback: None,
+            composer_upstream_search: None,
             custom_user_agent: None,
             project_id: None,
             apt_origin: None,
@@ -24839,6 +25225,170 @@ mod tests {
         let _ = std::fs::remove_dir_all(&storage_dir);
     }
 
+    /// A repository-admin grant may edit settings but not rename, the project admin of the
+    /// repository's project may rename
+    #[tokio::test]
+    async fn rename_needs_more_than_repository_admin_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (owner_id, owner_name) = tdh::create_user(&pool).await;
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "local", "generic").await;
+        let project_id = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO projects (key, name) VALUES ($1, $1) RETURNING id",
+        )
+        .bind(format!("prj-rename-{}", Uuid::new_v4()))
+        .fetch_one(&pool)
+        .await
+        .expect("create project");
+        sqlx::query("UPDATE repositories SET project_id = $2 WHERE id = $1")
+            .bind(repo_id)
+            .bind(project_id)
+            .execute(&pool)
+            .await
+            .expect("assign repo to project");
+        sqlx::query(
+            "INSERT INTO permissions (principal_type, principal_id, target_type, target_id, actions) \
+             VALUES ('user', $1, 'project', $2, $3)",
+        )
+        .bind(owner_id)
+        .bind(project_id)
+        .bind(vec!["read".to_string(), "admin".to_string()])
+        .execute(&pool)
+        .await
+        .expect("grant project admin");
+        tdh::grant_repo_access(&pool, repo_id, user_id).await;
+        tdh::grant_repo_actions(&pool, repo_id, user_id, &["admin"]).await;
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let maintainer = tdh::make_auth(user_id, &username);
+        let renamed = format!("{key}-renamed");
+        let patch = |v: serde_json::Value| -> UpdateRepositoryRequest {
+            serde_json::from_value(v).expect("deserialize update payload")
+        };
+
+        let edit = update_repository(
+            State(state.clone()),
+            Extension(Some(maintainer.clone())),
+            Path(key.clone()),
+            Json(patch(
+                serde_json::json!({"key": key, "description": "edited"}),
+            )),
+        )
+        .await;
+        let rename = update_repository(
+            State(state.clone()),
+            Extension(Some(maintainer)),
+            Path(key.clone()),
+            Json(patch(serde_json::json!({"key": renamed}))),
+        )
+        .await;
+        let owner_rename = update_repository(
+            State(state.clone()),
+            Extension(Some(tdh::make_auth(owner_id, &owner_name))),
+            Path(key.clone()),
+            Json(patch(serde_json::json!({"key": renamed}))),
+        )
+        .await;
+
+        let _ = sqlx::query("DELETE FROM permissions WHERE principal_id = ANY($1)")
+            .bind(vec![user_id, owner_id])
+            .execute(&pool)
+            .await;
+        tdh::cleanup_member_repo(&pool, repo_id, &dir).await;
+        let _ = sqlx::query("DELETE FROM projects WHERE id = $1")
+            .bind(project_id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup_user(&pool, user_id).await;
+        tdh::cleanup_user(&pool, owner_id).await;
+
+        assert!(edit.is_ok(), "same key is not a rename: {:?}", edit.err());
+        assert!(
+            matches!(rename, Err(AppError::Authorization(ref m)) if m.contains("Renaming")),
+            "repository admin must not rename: {:?}",
+            rename.map(|r| r.0.key)
+        );
+        assert_eq!(owner_rename.expect("project admin rename").0.key, renamed);
+    }
+
+    /// A project admin may clear the assignment and may rename inside the project, but a rename that
+    /// also clears `project_id` lands the repository outside any project, so it needs a system repo admin
+    #[tokio::test]
+    async fn rename_plus_unassign_needs_system_repo_admin_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (owner_id, owner_name) = tdh::create_user(&pool).await;
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "local", "generic").await;
+        let project_id = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO projects (key, name) VALUES ($1, $1) RETURNING id",
+        )
+        .bind(format!("prj-unassign-{}", Uuid::new_v4()))
+        .fetch_one(&pool)
+        .await
+        .expect("create project");
+        sqlx::query("UPDATE repositories SET project_id = $2 WHERE id = $1")
+            .bind(repo_id)
+            .bind(project_id)
+            .execute(&pool)
+            .await
+            .expect("assign repo to project");
+        sqlx::query(
+            "INSERT INTO permissions (principal_type, principal_id, target_type, target_id, actions) \
+             VALUES ('user', $1, 'project', $2, $3)",
+        )
+        .bind(owner_id)
+        .bind(project_id)
+        .bind(vec!["read".to_string(), "admin".to_string()])
+        .execute(&pool)
+        .await
+        .expect("grant project admin");
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let owner = tdh::make_auth(owner_id, &owner_name);
+        let renamed = format!("{key}-renamed");
+        let patch = |v: serde_json::Value| -> UpdateRepositoryRequest {
+            serde_json::from_value(v).expect("deserialize update payload")
+        };
+
+        let rename_unassign = update_repository(
+            State(state.clone()),
+            Extension(Some(owner)),
+            Path(key.clone()),
+            Json(patch(
+                serde_json::json!({"key": renamed, "project_id": null}),
+            )),
+        )
+        .await;
+        let after = sqlx::query_as::<_, (String, Option<Uuid>)>(
+            "SELECT key, project_id FROM repositories WHERE id = $1",
+        )
+        .bind(repo_id)
+        .fetch_one(&pool)
+        .await
+        .expect("reload repo");
+
+        let _ = sqlx::query("DELETE FROM permissions WHERE principal_id = $1")
+            .bind(owner_id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup_member_repo(&pool, repo_id, &dir).await;
+        let _ = sqlx::query("DELETE FROM projects WHERE id = $1")
+            .bind(project_id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup_user(&pool, owner_id).await;
+
+        assert!(
+            matches!(rename_unassign, Err(AppError::Authorization(ref m)) if m.contains("Renaming")),
+            "project admin must not rename while unassigning: {:?}",
+            rename_unassign.map(|r| r.0.key)
+        );
+        assert_eq!(after, (key, Some(project_id)), "repository is unchanged");
+    }
+
     /// #4420: the generic PUT and both multipart upload entry points refuse a
     /// remote repository with 405 and a virtual one with 400 (the native
     /// publish-route responses), even for an admin, and store nothing; a
@@ -25815,11 +26365,15 @@ mod tests {
 
         // Drop first, unconditionally, so a previously panicked run cannot leak
         // the trigger into this one.
-        let drop_trigger = "DROP TRIGGER IF EXISTS ak_test_block_delete_3475 ON artifacts";
-        sqlx::query(sqlx::AssertSqlSafe(drop_trigger))
-            .execute(&rig.pool)
-            .await
-            .ok();
+        let drop_trigger = || {
+            crate::api::handlers::test_db_helpers::drop_test_trigger(
+                &rig.pool,
+                "artifacts",
+                "ak_test_block_delete_3475",
+                "ak_test_block_delete_3475",
+            )
+        };
+        drop_trigger().await;
         sqlx::query(
             "CREATE OR REPLACE FUNCTION ak_test_block_delete_3475() RETURNS trigger AS \
              $$ BEGIN RAISE EXCEPTION 'ak-test-3475 injected failure'; END $$ LANGUAGE plpgsql",
@@ -25838,14 +26392,7 @@ mod tests {
 
         let result = rig.delete(path).await;
 
-        sqlx::query(sqlx::AssertSqlSafe(drop_trigger))
-            .execute(&rig.pool)
-            .await
-            .ok();
-        sqlx::query("DROP FUNCTION IF EXISTS ak_test_block_delete_3475()")
-            .execute(&rig.pool)
-            .await
-            .ok();
+        drop_trigger().await;
 
         assert!(
             result.is_err(),
@@ -28761,6 +29308,44 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // #6063: versioning_enabled on a format that ignores it
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn versioning_noop_warning_only_for_requested_true_on_unversioned_format() {
+        assert_eq!(
+            versioning_noop_warning("npm", true).as_deref(),
+            Some("299 - \"versioning_enabled has no effect for format npm\"")
+        );
+        assert!(versioning_noop_warning("debian", true).is_some());
+        assert!(versioning_noop_warning("some-wasm-plugin", true).is_some());
+        assert_eq!(versioning_noop_warning("npm", false), None);
+        assert_eq!(versioning_noop_warning("generic", true), None);
+        assert_eq!(versioning_noop_warning("mlmodel", true), None);
+    }
+
+    #[test]
+    fn versioning_warning_response_keeps_status_and_body() {
+        let mut repo = make_repo(false);
+        repo.versioning_enabled = true;
+        let warned = respond_with_versioning_warning(repo_to_response(repo.clone(), 0), true);
+        assert_eq!(warned.status(), StatusCode::OK);
+        assert_eq!(
+            warned.headers().get(header::WARNING).unwrap(),
+            "299 - \"versioning_enabled has no effect for format pypi\""
+        );
+
+        repo.format = RepositoryFormat::Generic;
+        let control = respond_with_versioning_warning(repo_to_response(repo.clone(), 0), true);
+        assert_eq!(control.status(), StatusCode::OK);
+        assert!(control.headers().get(header::WARNING).is_none());
+
+        repo.format = RepositoryFormat::Pypi;
+        let not_requested = respond_with_versioning_warning(repo_to_response(repo, 0), false);
+        assert!(not_requested.headers().get(header::WARNING).is_none());
+    }
+
+    // -----------------------------------------------------------------------
     // Permission check logic (Phase 3: admin-level endpoint checks)
     // -----------------------------------------------------------------------
 
@@ -31006,16 +31591,13 @@ mod tests {
         );
 
         // Drop the trigger (and function) so the fixture can tear down cleanly.
-        sqlx::query(sqlx::AssertSqlSafe(&*format!(
-            "DROP TRIGGER {trg_name} ON repositories"
-        )))
-        .execute(&fx.pool)
-        .await
-        .expect("drop blocking trigger");
-        sqlx::query(sqlx::AssertSqlSafe(&*format!("DROP FUNCTION {fn_name}()")))
-            .execute(&fx.pool)
-            .await
-            .expect("drop blocking trigger function");
+        crate::api::handlers::test_db_helpers::drop_test_trigger(
+            &fx.pool,
+            "repositories",
+            &trg_name,
+            &fn_name,
+        )
+        .await;
         let _ = storage.delete(&temp_key).await;
         fx.teardown().await;
     }
@@ -37678,6 +38260,7 @@ mod tests {
             quarantine_duration_minutes: None,
             virtual_metadata_partial: None,
             virtual_member_fallback: None,
+            composer_upstream_search: None,
             custom_user_agent: None,
             project_id: None,
             apt_origin: None,
@@ -39385,6 +39968,111 @@ mod tests {
         for user in [admin, owner] {
             tdh::cleanup_user(&pool, user).await;
         }
+    }
+
+    /// #5594: the generic `/download` of a docker repository's manifest serves the stored manifest
+    /// bytes with their real length. The row's `size_bytes` is the image size, so serving by it
+    /// failed the integrity check with a 502.
+    #[tokio::test]
+    async fn generic_download_serves_docker_manifest_5594_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use tower::ServiceExt;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "local", "docker").await;
+        tdh::grant_repo_actions(&pool, repo_id, user_id, &["read", "write"]).await;
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let bearer = tdh::bearer_for(&state, user_id).await;
+        let media_type = "application/vnd.oci.image.manifest.v1+json";
+        let manifest = format!(
+            r#"{{"schemaVersion":2,"mediaType":"{media_type}","config":{{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:{c}","size":4096}},"layers":[],"annotations":{{"build":"{u}"}}}}"#,
+            c = "1".repeat(64),
+            u = Uuid::new_v4()
+        );
+        let pushed = crate::api::handlers::oci_v2::router(None)
+            .with_state(state.clone())
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("PUT")
+                    .uri(format!("/{key}/acme/app/manifests/1.0"))
+                    .header(header::AUTHORIZATION, &bearer)
+                    .header(header::CONTENT_TYPE, media_type)
+                    .body(Body::from(manifest.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let push_status = pushed.status();
+        let uri = format!("/{key}/download/v2/acme/app/manifests/1.0");
+        let send = |request| {
+            tdh::send_with_headers(
+                tdh::router_with_auth(
+                    download_router(),
+                    state.clone(),
+                    tdh::make_auth(user_id, &username),
+                ),
+                request,
+            )
+        };
+        // #6358: a HEAD answers the stored length from object metadata, with
+        // no body. (It never reaches the download recorder: `prepare_head`.)
+        let (head_status, head_body, head_headers) = send(tdh::head(uri.clone())).await;
+        let (status, body, headers) = send(tdh::get(uri)).await;
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let content_length = |h: &axum::http::HeaderMap| {
+            h.get(header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+        };
+        assert_eq!(push_status, StatusCode::CREATED, "push the manifest");
+        assert_eq!(status, StatusCode::OK, "generic download: {body:?}");
+        assert_eq!(body, manifest.as_bytes(), "the manifest bytes");
+        assert_eq!(
+            content_length(&headers),
+            Some(manifest.len().to_string()),
+            "Content-Length is the manifest length, not the image size"
+        );
+        assert_eq!(head_status, StatusCode::OK, "HEAD: {head_body:?}");
+        assert!(head_body.is_empty(), "a HEAD has no body");
+        assert_eq!(
+            content_length(&head_headers),
+            Some(manifest.len().to_string())
+        );
+    }
+
+    /// #6358: the stored length of an object, from metadata where the backend
+    /// reports it and otherwise by counting a streamed read; a missing object
+    /// is NotFound either way.
+    #[tokio::test]
+    async fn stored_object_length_without_holding_the_object_6358() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::storage::StorageBackend;
+        let mem = tdh::MemStorage::default();
+        mem.put("m", Bytes::from(vec![7u8; 4096])).await.unwrap();
+        assert_eq!(
+            mem.stored_size("m").await.unwrap(),
+            None,
+            "no metadata size"
+        );
+        assert_eq!(stored_object_length(&mem, "m").await.unwrap(), 4096);
+        assert!(matches!(
+            stored_object_length(&mem, "gone").await,
+            Err(AppError::NotFound(_))
+        ));
+
+        let dir = tempfile::tempdir().unwrap();
+        let fs = crate::storage::filesystem::FilesystemStorage::new(dir.path());
+        fs.put("m", Bytes::from(vec![7u8; 513])).await.unwrap();
+        assert_eq!(stored_object_length(&fs, "m").await.unwrap(), 513);
+        assert!(matches!(
+            stored_object_length(&fs, "gone").await,
+            Err(AppError::NotFound(_))
+        ));
     }
 }
 

@@ -3155,6 +3155,7 @@ async fn search_packages(
         FROM artifacts a
         WHERE a.repository_id = ANY($1::uuid[])
           AND a.is_deleted = false
+          AND a.version IS NOT NULL
           AND LOWER(a.name) LIKE $2 ESCAPE '\'
         GROUP BY LOWER(a.name), a.name
         ORDER BY LOWER(a.name)
@@ -3176,6 +3177,7 @@ async fn search_packages(
         FROM artifacts
         WHERE repository_id = ANY($1::uuid[])
           AND is_deleted = false
+          AND version IS NOT NULL
           AND LOWER(name) LIKE $2 ESCAPE '\'
         "#,
     )
@@ -4030,6 +4032,10 @@ impl NugetMemberWalk<'_> {
 /// and a Remote member is asked through the NuGet-specific proxy leg, which
 /// that resolver's path-concatenating leg cannot do (#2775). `None` when no
 /// member serves, so a scan-aware walk moves on to its next member.
+///
+/// A member that could not answer (#5504, #5574) is passed over so a later
+/// member in the run can still serve; only when none does is the run reported
+/// as the walk's 503. Strict fallback (#5810) ends the run at once instead.
 async fn walk_unscanned_nuget_members<F, Fut>(
     walk: &NugetMemberWalk<'_>,
     members: Vec<crate::models::repository::Repository>,
@@ -4043,6 +4049,7 @@ where
     >,
 {
     let state = walk.state;
+    let mut unavailable = false;
     let mut idx = 0;
     while idx < members.len() {
         if members[idx].repo_type == RepositoryType::Remote {
@@ -4064,6 +4071,13 @@ where
                 {
                     return Some(Err(proxy_helpers::member_unavailable_response()));
                 }
+                // #5504: a non-strict run remembers an unavailable member
+                // and moves on, so a later member can still serve.
+                Err(resp) if proxy_helpers::is_member_unavailable_response(&resp) => {
+                    unavailable = true;
+                }
+                // Any other failure, an upstream 403/409 included, is a miss
+                // on this Remote, as before #5574.
                 Err(_) => {}
             }
             continue;
@@ -4097,10 +4111,18 @@ where
             Err(resp) if proxy_helpers::is_member_policy_block_response(&resp) => {
                 return Some(Err(resp))
             }
+            // A hosted member's storage fault (#5574): remembered, and a
+            // later member in the run may still serve. Strict mode ends here.
+            Err(resp) if proxy_helpers::is_member_unavailable_response(&resp) => {
+                if fallback.is_strict() {
+                    return Some(Err(resp));
+                }
+                unavailable = true;
+            }
             Err(_) => {}
         }
     }
-    None
+    unavailable.then(|| Err(proxy_helpers::member_unavailable_response()))
 }
 
 async fn flatcontainer_download(
@@ -4137,7 +4159,14 @@ async fn flatcontainer_download(
     )
     .fetch_optional(&state.db)
     .await
-    .map_err(crate::api::handlers::db_err)?
+    .map_err(crate::api::handlers::db_err)?;
+    // #6433: a proxy-cache row is served only after its cache sidecar is
+    // checked: one nothing vouches for is no row (a Remote resolves it through
+    // its proxy path below), a held or refused one is the gate's answer.
+    let artifact = proxy_helpers::vouched_row(&state, repo.id, artifact, |a| {
+        proxy_helpers::ServedRowRef::new(&a.storage_key, Some(a.size_bytes))
+    })
+    .await?
     .ok_or_else(|| (StatusCode::NOT_FOUND, "Package version not found").into_response());
 
     let artifact = match artifact {
@@ -5194,7 +5223,7 @@ fn base64_standard(bytes: &[u8]) -> String {
 ///
 /// Best-effort like the catalog writes it feeds: a failed lookup falls back to
 /// the `.nuspec` casing rather than failing the push.
-async fn existing_catalog_name(
+pub(crate) async fn existing_catalog_name(
     db: &PgPool,
     repository_id: uuid::Uuid,
     lowercased_id: &str,
@@ -5327,12 +5356,12 @@ async fn push_package(
     let filename = build_nupkg_filename(&package_id, &version);
     let artifact_path = build_nuget_artifact_path(&package_id, &version);
 
-    // #3976: this push writes the catalog twice -- once in the finalize tail of
-    // the upload below, once in the registration after it -- and `packages` is
-    // `UNIQUE (repository_id, name)`, which is case-sensitive while a NuGet id
-    // is not. Both writes therefore take ONE name, resolved here: the casing an
-    // earlier push of this id already registered, or, for an id the catalog has
-    // not seen, the casing the `.nuspec` declares. `artifacts.name` stays
+    // #3976: `packages` is `UNIQUE (repository_id, name)`, which is
+    // case-sensitive while a NuGet id is not, so the catalog write below takes
+    // ONE name, resolved here: the casing an earlier push of this id already
+    // registered, or, for an id the catalog has not seen, the casing the
+    // `.nuspec` declares. (#6346: the upload service no longer writes a second
+    // catalog row of its own for this push.) `artifacts.name` stays
     // lowercased -- every NuGet read compares `LOWER(name)` and none of them
     // read `packages`.
     let catalog_name = existing_catalog_name(&state.db, repo.id, &package_id)
@@ -5356,8 +5385,12 @@ async fn push_package(
         .map_err(|e| e.into_response())?;
     let artifact_service = state.create_artifact_service(storage);
     let content = staged.upload_content().await?;
+    // #6383: the `nuget` document the feed is served from commits in the same
+    // transaction as the artifact row. Written after the commit with its
+    // result discarded, a failure there (a pool timeout) left a stored package
+    // without its metadata and out of the feed.
     let artifact = artifact_service
-        .upload_content_with_sync_options(
+        .upload_content_with_commit_metadata(
             repo.id,
             &artifact_path,
             &package_id,
@@ -5367,31 +5400,21 @@ async fn push_package(
             digests,
             size_bytes,
             Some(user_id),
-            // #4889: queue after the metadata write below, not before it.
+            // #4889: queue after the commit below.
             false,
-            Some(&catalog_name),
+            // #6346: registered once, below, under `catalog_name` and with the
+            // `.nuspec` description.
+            crate::services::artifact_service::CatalogRegistration::Caller,
             None,
+            Some(crate::services::artifact_service::CommitMetadata {
+                format: "nuget",
+                metadata: build_nuget_push_metadata(&nuspec),
+            }),
         )
         .await
         .map_err(|e| e.into_response())?;
     // The staging copy is no longer needed once the service has consumed it.
     staged.discard().await;
-
-    // Build metadata JSON.
-    let metadata = build_nuget_push_metadata(&nuspec);
-
-    // Store metadata.
-    let _ = sqlx::query!(
-        r#"
-        INSERT INTO artifact_metadata (artifact_id, format, metadata)
-        VALUES ($1, 'nuget', $2)
-        ON CONFLICT (artifact_id) DO UPDATE SET metadata = $2
-        "#,
-        artifact.id,
-        metadata,
-    )
-    .execute(&state.db)
-    .await;
 
     // #4889: the metadata document is now written, so a worker that claims the
     // task immediately can send it. The helper also applies the #4725 guard
@@ -5449,19 +5472,20 @@ async fn push_package(
 // ---------------------------------------------------------------------------
 
 /// Metadata extracted from a .nuspec file.
-struct NuspecInfo {
-    id: String,
-    version: String,
-    description: String,
-    authors: String,
+pub(crate) struct NuspecInfo {
+    pub(crate) id: String,
+    pub(crate) version: String,
+    pub(crate) description: String,
+    pub(crate) authors: String,
 }
 
 /// Parse the .nuspec XML from inside a .nupkg (ZIP) archive.
 ///
-/// Reads directly from any `Read + Seek` source — the streaming push path passes
-/// the SEEKABLE staged scratch `File` so the archive is never re-buffered in
-/// memory. Uses simple string matching rather than a full XML parser.
-fn parse_nuspec_from_reader<R: std::io::Read + std::io::Seek>(
+/// Reads directly from any `Read + Seek` source — the push and generic-upload
+/// paths pass the SEEKABLE staged scratch `File` so the archive is never
+/// re-buffered in memory. Uses simple string matching rather than a full XML
+/// parser.
+pub(crate) fn parse_nuspec_from_reader<R: std::io::Read + std::io::Seek>(
     reader: R,
 ) -> Result<NuspecInfo, String> {
     // Bound the decompression: entry-count cap + per-metadata-entry cap so a
@@ -5540,7 +5564,7 @@ fn build_nuget_artifact_path(package_id: &str, version: &str) -> String {
 }
 
 /// Build the NuGet push metadata JSON.
-fn build_nuget_push_metadata(info: &NuspecInfo) -> serde_json::Value {
+pub(crate) fn build_nuget_push_metadata(info: &NuspecInfo) -> serde_json::Value {
     serde_json::json!({
         "id": info.id,
         "version": info.version,
@@ -6946,6 +6970,85 @@ mod push_db_tests {
     // similar 2xx) for each URL shape.
     // -----------------------------------------------------------------------
 
+    /// #6383: the `nuget` document the feed is served from commits with the
+    /// artifact row. The push used to write it after the commit and discard
+    /// the result, so a failure there stored a package the feed never listed
+    /// and its retry was refused with 409. Now the failure stores nothing and
+    /// the retry is a clean push. The catalog row is written once (#6346).
+    #[tokio::test]
+    async fn push_metadata_commits_with_the_row_and_catalog_is_written_once_6383() {
+        let Some(f) = tdh::Fixture::setup("local", "nuget").await else {
+            return;
+        };
+        let id = format!("Fault6383x{}", uuid::Uuid::new_v4().simple());
+        let fault = tdh::install_write_fault(&f.pool, "artifact_metadata", "metadata", &id).await;
+        let app = f.router_with_auth(super::router());
+        let req = put_nupkg(
+            format!("/{}/api/v2/package", f.repo_key),
+            build_nupkg(&id, "1.0.0", "fault 6383"),
+        )
+        .await;
+        let (status, body) = tdh::send(app, req).await;
+        fault.remove().await;
+        let rows = |pool: sqlx::PgPool, repo_id: uuid::Uuid, name: String| async move {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM artifacts \
+                 WHERE repository_id = $1 AND LOWER(name) = LOWER($2) AND NOT is_deleted",
+            )
+            .bind(repo_id)
+            .bind(name)
+            .fetch_one(&pool)
+            .await
+            .expect("count rows")
+        };
+        assert!(
+            !status.is_success(),
+            "a push whose metadata write fails must not answer {status}: {:?}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(
+            rows(f.pool.clone(), f.repo_id, id.clone()).await,
+            0,
+            "a push whose metadata write fails must store nothing"
+        );
+
+        let app = f.router_with_auth(super::router());
+        let req = put_nupkg(
+            format!("/{}/api/v2/package", f.repo_key),
+            build_nupkg(&id, "1.0.0", "fault 6383"),
+        )
+        .await;
+        let (status, body) = tdh::send(app, req).await;
+        assert!(
+            status.is_success(),
+            "the retry is a clean push, got {status}: {:?}",
+            String::from_utf8_lossy(&body)
+        );
+        let (metadata_rows, catalog_description): (i64, Option<String>) = sqlx::query_as(
+            "SELECT (SELECT COUNT(*) FROM artifact_metadata m JOIN artifacts a ON a.id = m.artifact_id \
+                      WHERE a.repository_id = $1 AND LOWER(a.name) = LOWER($2) AND m.format = 'nuget'), \
+                    (SELECT description FROM packages WHERE repository_id = $1 AND name = $2)",
+        )
+        .bind(f.repo_id)
+        .bind(&id)
+        .fetch_one(&f.pool)
+        .await
+        .expect("read metadata and catalog");
+        assert_eq!(metadata_rows, 1, "the pushed package has its metadata");
+        assert_eq!(catalog_description.as_deref(), Some("fault 6383"));
+        let catalog_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM packages WHERE repository_id = $1 AND LOWER(name) = LOWER($2)",
+        )
+        .bind(f.repo_id)
+        .bind(&id)
+        .fetch_one(&f.pool)
+        .await
+        .expect("count catalog rows");
+        assert_eq!(catalog_rows, 1, "one catalog row, in the .nuspec casing");
+
+        f.teardown().await;
+    }
+
     #[tokio::test]
     async fn push_package_route_accepts_no_trailing_slash() {
         let Some(f) = tdh::Fixture::setup("local", "nuget").await else {
@@ -7686,6 +7789,38 @@ mod read_db_tests {
             json["data"][0]["version"], "2.0.0-beta.1",
             "prerelease=true must surface the pre-release; body={json}"
         );
+
+        f.teardown().await;
+    }
+
+    // A file uploaded at the repository root has no version, it made the
+    // versions aggregate NULL and the whole search failed to decode (#6062)
+    #[tokio::test]
+    async fn search_skips_a_package_without_a_version() {
+        let Some(f) = tdh::Fixture::setup("local", "nuget").await else {
+            return;
+        };
+        push_pkg(&f, &f.repo_key, "Qa.RootPkg", "1.0.0", "versioned").await;
+        sqlx::query(
+            "INSERT INTO artifacts ( \
+                 repository_id, path, name, version, size_bytes, \
+                 checksum_sha256, content_type, storage_key, uploaded_by \
+             ) VALUES ($1, $2, $2, NULL, 4, $3, 'application/octet-stream', $2, $4)",
+        )
+        .bind(f.repo_id)
+        .bind("qa.rootonly.1.0.0.nupkg")
+        .bind("seed-qa-rootonly")
+        .bind(f.user_id)
+        .execute(&f.pool)
+        .await
+        .expect("seed a root upload");
+
+        let (status, json) = get_json(&f, format!("/{}/v3/search?q=qa.r", f.repo_key)).await;
+        assert_eq!(status, StatusCode::OK, "body={json}");
+        assert_eq!(json["totalHits"], 1, "body={json}");
+        let data = json["data"].as_array().expect("data array");
+        assert_eq!(data.len(), 1, "body={json}");
+        assert_eq!(data[0]["version"], "1.0.0", "body={json}");
 
         f.teardown().await;
     }
@@ -11308,6 +11443,176 @@ mod virtual_federation_tests {
             &body[..],
             HOSTED_BYTES,
             "the higher-priority hosted member must serve the coordinate it holds"
+        );
+    }
+
+    /// #5574: a higher-priority Remote member that cannot answer (its upstream
+    /// is down) or refuses the coordinate (an upstream 403) must not end the
+    /// walk: a later hosted member that holds the coordinate still serves it.
+    #[tokio::test]
+    async fn virtual_download_skips_a_failing_remote_for_a_hosted_member_5574() {
+        use wiremock::matchers::any;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const HOSTED_BYTES: &[u8] = b"hosted member nupkg 5574";
+
+        for upstream_status in [503u16, 403] {
+            let Some(fx) = tdh::Fixture::setup("virtual", "nuget").await else {
+                return;
+            };
+            let upstream = MockServer::start().await;
+            Mock::given(any())
+                .respond_with(ResponseTemplate::new(upstream_status))
+                .mount(&upstream)
+                .await;
+
+            let (remote_id, _remote_key, remote_dir) =
+                tdh::create_repo(&fx.pool, "remote", "nuget").await;
+            let (hosted_id, _hosted_key, hosted_dir) =
+                tdh::create_repo(&fx.pool, "local", "nuget").await;
+            sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+                .bind(format!("{}/v3/index.json", upstream.uri()))
+                .bind(remote_id)
+                .execute(&fx.pool)
+                .await
+                .expect("set member upstream");
+            tdh::link_virtual_member(&fx.pool, fx.repo_id, remote_id, 1).await;
+            tdh::link_virtual_member(&fx.pool, fx.repo_id, hosted_id, 2).await;
+            tdh::grant_repo_access(&fx.pool, remote_id, fx.user_id).await;
+            tdh::grant_repo_access(&fx.pool, hosted_id, fx.user_id).await;
+            seed_local_version(&fx.pool, hosted_id, "pkg5574", "1.0.0", fx.user_id).await;
+            let blob = hosted_dir.join("pkg5574/1.0.0/pkg5574.1.0.0.nupkg");
+            std::fs::create_dir_all(blob.parent().unwrap()).expect("member blob dir");
+            std::fs::write(&blob, HOSTED_BYTES).expect("member blob");
+
+            let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+            let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), &storage_path);
+            let state = tdh::build_state_with_proxy(fx.pool.clone(), &storage_path, proxy);
+            let auth = tdh::make_auth(fx.user_id, &fx.username);
+            let (status, body) = tdh::send(
+                tdh::router_with_auth(super::router(), state, auth),
+                tdh::get(format!(
+                    "/{}/v3/flatcontainer/pkg5574/1.0.0/pkg5574.1.0.0.nupkg",
+                    fx.repo_key
+                )),
+            )
+            .await;
+
+            tdh::cleanup_member_repo(&fx.pool, remote_id, &remote_dir).await;
+            tdh::cleanup_member_repo(&fx.pool, hosted_id, &hosted_dir).await;
+            fx.teardown().await;
+
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "upstream {upstream_status}: the hosted member must still serve"
+            );
+            assert_eq!(&body[..], HOSTED_BYTES, "upstream {upstream_status}");
+        }
+    }
+
+    /// #5574 (#6252): a hosted member whose stored package cannot be read is an
+    /// unavailable member, not a miss. A later Remote member that has the
+    /// coordinate still serves it.
+    #[tokio::test]
+    async fn virtual_download_passes_an_unreadable_hosted_member_for_a_remote_5574() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        const UPSTREAM_BYTES: &[u8] = b"upstream nupkg 5574";
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "nuget").await else {
+            return;
+        };
+        let upstream = upstream_with_versions("pkg5574h", &["1.0.0"]).await;
+        Mock::given(method("GET"))
+            .and(path("/flat/pkg5574h/1.0.0/pkg5574h.1.0.0.nupkg"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(UPSTREAM_BYTES))
+            .mount(&upstream)
+            .await;
+
+        let (hosted_id, _hosted_key, hosted_dir) =
+            tdh::create_repo(&fx.pool, "local", "nuget").await;
+        let (remote_id, _remote_key, remote_dir) =
+            tdh::create_repo(&fx.pool, "remote", "nuget").await;
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(format!("{}/v3/index.json", upstream.uri()))
+            .bind(remote_id)
+            .execute(&fx.pool)
+            .await
+            .expect("set member upstream");
+        tdh::link_virtual_member(&fx.pool, fx.repo_id, hosted_id, 1).await;
+        tdh::link_virtual_member(&fx.pool, fx.repo_id, remote_id, 2).await;
+        tdh::grant_repo_access(&fx.pool, hosted_id, fx.user_id).await;
+        tdh::grant_repo_access(&fx.pool, remote_id, fx.user_id).await;
+        // The row exists but no object is stored under its key: every read of
+        // the bytes fails, as on a storage outage.
+        seed_local_version(&fx.pool, hosted_id, "pkg5574h", "1.0.0", fx.user_id).await;
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), &storage_path);
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), &storage_path, proxy);
+        let auth = tdh::make_auth(fx.user_id, &fx.username);
+        let (status, body) = tdh::send(
+            tdh::router_with_auth(super::router(), state, auth),
+            tdh::get(format!(
+                "/{}/v3/flatcontainer/pkg5574h/1.0.0/pkg5574h.1.0.0.nupkg",
+                fx.repo_key
+            )),
+        )
+        .await;
+
+        tdh::cleanup_member_repo(&fx.pool, hosted_id, &hosted_dir).await;
+        tdh::cleanup_member_repo(&fx.pool, remote_id, &remote_dir).await;
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK, "the Remote member must still serve");
+        assert_eq!(&body[..], UPSTREAM_BYTES);
+    }
+
+    /// #5574 (#6252): when the only member that has the coordinate is a hosted
+    /// member whose storage fails, nothing serves, and the walk answers a
+    /// retryable 503 instead of the 404 a client caches. A missing row is
+    /// still a plain 404.
+    #[tokio::test]
+    async fn virtual_download_503s_when_only_an_unreadable_hosted_member_has_it_5574() {
+        let Some(fx) = tdh::Fixture::setup("virtual", "nuget").await else {
+            return;
+        };
+        let (hosted_id, _hosted_key, hosted_dir) =
+            tdh::create_repo(&fx.pool, "local", "nuget").await;
+        tdh::link_virtual_member(&fx.pool, fx.repo_id, hosted_id, 1).await;
+        tdh::grant_repo_access(&fx.pool, hosted_id, fx.user_id).await;
+        seed_local_version(&fx.pool, hosted_id, "pkg5574u", "1.0.0", fx.user_id).await;
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), &storage_path);
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), &storage_path, proxy);
+        let auth = tdh::make_auth(fx.user_id, &fx.username);
+        let send = || {
+            tdh::send(
+                tdh::router_with_auth(super::router(), state.clone(), auth.clone()),
+                tdh::get(format!(
+                    "/{}/v3/flatcontainer/pkg5574u/1.0.0/pkg5574u.1.0.0.nupkg",
+                    fx.repo_key
+                )),
+            )
+        };
+        let (unreadable, _) = send().await;
+        sqlx::query("DELETE FROM artifacts WHERE repository_id = $1")
+            .bind(hosted_id)
+            .execute(&fx.pool)
+            .await
+            .expect("drop the hosted row");
+        let (missing, _) = send().await;
+
+        tdh::cleanup_member_repo(&fx.pool, hosted_id, &hosted_dir).await;
+        fx.teardown().await;
+
+        assert_eq!(
+            (unreadable, missing),
+            (StatusCode::SERVICE_UNAVAILABLE, StatusCode::NOT_FOUND),
+            "a hosted member's storage fault must answer 503, a missing row 404"
         );
     }
 

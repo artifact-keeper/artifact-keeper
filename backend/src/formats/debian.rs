@@ -646,11 +646,14 @@ impl FormatHandler for DebianHandler {
 
         // Extract control if this is a package
         if !content.is_empty() && matches!(info.operation, DebianOperation::Package) {
-            // #2561: permit-scoped decode; on saturation skip this best-effort
-            // metadata enrichment rather than blocking/queueing.
-            if let Ok(Ok(control)) = crate::util::bounded_archive::with_ingest_extraction(|| {
-                Self::extract_control(content)
-            }) {
+            // #2561: permit-scoped decode; on saturation it waits briefly for a
+            // slot (#6230), and skips this best-effort enrichment if none frees.
+            if let Ok(Ok(control)) =
+                crate::util::bounded_archive::with_ingest_extraction_waiting(|| {
+                    Self::extract_control(content)
+                })
+                .await
+            {
                 metadata["control"] = serde_json::to_value(&control)?;
             }
         }
@@ -663,10 +666,12 @@ impl FormatHandler for DebianHandler {
 
         // Validate .deb packages
         if !content.is_empty() && matches!(info.operation, DebianOperation::Package) {
-            // #2561: permit-scoped decode, fast-fail 503 on saturation.
-            let control = crate::util::bounded_archive::with_ingest_extraction(|| {
+            // #2561: permit-scoped decode; on saturation it waits briefly
+            // for a slot, then sheds 503 (#6230).
+            let control = crate::util::bounded_archive::with_ingest_extraction_waiting(|| {
                 Self::extract_control(content)
-            })??;
+            })
+            .await??;
 
             // Verify package name matches
             if let Some(path_package) = &info.package {

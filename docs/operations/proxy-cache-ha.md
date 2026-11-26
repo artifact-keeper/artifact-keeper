@@ -70,6 +70,35 @@ replica waits for, and a waiting replica cannot serve from a fill in progress)
 are described, with a proposed design, in
 `docs/plans/2026-10-24-proxy-cross-replica-single-flight-design.md` (#4533).
 
+## Catalog durability on a database failover
+
+Since 1.13.0, a fill's catalog row commits without waiting for the WAL flush (`PROXY_CACHE_CATALOG_SYNC_COMMIT`, #5635). A database failover can therefore lose the last few hundred milliseconds of catalog rows. The cached files stay, and nothing is served ungated. See `docs/security/proxy-cache-commit-after-gate.md` for what is lost, what it costs and how to turn it off.
+
+### The re-catalog sweep
+
+A background sweep restores those rows without waiting for the file to be read again (#6429). It also restores a row that a failed best-effort catalog write never wrote. One replica runs it at a time, under the `proxy_cache_recatalog` scheduler lease.
+
+It walks every Remote's cache tree (this deployment's scope only) in pages of 1,000 keys, with a short pause between pages, in chunks of at most `PROXY_CACHE_RECATALOG_BUDGET` keys. Where a chunk stops is saved in the database (`scheduler_job_cursors`), so the next chunk resumes there on any replica, after a restart or a lease handover. It is written only while the chunk still holds the lease, and a cursor saved before the Remote was renamed is discarded. A chunk that stopped mid-walk is followed by the next one 30 seconds later; the interval separates complete walks. A Remote whose listing or queries fail is logged, counted (`outcome="remote_error"`) and skipped, and the walk goes on. For a sidecar whose content key has no catalog row it writes the row from the sidecar: size, digest, content type and any Package Age Policy hold. It reads the sidecar and checks that the body exists; it never reads the body. The row's insert charges the Remote's usage ledger, so `proxy_bytes` matches the live sum again. A row written by a concurrent fill is never overwritten.
+
+It leaves these alone:
+- a cached upstream 404 (negative-cache sidecar), a sidecar whose body is gone, or one whose recorded size is negative or not the body's size;
+- a sidecar younger than `PROXY_CACHE_RECATALOG_MIN_AGE_SECS`, whose own fill may still be committing;
+- a sidecar written before its Remote was created (left by a deleted repository with the same key);
+- an entry whose legacy `artifacts` row an operator deleted (in the trash) or rejected;
+- an entry purged while the sweep wrote its row. Invalidation now deletes the files before the row, and the sweep takes back a row it inserted for an entry that is gone.
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `PROXY_CACHE_RECATALOG_INTERVAL_SECS` | `21600` (6 h) | time between complete walks; the first starts within 5 minutes of startup. `0` or `off` turns the sweep off. At least 10 s. |
+| `PROXY_CACHE_RECATALOG_BUDGET` | `100000` | keys one chunk may list; chunks of a walk follow each other 30 s apart |
+| `PROXY_CACHE_RECATALOG_MIN_AGE_SECS` | `600` | sidecars younger than this are skipped |
+
+How long a walk takes: listing a filesystem cache measured 0.1-0.14 ms per key, so a 100,000-key chunk takes about 15-20 s with its page pauses and a walk about 50 s per 100,000 keys, including the 30 s between chunks: about 1.5 hours for 10 million keys. Object-store listings are slower per key.
+
+Each chunk logs one `Proxy-cache re-catalog pass` line (`info` when it restored or failed anything, `debug` otherwise) and counts `ak_proxy_cache_recatalog_total{outcome}` and `ak_proxy_cache_recatalog_bytes_total` (see `docs/operations/proxy-cache-metrics.md`).
+
+A restored row's `cached_at` and `last_accessed_at` are the time of the sweep, as with the read-time backfill. A cached index response whose catalog path ended in `/` is restored under the path without it.
+
 ## NFS mount options
 
 A replica that loses the race for a cold object on the buffered path (small

@@ -728,6 +728,29 @@ async fn enrich_scans(db: &PgPool, scans: Vec<ScanResult>) -> Result<Vec<ScanRes
             std::collections::HashMap::new()
         };
 
+    // A rescan the worker resolved by reusing this artifact's own earlier scan
+    // keeps its own id, or the artifact's list shows the source id twice
+    let reused_ids: Vec<Uuid> = scans
+        .iter()
+        .filter(|s| s.is_reused && s.source_scan_id.is_some())
+        .map(|s| s.id)
+        .collect();
+    let same_artifact_reuse: std::collections::HashSet<Uuid> = if reused_ids.is_empty() {
+        std::collections::HashSet::new()
+    } else {
+        sqlx::query_scalar::<_, Uuid>(
+            "SELECT r.id FROM scan_results r \
+             JOIN scan_results src ON src.id = r.source_scan_id \
+             WHERE r.id = ANY($1) AND src.artifact_id = r.artifact_id",
+        )
+        .bind(&reused_ids)
+        .fetch_all(db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?
+        .into_iter()
+        .collect()
+    };
+
     Ok(scans
         .into_iter()
         .map(|s| {
@@ -735,7 +758,12 @@ async fn enrich_scans(db: &PgPool, scans: Vec<ScanResult>) -> Result<Vec<ScanRes
                 .get(&s.artifact_id)
                 .map(|(n, v)| (Some(n.clone()), v.clone()))
                 .unwrap_or((None, None));
-            ScanResponse::from_scan(s, artifact_name, artifact_version)
+            let own_id = s.id;
+            let mut resp = ScanResponse::from_scan(s, artifact_name, artifact_version);
+            if same_artifact_reuse.contains(&own_id) {
+                resp.id = own_id;
+            }
+            resp
         })
         .collect())
 }
@@ -10322,9 +10350,10 @@ mod tests {
             advisory_client,
             scan_result_service,
             scan_config_service,
-            None, // trivy_url
-            None, // trivy_adapter_url
-            true, // incus_scanner_enabled (irrelevant without a Trivy URL)
+            None,  // trivy_url
+            None,  // trivy_adapter_url
+            true,  // incus_scanner_enabled (irrelevant without a Trivy URL)
+            false, // trivy_ignore_embedded_pom_declarations (likewise)
             fx.state.storage.clone(),
             fx.state.storage_registry.clone(),
             fx.storage_dir.to_string_lossy().into_owned(),
@@ -12003,6 +12032,74 @@ mod tests {
         fx.teardown().await;
         let body = res.expect("member sees artifact scans");
         assert_eq!(body.0.total, 1);
+    }
+
+    #[tokio::test]
+    async fn test_list_artifact_scans_rescan_reusing_own_scan_lists_distinct_ids_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let art = seed_artifact_row(&fx.pool, fx.repo_id).await;
+        let other = seed_artifact_row(&fx.pool, fx.repo_id).await;
+        let (source, _f) = seed_scan_with_finding(&fx.pool, fx.repo_id, art).await;
+        let mut reused = Vec::new();
+        for artifact_id in [art, other] {
+            let id = Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO scan_results (id, artifact_id, repository_id, scan_type, status, \
+                 findings_count, started_at, completed_at, is_reused, source_scan_id) \
+                 VALUES ($1, $2, $3, 'dependency', 'completed', 1, NOW(), NOW(), true, $4)",
+            )
+            .bind(id)
+            .bind(artifact_id)
+            .bind(fx.repo_id)
+            .bind(source)
+            .execute(&fx.pool)
+            .await
+            .expect("seed reused scan");
+            reused.push(id);
+        }
+        let own = list_artifact_scans(
+            State(fx.state.clone()),
+            Extension(tdh::make_auth(fx.user_id, &fx.username)),
+            Path(art),
+            Query(ListScansQuery::default()),
+        )
+        .await;
+        let cross = list_artifact_scans(
+            State(fx.state.clone()),
+            Extension(tdh::make_auth(fx.user_id, &fx.username)),
+            Path(other),
+            Query(ListScansQuery::default()),
+        )
+        .await;
+        teardown_scans(&fx.pool, fx.repo_id).await;
+        fx.teardown().await;
+
+        let mut ids: Vec<Uuid> = own
+            .expect("own scans")
+            .0
+            .items
+            .iter()
+            .map(|s| s.id)
+            .collect();
+        ids.sort();
+        let mut want = vec![source, reused[0]];
+        want.sort();
+        assert_eq!(ids, want, "each scan of the artifact listed once");
+        let cross_ids: Vec<Uuid> = cross
+            .expect("other scans")
+            .0
+            .items
+            .iter()
+            .map(|s| s.id)
+            .collect();
+        assert_eq!(
+            cross_ids,
+            vec![source],
+            "a byte-identical artifact still reports the source scan id"
+        );
     }
 
     // --- list_scans (filtered + unfiltered) -------------------------------

@@ -399,7 +399,7 @@ expect "a forward-merge claim naming another version's line is refused" 1 "disag
 # must not rot because an unrelated merge touched release-candidate.yml.
 export FAKE_RESOLVED_REF=refs/heads/release/1.9.x FAKE_RESOLVED_BLOB=blobPINNED
 FAKE_PREDICATE="$(good_predicate "$SHA_A" 4242 refs/heads/release/1.9.x blobPINNED)"
-expect "the recorded workflow blob matching the commit's -> accepted" 0 "as blessed at certification time"
+expect "the recorded workflow blob matching the commit's -> accepted" 0 "as recorded at certification time"
 
 FAKE_PREDICATE="$(good_predicate "$SHA_A" 4242 refs/heads/release/1.9.x blobOTHER)"
 expect "a certification recording another workflow blob is refused" 1 "does not describe this commit"
@@ -426,8 +426,7 @@ export FAKE_RESOLVED_REF=refs/heads/main
 FAKE_PREDICATE="$(good_predicate "$SHA_A" 4242 "")"
 expect "a legacy main certification with no certified_ref still passes" 0 "predates certified_ref"
 
-# The gate inherits the resolver's verdict -- which is where the content pin
-# on release-candidate.yml is enforced -- and never shrugs it off.
+# The gate inherits the resolver's verdict and never shrugs it off.
 FAKE_PREDICATE="$(good_predicate "$SHA_A" 4242)"
 export FAKE_RESOLVE_RC=1
 expect "a refused resolver blocks the gate (exit 1)" 1 "no line that may be released"

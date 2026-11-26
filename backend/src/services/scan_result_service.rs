@@ -112,6 +112,27 @@ fn score_recalc_lock_key(repository_id: Uuid) -> String {
     format!("repo-security-score:{repository_id}")
 }
 
+/// Per-repository turn for score recalculations inside this process (#6315).
+/// Taken before a pool connection is acquired, so the waiters of one
+/// repository queue here instead of each holding a pooled connection idle in
+/// `pg_advisory_lock`. The advisory lock still orders recalculations across
+/// replicas. An entry evicted while held only lets a second waiter through to
+/// the advisory lock, which keeps the ordering
+static SCORE_RECALC_TURNS: std::sync::LazyLock<
+    moka::future::Cache<Uuid, std::sync::Arc<tokio::sync::Mutex<()>>>,
+> = std::sync::LazyLock::new(|| {
+    moka::future::Cache::builder()
+        .max_capacity(10_000)
+        .time_to_idle(Duration::from_secs(10 * 60))
+        .build()
+});
+
+async fn score_recalc_turn(repository_id: Uuid) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    SCORE_RECALC_TURNS
+        .get_with(repository_id, async { Default::default() })
+        .await
+}
+
 /// Whether a failed score recalculation lost a race with a concurrent writer
 /// and is safe to run again: a serialization failure (`40001`) or a deadlock
 /// (`40P01`). The recalculation commits atomically, so a retry never leaves a
@@ -1403,22 +1424,29 @@ impl ScanResultService {
         scan_type: &str,
         checksum_sha256: Option<&str>,
     ) -> Result<ScanResult> {
-        let result = sqlx::query_as!(
-            ScanResult,
+        // #6232, #6423: a row a queued job creates records the job's claim in
+        // the same INSERT, so if the worker dies the claim's recovery fails
+        // this row instead of leaving it `running` for the janitor. Outside a
+        // queued job the token is NULL. Runtime query (not `query!`) so the
+        // `.sqlx/` offline cache needs no new entry.
+        let result = sqlx::query_as::<_, ScanResult>(
             r#"
-            INSERT INTO scan_results (artifact_id, repository_id, scan_type, status, started_at, checksum_sha256)
-            VALUES ($1, $2, $3, 'running', NOW(), $4)
+            INSERT INTO scan_results
+                (artifact_id, repository_id, scan_type, status, started_at, checksum_sha256,
+                 queue_claim_token)
+            VALUES ($1, $2, $3, 'running', NOW(), $4, $5)
             RETURNING id, artifact_id, repository_id, scan_type, status,
                       findings_count, critical_count, high_count, medium_count, low_count, info_count,
                       scanner_version, error_message, started_at, completed_at, created_at,
                       is_reused, source_scan_id, scan_completeness, scan_completeness_reason,
                       vuln_db_version, vuln_db_published_at
             "#,
-            artifact_id,
-            repository_id,
-            scan_type,
-            checksum_sha256,
         )
+        .bind(artifact_id)
+        .bind(repository_id)
+        .bind(scan_type)
+        .bind(checksum_sha256)
+        .bind(crate::services::scan_queue::current_claim())
         .fetch_one(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -1869,11 +1897,13 @@ impl ScanResultService {
         //   SELECT copied 0 rows. See #1058.
         //
         // Invariant relied upon: scan_findings rows are only ever deleted
-        // via the `ON DELETE CASCADE` from scan_results(id) (migration 022).
-        // A direct `DELETE FROM scan_findings WHERE scan_result_id = $X`
-        // would NOT be blocked by FOR SHARE on the parent row and would
-        // re-open this race. Don't add such a path without taking
-        // FOR SHARE on the parent here too.
+        // via the `ON DELETE CASCADE` from scan_results(id) (migration 022),
+        // or by `clear_retry_leftovers` (#5942, from `create_findings_for_row`
+        // and `convert_to_reused`), which first locks the parent row FOR
+        // UPDATE and so conflicts with the FOR SHARE taken here.
+        // Any other direct `DELETE FROM scan_findings WHERE scan_result_id
+        // = $X` would NOT be blocked by FOR SHARE on the parent row and would
+        // re-open this race. Don't add one without locking the parent too.
         let mut tx = self
             .db
             .begin()
@@ -2076,6 +2106,11 @@ impl ScanResultService {
             .begin()
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
+        // #6232: a queued job settles its rows only while it holds its claim;
+        // taken before the row locks below, in the order recovery takes them.
+        if !crate::services::scan_queue::claim_still_held(&mut tx).await? {
+            return self.get_scan(target_scan_id).await;
+        }
 
         // Pull source counts so we can copy them onto the target. The SELECT
         // runs inside the txn with `FOR SHARE` to close the TOCTOU window
@@ -2175,6 +2210,9 @@ impl ScanResultService {
         }
         // Safe: convert_should_noop returned false, so updated is Some.
         let updated = updated.expect("updated row present after no-op check");
+        // #5942: a target a retry reopened still holds its failed attempt's
+        // findings; the copy below replaces them in this transaction.
+        Self::clear_retry_leftovers(&mut tx, target_scan_id, true).await?;
 
         // Copy findings from the source scan into the target scan id. This
         // runs inside the same transaction so a failure here rolls back the
@@ -2225,6 +2263,10 @@ impl ScanResultService {
     /// `vuln_db` (#3014) is the vulnerability database the scanner graded
     /// against; `None` (no database, or not reported) is stored as NULL in
     /// both `vuln_db_version` and `vuln_db_published_at`.
+    ///
+    /// Returns whether the row was settled: `false` when a queued job's claim
+    /// was recovered for a rerun (see `scan_queue::claim_still_held`), and the
+    /// caller must not act on these totals (#6423).
     #[allow(clippy::too_many_arguments)]
     pub async fn complete_scan(
         &self,
@@ -2241,7 +2283,16 @@ impl ScanResultService {
         pin_identity: Option<&str>,
         scan_completeness_reason: Option<&str>,
         vuln_db: Option<&VulnDbProvenance>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
+        // #6232: a queued job settles its rows only while it holds its claim.
+        let mut tx = self
+            .db
+            .begin()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        if !crate::services::scan_queue::claim_still_held(&mut tx).await? {
+            return Ok(false);
+        }
         sqlx::query!(
             r#"
             UPDATE scan_results
@@ -2272,12 +2323,30 @@ impl ScanResultService {
             vuln_db.map(|p| p.version.as_str()),
             vuln_db.and_then(|p| p.published_at),
         )
-        .execute(&self.db)
+        .execute(&mut *tx)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
+        // #5942: a row a retry reopened carried the recorded failure until
+        // now; the completion supersedes it. So does a slow worker's verdict
+        // on a row recovery failed on the job's last attempt (#6423).
+        sqlx::query(
+            "UPDATE scan_results SET error_message = NULL \
+             WHERE id = $1 AND status = 'completed' \
+               AND (starts_with(error_message, $2) OR error_message = $3)",
+        )
+        .bind(scan_id)
+        .bind(crate::services::scan_state::RETRYING_AFTER_FAILURE_PREFIX)
+        .bind(crate::services::scan_queue::RECOVERED_SCAN_REASON)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+        tx.commit()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
         scan_completed();
-        Ok(())
+        Ok(true)
     }
 
     /// Mark a scan as failed with an error message and (when known) the
@@ -2292,6 +2361,15 @@ impl ScanResultService {
         scanner_version: Option<&str>,
         started_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<()> {
+        // #6232: a queued job settles its rows only while it holds its claim.
+        let mut tx = self
+            .db
+            .begin()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        if !crate::services::scan_queue::claim_still_held(&mut tx).await? {
+            return Ok(());
+        }
         sqlx::query!(
             r#"
             UPDATE scan_results
@@ -2305,9 +2383,12 @@ impl ScanResultService {
             scanner_version,
             started_at,
         )
-        .execute(&self.db)
+        .execute(&mut *tx)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
+        tx.commit()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
 
         scan_completed();
         Ok(())
@@ -2328,6 +2409,15 @@ impl ScanResultService {
         scan_id: Uuid,
         error: &str,
     ) -> Result<Option<Option<String>>> {
+        // #6232: a queued job settles its rows only while it holds its claim.
+        let mut tx = self
+            .db
+            .begin()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        if !crate::services::scan_queue::claim_still_held(&mut tx).await? {
+            return Ok(None);
+        }
         // Runtime query (not `query!`) so the `.sqlx/` offline cache needs
         // no new entry, as in `cleanup_stuck_scans_with_limit`.
         let row: Option<(Option<String>,)> = sqlx::query_as(
@@ -2341,14 +2431,137 @@ impl ScanResultService {
         )
         .bind(scan_id)
         .bind(error)
-        .fetch_optional(&self.db)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
+        tx.commit()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
 
         if row.is_some() {
             scan_completed();
         }
         Ok(row.map(|(checksum,)| checksum))
+    }
+
+    /// Put a trigger's pre-allocated row that an earlier attempt of the same
+    /// queued job left `failed` back to `running` before the retry uses it
+    /// (#5942):
+    ///
+    /// - `started_at` moves to now, so the stuck-scan janitor (which reaps by
+    ///   `started_at`) times the retry from its own start, not from the first
+    ///   attempt or the queue time;
+    /// - the `failed` inventory is cleared. The completion time is KEPT (the
+    ///   failed attempt's): the per-scanner "latest row" readers
+    ///   (`LATEST_PER_SCAN_TYPE_SQL`, the repository coverage windows) order
+    ///   by `completed_at DESC NULLS LAST`, and a NULL would let an older
+    ///   completed row of the same scanner outrank the reopened one, hiding
+    ///   the failure below. The retry's own completion or failure sets it to
+    ///   now;
+    /// - the recorded failure is KEPT, under
+    ///   [`RETRYING_AFTER_FAILURE_PREFIX`](crate::services::scan_state::RETRYING_AFTER_FAILURE_PREFIX):
+    ///   the gates count the row as that failure until the retry completes it
+    ///   or fails it again, so `block_on_fail` neither lets the artifact
+    ///   through nor releases its hold while the retry runs;
+    /// - the attempt's `scan_findings` and `scan_packages` stay until the
+    ///   retry writes its own result ([`Self::create_findings_for_row`],
+    ///   [`Self::convert_to_reused`]), which replaces them in one
+    ///   transaction, so a `max_severity` policy keeps seeing them too.
+    ///
+    /// A row in any other state is left alone. Returns whether it was reopened.
+    pub async fn reopen_failed_scan(&self, scan_id: Uuid) -> Result<bool> {
+        // #6232: a queued job settles its rows only while it holds its claim.
+        let mut tx = self
+            .db
+            .begin()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        if !crate::services::scan_queue::claim_still_held(&mut tx).await? {
+            return Ok(false);
+        }
+        // Runtime query, as in `fail_scan_if_running`.
+        let reopened = sqlx::query(
+            r#"
+            UPDATE scan_results
+            SET status = 'running',
+                error_message = $2 || COALESCE(error_message, 'no error recorded'),
+                inventory_status = 'complete', started_at = NOW()
+            WHERE id = $1 AND status = 'failed'
+            "#,
+        )
+        .bind(scan_id)
+        .bind(crate::services::scan_state::RETRYING_AFTER_FAILURE_PREFIX)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?
+        .rows_affected();
+        tx.commit()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        Ok(reopened > 0)
+    }
+
+    /// Inside `tx`, holding the row lock: when `scan_id` is a row reopened for
+    /// a retry (#5942), delete the failed attempt's findings and packages, as
+    /// the retry's own result is written in the same transaction. With
+    /// `drop_marker` the retry marker goes too, for a caller that completes
+    /// the row in that transaction; otherwise the marker stays until the
+    /// completion ([`Self::complete_scan`]) or a new failure replaces it, so
+    /// the row never reads as a plain first run in between. Returns whether
+    /// it was such a row.
+    async fn clear_retry_leftovers(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        scan_id: Uuid,
+        drop_marker: bool,
+    ) -> Result<bool> {
+        let db_err = |e: sqlx::Error| AppError::Database(e.to_string());
+        let marker: Option<(Option<String>,)> =
+            sqlx::query_as("SELECT error_message FROM scan_results WHERE id = $1 FOR UPDATE")
+                .bind(scan_id)
+                .fetch_optional(&mut **tx)
+                .await
+                .map_err(db_err)?;
+        let retrying = marker.and_then(|(m,)| m).is_some_and(|m| {
+            m.starts_with(crate::services::scan_state::RETRYING_AFTER_FAILURE_PREFIX)
+        });
+        if !retrying {
+            return Ok(false);
+        }
+        let drop = "UPDATE scan_results SET error_message = NULL WHERE id = $1";
+        let statements = [
+            "DELETE FROM scan_findings WHERE scan_result_id = $1",
+            "DELETE FROM scan_packages WHERE scan_result_id = $1",
+        ];
+        for sql in statements.into_iter().chain(drop_marker.then_some(drop)) {
+            sqlx::query(sql)
+                .bind(scan_id)
+                .execute(&mut **tx)
+                .await
+                .map_err(db_err)?;
+        }
+        Ok(true)
+    }
+
+    /// [`Self::create_findings`] for a trigger's pre-allocated row: when an
+    /// earlier attempt's retry reopened it (#5942), its leftover findings and
+    /// packages are replaced, in one transaction, by this attempt's findings,
+    /// so the row never holds both attempts' and never holds neither.
+    pub async fn create_findings_for_row(
+        &self,
+        scan_result_id: Uuid,
+        artifact_id: Uuid,
+        findings: &[RawFinding],
+    ) -> Result<()> {
+        let mut tx = self
+            .db
+            .begin()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        Self::clear_retry_leftovers(&mut tx, scan_result_id, false).await?;
+        insert_findings(&mut *tx, scan_result_id, artifact_id, findings).await?;
+        tx.commit()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))
     }
 
     /// Mark a scan as `not_applicable` (#1470): the scanner does not apply to
@@ -2365,6 +2578,15 @@ impl ScanResultService {
         reason: &str,
         started_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<()> {
+        // #6232: a queued job settles its rows only while it holds its claim.
+        let mut tx = self
+            .db
+            .begin()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        if !crate::services::scan_queue::claim_still_held(&mut tx).await? {
+            return Ok(());
+        }
         sqlx::query!(
             r#"
             UPDATE scan_results
@@ -2376,9 +2598,12 @@ impl ScanResultService {
             reason,
             started_at,
         )
-        .execute(&self.db)
+        .execute(&mut *tx)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
+        tx.commit()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
 
         scan_completed();
         Ok(())
@@ -3054,7 +3279,23 @@ impl ScanResultService {
     /// and start over, it counted against the attempt cap, and the last
     /// attempt computed from the stale snapshot and failed with 40001. A burst
     /// of 6 or more recalculations of one repository answered 500 (#5891).
+    ///
+    /// Waiters in one process queue on [`score_recalc_turn`] before they take
+    /// a pool connection, so a burst in one repository holds one connection
+    /// per replica, not one per waiter (#6315)
     pub async fn recalculate_score(&self, repository_id: Uuid) -> Result<RepoSecurityScore> {
+        let turn = score_recalc_turn(repository_id).await;
+        let _turn = turn.lock().await;
+        self.recalculate_score_under_advisory_lock(repository_id)
+            .await
+    }
+
+    /// [`Self::recalculate_score`] without the in-process turn: what waiters
+    /// on different replicas run against each other
+    async fn recalculate_score_under_advisory_lock(
+        &self,
+        repository_id: Uuid,
+    ) -> Result<RepoSecurityScore> {
         let lock_key = score_recalc_lock_key(repository_id);
         let mut guard = ScoreRecalcLock {
             conn: Some(
@@ -7386,7 +7627,8 @@ mod tests {
         /// completes and its recalculation R2 starts. Before the fix R1
         /// committed the stale score and R2 failed with 40001, so the score
         /// kept counting the jar as unscanned. Now R2 waits for R1 and
-        /// recomputes from a fresh snapshot.
+        /// recomputes from a fresh snapshot. In one process R2 waits on the
+        /// in-process turn (#6315), the snapshot rule is the same
         #[tokio::test]
         async fn concurrent_recalculations_keep_every_completed_scan_5006() {
             let Some(pool) = crate::testing::try_pool_with(8).await else {
@@ -7422,7 +7664,7 @@ mod tests {
                 let svc = ScanResultService::new(pool.clone());
                 async move { svc.recalculate_score(repo_id).await }
             });
-            let r1_pid = wait_for_blocked_backend_5006(&pool, &[blocker_pid], &[]).await;
+            wait_for_blocked_backend_5006(&pool, &[blocker_pid], &[]).await;
 
             // Second scan completion: the jar, cataloged with one finding.
             seed_scan_4338(
@@ -7437,7 +7679,8 @@ mod tests {
                 let svc = ScanResultService::new(pool.clone());
                 async move { svc.recalculate_score(repo_id).await }
             });
-            wait_for_blocked_backend_5006(&pool, &[blocker_pid, r1_pid], &[r1_pid]).await;
+            // R2 waits for R1 on the in-process turn (#6315)
+            wait_for_turn_holders_6315(repo_id, 2).await;
 
             blocker.commit().await.expect("release score row");
             let r1 = r1.await.expect("join r1");
@@ -7506,7 +7749,9 @@ mod tests {
                                 &[(Severity::High, Some(cve.as_str()), "t", "lib")],
                             )
                             .await;
-                            svc.recalculate_score(repo_id).await
+                            // Every waiter meets on the advisory lock, as
+                            // waiters on different replicas do (#6315)
+                            svc.recalculate_score_under_advisory_lock(repo_id).await
                         })
                     })
                     .collect();
@@ -7575,6 +7820,87 @@ mod tests {
                     .expect("the next recalculation must not wait on a cancelled one's lock");
             next.expect("the next recalculation succeeds");
             cleanup_repo(&pool, repo_id).await;
+        }
+
+        /// Poll until `n` recalculations of `repo_id` hold its in-process turn
+        /// handle, the one running and the ones queued behind it (#6315)
+        async fn wait_for_turn_holders_6315(repo_id: Uuid, n: usize) {
+            let turn = score_recalc_turn(repo_id).await;
+            let deadline = std::time::Instant::now() + Duration::from_secs(15);
+            // The cache and this function hold a handle each
+            while std::sync::Arc::strong_count(&turn) < n + 2 {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{n} recalculations did not queue on the in-process turn within 15 s"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+
+        /// #6315: recalculations of one repository waiting for its score lock,
+        /// held here by another replica, take one pool connection between them.
+        /// Before the fix each waiter held a connection idle in
+        /// `pg_advisory_lock` and a request on the same pool timed out
+        #[tokio::test]
+        async fn waiting_recalculations_leave_the_pool_free_6315() {
+            const WAITERS: usize = 6;
+            let Some(setup) = crate::testing::try_pool_with(2).await else {
+                return;
+            };
+            let repo_id = insert_test_repo(&setup).await;
+            let url = std::env::var("DATABASE_URL").expect("DATABASE_URL");
+            let pool = sqlx::postgres::PgPoolOptions::new()
+                .max_connections(3)
+                .acquire_timeout(Duration::from_secs(30))
+                .connect(&url)
+                .await
+                .expect("pool of 3");
+
+            let mut other_replica = crate::testing::bounded_connect(&url)
+                .await
+                .expect("connect");
+            sqlx::query("SELECT pg_advisory_lock(hashtextextended($1, 0))")
+                .bind(score_recalc_lock_key(repo_id))
+                .execute(&mut other_replica)
+                .await
+                .expect("hold the score lock");
+            let holder_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+                .fetch_one(&mut other_replica)
+                .await
+                .expect("holder pid");
+
+            let tasks: Vec<_> = (0..WAITERS)
+                .map(|_| {
+                    let svc = ScanResultService::new(pool.clone());
+                    tokio::spawn(async move { svc.recalculate_score(repo_id).await })
+                })
+                .collect();
+            wait_for_blocked_backend_5006(&setup, &[holder_pid], &[]).await;
+            wait_for_turn_holders_6315(repo_id, WAITERS).await;
+
+            let in_use = pool.size() as usize - pool.num_idle();
+            let fresh = tokio::time::timeout(Duration::from_secs(1), pool.acquire()).await;
+            assert!(
+                matches!(fresh, Ok(Ok(_))),
+                "a request on the pool must get a connection while {WAITERS} recalculations wait"
+            );
+            drop(fresh);
+            assert!(
+                in_use <= 1,
+                "{in_use} pool connections held by recalculations waiting for one lock"
+            );
+
+            sqlx::query("SELECT pg_advisory_unlock(hashtextextended($1, 0))")
+                .bind(score_recalc_lock_key(repo_id))
+                .execute(&mut other_replica)
+                .await
+                .expect("release the score lock");
+            for task in tasks {
+                task.await.expect("join").expect("recalculation succeeds");
+            }
+            sqlx::Connection::close(other_replica).await.ok();
+            pool.close().await;
+            cleanup_repo(&setup, repo_id).await;
         }
 
         async fn svc_score(pool: &PgPool, repo_id: Uuid) -> RepoSecurityScore {

@@ -40,6 +40,20 @@ pub fn router() -> Router<SharedState> {
         )
 }
 
+/// Parse an optional JSON body: empty (or `null`) is the default request, a body that was
+/// sent and is malformed is a 400. `Option<Json<T>>` cannot express that on
+/// axum 0.7 (its `FromRequest` maps every rejection, including a wrong
+/// content-type and invalid JSON, to `None`), so the raw bytes are parsed
+/// instead (#2912).
+fn parse_optional_body<T: serde::de::DeserializeOwned + Default>(body: &[u8]) -> Result<T> {
+    let trimmed = body.trim_ascii();
+    if trimmed.is_empty() || trimmed == b"null" {
+        return Ok(T::default());
+    }
+    serde_json::from_slice(trimmed)
+        .map_err(|e| AppError::Validation(format!("Invalid request body: {e}")))
+}
+
 // ---------------------------------------------------------------------------
 // Request / Response types
 // ---------------------------------------------------------------------------
@@ -58,7 +72,7 @@ pub struct QuarantineStatusResponse {
     pub is_blocked: bool,
 }
 
-#[derive(Debug, Deserialize, ToSchema)]
+#[derive(Debug, Default, Deserialize, ToSchema)]
 pub struct QuarantineNowRequest {
     /// Reason shown to developers whose downloads are blocked.
     pub reason: Option<String>,
@@ -78,6 +92,17 @@ pub struct RejectRequest {
     /// meant for. When the tag row now names another image, that digest is
     /// held instead and the response names both. Defaults to the digest the
     /// row names when the request is handled.
+    #[serde(default)]
+    pub expected_digest: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, ToSchema)]
+pub struct ReleaseRequest {
+    /// OCI images (#5766): the manifest digest (`sha256:<hex>`) the release
+    /// was decided for. When the tag row now names another image, that
+    /// digest's held row is released instead and the response names both;
+    /// the new image's hold is left in place. Defaults to the digest the row
+    /// names when the request is handled.
     #[serde(default)]
     pub expected_digest: Option<String>,
 }
@@ -304,13 +329,10 @@ pub async fn quarantine_artifact(
     // express that on axum 0.7 — its `FromRequest` impl maps every rejection,
     // including a wrong content-type and invalid JSON, to `None` — so parse the
     // raw bytes instead (#2912).
-    let (reason, expected_digest) = if body.is_empty() {
-        (None, None)
-    } else {
-        let req = serde_json::from_slice::<QuarantineNowRequest>(&body)
-            .map_err(|e| AppError::Validation(format!("Invalid request body: {e}")))?;
-        (req.reason, req.expected_digest)
-    };
+    let QuarantineNowRequest {
+        reason,
+        expected_digest,
+    } = parse_optional_body(&body)?;
     let outcome = quarantine_service::quarantine_now_bound(
         &state.db,
         artifact_id,
@@ -347,9 +369,11 @@ pub async fn quarantine_artifact(
     params(
         ("artifact_id" = Uuid, Path, description = "Artifact ID"),
     ),
+    request_body(content = Option<ReleaseRequest>, description = "Optional; an empty body releases the row as it reads now"),
     security(("bearer_auth" = [])),
     responses(
         (status = 200, description = "Artifact released", body = QuarantineActionResponse),
+        (status = 400, description = "Malformed request body or expected_digest"),
         (status = 401, description = "Authentication required"),
         (status = 403, description = "Admin access required"),
         (status = 404, description = "Artifact not found"),
@@ -360,21 +384,25 @@ pub async fn release_artifact(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(artifact_id): Path<Uuid>,
+    body: Bytes,
 ) -> Result<Json<QuarantineActionResponse>> {
     let auth =
         auth.ok_or_else(|| AppError::Authentication("Authentication required".to_string()))?;
     auth.require_admin()?;
 
+    // The body is optional (the route took none before #5766), so an empty
+    // one keeps the old call working; a body that was sent and is malformed
+    // is a 400, as for quarantine-now.
+    let req = parse_optional_body::<ReleaseRequest>(&body)?;
+
     // Verify artifact exists
     let (previous_status, _) = quarantine_service::get_status(&state.db, artifact_id).await?;
 
-    quarantine_service::transition(
-        &state.db,
-        artifact_id,
-        quarantine_service::QuarantineState::Released,
-        None,
-    )
-    .await?;
+    // #5766: bound to the digest the release was decided for, so a release
+    // that lands after the tag moved cannot clear the new image's hold.
+    let outcome =
+        quarantine_service::release_bound(&state.db, artifact_id, req.expected_digest.as_deref())
+            .await?;
 
     audit_fire_and_forget(
         state.db.clone(),
@@ -387,6 +415,11 @@ pub async fn release_artifact(
         .details(serde_json::json!({
             "artifact_id": artifact_id,
             "previous_status": previous_status,
+            // #5766: the tag moved before the release landed; the old
+            // image's row was released instead.
+            "held_artifact_id": outcome.moved.as_ref().map(|m| m.artifact_id),
+            "held_digest": outcome.moved.as_ref().map(|m| m.held_digest.clone()),
+            "moved_to_digest": outcome.moved.as_ref().map(|m| m.moved_to.clone()),
         })),
     )
     .await;
@@ -405,10 +438,7 @@ pub async fn release_artifact(
 
     Ok(Json(QuarantineActionResponse::new(
         artifact_id,
-        quarantine_service::HoldOutcome {
-            status: "released",
-            moved: None,
-        },
+        outcome,
         "Artifact released from quarantine".to_string(),
     )))
 }
@@ -1387,6 +1417,30 @@ mod tests {
         tdh::cleanup_user(&fx.pool, other).await;
         fx.teardown().await;
     }
+
+    /// #5766: the release body is optional (the route took none before), so
+    /// the OpenAPI document must not mark it required; generated clients
+    /// would otherwise force one.
+    #[test]
+    fn release_request_body_is_optional_in_openapi() {
+        let doc = serde_json::to_value(QuarantineApiDoc::openapi()).unwrap();
+        let body = doc["paths"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .find(|(p, _)| p.ends_with("/{artifact_id}/release"))
+            .map(|(_, v)| v["post"]["requestBody"].clone())
+            .expect("the release path is documented");
+        assert!(
+            body.get("content").is_some(),
+            "the body is documented: {body}"
+        );
+        assert_ne!(
+            body.get("required"),
+            Some(&serde_json::Value::Bool(true)),
+            "the release body must not be required: {body}"
+        );
+    }
 }
 
 #[derive(OpenApi)]
@@ -1401,6 +1455,7 @@ mod tests {
     components(schemas(
         QuarantineStatusResponse,
         QuarantineNowRequest,
+        ReleaseRequest,
         QuarantineActionResponse,
         RejectRequest,
         ReleaseProxyCacheRequest,

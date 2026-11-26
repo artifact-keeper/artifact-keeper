@@ -1087,8 +1087,10 @@ async fn release_publish_timestamp(
 }
 
 /// Monotonic floor for the `Release` `Date:` field: the moment this binary was
-/// built (`RELEASE_DATE_FLOOR_EPOCH`, baked by `build.rs`; honors
-/// `SOURCE_DATE_EPOCH` so reproducible builds stay reproducible).
+/// built (`ak_build_info::RELEASE_DATE_FLOOR_EPOCH`, baked by that crate's
+/// build script; honors `SOURCE_DATE_EPOCH` so reproducible builds stay
+/// reproducible, and is a fixed 2026-01-01 in dev and test builds so they do
+/// not depend on the clock).
 ///
 /// Why a floor exists: [`release_publish_timestamp`] replaced a `Utc::now()`
 /// stamp with a state-derived one, so at deploy every pre-existing repo steps
@@ -1115,12 +1117,9 @@ async fn release_publish_timestamp(
 /// render different bytes on different replicas and the detached-signature
 /// invariant this file exists to hold would break again.
 fn release_date_floor() -> chrono::DateTime<chrono::Utc> {
-    // Compile-time constant; build.rs validates it parses, but degrade to
-    // "no floor" (epoch 0) rather than panic inside a request handler.
-    env!("RELEASE_DATE_FLOOR_EPOCH")
-        .parse::<i64>()
-        .ok()
-        .and_then(|secs| chrono::DateTime::from_timestamp(secs, 0))
+    // Compile-time constant; degrade to "no floor" (epoch 0) rather than
+    // panic inside a request handler should it ever be out of range.
+    chrono::DateTime::from_timestamp(ak_build_info::RELEASE_DATE_FLOOR_EPOCH, 0)
         .unwrap_or(chrono::DateTime::<chrono::Utc>::UNIX_EPOCH)
 }
 
@@ -1926,11 +1925,13 @@ async fn pool_entry_in_indexes(
             continue;
         }
         // #2561: permit-scoped decode on this serve path (each cached index
-        // inflates up to the 128 MiB budget), fast-fail 503 on saturation; the
+        // inflates up to the 128 MiB budget); on saturation it waits briefly for
+        // a slot, then sheds 503 (#6230); the
         // permit is released before the next cache read.
-        let Some(text) = crate::util::bounded_archive::with_ingest_extraction(|| {
+        let Some(text) = crate::util::bounded_archive::with_ingest_extraction_waiting(|| {
             decompress_packages_index(&name, &bytes)
-        })?
+        })
+        .await?
         else {
             continue;
         };
@@ -3730,9 +3731,10 @@ async fn resolve_flat_expected_checksum(
             continue;
         };
         // #2561: permit-scoped decode, same as the pool resolver.
-        let Some(text) = crate::util::bounded_archive::with_ingest_extraction(|| {
+        let Some(text) = crate::util::bounded_archive::with_ingest_extraction_waiting(|| {
             decompress_packages_index(&cache_path, &bytes)
-        })?
+        })
+        .await?
         else {
             continue;
         };
@@ -4067,7 +4069,13 @@ async fn pool_download(
     )
     .fetch_optional(&state.db)
     .await
-    .map_err(crate::api::handlers::db_err)?
+    .map_err(crate::api::handlers::db_err)?;
+    // #6433: a proxy-cache row nothing vouches for is no row (the proxy path
+    // below resolves it); a held or refused one is the gate's answer.
+    let artifact = proxy_helpers::vouched_row(&state, repo.id, artifact, |a| {
+        proxy_helpers::ServedRowRef::new(&a.storage_key, Some(a.size_bytes))
+    })
+    .await?
     .ok_or_else(|| (StatusCode::NOT_FOUND, "Package not found").into_response());
 
     let artifact = match artifact {
@@ -4879,8 +4887,12 @@ async fn persist_debian_upload(
     // `Bytes` is refcounted: this keeps the upload body readable for the
     // maintainer-script pass below without copying it.
     let analysis_body = body.clone();
+    // #6317: the control document `Packages` renders from commits in the same
+    // transaction as the artifact row. Written as a separate step after the
+    // commit, a pool timeout there answered 503 for a stored package (whose
+    // retry then got 409) and left it out of the index.
     let artifact = artifact_service
-        .upload_with_sync_options(
+        .upload_with_commit_metadata(
             repo.id,
             &upload.artifact_path,
             &upload.control.package,
@@ -4888,16 +4900,21 @@ async fn persist_debian_upload(
             DEBIAN_BINARY_CONTENT_TYPE,
             body,
             user_id,
-            // #4889: queue after the control document is written below, not
-            // before it.
+            // #4889: queue below, once the upload has committed.
             false,
+            // #6346: `record_debian_package_extras` registers the catalog row
+            // once, with the control file's description.
+            crate::services::artifact_service::CatalogRegistration::Caller,
+            Some(crate::services::artifact_service::CommitMetadata {
+                format: "debian",
+                metadata: upload.metadata.clone(),
+            }),
         )
         .await
         .map_err(|e| e.into_response())?;
 
-    record_debian_package(
-        state,
-        &artifact_service,
+    record_debian_package_extras(
+        &state.db,
         repo.id,
         artifact.id,
         artifact.size_bytes,
@@ -4905,8 +4922,7 @@ async fn persist_debian_upload(
         upload,
         &analysis_body,
     )
-    .await
-    .map_err(|e| e.into_response())?;
+    .await;
 
     if enqueue_sync_tasks {
         super::queue_push_sync_tasks_now(
@@ -4922,54 +4938,13 @@ async fn persist_debian_upload(
     Ok(artifact)
 }
 
-/// Everything a Debian upload records once its `artifacts` row exists: the
-/// `artifact_metadata` control document (which `Packages` renders from), the
-/// maintainer-script analysis (#4033), the package catalog row, and the
-/// repository's `updated_at` bump. Shared by the native upload routes and the
-/// generic chunked completion (#1846, via [`StagedDebianPackage::parts`]), so
-/// a `.deb` gets the same records whichever way it arrived. `deb_head` must reach the end of the
-/// `control.tar` member. Only the metadata write is fatal; the rest is
-/// best-effort, as on the native path (see [`record_debian_package_extras`],
-/// which the migration importer calls after writing the control document in
-/// its own transaction, #4657).
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn record_debian_package(
-    state: &SharedState,
-    artifact_service: &ArtifactService,
-    repo_id: uuid::Uuid,
-    artifact_id: uuid::Uuid,
-    size_bytes: i64,
-    checksum_sha256: &str,
-    upload: &DebianPackageUpload,
-    deb_head: &[u8],
-) -> crate::error::Result<()> {
-    artifact_service
-        .set_metadata(
-            artifact_id,
-            "debian",
-            upload.metadata.clone(),
-            serde_json::json!({}),
-        )
-        .await?;
-
-    record_debian_package_extras(
-        &state.db,
-        repo_id,
-        artifact_id,
-        size_bytes,
-        checksum_sha256,
-        upload,
-        deb_head,
-    )
-    .await;
-    Ok(())
-}
-
-/// The best-effort part of [`record_debian_package`]: maintainer-script
-/// analysis, the package catalog row and the repository `updated_at` bump.
-/// The migration importer (#4657) writes the control document inside its own
-/// transaction and calls this once it commits, so a migrated `.deb` ends up
-/// with exactly the records a native upload has.
+/// What a Debian upload records once its `artifacts` row and the `debian`
+/// control document (which `Packages` renders from) exist: maintainer-script
+/// analysis (#4033), the package catalog row and the repository `updated_at`
+/// bump, all best-effort. The native upload commits the control document with
+/// the row (#6317), as the generic chunked completion (#1846) and the
+/// migration importer (#4657) do, and calls this once it commits, so a `.deb`
+/// gets the same records whichever way it arrived.
 pub(crate) async fn record_debian_package_extras(
     db: &PgPool,
     repo_id: uuid::Uuid,
@@ -4981,7 +4956,8 @@ pub(crate) async fn record_debian_package_extras(
 ) {
     // `preinst`/`postinst`/`prerm`/`postrm` run as root on `apt install`
     // (#4033). Best-effort: the artifact row is already committed.
-    let (scripts, unanalyzed, completeness) = extract_deb_maintainer_scripts(deb_head);
+    let (scripts, unanalyzed, completeness) =
+        extract_deb_maintainer_scripts_waiting(deb_head).await;
     debug_assert!(
         scripts
             .iter()
@@ -5036,8 +5012,8 @@ const STAGED_DEB_MAX_MEMBERS: usize = 16;
 
 /// A `.deb` that arrived through the generic chunked upload flow
 /// (`/api/v1/uploads`), parsed and validated exactly as the native upload
-/// routes do, ready for [`record_debian_package`] once its `artifacts` row
-/// exists.
+/// routes do, ready for [`record_debian_package_extras`] once its `artifacts`
+/// row exists.
 pub(crate) struct StagedDebianPackage {
     upload: DebianPackageUpload,
     /// The package's head through the end of its `control.tar` member: all the
@@ -5046,7 +5022,7 @@ pub(crate) struct StagedDebianPackage {
 }
 
 impl StagedDebianPackage {
-    /// The parsed upload and the package head, as [`record_debian_package`]
+    /// The parsed upload and the package head, as [`record_debian_package_extras`]
     /// takes them once the artifact row exists.
     pub(crate) fn parts(&self) -> (&DebianPackageUpload, &[u8]) {
         (&self.upload, &self.deb_head)
@@ -5548,22 +5524,40 @@ fn collect_deb_maintainer_scripts<R: Read>(decoded: R) -> ExtractedScripts {
 ///
 /// Never fails: a package that cannot be opened yields no scripts and a
 /// `NotRead` completeness naming the reason, so the analysis row says "could
-/// not look" rather than "nothing found". The decode runs under the shared
-/// ingest-extraction permit; a saturated server is likewise `NotRead`, not a
-/// clean result.
+/// not look" rather than "nothing found". The caller holds the shared
+/// ingest-extraction permit across this decode (see
+/// [`extract_deb_maintainer_scripts_waiting`]).
 fn extract_deb_maintainer_scripts(body: &[u8]) -> ExtractedScripts {
     let not_read = |reason: String| (Vec::new(), Vec::new(), Completeness::NotRead { reason });
     let (member_name, data) = match DebianHandler::control_tar_member(body) {
         Ok(found) => found,
         Err(e) => return not_read(format!("control.tar could not be located: {e}")),
     };
-    match crate::util::bounded_archive::with_ingest_extraction(|| {
-        control_tar_decoder(member_name, data).map(collect_deb_maintainer_scripts)
-    }) {
-        Ok(Ok(result)) => result,
-        Ok(Err(e)) => not_read(format!("{member_name} could not be decoded: {e}")),
-        Err(e) => not_read(format!("extraction slot unavailable: {e}")),
+    match control_tar_decoder(member_name, data).map(collect_deb_maintainer_scripts) {
+        Ok(result) => result,
+        Err(e) => not_read(format!("{member_name} could not be decoded: {e}")),
     }
+}
+
+/// [`extract_deb_maintainer_scripts`] under the shared ingest-extraction
+/// permit. On saturation it waits briefly for a slot (#6230): a fast-fail
+/// acquire always lost to queued uploads, so a burst recorded every package
+/// as unread. A server still saturated after the wait is `NotRead`, not a
+/// clean result.
+async fn extract_deb_maintainer_scripts_waiting(body: &[u8]) -> ExtractedScripts {
+    crate::util::bounded_archive::with_ingest_extraction_waiting(|| {
+        extract_deb_maintainer_scripts(body)
+    })
+    .await
+    .unwrap_or_else(|e| {
+        (
+            Vec::new(),
+            Vec::new(),
+            Completeness::NotRead {
+                reason: format!("extraction slot unavailable: {e}"),
+            },
+        )
+    })
 }
 
 #[cfg(ak_test_shard = "handlers-1")]
@@ -9849,6 +9843,25 @@ mod maintainer_script_tests {
             findings.iter().any(|f| f.severity >= ScriptSeverity::High),
             "curl | sh in a root-run postinst must be a high-severity finding: {findings:?}"
         );
+    }
+
+    /// #6230: with the repository's ingest bucket full, the maintainer-script
+    /// analysis waits for a permit and reads the package once one frees. The
+    /// fast-fail acquire it replaced always lost to queued uploads, so a burst
+    /// recorded every package as `NotRead`.
+    #[tokio::test]
+    async fn maintainer_script_analysis_waits_for_ingest_permit_6230() {
+        let tar = tar_with(&[("control", CONTROL), ("postinst", HOSTILE)]);
+        let body = deb("control.tar.gz", &gz(&tar));
+        let ((scripts, _unanalyzed, completeness), queued) =
+            crate::util::bounded_archive::test_support::run_queued_behind_full_tenant(
+                crate::util::bounded_archive::TenantKey::Repo(uuid::Uuid::new_v4()),
+                async move { extract_deb_maintainer_scripts_waiting(&body).await },
+            )
+            .await;
+        assert!(queued, "the analysis must wait for a permit");
+        assert_eq!(completeness, Completeness::Complete);
+        assert_eq!(scripts.len(), 1);
     }
 
     #[test]

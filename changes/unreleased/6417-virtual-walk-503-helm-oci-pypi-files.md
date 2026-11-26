@@ -1,0 +1,9 @@
+---
+section: Changed
+issues: [#6417, #5620]
+---
+- **Helm chart archives, OCI manifests, blobs and tag lists, and PyPI distribution files answer `503` with `Retry-After` through a virtual repository when no member has the item and a member could not answer** (#6417, #5620). The #5504 rule (a member's upstream `5xx` or `429`, transport failure, timeout or open circuit is not a miss) now covers these walks too. They used to answer `404` (`Chart not found`, `MANIFEST_UNKNOWN`, `BLOB_UNKNOWN`, `NAME_UNKNOWN`, `Artifact not found in any member repository`), which clients report as "not found". A plain OCI Remote whose upstream cannot answer a cold manifest or blob pull now answers `503 UNAVAILABLE` instead of `404`, and a cold tag list answers `503` instead of `502`. On these OCI routes an upstream `429` (rate limiting) is reported as `503 UNAVAILABLE` too. A miss or a permanent `4xx` from every member is still `404`, and a member that answers still serves. The Go `@v/list`, `@latest` and `.info` routes already answer a `5xx` for an outage since #6214.
+
+  **How clients react.** `pip` and `uv` retry a `503` and then fail with the status; they do not retry a `404`. `docker` retries a layer download on a `503`. Configured as a registry mirror, `docker` and `containerd` move on to the next endpoint on a `503` just as on a `404`. `helm` reports the status and does not cache it. For context only, since this PR does not change Go: the Go routes have answered a `5xx` for an outage since 1.12.4 (#6214). `go` moves on to the next `GOPROXY` entry only after a `404` or `410` when entries are separated by `,`, so an outage stops `go` instead of sending it to `direct`; separating entries with `|` makes it fail over on any error.
+
+  **Default change:** these routes answer `503` with `Retry-After: 1` during a member outage instead of `404`. There is no setting for this. A member answering `404`, or a permanent `4xx`, keeps the `404`.

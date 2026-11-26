@@ -1,0 +1,5 @@
+---
+section: Added
+issues: [#6468]
+---
+- **`DOWNLOAD_VERIFY_SKIP_CLIENT_VERIFIED=oci` turns serve-time SHA-256 verification off on OCI blob pulls, where the client checks the digest itself** (#6468). Verification hashes every byte served. On a core without SHA instructions that dominates large pulls. Measured on grace (Xeon E5-2680 v2, filesystem storage, warm), a 1 GiB OCI blob pull cost about 8 backend CPU-seconds at about 140 MB/s with verification, and about 1.2 CPU-seconds at about 1.2 GB/s without it; full numbers are in the PR, and `scripts/perf/serve-verify-large-objects.sh` and `cargo bench --bench serve_verify` reproduce them. An OCI client always checks a blob against the `sha256:` digest it pulled, so a corrupt blob is refused there either way. With the option set, the server no longer aborts, counts (`ak_stored_object_integrity_failures_total`) or repairs from upstream a corrupt blob on that route; the storage scrub still finds and repairs it. **The default is unchanged**: unset, every route verifies, as before. Other values are logged and ignored, and every other route keeps verifying.

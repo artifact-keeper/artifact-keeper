@@ -1092,6 +1092,17 @@ async fn complete_session_commit(
                 return Err(map_err(StatusCode::BAD_REQUEST, reason));
             }
         }
+        if let Err(rejection) = format_finalize::ensure_unique_nuget(
+            &state.db,
+            repo.id,
+            &session.artifact_path,
+            staged_native.as_ref(),
+        )
+        .await
+        {
+            UploadService::fail_committing(&state.db, &session, &rejection.to_string()).await;
+            return Err(rejection.into_response());
+        }
     }
 
     if stream_assembly {
@@ -1134,6 +1145,20 @@ async fn complete_session_commit(
                     UploadService::fail_committing(&state.db, &session, &reason).await;
                     return Err(map_err(StatusCode::BAD_REQUEST, reason));
                 }
+            }
+            if let Err(rejection) = format_finalize::ensure_unique_nuget(
+                &state.db,
+                repo.id,
+                &session.artifact_path,
+                staged_native.as_ref(),
+            )
+            .await
+            {
+                if let Some(staged_key) = &staged_key {
+                    let _ = storage.delete(staged_key).await;
+                }
+                UploadService::fail_committing(&state.db, &session, &rejection.to_string()).await;
+                return Err(rejection.into_response());
             }
         }
         if let Some(staged_key) = staged_key {
@@ -2434,6 +2459,12 @@ fn completed_package_catalog_entry(
     // chunked Maven uploads that carry their coordinates only in the path.
     let metadata = replicated_maven_artifact_metadata(session);
     let maven_layout = matches!(format, RepositoryFormat::Maven | RepositoryFormat::Gradle);
+    // #6271: without replicated POM metadata the path is the only coordinate,
+    // and a file outside the GAV layout is not a package
+    if maven_layout && metadata.is_none() {
+        return crate::services::package_service::maven_catalog_coordinates(&session.artifact_path)
+            .map(|(name, version, _)| (name, version));
+    }
     let version = if maven_layout {
         metadata
             .and_then(|m| m.get("version"))
@@ -3266,6 +3297,21 @@ mod tests {
             completed_package_catalog_entry(&session, &RepositoryFormat::Generic),
             None
         );
+    }
+
+    #[test]
+    fn test_completed_package_catalog_entry_skips_non_gav_maven_files_6271() {
+        for path in [
+            "com/myDomain/notes.txt",
+            "com/acme/widget/1.2.3/_remote.repositories",
+        ] {
+            let session = test_upload_session(path, Some("com"), Some("myDomain"));
+            assert_eq!(
+                completed_package_catalog_entry(&session, &RepositoryFormat::Maven),
+                None,
+                "{path}"
+            );
+        }
     }
 
     #[test]
@@ -6774,14 +6820,7 @@ mod tests {
         let app = upload_router_with_auth(f.state.clone(), auth);
         let (status, _body) = tdh::send(app, complete_req(session_id)).await;
 
-        let drop_trg = format!("DROP TRIGGER IF EXISTS {trigger} ON artifacts");
-        let _ = sqlx::query(sqlx::AssertSqlSafe(&*drop_trg))
-            .execute(&f.pool)
-            .await;
-        let drop_fn = format!("DROP FUNCTION IF EXISTS {func}()");
-        let _ = sqlx::query(sqlx::AssertSqlSafe(&*drop_fn))
-            .execute(&f.pool)
-            .await;
+        tdh::drop_test_trigger(&f.pool, "artifacts", &trigger, &func).await;
 
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         let (state, token, deadline) = lease_state(&f, session_id).await;

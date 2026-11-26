@@ -73,6 +73,8 @@ use crate::services::scheduler_service::normalize_cron_expression;
 use crate::storage::keys::prefix_matches;
 
 mod assignments;
+mod derived_state;
+pub use derived_state::SweepDerivedState;
 
 /// SQL fragment implementing a policy's exclusion ("keep") list.
 ///
@@ -211,28 +213,90 @@ macro_rules! max_age_expired {
     };
 }
 
+/// The retention-group columns of one candidate artifact, selected in the
+/// inner `grouped` CTE and consumed by [`retention_rank!`].
+///
+/// * `rank_repository` -- `a.repository_id`. It leads every partition so the
+///   rank is per repository even in the legacy global max-age variant; inside a
+///   single-repository query it is constant and changes nothing.
+/// * `rank_group` -- the package the artifact belongs to. For OCI formats the
+///   image (the tag stripped from `name`, see [`max_versions_ranked_cte!`]);
+///   for a Maven-layout file the coordinate directory
+///   (`com/example/alpha/core`, i.e. groupId + artifactId), because `name` is
+///   only the artifactId and is shared across groupIds (#5771); otherwise
+///   `name`.
+/// * `rank_version` -- non-NULL only for a Maven-layout file whose path sits
+///   in its version directory (`<group>/<artifact>/<version>/<file>`). Those
+///   are ranked per *version*: a version is one pom plus its jars, classifier
+///   jars and Gradle `.module`, and keeping or dropping only some of them
+///   leaves a broken version (#5771). Every other row (other formats, and a
+///   version-less Maven row such as a group-level plugin `maven-metadata.xml`)
+///   keeps NULL and is ranked per row as before.
+/// * `rank_at` -- the recency clock, `COALESCE(oci_tags.updated_at,
+///   created_at)`.
+///
+/// Requires `a` (`artifacts`), `r` (`repositories`) and `ot`
+/// ([`oci_tag_join!`]) in scope.
+macro_rules! retention_rank_columns {
+    () => {
+        r#"a.repository_id AS rank_repository,
+           CASE
+               WHEN r.format IN ('docker', 'podman', 'buildx', 'oras', 'wasm_oci', 'helm_oci')
+                    AND a.name !~ ':[a-z0-9]+([+._-][a-z0-9]+)*:[A-Za-z0-9=_-]+$'
+                    AND a.name !~ ':sha256-[A-Fa-f0-9]+\.(sig|att|sbom)$'
+                    AND a.name ~ ':[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$'
+               THEN regexp_replace(a.name, ':[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$', '')
+               WHEN r.format IN ('maven', 'gradle')
+                    AND a.version IS NOT NULL
+                    AND a.path ~ '[^/]/[^/]+/[^/]+$'
+                    AND regexp_replace(a.path, '^.*/([^/]+)/[^/]+$', '\1') = a.version
+               THEN regexp_replace(a.path, '/[^/]+/[^/]+$', '')
+               ELSE a.name
+           END AS rank_group,
+           CASE
+               WHEN r.format IN ('maven', 'gradle')
+                    AND a.version IS NOT NULL
+                    AND a.path ~ '[^/]/[^/]+/[^/]+$'
+                    AND regexp_replace(a.path, '^.*/([^/]+)/[^/]+$', '\1') = a.version
+               THEN a.version
+           END AS rank_version,
+           COALESCE(ot.updated_at, a.created_at) AS rank_at"#
+    };
+}
+
 /// Rank an artifact within its retention group, newest first.
 ///
-/// The grouping and recency rules are documented on
-/// [`max_versions_ranked_cte!`]. `a.repository_id` leads the partition so the
-/// rank is per repository even in the legacy global max-age variant; inside a
-/// single-repository query it is constant and changes nothing. Requires `a`
-/// (`artifacts`), `r` (`repositories`) and `ot` ([`oci_tag_join!`]) in scope.
+/// Evaluated over [`retention_rank_source!`]. A row without a `rank_version`
+/// is ranked by itself (`row_number`), exactly as every format was before
+/// #5771. A Maven-layout row takes the rank of its *version*: `dense_rank`
+/// over the version's newest upload (`rank_version_at`, the latest `rank_at`
+/// of any of its files), so every file of a version shares one rank and
+/// `rn > N` keeps or deletes the whole version. "Newest" stays upload time,
+/// not Maven version order; the version string only breaks exact ties.
+/// `rank_version IS NULL` is part of the partition so the two kinds of row
+/// never share a numbering. The grouping and recency rules are documented on
+/// [`max_versions_ranked_cte!`].
 macro_rules! retention_rank {
     () => {
-        r#"row_number() OVER (
-               PARTITION BY
-                   a.repository_id,
-                   CASE
-                       WHEN r.format IN ('docker', 'podman', 'buildx', 'oras', 'wasm_oci', 'helm_oci')
-                            AND a.name !~ ':[a-z0-9]+([+._-][a-z0-9]+)*:[A-Za-z0-9=_-]+$'
-                            AND a.name !~ ':sha256-[A-Fa-f0-9]+\.(sig|att|sbom)$'
-                            AND a.name ~ ':[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$'
-                       THEN regexp_replace(a.name, ':[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$', '')
-                       ELSE a.name
-                   END
-               ORDER BY COALESCE(ot.updated_at, a.created_at) DESC, a.id DESC
-           )"#
+        r#"CASE
+               WHEN rank_version IS NULL THEN row_number() OVER (
+                   PARTITION BY rank_repository, rank_group, rank_version IS NULL
+                   ORDER BY rank_at DESC, id DESC
+               )
+               ELSE dense_rank() OVER (
+                   PARTITION BY rank_repository, rank_group, rank_version IS NULL
+                   ORDER BY rank_version_at DESC, rank_version DESC
+               )
+           END"#
+    };
+}
+
+/// The `FROM` of the outer `ranked` CTE: the `grouped` candidates plus each
+/// one's version recency (`rank_version_at`). A separate level because a
+/// window function cannot be nested in another.
+macro_rules! retention_rank_source {
+    () => {
+        "FROM (\n    SELECT grouped.*,\n           max(rank_at) OVER (\n               PARTITION BY rank_repository, rank_group, rank_version\n           ) AS rank_version_at\n    FROM grouped\n) g\n"
     };
 }
 
@@ -264,6 +328,15 @@ macro_rules! retention_rank {
 /// #2998 open for podman, buildx, oras, wasm_oci and helm_oci. (`"oci"` is a
 /// parser alias, not a `repository_format` enum value, so it is not listed.)
 ///
+/// **Maven.** A Maven (or Gradle) row stores only the artifactId in `name`,
+/// and one version is several rows (pom, jar, `-sources.jar`, ...). Ranking
+/// rows by `name` kept the newest N *files* per artifactId across every
+/// groupId: deploying `com.example.beta:core` deleted every version of
+/// `com.example.alpha:core`, and a version could lose its pom (#5771). Maven
+/// rows are therefore grouped by their coordinate directory and ranked per
+/// version, so `keep = N` keeps the N most recently uploaded versions of each
+/// groupId:artifactId with all their files (see [`retention_rank_columns!`]).
+///
 /// **Recency.** Ordering is `COALESCE(oci_tags.updated_at, created_at)`, not
 /// `created_at`. A manifest PUT upserts the existing `artifacts` row and never
 /// touches `created_at`, so a rolling tag is always the OLDEST row of its image
@@ -281,12 +354,16 @@ macro_rules! retention_rank {
 macro_rules! max_versions_ranked_cte {
     () => {
         concat!(
-            "\nWITH ranked AS (\n    SELECT a.id,\n           a.size_bytes,\n           ",
-            retention_rank!(),
-            " AS rn\nFROM artifacts a\nJOIN repositories r ON r.id = a.repository_id\n",
+            "\nWITH grouped AS (\n    SELECT a.id,\n           a.size_bytes,\n           ",
+            retention_rank_columns!(),
+            "\nFROM artifacts a\nJOIN repositories r ON r.id = a.repository_id\n",
             oci_tag_join!(),
             "WHERE a.repository_id = $1\n    AND a.is_deleted = false\n",
             policy_filter_predicate!("a.", "$3", "$4", "$5", "$6"),
+            "),\nranked AS (\n    SELECT id,\n           size_bytes,\n           ",
+            retention_rank!(),
+            " AS rn\n",
+            retention_rank_source!(),
             ")\n"
         )
     };
@@ -415,16 +492,20 @@ macro_rules! retention_update_sql {
 macro_rules! retention_ranked_cte {
     ($repository_predicate:literal, $filter_params:tt, $($condition:tt)+) => {
         concat!(
-            "\nWITH ranked AS (\n    SELECT a.id,\n           a.size_bytes,\n           ",
+            "\nWITH grouped AS (\n    SELECT a.id,\n           a.size_bytes,\n           ",
             $($condition)+,
             " AS expired,\n           ",
-            retention_rank!(),
-            " AS rn\nFROM artifacts a\nJOIN repositories r ON r.id = a.repository_id\n",
+            retention_rank_columns!(),
+            "\nFROM artifacts a\nJOIN repositories r ON r.id = a.repository_id\n",
             oci_tag_join!(),
             "WHERE\n    ",
             $repository_predicate,
             "a.is_deleted = false\n",
             filters_at!($filter_params),
+            "),\nranked AS (\n    SELECT id,\n           size_bytes,\n           expired,\n           ",
+            retention_rank!(),
+            " AS rn\n",
+            retention_rank_source!(),
             ")\n"
         )
     };
@@ -1341,6 +1422,14 @@ pub struct LifecycleService {
     proxy_service: Option<std::sync::Arc<crate::services::proxy_service::ProxyService>>,
     /// Candidates per page of a live proxy-cache sweep.
     proxy_cache_page_size: i64,
+    /// Dropped for every npm package a sweep removes versions of (#5779).
+    /// See [`LifecycleService::with_npm_packument_cache`].
+    npm_packument_cache:
+        Option<std::sync::Arc<crate::services::npm_packument_cache::NpmPackumentCache>>,
+    /// The services behind the rest of a delete's derived state: peers'
+    /// delete sync, audit, events, search, Maven metadata and the Cargo
+    /// index (#6469). See [`LifecycleService::with_derived_state`].
+    derived_state: SweepDerivedState,
 }
 
 impl LifecycleService {
@@ -1349,7 +1438,30 @@ impl LifecycleService {
             db,
             proxy_service: None,
             proxy_cache_page_size: proxy_cache::EVICTION_PAGE_SIZE,
+            npm_packument_cache: None,
+            derived_state: SweepDerivedState::default(),
         }
+    }
+
+    /// The services a sweep updates the rest of each format's derived state
+    /// through (#6469), as the per-artifact delete does. Without them the
+    /// sweep still fans out peer delete sync and writes audit rows (those
+    /// need only the database), and skips events, search documents, Maven
+    /// stored metadata and the Cargo index cache.
+    pub fn with_derived_state(mut self, derived_state: SweepDerivedState) -> Self {
+        self.derived_state = derived_state;
+        self
+    }
+
+    /// The npm packument cache a sweep invalidates (#5779). Without it a
+    /// Local's packument, and that of every Virtual serving it, keeps listing
+    /// a swept version until the cache entry expires
+    pub fn with_npm_packument_cache(
+        mut self,
+        cache: Option<std::sync::Arc<crate::services::npm_packument_cache::NpmPackumentCache>>,
+    ) -> Self {
+        self.npm_packument_cache = cache;
+        self
     }
 
     /// Execute a policy (dry_run=true previews without deleting).
@@ -1584,6 +1696,14 @@ impl LifecycleService {
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
         let result = Self::dispatch_execute(&mut tx, policy, false).await?;
+        if result.artifacts_removed > 0 {
+            // Step 4's work is owed from the moment the deletes commit: a
+            // restart before it finishes leaves this row for the next tick
+            // to resume (#6469).
+            derived_state::record_pending_fanout(&mut tx, repository_id, deleted_at)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
+        }
         tx.commit()
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
@@ -1609,6 +1729,18 @@ impl LifecycleService {
         // naming it (ETARGET for clients) and the catalog's Latest on it.
         if result.artifacts_removed > 0 {
             self.retract_swept_versions(repository_id, deleted_at).await;
+            self.invalidate_swept_packuments(repository_id, deleted_at)
+                .await;
+            // Step 4 (#6469): the rest of the per-artifact delete's
+            // derived state, batched, and resumable from the row recorded
+            // above if this process stops part-way.
+            derived_state::finish_swept_deletes(
+                &self.db,
+                &self.derived_state,
+                repository_id,
+                deleted_at,
+            )
+            .await;
         }
 
         Ok(result)
@@ -1646,6 +1778,55 @@ impl LifecycleService {
             }
         };
         ArtifactService::retract_deleted_versions(&self.db, repository_id, &swept).await;
+    }
+
+    /// Drop the cached packument of every npm package a sweep of
+    /// `repository_id` removed versions of in the transaction stamped
+    /// `deleted_at` (#5779), in the repository and every Virtual serving it,
+    /// as the per-artifact delete does. Best effort, the deletions are committed
+    async fn invalidate_swept_packuments(&self, repository_id: Uuid, deleted_at: DateTime<Utc>) {
+        let Some(cache) = self.npm_packument_cache.as_ref() else {
+            return;
+        };
+        let swept: std::result::Result<Vec<(String, String)>, sqlx::Error> = sqlx::query_as(
+            "SELECT DISTINCT r.key, a.path FROM artifacts a \
+             JOIN repositories r ON r.id = a.repository_id \
+             WHERE a.repository_id = $1 AND r.format::text = ANY($3) \
+               AND a.is_deleted = true AND a.deleted_at >= $2",
+        )
+        .bind(repository_id)
+        .bind(deleted_at)
+        .bind(crate::api::handlers::npm::NPM_FAMILY_FORMATS)
+        .fetch_all(&self.db)
+        .await;
+        let swept = match swept {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::warn!(
+                    "Lifecycle: failed to list the npm versions swept from repository {}: {}",
+                    repository_id,
+                    e
+                );
+                return;
+            }
+        };
+        let packages: std::collections::BTreeSet<(&str, &str)> = swept
+            .iter()
+            .filter_map(|(key, path)| {
+                crate::api::handlers::npm::npm_package_name_from_artifact_path(path)
+                    .map(|package| (key.as_str(), package))
+            })
+            .collect();
+        for (key, package) in packages {
+            crate::services::npm_packument_cache::invalidate_package_and_virtuals(
+                &self.db,
+                cache,
+                repository_id,
+                key,
+                package,
+            )
+            .await;
+        }
     }
 
     /// Dispatch to the per-type implementation against a single
@@ -1774,6 +1955,9 @@ impl LifecycleService {
         &self,
         abort: &CancellationToken,
     ) -> Result<Vec<PolicyExecutionResult>> {
+        // Finish what an earlier cycle's sweeps left owed (a restart, or a
+        // failed page) before sweeping again (#6469).
+        derived_state::resume_pending_sweep_fanouts(&self.db, &self.derived_state).await;
         let policies = self.load_enabled_policies().await?;
         self.execute_due_from(policies, abort).await
     }
@@ -3182,6 +3366,263 @@ mod tests {
             .execute(&pool)
             .await
             .expect("cleanup docker repository");
+    }
+
+    /// Seed a hosted Maven repository with `(groupId path, artifactId,
+    /// version, minutes ago)` releases, each deployed as pom + jar + sources
+    /// a few seconds apart, as `mvn deploy` with `maven-source-plugin` does.
+    /// Returns the repository id. Every row is named after the artifactId
+    /// only, exactly as the Maven upload handler stores it.
+    async fn seed_maven_releases_5771(
+        pool: &sqlx::PgPool,
+        releases: &[(&str, &str, &str, i64)],
+    ) -> Uuid {
+        let repository_id = Uuid::new_v4();
+        let key = format!("lifecycle-maven-{}", repository_id.simple());
+        sqlx::query(
+            "INSERT INTO repositories (id, key, name, storage_path, repo_type, format) \
+             VALUES ($1, $2, $2, $3, 'local', 'maven'::repository_format)",
+        )
+        .bind(repository_id)
+        .bind(&key)
+        .bind(format!("/tmp/{key}"))
+        .execute(pool)
+        .await
+        .expect("insert maven repository");
+
+        for (group_path, artifact, version, minutes_ago) in releases {
+            for (offset_seconds, file) in [
+                (0, format!("{artifact}-{version}.pom")),
+                (1, format!("{artifact}-{version}.jar")),
+                (2, format!("{artifact}-{version}-sources.jar")),
+            ] {
+                let id = Uuid::new_v4();
+                sqlx::query(
+                    "INSERT INTO artifacts (id, repository_id, path, name, version, size_bytes, \
+                     checksum_sha256, content_type, storage_key, created_at) \
+                     VALUES ($1, $2, $3, $4, $5, 100, $6, 'application/java-archive', $7, $8)",
+                )
+                .bind(id)
+                .bind(repository_id)
+                .bind(format!("{group_path}/{artifact}/{version}/{file}"))
+                .bind(artifact)
+                .bind(version)
+                .bind("0".repeat(64))
+                .bind(format!("maven/{id}"))
+                .bind(
+                    Utc::now() - chrono::Duration::minutes(*minutes_ago)
+                        + chrono::Duration::seconds(offset_seconds),
+                )
+                .execute(pool)
+                .await
+                .expect("insert maven artifact");
+            }
+        }
+        repository_id
+    }
+
+    /// The live `(version directory, file count)` of every coordinate left in
+    /// the repository, e.g. `com/example/alpha/core/2.1.0` -> 3.
+    async fn live_maven_versions_5771(
+        pool: &sqlx::PgPool,
+        repository_id: Uuid,
+    ) -> Vec<(String, i64)> {
+        sqlx::query_as(
+            "SELECT regexp_replace(path, '/[^/]+$', '') AS dir, COUNT(*) \
+             FROM artifacts WHERE repository_id = $1 AND is_deleted = false \
+             GROUP BY 1 ORDER BY 1",
+        )
+        .bind(repository_id)
+        .fetch_all(pool)
+        .await
+        .expect("read live maven versions")
+    }
+
+    async fn create_repo_policy_5771(
+        service: &LifecycleService,
+        repository_id: Uuid,
+        policy_type: &str,
+        config: serde_json::Value,
+    ) -> LifecyclePolicy {
+        service
+            .create_policy(CreateLifecyclePolicyRequest {
+                applies_to_all: false,
+                repository_ids: None,
+                repository_id: Some(repository_id),
+                name: format!("maven-5771-{}", Uuid::new_v4().simple()),
+                description: None,
+                policy_type: policy_type.to_string(),
+                config,
+                priority: None,
+                cron_schedule: None,
+                enabled: None,
+            })
+            .await
+            .expect("create lifecycle policy")
+    }
+
+    /// #5771: `max_versions` on Maven ranked rows by `name` (the artifactId
+    /// alone) and per file, so it kept the newest N *files* per artifactId
+    /// across groupIds. The issue's reproduction: every version of
+    /// `com.example.alpha:core` was deleted because `com.example.beta:core`
+    /// was deployed later, and `beta:core:9.0.0` lost its pom. It must keep
+    /// the newest N *versions* of each groupId:artifactId, whole.
+    #[tokio::test]
+    async fn test_max_versions_maven_keeps_versions_per_coordinate_5771() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let repository_id = seed_maven_releases_5771(
+            &pool,
+            &[
+                ("com/example/alpha", "core", "1.0.0", 60),
+                ("com/example/alpha", "core", "1.1.0", 50),
+                ("com/example/alpha", "core", "1.2.0", 40),
+                ("com/example/alpha", "core", "2.0.0", 30),
+                ("com/example/alpha", "core", "2.1.0", 20),
+                ("com/example/beta", "core", "9.0.0", 10),
+            ],
+        )
+        .await;
+        // A version-less Maven row (a group-level plugin `maven-metadata.xml`)
+        // is not a version and must not be swept with them.
+        sqlx::query(
+            "INSERT INTO artifacts (repository_id, path, name, version, size_bytes, \
+             checksum_sha256, content_type, storage_key, created_at) \
+             VALUES ($1, 'com/example/alpha/maven-metadata.xml', 'com.example.alpha', NULL, \
+                     10, $2, 'application/xml', 'maven/plugin-metadata', NOW() - INTERVAL '2 hours')",
+        )
+        .bind(repository_id)
+        .bind("0".repeat(64))
+        .execute(&pool)
+        .await
+        .expect("insert plugin group metadata");
+
+        let service = LifecycleService::new(pool.clone());
+        let policy =
+            create_repo_policy_5771(&service, repository_id, "max_versions", json!({"keep": 2}))
+                .await;
+
+        let preview = service
+            .execute_policy(policy.id, true)
+            .await
+            .expect("preview lifecycle policy");
+        let execution = service
+            .execute_policy(policy.id, false)
+            .await
+            .expect("execute lifecycle policy");
+        let live = live_maven_versions_5771(&pool, repository_id).await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repository_id)
+            .execute(&pool)
+            .await;
+
+        // alpha:core 1.0.0, 1.1.0 and 1.2.0 go, with all three files each.
+        assert_eq!(preview.artifacts_matched, 9, "{live:?}");
+        assert_eq!(execution.artifacts_matched, 9, "{live:?}");
+        assert_eq!(execution.artifacts_removed, 9, "{live:?}");
+        assert_eq!(
+            live,
+            vec![
+                ("com/example/alpha".to_string(), 1),
+                ("com/example/alpha/core/2.0.0".to_string(), 3),
+                ("com/example/alpha/core/2.1.0".to_string(), 3),
+                ("com/example/beta/core/9.0.0".to_string(), 3),
+            ]
+        );
+    }
+
+    /// #5771: "newest" is the version's latest upload, and every file of a
+    /// version shares that rank, so versions uploaded out of order are kept
+    /// whole (the issue's second run kept `1.0.jar`, `1.1.jar` and
+    /// `1.1.pom`). The same version ranking backs `max_age_days` + `min_keep`.
+    #[tokio::test]
+    async fn test_maven_retention_ranks_whole_versions_by_upload_5771() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let releases: Vec<(&str, &str, &str, i64)> = [
+            ("1.2", 80),
+            ("1.9", 70),
+            ("1.10", 60),
+            ("1.11", 50),
+            ("2.0", 40),
+            ("1.3", 30),
+            ("1.0", 20),
+            ("1.1", 10),
+        ]
+        .into_iter()
+        .map(|(version, minutes_ago)| ("org/example", "lib", version, minutes_ago))
+        .collect();
+        let service = LifecycleService::new(pool.clone());
+
+        let max_versions_repo = seed_maven_releases_5771(&pool, &releases).await;
+        let policy = create_repo_policy_5771(
+            &service,
+            max_versions_repo,
+            "max_versions",
+            json!({"keep": 3}),
+        )
+        .await;
+        let execution = service
+            .execute_policy(policy.id, false)
+            .await
+            .expect("execute max_versions");
+        let max_versions_live = live_maven_versions_5771(&pool, max_versions_repo).await;
+
+        // Age every row past the 1-day window, so `min_keep` alone decides
+        // what survives.
+        let min_keep_repo = seed_maven_releases_5771(&pool, &releases).await;
+        sqlx::query(
+            "UPDATE artifacts SET created_at = created_at - INTERVAL '10 days' \
+             WHERE repository_id = $1",
+        )
+        .bind(min_keep_repo)
+        .execute(&pool)
+        .await
+        .expect("age maven rows");
+        let policy = create_repo_policy_5771(
+            &service,
+            min_keep_repo,
+            "max_age_days",
+            json!({"days": 1, "min_keep": 2}),
+        )
+        .await;
+        let min_keep_execution = service
+            .execute_policy(policy.id, false)
+            .await
+            .expect("execute max_age_days with min_keep");
+        let min_keep_live = live_maven_versions_5771(&pool, min_keep_repo).await;
+
+        for repository_id in [max_versions_repo, min_keep_repo] {
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(repository_id)
+                .execute(&pool)
+                .await;
+        }
+
+        assert_eq!(execution.artifacts_removed, 15, "{max_versions_live:?}");
+        assert_eq!(
+            max_versions_live,
+            vec![
+                ("org/example/lib/1.0".to_string(), 3),
+                ("org/example/lib/1.1".to_string(), 3),
+                ("org/example/lib/1.3".to_string(), 3),
+            ]
+        );
+        assert_eq!(
+            min_keep_execution.artifacts_removed, 18,
+            "{min_keep_live:?}"
+        );
+        assert_eq!(
+            min_keep_live,
+            vec![
+                ("org/example/lib/1.0".to_string(), 3),
+                ("org/example/lib/1.1".to_string(), 3),
+            ]
+        );
     }
 
     /// #5368: a lifecycle policy never trashes an MCP server version (that

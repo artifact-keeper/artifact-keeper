@@ -16,8 +16,26 @@ FROM rust:${RUST_VERSION}-alpine${ALPINE_VERSION} AS rust-alpine-base
 RUN apk add --no-cache \
     build-base pkgconfig perl openssl-dev openssl-libs-static \
     zlib-dev zlib-static xz-dev xz-static \
-    bzip2-dev bzip2-static protobuf-dev curl
-RUN cargo install cargo-chef --locked
+    bzip2-dev bzip2-static protobuf-dev curl xz
+# Same cargo-chef and cargo-auditable pins as Dockerfile.backend (#6180).
+ARG CARGO_CHEF_VERSION=0.1.78
+ARG CARGO_AUDITABLE_VERSION=0.7.7
+ARG CARGO_AUDITABLE_SHA256_X86_64=7676443367c5e33d9fb22acef63cccb5e9202de12dae1b0579995eb3e2bc7a18
+ARG CARGO_AUDITABLE_SHA256_AARCH64=c324af56990601354bbf40080f582ba46f8ec8b807a1388e25bb7e429d285c18
+RUN cargo install cargo-chef --locked --version "${CARGO_CHEF_VERSION}" && \
+    ARCH=$(uname -m) && \
+    case "$ARCH" in \
+      x86_64)  AUDITABLE_SHA256="${CARGO_AUDITABLE_SHA256_X86_64}" ;; \
+      aarch64) AUDITABLE_SHA256="${CARGO_AUDITABLE_SHA256_AARCH64}" ;; \
+      *)       echo "Unsupported architecture: $ARCH" && exit 1 ;; \
+    esac && \
+    AUDITABLE_DIR="cargo-auditable-${ARCH}-unknown-linux-musl" && \
+    curl --proto '=https' --tlsv1.2 -sSfL "https://github.com/rust-secure-code/cargo-auditable/releases/download/v${CARGO_AUDITABLE_VERSION}/${AUDITABLE_DIR}.tar.xz" \
+      -o /tmp/cargo-auditable.tar.xz && \
+    echo "${AUDITABLE_SHA256}  /tmp/cargo-auditable.tar.xz" | sha256sum -c - && \
+    tar -xJf /tmp/cargo-auditable.tar.xz -C /usr/local/cargo/bin --strip-components=1 "${AUDITABLE_DIR}/cargo-auditable" && \
+    rm /tmp/cargo-auditable.tar.xz && \
+    cargo auditable --version
 
 # ---------- Stage 1: Plan dependencies ----------
 FROM rust-alpine-base AS planner
@@ -34,7 +52,7 @@ ENV SQLX_OFFLINE=true
 ARG CARGO_FEATURES=""
 RUN FEATURES="vendored-openssl"; \
     if [ -n "$CARGO_FEATURES" ]; then FEATURES="$FEATURES,$CARGO_FEATURES"; fi && \
-    cargo chef cook --release --features "$FEATURES" --recipe-path recipe.json
+    cargo chef cook --locked --release --features "$FEATURES" --recipe-path recipe.json
 
 # ---------- Stage 3: Build binary ----------
 FROM rust-alpine-base AS builder
@@ -46,16 +64,13 @@ COPY .sqlx ./.sqlx
 COPY backend ./backend
 ARG GIT_SHA=unknown
 ARG CARGO_FEATURES=""
-ARG APP_VERSION=""
 ENV SQLX_OFFLINE=true
 ENV GIT_SHA=${GIT_SHA}
-RUN if [ -n "${APP_VERSION}" ]; then \
-      CLEAN_VERSION=$(echo "${APP_VERSION}" | sed 's/^v//'); \
-      sed -i "s/^version = \".*\"/version = \"${CLEAN_VERSION}\"/" Cargo.toml; \
-    fi && \
-    FEATURES="vendored-openssl"; \
+# `cargo auditable build --locked`, and no Cargo.toml version rewrite: see
+# Dockerfile.backend (#6180).
+RUN FEATURES="vendored-openssl"; \
     if [ -n "$CARGO_FEATURES" ]; then FEATURES="$FEATURES,$CARGO_FEATURES"; fi && \
-    cargo build --release --features "$FEATURES" --bin artifact-keeper
+    cargo auditable build --locked --release --features "$FEATURES" --bin artifact-keeper
 
 # ---------- Stage 4: Build the grype scanner CLI from source ----------
 # The trivy CLI is intentionally NOT bundled in the runtime image. The backend

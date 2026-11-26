@@ -638,6 +638,23 @@ impl GcsConfig {
 // Backend
 // ---------------------------------------------------------------------------
 
+/// One object of a GCS `objects.list` response.
+#[derive(serde::Deserialize)]
+struct GcsObject {
+    name: String,
+    #[serde(default)]
+    updated: Option<String>,
+}
+
+/// A GCS `objects.list` response page.
+#[derive(serde::Deserialize)]
+struct GcsListResponse {
+    #[serde(default)]
+    items: Vec<GcsObject>,
+    #[serde(rename = "nextPageToken")]
+    next_page_token: Option<String>,
+}
+
 /// Google Cloud Storage backend.
 pub struct GcsBackend {
     config: GcsConfig,
@@ -1038,60 +1055,13 @@ impl GcsBackend {
 
     /// [`Self::list`] that also carries each object's `updated` time.
     pub async fn list_with_modified(&self, prefix: Option<&str>) -> Result<Vec<super::ListedKey>> {
-        #[derive(serde::Deserialize)]
-        struct GcsObject {
-            name: String,
-            #[serde(default)]
-            updated: Option<String>,
-        }
-        #[derive(serde::Deserialize)]
-        struct GcsListResponse {
-            #[serde(default)]
-            items: Vec<GcsObject>,
-            #[serde(rename = "nextPageToken")]
-            next_page_token: Option<String>,
-        }
-
         let mut all_keys = Vec::new();
         let mut page_token: Option<String> = None;
-
         loop {
-            let token = self.get_bearer_token().await?;
-            let base = format!(
-                "{}/storage/v1/b/{}/o",
-                self.base_url,
-                urlencoding::encode(&self.config.bucket)
-            );
-
-            let mut params = Vec::new();
-            if let Some(p) = prefix {
-                params.push(format!("prefix={}", urlencoding::encode(p)));
-            }
-            if let Some(ref pt) = page_token {
-                params.push(format!("pageToken={}", urlencoding::encode(pt)));
-            }
-
-            let url = if params.is_empty() {
-                base
-            } else {
-                format!("{}?{}", base, params.join("&"))
-            };
-
-            let response = self
-                .client
-                .get(&url)
-                .header("Authorization", format!("Bearer {}", token))
-                .send()
-                .await
-                .map_err(|e| request_error("GCS list failed", e))?;
-
-            let response = require_success(response, "GCS list failed").await?;
-            let list_response: GcsListResponse = response
-                .json()
-                .await
-                .map_err(|e| request_error("Failed to parse GCS list response", e))?;
-
-            all_keys.extend(list_response.items.into_iter().map(|o| {
+            let page = self
+                .list_request(prefix, page_token.as_deref(), None, None)
+                .await?;
+            all_keys.extend(page.items.into_iter().map(|o| {
                 super::ListedKey {
                     key: o.name,
                     last_modified: o
@@ -1101,14 +1071,88 @@ impl GcsBackend {
                         .map(|d| d.with_timezone(&chrono::Utc)),
                 }
             }));
-
-            match list_response.next_page_token {
+            match page.next_page_token {
                 Some(pt) => page_token = Some(pt),
                 None => break,
             }
         }
-
         Ok(all_keys)
+    }
+
+    /// One bounded page of [`Self::list`] (#6429): `startOffset` set to the
+    /// cursor (the last name listed) and `maxResults` to the page size, so a
+    /// page reads about one page of the bucket listing.
+    pub async fn list_page(
+        &self,
+        prefix: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<crate::services::storage_service::KeyPage> {
+        let limit = limit.max(1);
+        let mut names = Vec::new();
+        let mut page_token: Option<String> = None;
+        loop {
+            let max = (limit + 2 - names.len()).to_string();
+            let page = self
+                .list_request(Some(prefix), page_token.as_deref(), cursor, Some(&max))
+                .await?;
+            // `startOffset` is inclusive; the cursor itself was on the last page.
+            names.extend(
+                page.items
+                    .into_iter()
+                    .map(|o| o.name)
+                    .filter(|n| Some(n.as_str()) != cursor),
+            );
+            match page.next_page_token {
+                Some(pt) if names.len() <= limit => page_token = Some(pt),
+                _ => break,
+            }
+        }
+        Ok(crate::services::storage_service::KeyPage::from_sorted(
+            names, None, limit,
+        ))
+    }
+
+    /// One `objects.list` request.
+    async fn list_request(
+        &self,
+        prefix: Option<&str>,
+        page_token: Option<&str>,
+        start_offset: Option<&str>,
+        max_results: Option<&str>,
+    ) -> Result<GcsListResponse> {
+        let token = self.get_bearer_token().await?;
+        let base = format!(
+            "{}/storage/v1/b/{}/o",
+            self.base_url,
+            urlencoding::encode(&self.config.bucket)
+        );
+        let params: Vec<String> = [
+            ("prefix", prefix),
+            ("pageToken", page_token),
+            ("startOffset", start_offset),
+            ("maxResults", max_results),
+        ]
+        .into_iter()
+        .filter_map(|(name, value)| value.map(|v| format!("{name}={}", urlencoding::encode(v))))
+        .collect();
+        let url = if params.is_empty() {
+            base
+        } else {
+            format!("{}?{}", base, params.join("&"))
+        };
+        let response = self
+            .client
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", token))
+            .send()
+            .await
+            .map_err(|e| request_error("GCS list failed", e))?;
+        let response = require_success(response, "GCS list failed").await?;
+        response
+            .json()
+            .await
+            .map_err(|e| request_error("Failed to parse GCS list response", e))
     }
 
     /// Issue a single GCS `rewriteTo` POST with a freshly obtained bearer token.
@@ -4009,6 +4053,40 @@ mod tests {
         let backend = mock_backend(&server.uri()).await;
         let keys = backend.list(None).await.unwrap();
         assert_eq!(keys, vec!["a.txt", "b.txt", "c.txt"]);
+    }
+
+    /// #6429: `list_page` asks for one page from the cursor on and drops the
+    /// cursor itself (`startOffset` is inclusive).
+    #[tokio::test]
+    async fn test_list_page_starts_after_the_cursor_6429() {
+        use wiremock::matchers::{method, path_regex, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex("/storage/v1/b/.*/o"))
+            .and(query_param("prefix", "proxy-cache/r/"))
+            .and(query_param("startOffset", "proxy-cache/r/b"))
+            .and(query_param("maxResults", "4"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "items": [
+                    {"name": "proxy-cache/r/b"},
+                    {"name": "proxy-cache/r/c"},
+                    {"name": "proxy-cache/r/d"},
+                    {"name": "proxy-cache/r/e"}
+                ],
+                "nextPageToken": "more"
+            })))
+            .mount(&server)
+            .await;
+
+        let backend = mock_backend(&server.uri()).await;
+        let page = backend
+            .list_page("proxy-cache/r/", Some("proxy-cache/r/b"), 2)
+            .await
+            .unwrap();
+        assert_eq!(page.keys, vec!["proxy-cache/r/c", "proxy-cache/r/d"]);
+        assert_eq!(page.next.as_deref(), Some("proxy-cache/r/d"));
     }
 
     #[tokio::test]

@@ -202,15 +202,66 @@ pub enum ConflictType {
     FormatMismatch,
 }
 
+/// Error summary of a job the janitor paused because its worker's claim
+/// lapsed (#6253). `/resume` clears it.
+pub const WORKER_LOST: &str = "worker lost";
+
+/// How long a migration worker's claim on its job row lasts unless renewed.
+/// The renewal runs every third of it, so a replica that died is noticed
+/// within about this long (#6253).
+pub const JOB_CLAIM_TTL_SECS: f64 = 300.0;
+
+/// Pause the jobs the workers of replica `owner` were running as it shuts
+/// down, so `/resume` continues them (#6253).
+pub async fn pause_jobs_on_shutdown(db: PgPool, owner: &str) {
+    match MigrationService::new(db).pause_jobs_claimed_by(owner).await {
+        Ok(0) => {}
+        Ok(paused) => info!(paused, "Paused the migration jobs this replica was running"),
+        Err(e) => warn!(error = %e, "Failed to pause this replica's migration jobs"),
+    }
+}
+
 /// Migration service for orchestrating the migration process
 pub struct MigrationService {
     db: PgPool,
+    /// The worker claim this service writes under (#6305). When set, the
+    /// worker's progress, totals, warning and final status writes apply only
+    /// while the job row still carries this `claim_token`, so a worker whose
+    /// job was taken over cannot write onto the new owner's row in the
+    /// window before its claim renewal notices the loss. `None` (every
+    /// non-worker caller) leaves those writes unguarded, as before.
+    claim_token: Option<Uuid>,
 }
 
 impl MigrationService {
     /// Create a new migration service
     pub fn new(db: PgPool) -> Self {
-        Self { db }
+        Self {
+            db,
+            claim_token: None,
+        }
+    }
+
+    /// Guard the worker's job-row writes with its claim token (#6305).
+    pub fn with_claim_token(mut self, claim_token: Option<Uuid>) -> Self {
+        self.claim_token = claim_token;
+        self
+    }
+
+    /// Whether the job row still carries this service's claim token (always
+    /// true without one). `false` also when the row is gone.
+    pub async fn holds_claim(&self, job_id: Uuid) -> Result<bool, MigrationError> {
+        let Some(token) = self.claim_token else {
+            return Ok(true);
+        };
+        let held: Option<bool> = sqlx::query_scalar(
+            "SELECT claim_token IS NOT DISTINCT FROM $2 FROM migration_jobs WHERE id = $1",
+        )
+        .bind(job_id)
+        .bind(token)
+        .fetch_optional(&self.db)
+        .await?;
+        Ok(held.unwrap_or(false))
     }
 
     /// Create an Artifactory client from a source connection
@@ -864,11 +915,12 @@ impl MigrationService {
             r#"
             UPDATE migration_jobs
             SET status = $1
-            WHERE id = $2
+            WHERE id = $2 AND ($3::uuid IS NULL OR claim_token = $3)
             "#,
         )
         .bind(status.to_string())
         .bind(job_id)
+        .bind(self.claim_token)
         .execute(&self.db)
         .await?;
 
@@ -904,6 +956,54 @@ impl MigrationService {
         Ok(result.rows_affected() > 0)
     }
 
+    /// Pause a job that is still `running` because its worker stops with the
+    /// process (#6253). `migration_items` keeps what was done, so `/resume`
+    /// skips it. Returns whether the row was paused.
+    pub async fn pause_running_job(&self, job_id: Uuid) -> Result<bool, MigrationError> {
+        let result = sqlx::query(
+            "UPDATE migration_jobs SET status = 'paused' WHERE id = $1 AND status = 'running' \
+             AND ($2::uuid IS NULL OR claim_token = $2)",
+        )
+        .bind(job_id)
+        .bind(self.claim_token)
+        .execute(&self.db)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Pause every `running` job whose worker claim is held by `owner`, for a
+    /// replica that shuts down with workers still running (#6253).
+    pub async fn pause_jobs_claimed_by(&self, owner: &str) -> Result<u64, MigrationError> {
+        let result = sqlx::query(
+            "UPDATE migration_jobs SET status = 'paused' \
+             WHERE status = 'running' AND claimed_by = $1",
+        )
+        .bind(owner)
+        .execute(&self.db)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Pause every `running` job whose worker claim lapsed: the replica that
+    /// ran it died without a clean shutdown (#6253). The job is left for an
+    /// operator to resume, with [`WORKER_LOST`] as its error summary.
+    pub async fn pause_stale_running_jobs(&self) -> Result<u64, MigrationError> {
+        let result = sqlx::query(
+            "UPDATE migration_jobs SET status = 'paused', error_summary = $1 \
+             WHERE status = 'running' AND claim_expires_at < NOW()",
+        )
+        .bind(WORKER_LOST)
+        .execute(&self.db)
+        .await?;
+        if result.rows_affected() > 0 {
+            warn!(
+                jobs = result.rows_affected(),
+                "Paused migration jobs whose worker was lost; resume them to continue"
+            );
+        }
+        Ok(result.rows_affected())
+    }
+
     /// Finalize a job with a terminal status and stamp `finished_at`, unless
     /// the operator has already paused or cancelled it — the guard keeps a
     /// pause that races the worker's final write from being overwritten
@@ -920,10 +1020,12 @@ impl MigrationService {
             UPDATE migration_jobs
             SET status = $1, finished_at = NOW()
             WHERE id = $2 AND status NOT IN ('paused', 'cancelled')
+              AND ($3::uuid IS NULL OR claim_token = $3)
             "#,
         )
         .bind(status.to_string())
         .bind(job_id)
+        .bind(self.claim_token)
         .execute(&self.db)
         .await?;
 
@@ -957,10 +1059,12 @@ impl MigrationService {
             WHERE id = $2
               AND status NOT IN ('paused', 'cancelled')
               AND COALESCE(error_summary, '') = ''
+              AND ($3::uuid IS NULL OR claim_token = $3)
             "#,
         )
         .bind(warning)
         .bind(job_id)
+        .bind(self.claim_token)
         .execute(&self.db)
         .await?;
 
@@ -1013,6 +1117,7 @@ impl MigrationService {
                     OR $1 + $2 + $3
                        >= completed_items + failed_items + skipped_items
                   )
+              AND ($7::uuid IS NULL OR claim_token = $7)
             "#,
         )
         .bind(completed)
@@ -1021,6 +1126,7 @@ impl MigrationService {
         .bind(transferred_bytes)
         .bind(job_id)
         .bind(view.overwrites())
+        .bind(self.claim_token)
         .execute(&self.db)
         .await?;
 
@@ -1069,12 +1175,14 @@ impl MigrationService {
                     ELSE GREATEST(total_bytes, $2)
                 END
             WHERE id = $3 AND status NOT IN ('paused', 'cancelled')
+              AND ($5::uuid IS NULL OR claim_token = $5)
             "#,
         )
         .bind(total_items)
         .bind(total_bytes)
         .bind(job_id)
         .bind(view.overwrites())
+        .bind(self.claim_token)
         .execute(&self.db)
         .await?;
 
@@ -4327,6 +4435,7 @@ mod tests {
             crate::services::artifactory_client::ArtifactoryError,
         > {
             Ok(crate::services::artifactory_client::AqlResponse {
+                incomplete: false,
                 results: vec![],
                 range: crate::services::artifactory_client::AqlRange {
                     start_pos: offset,

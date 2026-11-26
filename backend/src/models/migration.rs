@@ -147,7 +147,17 @@ pub struct MigrationConfig {
     /// to return inaccurate digests (issue #856).
     #[serde(default = "default_true")]
     pub verify_checksums: bool,
+    /// Migrate only artifacts modified strictly after this instant. The bound
+    /// is exclusive on both Artifactory (AQL `$gt`) and Nexus sources: an
+    /// artifact modified exactly at `date_from` is not listed. When chaining
+    /// incremental runs, start the next window a little before the previous
+    /// run's `date_to` rather than exactly at it; with
+    /// `conflict_resolution: skip` the overlap costs only a duplicate check
+    /// (#6260). See `docs/migration-date-window.md`.
     pub date_from: Option<DateTime<Utc>>,
+    /// Migrate only artifacts modified strictly before this instant. Exclusive,
+    /// like `date_from` (AQL `$lt`): an artifact modified exactly at `date_to`
+    /// is left for the next window, so overlap consecutive windows (#6260).
     pub date_to: Option<DateTime<Utc>>,
 }
 

@@ -195,6 +195,11 @@ async fn depth_response(
     .fetch_optional(&state.db)
     .await
     .map_err(super::db_err)?;
+    // #6433: a proxy-cache row is served only after its sidecar is checked.
+    let artifact = proxy_helpers::vouched_row(state, repo.id, artifact, |(_, key, size, _)| {
+        proxy_helpers::ServedRowRef::new(key, Some(*size))
+    })
+    .await?;
     let (id, storage_key, size_bytes, checksum) =
         artifact.ok_or_else(|| (StatusCode::NOT_FOUND, "Package not found").into_response())?;
     crate::services::quarantine_service::check_artifact_download(&state.db, id)
@@ -1964,6 +1969,24 @@ pub(crate) async fn record_rpm_metadata_in_tx(
     repo_id: uuid::Uuid,
     metadata: &serde_json::Value,
 ) -> Result<(), sqlx::Error> {
+    write_rpm_metadata_in_tx(tx, artifact_id, metadata).await?;
+    let _ = sqlx::query("UPDATE repositories SET updated_at = NOW() WHERE id = $1")
+        .bind(repo_id)
+        .execute(&mut **tx)
+        .await;
+    Ok(())
+}
+
+/// The `artifact_metadata` half of [`record_rpm_metadata_in_tx`], without the
+/// repository `updated_at` bump: the shared upload service writes an RPM
+/// document in its commit transaction with this (#6383), and the caller bumps
+/// the timestamp after the commit, so concurrent uploads to one repository do
+/// not queue on its row while they commit.
+pub(crate) async fn write_rpm_metadata_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    artifact_id: uuid::Uuid,
+    metadata: &serde_json::Value,
+) -> Result<(), sqlx::Error> {
     sqlx::query("SAVEPOINT rpm_metadata")
         .execute(&mut **tx)
         .await?;
@@ -2004,10 +2027,6 @@ pub(crate) async fn record_rpm_metadata_in_tx(
         }
         Err(e) => return Err(e),
     }
-    let _ = sqlx::query("UPDATE repositories SET updated_at = NOW() WHERE id = $1")
-        .bind(repo_id)
-        .execute(&mut **tx)
-        .await;
     Ok(())
 }
 
@@ -2957,9 +2976,10 @@ async fn upstream_proxy(
         return Err((StatusCode::NOT_FOUND, "Not found").into_response());
     }
 
-    // Cache hit by filename: serve the local copy.
+    // Cache hit by filename: serve the local copy. #6433: a proxy-cache row
+    // nothing vouches for is a miss, fetched through the proxy below.
     if let Some(hit) =
-        proxy_helpers::find_local_by_filename_suffix(&state.db, repo.id, filename).await?
+        proxy_helpers::find_servable_local_by_filename_suffix(&state, repo.id, filename).await?
     {
         let artifact = sqlx::query!(
             "SELECT id, size_bytes, checksum_sha256, storage_key FROM artifacts WHERE id = $1",
@@ -3312,44 +3332,45 @@ async fn download_package(
 
     let filename = pkg_path.rsplit('/').next().unwrap_or(&pkg_path);
 
-    let hit =
-        match proxy_helpers::find_local_by_filename_suffix(&state.db, repo.id, filename).await? {
-            Some(a) => a,
-            None => {
-                let upstream_path = format!("packages/{}", pkg_path);
-                // #4112: scan-on-proxy, Remote and Virtual. `None` when
-                // nothing scans: the untouched path below serves.
-                if let Some(served) =
-                    serve_scanned_rpm_download(&state, auth.as_ref(), &repo, &upstream_path, &ctx)
-                        .await?
-                {
-                    return served;
-                }
-                let (default_ct, cd_filename) = if repo.repo_type == RepositoryType::Virtual {
-                    ("application/x-rpm", Some(filename))
-                } else {
-                    ("application/octet-stream", None)
-                };
-                if let Some(resp) = proxy_helpers::try_remote_or_virtual_download(
-                    &state,
-                    auth.as_ref(),
-                    &repo,
-                    &ctx,
-                    proxy_helpers::DownloadResponseOpts {
-                        upstream_path: &upstream_path,
-                        virtual_lookup: proxy_helpers::VirtualLookup::PathSuffix(filename),
-                        default_content_type: default_ct,
-                        content_disposition_filename: cd_filename,
-                        suppress_upstream_proxy: false,
-                    },
-                )
-                .await?
-                {
-                    return Ok(resp);
-                }
-                return Err((StatusCode::NOT_FOUND, "Package not found").into_response());
+    let hit = match proxy_helpers::find_servable_local_by_filename_suffix(&state, repo.id, filename)
+        .await?
+    {
+        Some(a) => a,
+        None => {
+            let upstream_path = format!("packages/{}", pkg_path);
+            // #4112: scan-on-proxy, Remote and Virtual. `None` when
+            // nothing scans: the untouched path below serves.
+            if let Some(served) =
+                serve_scanned_rpm_download(&state, auth.as_ref(), &repo, &upstream_path, &ctx)
+                    .await?
+            {
+                return served;
             }
-        };
+            let (default_ct, cd_filename) = if repo.repo_type == RepositoryType::Virtual {
+                ("application/x-rpm", Some(filename))
+            } else {
+                ("application/octet-stream", None)
+            };
+            if let Some(resp) = proxy_helpers::try_remote_or_virtual_download(
+                &state,
+                auth.as_ref(),
+                &repo,
+                &ctx,
+                proxy_helpers::DownloadResponseOpts {
+                    upstream_path: &upstream_path,
+                    virtual_lookup: proxy_helpers::VirtualLookup::PathSuffix(filename),
+                    default_content_type: default_ct,
+                    content_disposition_filename: cd_filename,
+                    suppress_upstream_proxy: false,
+                },
+            )
+            .await?
+            {
+                return Ok(resp);
+            }
+            return Err((StatusCode::NOT_FOUND, "Package not found").into_response());
+        }
+    };
 
     // RPM hit-path needs the SHA256 to emit X-Checksum-SHA256, so re-query
     // to pick up the checksum field that the lightweight helper omits.
@@ -3575,13 +3596,25 @@ async fn store_rpm(
 
     let size_bytes = content.len() as i64;
 
+    // Store RPM-specific metadata: filename-derived NEVRA enriched with the
+    // parsed RPM header (summary, license, sourcerpm, ...) so primary.xml can
+    // describe the package fully (#2588). The filename already parsed above,
+    // so the builder always yields metadata here.
+    //
+    // #6383: the document commits in the same transaction as the artifact
+    // row, on both layouts. Written after the commit with a failure only
+    // logged, a pool timeout there left a stored package out of
+    // `primary.xml`.
+    let rpm_metadata = parsed_metadata
+        .unwrap_or_else(|| build_rpm_metadata(&pkg_name, &pkg_version, &release, &arch, filename));
+
     let artifact_id = if depth > 0 {
         let storage = state
             .storage_for_repo(&repo.storage_location())
             .map_err(IntoResponse::into_response)?;
         state
             .create_artifact_service(storage)
-            .upload_with_sync_options(
+            .upload_with_commit_metadata(
                 repo.id,
                 &artifact_path,
                 &pkg_name,
@@ -3589,9 +3622,14 @@ async fn store_rpm(
                 "application/x-rpm",
                 content.clone(),
                 Some(user_id),
-                // #4889: queue after the RPM metadata write below, not before
-                // it.
+                // #4889: queue below, once the upload has committed.
                 false,
+                // #6346: registered once, below, with the header's summary.
+                crate::services::artifact_service::CatalogRegistration::Caller,
+                Some(crate::services::artifact_service::CommitMetadata {
+                    format: "rpm",
+                    metadata: rpm_metadata.clone(),
+                }),
             )
             .await
             .map_err(IntoResponse::into_response)?
@@ -3606,8 +3644,33 @@ async fn store_rpm(
         };
         let location = repo.storage_location();
         proxy_helpers::put_artifact_bytes(state, repo, &storage_key, content.clone()).await?;
-        let (id, retired) = proxy_helpers::insert_artifact_replacing(
+        let mut tx = super::publish_quota::begin_admitted_publish(
             &state.db,
+            repo.id,
+            &artifact_path,
+            size_bytes,
+        )
+        .await?;
+        let retired = if replacing {
+            crate::services::artifact_service::retire_overwritten_artifact(
+                &mut tx,
+                repo.id,
+                &location,
+                &artifact_path,
+                None,
+                crate::services::artifact_service::OverwriteReplacement {
+                    storage_key: &storage_key,
+                    checksum_sha256: &computed_sha256,
+                    uploaded_by: Some(user_id),
+                },
+            )
+            .await
+            .map_err(IntoResponse::into_response)?
+        } else {
+            None
+        };
+        let id = proxy_helpers::insert_artifact_row(
+            &mut tx,
             proxy_helpers::NewArtifact {
                 repository_id: repo.id,
                 path: &artifact_path,
@@ -3619,13 +3682,20 @@ async fn store_rpm(
                 storage_key: &storage_key,
                 uploaded_by: user_id,
             },
-            replacing.then_some(&location),
         )
         .await?;
+        write_rpm_metadata_in_tx(&mut tx, id, &rpm_metadata)
+            .await
+            .map_err(|e| proxy_helpers::internal_error("Database", e))?;
+        tx.commit()
+            .await
+            .map_err(|e| proxy_helpers::internal_error("Database", e))?;
         crate::services::artifact_service::forget_retired_artifact(
             state.search_service.as_ref(),
             retired.as_ref(),
         );
+        // As `proxy_helpers::insert_artifact` does once its row commits.
+        crate::services::quarantine_service::apply_upload_hold_hosted(&state.db, repo.id, id).await;
         // #4166: the ArtifactService branch above scans via finalize_upload;
         // this direct insert has to trigger scan-on-upload itself.
         crate::services::scanner_service::trigger_scan_on_upload(
@@ -3638,16 +3708,10 @@ async fn store_rpm(
         id
     };
 
-    // Store RPM-specific metadata: filename-derived NEVRA enriched with the
-    // parsed RPM header (summary, license, sourcerpm, ...) so primary.xml can
-    // describe the package fully (#2588). The filename already parsed above,
-    // so the builder always yields metadata here.
-    let rpm_metadata = parsed_metadata
-        .unwrap_or_else(|| build_rpm_metadata(&pkg_name, &pkg_version, &release, &arch, filename));
-
-    if let Err(e) = record_rpm_metadata(&state.db, artifact_id, repo.id, &rpm_metadata).await {
-        warn!(artifact_id = %artifact_id, error = %e, "RPM metadata could not be recorded");
-    }
+    let _ = sqlx::query("UPDATE repositories SET updated_at = NOW() WHERE id = $1")
+        .bind(repo.id)
+        .execute(&state.db)
+        .await;
 
     // `%pre`/`%post`/`%preun`/`%postun` run as root on `dnf install` (#4033).
     // Best-effort: the artifact row is already committed, and a package with

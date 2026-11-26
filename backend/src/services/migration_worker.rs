@@ -202,6 +202,16 @@ pub struct MigrationWorker {
     storage_registry: Arc<StorageRegistry>,
     config: WorkerConfig,
     cancel_token: CancellationToken,
+    /// The process shutdown token `cancel_token` was derived from. When it
+    /// fired, the run stops as `paused`, not `cancelled`, so `/resume` can
+    /// finish it on another replica (#6253).
+    shutdown_token: CancellationToken,
+    /// Fired when the worker's claim on the job row was lost: the janitor
+    /// paused the job, or another worker took it over (#6305). The spawner
+    /// also cancels `cancel_token` then, so the run stops right away; this
+    /// token tells the interruption exit not to write a status onto a row
+    /// that is no longer this worker's.
+    claim_lost: CancellationToken,
     /// Optional search backend. When present, every imported artifact is
     /// indexed into OpenSearch as it commits so migrated content is
     /// searchable/visible without waiting for a manual or startup reindex
@@ -225,8 +235,34 @@ impl MigrationWorker {
             storage_registry,
             config,
             cancel_token,
+            shutdown_token: CancellationToken::new(),
+            claim_lost: CancellationToken::new(),
             search_service: None,
         }
+    }
+
+    /// Write the job row only while it still carries `claim_token`, the
+    /// worker's claim (#6305): the progress, totals, warning and final status
+    /// writes are all guarded by it, so a worker whose job was taken over
+    /// cannot write onto the new owner's row before its claim renewal
+    /// reports the loss.
+    pub fn with_claim_token(mut self, claim_token: Option<Uuid>) -> Self {
+        self.migration_service = self.migration_service.with_claim_token(claim_token);
+        self
+    }
+
+    /// Record the token that fires when this worker's claim on the job row
+    /// is lost (#6305).
+    pub fn with_claim_lost_token(mut self, claim_lost: CancellationToken) -> Self {
+        self.claim_lost = claim_lost;
+        self
+    }
+
+    /// Record the process shutdown token the worker's `cancel_token` is a
+    /// child of (#6253).
+    pub fn with_shutdown_token(mut self, shutdown_token: CancellationToken) -> Self {
+        self.shutdown_token = shutdown_token;
+        self
     }
 
     /// Attach an OpenSearch service so imported artifacts are indexed for
@@ -785,6 +821,16 @@ impl MigrationWorker {
         )
         .await?;
 
+        // Every write below is guarded by the claim, but a worker that was
+        // taken over has nothing left to say about the job (#6305).
+        if !self.migration_service.holds_claim(job_id).await? {
+            tracing::warn!(
+                job_id = %job_id,
+                "Migration worker finished after another worker or the janitor took its claim; leaving the job row to them"
+            );
+            return Ok(());
+        }
+
         // A run that walked repositories it was asked to migrate and moved no
         // counter at all is not evidence of success. It is what a source
         // whose listing quietly returned nothing looks like from the API:
@@ -947,6 +993,17 @@ impl MigrationWorker {
         skipped: i32,
         transferred: i64,
     ) -> Result<(), MigrationError> {
+        // A job another worker took over is no longer this worker's to write
+        // to at all, counters included (#6305). The renewal's loss signal can
+        // lag the takeover by up to one renewal interval, so ask the row.
+        if !self.migration_service.holds_claim(job_id).await? {
+            tracing::warn!(
+                job_id = %job_id,
+                "Migration worker stopped: another worker or the janitor now holds its claim on the job"
+            );
+            return Ok(());
+        }
+
         // A Partial view: the run stopped part-way through enumerating, so its
         // counters describe less of the job than the row may already record.
         // They may advance the row, never replace it — publishing them
@@ -964,6 +1021,23 @@ impl MigrationWorker {
             SourceView::Partial,
         )
         .await?;
+
+        // Checked before the shutdown pause and the cancel: a lost claim means
+        // the row left `running` (the operator's status is already on it) or
+        // another owner holds it, so neither may write a status (#6305).
+        if self.claim_lost.is_cancelled() {
+            tracing::warn!(
+                job_id = %job_id,
+                "Migration worker stopped: it lost its claim on the job"
+            );
+            return Ok(());
+        }
+
+        if self.shutdown_token.is_cancelled() {
+            tracing::info!(job_id = %job_id, "Migration paused, the backend is shutting down");
+            self.migration_service.pause_running_job(job_id).await?;
+            return Ok(());
+        }
 
         if self.cancel_token.is_cancelled() {
             // An in-process token cancel leaves no trace in the database (the
@@ -1059,9 +1133,30 @@ impl MigrationWorker {
             let artifacts = client
                 .list_artifacts_with_date_filter(repo_key, offset, limit, date_from, date_to)
                 .await?;
-            pages_fetched += 1;
+            // A call the source cut short on its fetch budget (#6260) has
+            // walked its budget of upstream pages and is followed by a
+            // pause/cancel check below, so it is not a runaway: counting it
+            // would let a narrow date window over a large repository use up
+            // the guard and end the walk early while reporting success.
+            if !artifacts.incomplete {
+                pages_fetched += 1;
+            }
 
             let page_len = artifacts.results.len();
+
+            // A source that stopped on its per-call fetch budget (#6260) hands
+            // back a short or empty page that is not the end of the listing.
+            // The per-artifact pause/cancel check below never runs for an
+            // empty one, so check here: a narrow date window over a large
+            // Nexus repository can return many empty pages in a row.
+            if artifacts.incomplete {
+                if self.cancel_token.is_cancelled() || self.is_paused(job_id).await? {
+                    return Ok(RepoProcessOutcome::Interrupted);
+                }
+                if page_len == 0 {
+                    continue;
+                }
+            }
 
             if page_len == 0 {
                 break;
@@ -1110,15 +1205,6 @@ impl MigrationWorker {
                     continue;
                 }
 
-                // Dry run: report what would move and stop here. First branch
-                // in the body on purpose, ahead of every DB read/write, the
-                // download, and the storage put.
-                if self.config.dry_run {
-                    *completed += 1;
-                    *transferred += size;
-                    continue;
-                }
-
                 // Keep sha256 and sha1 separate so verification can compare
                 // each digest against the corresponding locally computed
                 // value. Picking a single "checksum" field and computing
@@ -1132,6 +1218,15 @@ impl MigrationWorker {
 
                 // Skip if already completed in THIS job (resume support within same job)
                 if self.is_item_already_completed(job_id, &source_path).await? {
+                    if artifact.possible_duplicate {
+                        // The source listed this row twice in one walk
+                        // (#6360: a Nexus asset walk past its dedupe cap).
+                        // It is one artifact, already done: take it back out
+                        // of the totals instead of counting it as skipped.
+                        *discovered -= 1;
+                        *discovered_bytes -= size;
+                        continue;
+                    }
                     *skipped += 1;
                     continue;
                 }
@@ -1150,11 +1245,7 @@ impl MigrationWorker {
                 let should_skip_duplicate = self
                     .check_artifact_duplicate(
                         keys.target.as_str(),
-                        &duplicate_lookup_path(
-                            package_type,
-                            &artifact_path,
-                            debian_component.as_deref(),
-                        ),
+                        &artifact_path,
                         &source_path,
                         &ExpectedChecksums {
                             sha256: expected_sha256.clone(),
@@ -1162,6 +1253,7 @@ impl MigrationWorker {
                         },
                         conflict_resolution,
                         package_type,
+                        debian_component.as_deref(),
                     )
                     .await?;
 
@@ -1172,14 +1264,29 @@ impl MigrationWorker {
                         "Skipping duplicate artifact (already exists with matching checksum)"
                     );
                     // #3927: repair a pre-fix import's missing Maven
-                    // coordinates instead of skipping past them.
-                    self.repair_migrated_maven_metadata(
-                        keys.target.as_str(),
-                        package_type,
-                        &artifact_path,
-                    )
-                    .await;
+                    // coordinates instead of skipping past them. A write, so
+                    // not on a dry run.
+                    if !self.config.dry_run {
+                        self.repair_migrated_maven_metadata(
+                            keys.target.as_str(),
+                            package_type,
+                            &artifact_path,
+                        )
+                        .await;
+                    }
                     *skipped += 1;
+                    continue;
+                }
+
+                // Dry run: report what would move and stop here, ahead of
+                // every DB write, the download, and the storage put. It sits
+                // after the read-only skip checks above so a dry run counts an
+                // artifact the destination already holds as skipped, the way
+                // the real run would, instead of as one it would transfer
+                // (#6196).
+                if self.config.dry_run {
+                    *completed += 1;
+                    *transferred += size;
                     continue;
                 }
 
@@ -1279,7 +1386,7 @@ impl MigrationWorker {
             // termination must be decided from the page shape, not from a
             // running total. A short page (fewer rows than `limit`) means
             // the result set is exhausted.
-            if !should_fetch_next_page(page_len, limit) {
+            if !artifacts.incomplete && !should_fetch_next_page(page_len, limit) {
                 break;
             }
 
@@ -1344,11 +1451,12 @@ impl MigrationWorker {
         let should_skip = self
             .check_artifact_duplicate(
                 keys.target.as_str(),
-                &duplicate_lookup_path(package_type, artifact_path, debian_component),
+                artifact_path,
                 source_path,
                 &expected,
                 conflict_resolution,
                 package_type,
+                debian_component,
             )
             .await?;
         // #4657: a `.deb` imported before the importer registered Debian
@@ -1786,6 +1894,7 @@ impl MigrationWorker {
     /// its referenced content is complete; otherwise it falls through so the
     /// walker can fetch the missing pieces (registered content is deduped, so
     /// genuinely-complete items stay idempotent).
+    #[allow(clippy::too_many_arguments)]
     async fn check_artifact_duplicate(
         &self,
         repo_key: &str,
@@ -1794,6 +1903,7 @@ impl MigrationWorker {
         expected: &ExpectedChecksums,
         conflict_resolution: ConflictResolution,
         package_type: &str,
+        debian_component: Option<&str>,
     ) -> Result<bool, MigrationError> {
         // Docker/OCI blobs no longer produce an `artifacts` row (they live
         // only in `oci_blobs`, matching the live push path), so their
@@ -1870,12 +1980,13 @@ impl MigrationWorker {
                 // no-op. Same rule #3533 applied to Docker/OCI manifests,
                 // reached here through the shared path helper rather than a
                 // second copy of the shape.
-                let legacy_candidate: Option<&str> =
-                    if migration_destination_path(package_type, artifact_path) == artifact_path {
-                        None
-                    } else {
-                        Some(legacy_source_path)
-                    };
+                let lookup_path =
+                    duplicate_lookup_path(package_type, artifact_path, debian_component);
+                let legacy_candidate: Option<&str> = if lookup_path == artifact_path {
+                    None
+                } else {
+                    Some(legacy_source_path)
+                };
                 sqlx::query_as(
                     r#"
                     SELECT a.checksum_sha256, a.checksum_sha1
@@ -1889,7 +2000,7 @@ impl MigrationWorker {
                     "#,
                 )
                 .bind(repo_key)
-                .bind(artifact_path)
+                .bind(&lookup_path)
                 .bind(legacy_candidate)
                 .fetch_optional(&self.db)
                 .await?
@@ -2435,6 +2546,18 @@ impl MigrationWorker {
                 use tokio::io::BufReader;
                 use tokio_util::io::ReaderStream;
 
+                // The disk usage threshold (#5191), from its cached reading:
+                // an item that would take the volume to the block threshold is
+                // not written. The job pauses at the next artifact while the
+                // volume stays blocked (`is_paused`).
+                let staged = tokio::fs::metadata(&temp_path).await.map(|m| m.len()).ok();
+                if let Some(refusal) = crate::services::quota::disk::refusal(staged) {
+                    return Err(MigrationError::StorageError(format!(
+                        "{} ({})",
+                        refusal.message,
+                        refusal.code()
+                    )));
+                }
                 let file = tokio::fs::File::open(&temp_path).await.map_err(|e| {
                     MigrationError::StorageError(format!(
                         "Failed to reopen temp file for upload: {e}"
@@ -3365,8 +3488,29 @@ impl MigrationWorker {
         Ok(())
     }
 
-    /// Check if the job has been paused via the database
+    /// Check if the job has been paused via the database.
+    ///
+    /// Also pauses a running job while the storage volume is at its disk
+    /// block threshold (#5191): the import would fill the disk, and a paused
+    /// job resumes where it stopped once space is freed (`/resume`).
     async fn is_paused(&self, job_id: Uuid) -> Result<bool, MigrationError> {
+        if crate::services::quota::disk::refusal(None).is_some() {
+            let paused = sqlx::query(
+                "UPDATE migration_jobs SET status = 'paused', error_summary = $2 \
+                 WHERE id = $1 AND status = 'running'",
+            )
+            .bind(job_id)
+            .bind(DISK_PAUSE_SUMMARY)
+            .execute(&self.db)
+            .await?;
+            if paused.rows_affected() > 0 {
+                tracing::warn!(
+                    job_id = %job_id,
+                    "migration paused: storage volume at its disk block threshold; free disk \
+                     or add storage, then resume the job"
+                );
+            }
+        }
         let status: (String,) = sqlx::query_as("SELECT status FROM migration_jobs WHERE id = $1")
             .bind(job_id)
             .fetch_one(&self.db)
@@ -3418,6 +3562,11 @@ impl MigrationWorker {
             .await
     }
 }
+
+/// The `error_summary` of a job paused at the disk block threshold (#5191).
+pub(crate) const DISK_PAUSE_SUMMARY: &str = "Paused: server storage nearly full: free disk or add \
+     storage (DISK_THRESHOLD_EXCEEDED). Resume the job once usage is below \
+     STORAGE_DISK_BLOCK_PERCENT.";
 
 /// Result of a successful artifact transfer.
 ///
@@ -3909,10 +4058,10 @@ pub(crate) fn debian_destination_path(artifact_path: &str, component: Option<&st
 }
 
 /// The path the duplicate check looks an item up under: a `.deb`'s
-/// destination (#4740), since a re-run must find a package under the
-/// component it is now filed in, and must re-import (and retire) one an
-/// earlier run stored under the wrong component. Every other item keeps its
-/// source-relative path.
+/// destination (#4740) or the destination path composed by
+/// [`migration_destination_path`] (#6197), so re-runs for formats whose
+/// stored layout differs from the source path (such as PyPI or npm) match
+/// the already-imported `artifacts.path`.
 fn duplicate_lookup_path(
     package_type: &str,
     artifact_path: &str,
@@ -3921,7 +4070,7 @@ fn duplicate_lookup_path(
     if package_type.eq_ignore_ascii_case("debian") {
         debian_destination_path(artifact_path, debian_component)
     } else {
-        artifact_path.to_string()
+        migration_destination_path(package_type, artifact_path)
     }
 }
 
@@ -4996,6 +5145,26 @@ mod tests {
         assert_eq!(
             migration_destination_path("npm", "lodash/-/lodash-4.17.21.tgz"),
             "lodash/4.17.21/lodash-4.17.21.tgz"
+        );
+    }
+
+    #[test]
+    fn test_duplicate_lookup_path_matches_destination_6197() {
+        assert_eq!(
+            duplicate_lookup_path(
+                "pypi",
+                "packages/example-pkg/1.1.0/example-pkg-1.1.0.tar.gz",
+                None,
+            ),
+            "example-pkg/1.1.0/example-pkg-1.1.0.tar.gz"
+        );
+        assert_eq!(
+            duplicate_lookup_path("npm", "lodash/-/lodash-4.17.21.tgz", None),
+            "lodash/4.17.21/lodash-4.17.21.tgz"
+        );
+        assert_eq!(
+            duplicate_lookup_path("maven", "org/ex/lib/1.0/lib-1.0.jar", None),
+            "org/ex/lib/1.0/lib-1.0.jar"
         );
     }
 
@@ -6928,7 +7097,9 @@ mod tests {
                 // One short page ends pagination; reads must use the SOURCE key.
                 assert_eq!(repo_key, "dry-src", "source must be read by source key");
                 Ok(AqlResponse {
+                    incomplete: false,
                     results: vec![AqlResult {
+                        possible_duplicate: false,
                         repo: repo_key.to_string(),
                         path: "pkg/1.0".into(),
                         name: "thing.tar.gz".into(),
@@ -7084,6 +7255,13 @@ mod tests {
         /// guard matches and only the `RepoProcessOutcome::Interrupted`
         /// propagation can stop the terminal write.
         CancelToken,
+        /// The process shutdown token the worker's token is a child of fires
+        /// mid-listing, with the job row still `running` (#6253).
+        Shutdown,
+        /// The worker's claim renewal reports the claim lost mid-listing (the
+        /// janitor or another worker took the job), and the spawner's
+        /// forwarder cancels the worker's token in response (#6305).
+        ClaimLost,
         /// The operator pauses/cancels AFTER the last per-artifact check: the
         /// mock flips the job row to this status while returning an EMPTY
         /// listing, so the repository completes cleanly and the run walks all
@@ -7104,6 +7282,10 @@ mod tests {
         /// The same token the worker under test holds, so
         /// [`MockInterrupt::CancelToken`] can fire it mid-listing.
         cancel_token: CancellationToken,
+        /// The parent of `cancel_token`, fired by [`MockInterrupt::Shutdown`].
+        shutdown_token: CancellationToken,
+        /// The worker's claim-lost token, fired by [`MockInterrupt::ClaimLost`].
+        claim_lost: CancellationToken,
     }
 
     #[async_trait::async_trait]
@@ -7142,6 +7324,7 @@ mod tests {
             match self.interrupt {
                 MockInterrupt::None => {
                     return Ok(AqlResponse {
+                        incomplete: false,
                         results: vec![],
                         range: AqlRange {
                             start_pos: offset,
@@ -7159,6 +7342,11 @@ mod tests {
                         .expect("flip job status mid-listing");
                 }
                 MockInterrupt::CancelToken => self.cancel_token.cancel(),
+                MockInterrupt::Shutdown => self.shutdown_token.cancel(),
+                MockInterrupt::ClaimLost => {
+                    self.claim_lost.cancel();
+                    self.cancel_token.cancel();
+                }
                 MockInterrupt::JobStatusOnDrain(status) => {
                     sqlx::query("UPDATE migration_jobs SET status = $1 WHERE id = $2")
                         .bind(status)
@@ -7170,6 +7358,7 @@ mod tests {
                     // for the per-artifact check to interrupt on, so the run
                     // reaches finalize_job_status with the flipped status.
                     return Ok(AqlResponse {
+                        incomplete: false,
                         results: vec![],
                         range: AqlRange {
                             start_pos: offset,
@@ -7180,7 +7369,9 @@ mod tests {
                 }
             }
             Ok(AqlResponse {
+                incomplete: false,
                 results: vec![AqlResult {
+                    possible_duplicate: false,
                     repo: repo_key.to_string(),
                     path: "pkg/1.0".into(),
                     name: "thing.tar.gz".into(),
@@ -7265,7 +7456,9 @@ mod tests {
             std::collections::HashMap::new(),
             "filesystem".to_string(),
         ));
-        let cancel_token = CancellationToken::new();
+        let shutdown_token = CancellationToken::new();
+        let cancel_token = shutdown_token.child_token();
+        let claim_lost = CancellationToken::new();
         let worker = MigrationWorker::new(
             pool.clone(),
             registry,
@@ -7274,7 +7467,9 @@ mod tests {
                 ..WorkerConfig::default()
             },
             cancel_token.clone(),
-        );
+        )
+        .with_shutdown_token(shutdown_token.clone())
+        .with_claim_lost_token(claim_lost.clone());
 
         worker
             .process_job(
@@ -7285,6 +7480,8 @@ mod tests {
                     repo_key: repo_key.clone(),
                     interrupt,
                     cancel_token,
+                    shutdown_token,
+                    claim_lost,
                 }),
                 ConflictResolution::Skip,
                 None,
@@ -7433,6 +7630,199 @@ mod tests {
         cleanup_single_repo_job(&pool, job_id, conn_id).await;
     }
 
+    /// A backend shutting down mid-job leaves the job `paused`, not
+    /// `cancelled` or `running`, so `/resume` can finish it (#6253).
+    #[tokio::test]
+    async fn test_process_job_shutdown_during_repo_pauses_the_job_6253() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let (job_id, conn_id, status, finished) =
+            run_single_repo_job(&pool, "shutdown-src", MockInterrupt::Shutdown).await;
+
+        assert_eq!(status, "paused", "a shutdown must leave the job resumable");
+        assert!(!finished, "a paused job must not be stamped finished");
+
+        cleanup_single_repo_job(&pool, job_id, conn_id).await;
+    }
+
+    /// A worker whose claim was lost stops on the cancelled token but writes
+    /// no status: the row now belongs to the janitor or to the worker that
+    /// resumed it, so stamping it `cancelled` would wreck that run (#6305).
+    #[tokio::test]
+    async fn test_process_job_claim_lost_stops_without_writing_status_6305() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let (job_id, conn_id, status, finished) =
+            run_single_repo_job(&pool, "claimlost-src", MockInterrupt::ClaimLost).await;
+
+        assert_eq!(
+            status, "running",
+            "a worker that lost its claim must leave the row to its new owner"
+        );
+        assert!(
+            !finished,
+            "a worker that lost its claim must not finish the job"
+        );
+
+        cleanup_single_repo_job(&pool, job_id, conn_id).await;
+    }
+
+    /// Hand `job_id` to another worker: `running` under a fresh claim token,
+    /// as a resume elsewhere leaves it. Returns that token.
+    async fn take_over_job(pool: &sqlx::PgPool, job_id: Uuid) -> Uuid {
+        let theirs = Uuid::new_v4();
+        sqlx::query(
+            "UPDATE migration_jobs SET status = 'running', claimed_by = 'other-pod:1:x', \
+             claim_token = $2, claim_expires_at = NOW() + interval '5 minutes' WHERE id = $1",
+        )
+        .bind(job_id)
+        .bind(theirs)
+        .execute(pool)
+        .await
+        .expect("take the job over");
+        theirs
+    }
+
+    /// The window before the renewal notices a takeover (#6305): the old
+    /// worker's final writes, each guarded by its claim token, leave the new
+    /// owner's row alone, while a service holding the row's token still
+    /// writes.
+    #[tokio::test]
+    async fn test_writes_under_a_taken_over_claim_are_rejected_6305() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (_repo, conn_id, job_id) = seed_single_repo_job(&pool, "takeover-svc").await;
+        let theirs = take_over_job(&pool, job_id).await;
+        let stale = MigrationService::new(pool.clone()).with_claim_token(Some(Uuid::new_v4()));
+
+        assert!(!stale.holds_claim(job_id).await.expect("holds_claim"));
+        assert!(!stale
+            .update_job_totals(job_id, 9, 900, SourceView::Complete)
+            .await
+            .expect("totals"));
+        assert!(!stale
+            .update_job_progress(job_id, 9, 0, 0, 900, SourceView::Complete)
+            .await
+            .expect("progress"));
+        assert!(!stale
+            .record_job_warning(job_id, "stale warning")
+            .await
+            .expect("warning"));
+        assert!(!stale
+            .finalize_job_status(job_id, MigrationJobStatus::Completed)
+            .await
+            .expect("finalize"));
+        assert!(!stale
+            .pause_running_job(job_id)
+            .await
+            .expect("shutdown pause"));
+        stale
+            .update_job_status(job_id, MigrationJobStatus::Cancelled)
+            .await
+            .expect("status");
+
+        let row: (String, bool, i32, i32, Option<String>, Option<Uuid>) = sqlx::query_as(
+            "SELECT status, finished_at IS NOT NULL, total_items, completed_items, \
+             error_summary, claim_token FROM migration_jobs WHERE id = $1",
+        )
+        .bind(job_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read job row");
+        assert_eq!(
+            row,
+            ("running".to_string(), false, 0, 0, None, Some(theirs)),
+            "a stale worker wrote onto the new owner's row"
+        );
+
+        // Control: the owner's own token still writes.
+        let owner = MigrationService::new(pool.clone()).with_claim_token(Some(theirs));
+        assert!(owner.holds_claim(job_id).await.expect("holds_claim"));
+        assert!(owner
+            .finalize_job_status(job_id, MigrationJobStatus::Completed)
+            .await
+            .expect("finalize"));
+
+        cleanup_single_repo_job(&pool, job_id, conn_id).await;
+    }
+
+    /// A worker whose job was taken over before it finished, with no loss
+    /// signal yet (the renewal has not run), still leaves the row to the new
+    /// owner instead of stamping it `completed` (#6305).
+    #[tokio::test]
+    async fn test_process_job_taken_over_before_renewal_does_not_finalize_6305() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_key, conn_id, job_id) = seed_single_repo_job(&pool, "takeover-run").await;
+        let theirs = take_over_job(&pool, job_id).await;
+
+        let staging = tempfile::tempdir().expect("tempdir");
+        let registry = Arc::new(StorageRegistry::new(
+            std::collections::HashMap::new(),
+            "filesystem".to_string(),
+        ));
+        let shutdown_token = CancellationToken::new();
+        let cancel_token = shutdown_token.child_token();
+        let worker = MigrationWorker::new(
+            pool.clone(),
+            registry,
+            WorkerConfig {
+                staging_path: staging.path().to_str().unwrap().to_string(),
+                ..WorkerConfig::default()
+            },
+            cancel_token.clone(),
+        )
+        .with_shutdown_token(shutdown_token.clone())
+        .with_claim_token(Some(Uuid::new_v4()));
+        worker
+            .process_job(
+                job_id,
+                Arc::new(InterruptingSource {
+                    pool: pool.clone(),
+                    job_id,
+                    repo_key: repo_key.clone(),
+                    interrupt: MockInterrupt::None,
+                    cancel_token,
+                    shutdown_token,
+                    claim_lost: CancellationToken::new(),
+                }),
+                ConflictResolution::Skip,
+                None,
+            )
+            .await
+            .expect("process_job must not error");
+
+        let row: (String, bool, Option<String>, Option<Uuid>) = sqlx::query_as(
+            "SELECT status, finished_at IS NOT NULL, error_summary, claim_token \
+             FROM migration_jobs WHERE id = $1",
+        )
+        .bind(job_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read job row");
+        assert_eq!(
+            row,
+            ("running".to_string(), false, None, Some(theirs)),
+            "the taken-over worker finalized the new owner's job"
+        );
+
+        let _ = sqlx::query("DELETE FROM repositories WHERE key = $1")
+            .bind(&repo_key)
+            .execute(&pool)
+            .await;
+        cleanup_single_repo_job(&pool, job_id, conn_id).await;
+    }
+
     // -----------------------------------------------------------------------
     // #3378: the job row carries a real denominator AND a real numerator
     // (DB-gated via try_pool)
@@ -7511,6 +7901,7 @@ mod tests {
         let results: Vec<AqlResult> = artifacts[start..end]
             .iter()
             .map(|(name, size)| AqlResult {
+                possible_duplicate: false,
                 repo: repo_key.to_string(),
                 path: "pkg/1.0".into(),
                 name: name.clone(),
@@ -7523,6 +7914,7 @@ mod tests {
             .collect();
 
         AqlResponse {
+            incomplete: false,
             range: AqlRange {
                 start_pos: offset,
                 end_pos: offset + limit,
@@ -7910,6 +8302,91 @@ mod tests {
                 .expect("item count");
         assert_eq!(items, 0, "a dry run must still write no migration_items");
 
+        let _ = sqlx::query("DELETE FROM repositories WHERE key = $1")
+            .bind(&repo_key)
+            .execute(&pool)
+            .await;
+        cleanup_single_repo_job(&pool, job_id, conn_id).await;
+    }
+
+    /// A dry run under `conflict_resolution: skip` previews the delta a real
+    /// run would move: an artifact the destination already holds is skipped,
+    /// not counted as one it would transfer (#6196).
+    ///
+    /// Fails-before: the dry-run branch ran ahead of the duplicate check, so
+    /// all three artifacts came back as completed (27 bytes) and none skipped.
+    ///
+    /// DB-gated via `try_pool` so it skips cleanly without `DATABASE_URL`.
+    #[tokio::test]
+    async fn test_process_job_dry_run_skips_existing_artifacts_6196() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let (repo_key, conn_id, job_id) = seed_single_repo_job(&pool, "drydup-6196").await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo_id = seed_destination_repo(&pool, &repo_key, tmp.path()).await;
+
+        // `two.tar.gz` is already in the destination.
+        sqlx::query(
+            "INSERT INTO artifacts \
+               (repository_id, path, name, size_bytes, checksum_sha256, content_type, storage_key) \
+             VALUES ($1, 'pkg/1.0/two.tar.gz', 'two.tar.gz', 8, $2, 'application/octet-stream', $3)",
+        )
+        .bind(repo_id)
+        .bind(format!("{:064x}", 2))
+        .bind(format!("{repo_key}/pkg/1.0/two.tar.gz"))
+        .execute(&pool)
+        .await
+        .expect("seed pre-existing artifact");
+
+        run_enumerating_job(
+            &pool,
+            job_id,
+            &repo_key,
+            &[("one.tar.gz", 4), ("two.tar.gz", 8), ("three.tar.gz", 15)],
+            WorkerConfig {
+                dry_run: true,
+                throttle_delay_ms: 0,
+                ..WorkerConfig::default()
+            },
+        )
+        .await;
+
+        let finished = read_job_counters(&pool, job_id).await;
+        assert_eq!(
+            (
+                finished.completed_items,
+                finished.skipped_items,
+                finished.transferred_bytes
+            ),
+            (2, 1, 19),
+            "a dry run must count the artifact already in the destination as \
+             skipped and leave its bytes out of the estimate: {finished:?}"
+        );
+        assert_eq!(finished.total_items, 3);
+
+        let items: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM migration_items WHERE job_id = $1")
+                .bind(job_id)
+                .fetch_one(&pool)
+                .await
+                .expect("item count");
+        assert_eq!(items, 0, "a dry run must still write no migration_items");
+        let artifacts: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM artifacts WHERE repository_id = $1")
+                .bind(repo_id)
+                .fetch_one(&pool)
+                .await
+                .expect("artifact count");
+        assert_eq!(artifacts, 1, "a dry run must not write artifacts");
+
+        let _ = sqlx::query("DELETE FROM artifacts WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
         let _ = sqlx::query("DELETE FROM repositories WHERE key = $1")
             .bind(&repo_key)
             .execute(&pool)
@@ -9446,6 +9923,562 @@ mod tests {
         assert_eq!(count, 1);
     }
 
+    /// A Nexus repository of plain files has no components, only assets. The
+    /// real Nexus client lists them through `/assets`, and the worker stores
+    /// each at its Nexus path in a generic repository, verified against the
+    /// sha256/sha1 Nexus advertises. A file whose advertised digest does not
+    /// match the bytes fails, so the digests really are checked.
+    #[tokio::test]
+    async fn test_nexus_component_less_assets_migrate_with_checksums() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::nexus_client::{NexusAuth, NexusClient, NexusClientConfig};
+        use wiremock::matchers::{method, path, query_param, query_param_is_missing};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (worker, storage, _tmp, repo_id, target_key) =
+            setup_repo_for_import(&pool, "mig-nexus-assets", "generic").await;
+        let (_unused_key, conn_id, job_id) = seed_single_repo_job(&pool, "mig-nexus-assets").await;
+
+        // (Nexus path, body, sha1 of the body as Nexus reports it)
+        let files: [(&str, &[u8], &str); 3] = [
+            (
+                "/fixtures/ios/fixture.json",
+                b"{\"mail\":\"ios\"}",
+                "27c590b03e18d9bbcab5f5684fd82aa249543f39",
+            ),
+            (
+                "docs/web/top.ics",
+                b"BEGIN:VCALENDAR",
+                "a6df46ec8e5798b513895443c777dba0a415e0fd",
+            ),
+            (
+                "fixtures/users/corrupt.bin",
+                b"bytes nexus did not hash",
+                "2123e63b02c25aa279da791dee2614480bb34dbb",
+            ),
+        ];
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/service/rest/v1/components"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "items": [], "continuationToken": null })),
+            )
+            .mount(&server)
+            .await;
+        let asset = |(p, body, sha1): (&str, &[u8], &str), sha256: String| {
+            serde_json::json!({
+                "id": p,
+                "format": "raw",
+                "path": p,
+                "checksum": {
+                    "sha1": sha1,
+                    "sha256": sha256,
+                    "md5": "00000000000000000000000000000000"
+                },
+                "fileSize": body.len()
+            })
+        };
+        let pages = [
+            (
+                None,
+                Some("a1"),
+                vec![asset(files[0], sha256_hex_of(files[0].1))],
+            ),
+            (
+                Some("a1"),
+                None,
+                vec![
+                    asset(files[1], sha256_hex_of(files[1].1)),
+                    asset(files[2], sha256_hex_of(b"other bytes")),
+                ],
+            ),
+        ];
+        for (token, next, items) in pages {
+            let route = Mock::given(method("GET"))
+                .and(path("/service/rest/v1/assets"))
+                .and(query_param("repository", "test-data"));
+            let route = match token {
+                Some(t) => route.and(query_param("continuationToken", t)),
+                None => route.and(query_param_is_missing("continuationToken")),
+            };
+            route
+                .respond_with(ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({ "items": items, "continuationToken": next }),
+                ))
+                .mount(&server)
+                .await;
+        }
+        for (p, body, _) in files {
+            Mock::given(method("GET"))
+                .and(path(format!(
+                    "/repository/test-data/{}",
+                    p.trim_start_matches('/')
+                )))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(body.to_vec()))
+                .mount(&server)
+                .await;
+        }
+
+        let client = NexusClient::new(NexusClientConfig {
+            base_url: server.uri(),
+            auth: NexusAuth {
+                username: "u".into(),
+                password: "p".into(),
+            },
+            throttle_delay_ms: 0,
+            ..Default::default()
+        })
+        .expect("build nexus client");
+
+        let keys = RepoKeys {
+            source: "test-data".to_string(),
+            target: target_key.clone(),
+        };
+        let (mut completed, mut failed, mut skipped, mut transferred) = (0i32, 0i32, 0i32, 0i64);
+        let (mut discovered, mut discovered_bytes) = (0i32, 0i64);
+        let outcome = worker
+            .process_repository_artifacts(
+                job_id,
+                Arc::new(client),
+                storage.clone(),
+                &keys,
+                "generic",
+                None,
+                None,
+                ConflictResolution::Skip,
+                false,
+                &mut completed,
+                &mut failed,
+                &mut skipped,
+                &mut transferred,
+                &mut discovered,
+                &mut discovered_bytes,
+                None,
+            )
+            .await
+            .expect("process the Nexus repository");
+
+        assert!(matches!(outcome, RepoProcessOutcome::Completed));
+        assert_eq!(discovered, 3, "all three component-less assets are listed");
+        assert_eq!(
+            (completed, failed, skipped),
+            (2, 1, 0),
+            "two files migrate, the one with a wrong advertised sha256 fails"
+        );
+
+        let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
+            "SELECT path, checksum_sha256, checksum_sha1 FROM artifacts \
+             WHERE repository_id = $1 AND is_deleted = false ORDER BY path",
+        )
+        .bind(repo_id)
+        .fetch_all(&pool)
+        .await
+        .expect("read migrated artifacts");
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "docs/web/top.ics".to_string(),
+                    sha256_hex_of(files[1].1),
+                    Some(files[1].2.to_string()),
+                ),
+                (
+                    "fixtures/ios/fixture.json".to_string(),
+                    sha256_hex_of(files[0].1),
+                    Some(files[0].2.to_string()),
+                ),
+            ],
+            "each file lands at its Nexus path with its digests"
+        );
+
+        sqlx::query("DELETE FROM migration_jobs WHERE id = $1")
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM source_connections WHERE id = $1")
+            .bind(conn_id)
+            .execute(&pool)
+            .await
+            .ok();
+    }
+
+    /// A Nexus whose `test-data` raw repository holds `old_pages` pages of
+    /// components modified in 2020, then one page with a single component
+    /// modified in 2026, so a `date_from` of 2025 leaves the first
+    /// `old_pages` pages empty (#6260). Returns the server and a client whose
+    /// listing calls fetch at most `budget` upstream pages each.
+    async fn windowed_nexus(
+        old_pages: usize,
+        budget: usize,
+    ) -> (
+        wiremock::MockServer,
+        crate::services::nexus_client::NexusClient,
+    ) {
+        use crate::services::nexus_client::{NexusAuth, NexusClient, NexusClientConfig};
+        use wiremock::matchers::{method, path, query_param, query_param_is_missing};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let body: &[u8] = b"new bytes";
+        let component = |n: usize, modified: &str, sha256: String| {
+            serde_json::json!({
+                "id": format!("c{n}"),
+                "repository": "test-data",
+                "format": "raw",
+                "name": format!("f{n}"),
+                "assets": [{
+                    "id": format!("a{n}"),
+                    "format": "raw",
+                    "path": format!("w/f{n}.bin"),
+                    "checksum": { "sha256": sha256 },
+                    "fileSize": body.len(),
+                    "lastModified": modified
+                }]
+            })
+        };
+        let server = MockServer::start().await;
+        for page in 0..=old_pages {
+            let items = if page < old_pages {
+                vec![component(
+                    page,
+                    "2020-01-01T00:00:00.000+00:00",
+                    "0".repeat(64),
+                )]
+            } else {
+                vec![component(
+                    page,
+                    "2026-01-01T00:00:00.000+00:00",
+                    sha256_hex_of(body),
+                )]
+            };
+            let next = (page < old_pages).then(|| format!("t{}", page + 1));
+            let route = Mock::given(method("GET"))
+                .and(path("/service/rest/v1/components"))
+                .and(query_param("repository", "test-data"));
+            let route = if page == 0 {
+                route.and(query_param_is_missing("continuationToken"))
+            } else {
+                route.and(query_param("continuationToken", format!("t{page}")))
+            };
+            route
+                .respond_with(ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({ "items": items, "continuationToken": next }),
+                ))
+                .mount(&server)
+                .await;
+        }
+        Mock::given(method("GET"))
+            .and(path("/service/rest/v1/assets"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "items": [], "continuationToken": null })),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/repository/test-data/w/f{old_pages}.bin")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.to_vec()))
+            .mount(&server)
+            .await;
+        let client = NexusClient::new(NexusClientConfig {
+            base_url: server.uri(),
+            auth: NexusAuth {
+                username: "u".into(),
+                password: "p".into(),
+            },
+            throttle_delay_ms: 0,
+            list_page_budget: budget,
+            ..Default::default()
+        })
+        .expect("build nexus client");
+        (server, client)
+    }
+
+    async fn component_requests(server: &wiremock::MockServer) -> usize {
+        server
+            .received_requests()
+            .await
+            .expect("wiremock records requests")
+            .iter()
+            .filter(|r| r.url.path() == "/service/rest/v1/components")
+            .count()
+    }
+
+    /// A Nexus listing call that stops on its page budget hands back an empty
+    /// page that is not the end of the repository (#6260). The worker must
+    /// list again rather than read it as the end, or a narrow window over a
+    /// large repository would migrate nothing.
+    #[tokio::test]
+    async fn test_nexus_budgeted_empty_pages_do_not_end_the_walk_6260() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (worker, storage, _tmp, _repo_id, target_key) =
+            setup_repo_for_import(&pool, "mig-nexus-budget", "generic").await;
+        let (_unused_key, conn_id, job_id) = seed_single_repo_job(&pool, "mig-nexus-budget").await;
+        let (server, client) = windowed_nexus(6, 2).await;
+
+        let keys = RepoKeys {
+            source: "test-data".to_string(),
+            target: target_key.clone(),
+        };
+        let (mut completed, mut failed, mut skipped, mut transferred) = (0i32, 0i32, 0i32, 0i64);
+        let (mut discovered, mut discovered_bytes) = (0i32, 0i64);
+        let outcome = worker
+            .process_repository_artifacts(
+                job_id,
+                Arc::new(client),
+                storage.clone(),
+                &keys,
+                "generic",
+                Some("2025-01-01T00:00:00+00:00"),
+                None,
+                ConflictResolution::Skip,
+                false,
+                &mut completed,
+                &mut failed,
+                &mut skipped,
+                &mut transferred,
+                &mut discovered,
+                &mut discovered_bytes,
+                None,
+            )
+            .await
+            .expect("process the windowed Nexus repository");
+
+        assert!(matches!(outcome, RepoProcessOutcome::Completed));
+        assert_eq!(
+            (discovered, completed, failed),
+            (1, 1, 0),
+            "the one in-window component behind six out-of-window pages migrates"
+        );
+        assert_eq!(
+            component_requests(&server).await,
+            7,
+            "each upstream page is still fetched exactly once"
+        );
+
+        sqlx::query("DELETE FROM migration_jobs WHERE id = $1")
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM source_connections WHERE id = $1")
+            .bind(conn_id)
+            .execute(&pool)
+            .await
+            .ok();
+    }
+
+    /// While a Nexus listing walks pages that hold nothing in the window, a
+    /// cancel must stop the job within one page budget, not after the whole
+    /// repository (#6260). The per-artifact check never runs for an empty
+    /// page, so the worker checks between budgeted calls.
+    #[tokio::test]
+    async fn test_nexus_cancel_is_seen_between_budgeted_listing_calls_6260() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (worker, storage, _tmp, _repo_id, target_key) =
+            setup_repo_for_import(&pool, "mig-nexus-cancel", "generic").await;
+        let (_unused_key, conn_id, job_id) = seed_single_repo_job(&pool, "mig-nexus-cancel").await;
+        sqlx::query("UPDATE migration_jobs SET status = 'cancelled' WHERE id = $1")
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .expect("cancel the job");
+        let (server, client) = windowed_nexus(40, 3).await;
+
+        let keys = RepoKeys {
+            source: "test-data".to_string(),
+            target: target_key.clone(),
+        };
+        let (mut completed, mut failed, mut skipped, mut transferred) = (0i32, 0i32, 0i32, 0i64);
+        let (mut discovered, mut discovered_bytes) = (0i32, 0i64);
+        let outcome = worker
+            .process_repository_artifacts(
+                job_id,
+                Arc::new(client),
+                storage.clone(),
+                &keys,
+                "generic",
+                Some("2025-01-01T00:00:00+00:00"),
+                None,
+                ConflictResolution::Skip,
+                false,
+                &mut completed,
+                &mut failed,
+                &mut skipped,
+                &mut transferred,
+                &mut discovered,
+                &mut discovered_bytes,
+                None,
+            )
+            .await
+            .expect("process the windowed Nexus repository");
+
+        assert!(matches!(outcome, RepoProcessOutcome::Interrupted));
+        assert_eq!(
+            component_requests(&server).await,
+            3,
+            "the cancel is seen after one budget of pages, not after all 41"
+        );
+        assert_eq!(completed, 0);
+
+        sqlx::query("DELETE FROM migration_jobs WHERE id = $1")
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM source_connections WHERE id = $1")
+            .bind(conn_id)
+            .execute(&pool)
+            .await
+            .ok();
+    }
+
+    /// Past the Nexus dedupe cap the asset walk lists a component's file a
+    /// second time (#6360). The worker must drop that row without counting it:
+    /// the job's totals and its skipped count describe three artifacts, not
+    /// four.
+    #[tokio::test]
+    async fn test_nexus_duplicate_past_the_dedupe_cap_is_not_counted_6360() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::nexus_client::{NexusAuth, NexusClient, NexusClientConfig};
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (worker, storage, _tmp, _repo_id, target_key) =
+            setup_repo_for_import(&pool, "mig-nexus-dupcap", "generic").await;
+        let (_unused_key, conn_id, job_id) = seed_single_repo_job(&pool, "mig-nexus-dupcap").await;
+
+        let files: [(&str, &[u8]); 3] = [
+            ("com/ex/lib/1.0/lib-1.0.jar", b"jar bytes"),
+            ("com/ex/lib/1.0/lib-1.0.pom", b"<project/>"),
+            ("docs/install.txt", b"read me"),
+        ];
+        let asset = |(p, body): (&str, &[u8])| {
+            serde_json::json!({
+                "id": p,
+                "format": "maven2",
+                "path": p,
+                "checksum": { "sha256": sha256_hex_of(body) },
+                "fileSize": body.len()
+            })
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/service/rest/v1/components"))
+            .and(query_param("repository", "test-data"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "items": [{
+                    "id": "c1", "repository": "test-data", "format": "maven2",
+                    "group": "com.ex", "name": "lib", "version": "1.0",
+                    "assets": [asset(files[0]), asset(files[1])]
+                }],
+                "continuationToken": null
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/service/rest/v1/assets"))
+            .and(query_param("repository", "test-data"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "items": [asset(files[0]), asset(files[1]), asset(files[2])],
+                "continuationToken": null
+            })))
+            .mount(&server)
+            .await;
+        for (p, body) in files {
+            Mock::given(method("GET"))
+                .and(path(format!("/repository/test-data/{p}")))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(body.to_vec()))
+                .mount(&server)
+                .await;
+        }
+        let client = NexusClient::new(NexusClientConfig {
+            base_url: server.uri(),
+            auth: NexusAuth {
+                username: "u".into(),
+                password: "p".into(),
+            },
+            throttle_delay_ms: 0,
+            // The jar is recorded; the pom is not and is listed again.
+            listed_paths_cap: 1,
+            ..Default::default()
+        })
+        .expect("build nexus client");
+
+        let keys = RepoKeys {
+            source: "test-data".to_string(),
+            target: target_key.clone(),
+        };
+        let (mut completed, mut failed, mut skipped, mut transferred) = (0i32, 0i32, 0i32, 0i64);
+        let (mut discovered, mut discovered_bytes) = (0i32, 0i64);
+        let outcome = worker
+            .process_repository_artifacts(
+                job_id,
+                Arc::new(client),
+                storage.clone(),
+                &keys,
+                "generic",
+                None,
+                None,
+                ConflictResolution::Overwrite,
+                false,
+                &mut completed,
+                &mut failed,
+                &mut skipped,
+                &mut transferred,
+                &mut discovered,
+                &mut discovered_bytes,
+                None,
+            )
+            .await
+            .expect("process the Nexus repository");
+
+        assert!(matches!(outcome, RepoProcessOutcome::Completed));
+        let bytes: i64 = files.iter().map(|(_, b)| b.len() as i64).sum();
+        assert_eq!(
+            (discovered, discovered_bytes, completed, failed, skipped),
+            (3, bytes, 3, 0, 0),
+            "three artifacts, each counted once, even with overwrite"
+        );
+        assert_eq!(
+            server
+                .received_requests()
+                .await
+                .expect("wiremock records requests")
+                .iter()
+                .filter(|r| r.url.path().starts_with("/repository/"))
+                .count(),
+            3,
+            "the duplicate row is not downloaded again"
+        );
+
+        sqlx::query("DELETE FROM migration_jobs WHERE id = $1")
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM source_connections WHERE id = $1")
+            .bind(conn_id)
+            .execute(&pool)
+            .await
+            .ok();
+    }
+
     /// End-to-end #2457 import over the Artifactory source layout: a config
     /// blob, a layer blob, and a tagged image manifest must land in the OCI
     /// index (oci_blobs + oci_tags + manifest_blob_refs) with bytes at the
@@ -9980,6 +11013,7 @@ mod tests {
                 &expected,
                 ConflictResolution::Skip,
                 "docker",
+                None,
             )
             .await
             .expect("duplicate check");
@@ -10035,6 +11069,7 @@ mod tests {
                 &expected,
                 ConflictResolution::Skip,
                 "docker",
+                None,
             )
             .await
             .expect("duplicate check after repair");
@@ -10129,6 +11164,7 @@ mod tests {
                 &index_expected,
                 ConflictResolution::Skip,
                 "docker",
+                None,
             )
             .await
             .unwrap();
@@ -10151,6 +11187,7 @@ mod tests {
                 &index_expected,
                 ConflictResolution::Skip,
                 "docker",
+                None,
             )
             .await
             .unwrap();
@@ -10172,6 +11209,7 @@ mod tests {
                 },
                 ConflictResolution::Skip,
                 "docker",
+                None,
             )
             .await
             .unwrap();
@@ -10253,6 +11291,7 @@ mod tests {
                 },
                 ConflictResolution::Skip,
                 "docker",
+                None,
             )
             .await
             .expect("duplicate check");
@@ -10305,6 +11344,7 @@ mod tests {
                 },
                 ConflictResolution::Skip,
                 "docker",
+                None,
             )
             .await
             .expect("duplicate check");
@@ -10783,6 +11823,92 @@ mod tests {
         fx.teardown().await;
     }
 
+    /// A Nexus npm tarball whose version is a numeric prerelease
+    /// (`1.1.6-4`) must land under its real package name, show in that
+    /// package's packument and download from the advertised tarball URL.
+    /// Splitting the filename at its last hyphen filed it as package
+    /// `@acme/acme-core-1.1.6` version `4`, invisible to npm.
+    #[tokio::test]
+    async fn test_npm_prerelease_import_lands_in_its_packument() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use std::io::Write;
+        let Some(fx) = tdh::Fixture::setup("local", "npm").await else {
+            return;
+        };
+        let storage: Arc<dyn StorageBackend> = Arc::new(
+            crate::storage::filesystem::FilesystemStorage::new(fx.storage_dir.to_str().unwrap()),
+        );
+        let worker = MigrationWorker::new(
+            fx.pool.clone(),
+            Arc::new(StorageRegistry::new(
+                std::collections::HashMap::new(),
+                "filesystem".to_string(),
+            )),
+            WorkerConfig::default(),
+            CancellationToken::new(),
+        );
+
+        let package_json = br#"{"name":"@acme/acme-core","version":"1.1.6-4"}"#;
+        let mut tar_buf = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_buf);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(package_json.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, "package/package.json", &package_json[..])
+                .unwrap();
+            builder.finish().unwrap();
+        }
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gz.write_all(&tar_buf).unwrap();
+        let body = bytes::Bytes::from(gz.finish().unwrap());
+
+        let path = "@acme/acme-core/-/acme-core-1.1.6-4.tgz";
+        let mut files = std::collections::HashMap::new();
+        files.insert(path.to_string(), body.clone());
+        transfer_one(&worker, &storage, &files, &fx.repo_key, "npm", path)
+            .await
+            .expect("npm transfer must succeed");
+
+        let (name, version): (String, Option<String>) = sqlx::query_as(
+            "SELECT name, version FROM artifacts WHERE repository_id = $1 AND is_deleted = false",
+        )
+        .bind(fx.repo_id)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("one artifact row");
+        assert_eq!(name, "@acme/acme-core");
+        assert_eq!(version.as_deref(), Some("1.1.6-4"));
+
+        let router = fx.router_with_auth(crate::api::handlers::npm::router());
+        let (status, packument) = tdh::send(
+            router,
+            tdh::get(format!("/{}/@acme%2Facme-core", fx.repo_key)),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK, "packument");
+        let packument: serde_json::Value = serde_json::from_slice(&packument).unwrap();
+        let tarball = packument["versions"]["1.1.6-4"]["dist"]["tarball"]
+            .as_str()
+            .unwrap_or_else(|| panic!("1.1.6-4 missing from the packument: {packument}"));
+        let repo_prefix = format!("/{}/", fx.repo_key);
+        let tarball_path = &tarball[tarball.find(&repo_prefix).expect("repo in tarball URL")..];
+        assert_eq!(
+            tarball_path,
+            format!("/{}/{}", fx.repo_key, path),
+            "the advertised tarball URL is the npm registry path"
+        );
+
+        let router = fx.router_with_auth(crate::api::handlers::npm::router());
+        let (status, served) = tdh::send(router, tdh::get(tarball_path.to_string())).await;
+        assert_eq!(status, axum::http::StatusCode::OK, "tarball download");
+        assert_eq!(&served[..], &body[..]);
+
+        fx.teardown().await;
+    }
+
     /// Repair on re-run, the way #3533 repairs a pre-fix Docker import: a
     /// legacy `<repo_key>/<path>` row must NOT count as a duplicate of the
     /// canonical `<path>` row (otherwise "re-run the migration" is a silent
@@ -10838,6 +11964,7 @@ mod tests {
                     &expected,
                     ConflictResolution::Skip,
                     "generic",
+                    None,
                 )
                 .await
                 .expect("duplicate check"),
@@ -10896,6 +12023,7 @@ mod tests {
                     &expected,
                     ConflictResolution::Skip,
                     "generic",
+                    None,
                 )
                 .await
                 .expect("duplicate check"),
@@ -11519,6 +12647,7 @@ mod tests {
             let results: Vec<AqlResult> = self.files[start..end]
                 .iter()
                 .map(|(dir, name)| AqlResult {
+                    possible_duplicate: false,
                     repo: repo_key.to_string(),
                     path: (*dir).to_string(),
                     name: (*name).to_string(),
@@ -11531,6 +12660,7 @@ mod tests {
                 .collect();
             let page = results.len() as i64;
             Ok(AqlResponse {
+                incomplete: false,
                 results,
                 range: AqlRange {
                     start_pos: offset,
@@ -11963,6 +13093,66 @@ mod tests {
         // Once registered, a further re-run skips it as before.
         let again = run().await;
         assert_eq!((again.0, again.1, again.2), (0, 0, 1));
+
+        cleanup_repo(&pool, repo_id).await;
+    }
+
+    /// #6197: formats whose stored destination path differs from the source
+    /// path (e.g. Nexus PyPI `packages/<name>/<ver>/<file>` stored as
+    /// `<name>/<ver>/<file>`) must still match in `check_artifact_duplicate`
+    /// under `ConflictResolution::Skip`.
+    #[tokio::test]
+    async fn test_pypi_reimport_skips_with_conflict_resolution_skip_6197() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (worker, storage, _tmp, repo_id, repo_key) =
+            setup_repo_for_import(&pool, "mig6197-pypi", "pypi").await;
+        let source_rel = "packages/example-pkg/1.1.0/example-pkg-1.1.0.tar.gz";
+        let body = bytes::Bytes::from_static(b"pypi-sdist-payload");
+        let body_hex = sha256_hex_of(&body);
+        let mut files = std::collections::HashMap::new();
+        files.insert(source_rel.to_string(), body.clone());
+
+        transfer_one(&worker, &storage, &files, &repo_key, "pypi", source_rel)
+            .await
+            .expect("first import");
+
+        let keys = RepoKeys {
+            source: repo_key.clone(),
+            target: repo_key.clone(),
+        };
+        let mut counters = (0i32, 0i32, 0i32, 0i64);
+        worker
+            .process_single_artifact(
+                Uuid::new_v4(),
+                Arc::new(MapSource { files }),
+                storage,
+                &keys,
+                "pypi",
+                source_rel,
+                &build_source_path(&repo_key, source_rel),
+                body.len() as i64,
+                ExpectedChecksums {
+                    sha256: Some(body_hex),
+                    sha1: None,
+                },
+                ConflictResolution::Skip,
+                false,
+                &mut counters.0,
+                &mut counters.1,
+                &mut counters.2,
+                &mut counters.3,
+                None,
+            )
+            .await
+            .expect("process_single_artifact");
+        assert_eq!(
+            (counters.0, counters.1, counters.2),
+            (0, 0, 1),
+            "re-running with ConflictResolution::Skip must skip existing rewritten-path artifacts"
+        );
 
         cleanup_repo(&pool, repo_id).await;
     }
@@ -12695,6 +13885,61 @@ mod tests {
     /// worker can observe. If someone later makes the in-process token real
     /// (a registry of running workers, per the issue's second option), the
     /// token assertion here fails and points at this exit.
+    /// #5191: at the disk block threshold a running import pauses (resumable,
+    /// with a summary naming the cause) instead of filling the volume.
+    #[tokio::test]
+    async fn test_a_blocked_disk_pauses_the_running_job_5191() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_key, conn_id, job_id) = seed_single_repo_job(&pool, "disk-5191").await;
+        sqlx::query("UPDATE migration_jobs SET status='running', started_at=NOW() WHERE id=$1")
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .expect("running");
+        let staging = tempfile::tempdir().expect("tempdir");
+        let registry = Arc::new(StorageRegistry::new(
+            std::collections::HashMap::new(),
+            "filesystem".to_string(),
+        ));
+        let worker = MigrationWorker::new(
+            pool.clone(),
+            registry,
+            WorkerConfig {
+                staging_path: staging.path().to_str().unwrap().to_string(),
+                ..WorkerConfig::default()
+            },
+            CancellationToken::new(),
+        );
+
+        crate::services::quota::disk::block_for_tests(false);
+        assert!(
+            !worker.is_paused(job_id).await.unwrap(),
+            "not blocked: runs on"
+        );
+        crate::services::quota::disk::block_for_tests(true);
+        assert!(
+            worker.is_paused(job_id).await.unwrap(),
+            "blocked: the job stops"
+        );
+        crate::services::quota::disk::block_for_tests(false);
+        assert_eq!(
+            worker.job_status(job_id).await.unwrap().as_deref(),
+            Some("paused")
+        );
+        assert_eq!(
+            read_error_summary(&pool, job_id).await.as_deref(),
+            Some(DISK_PAUSE_SUMMARY)
+        );
+        let _ = sqlx::query("DELETE FROM repositories WHERE key = $1")
+            .bind(&repo_key)
+            .execute(&pool)
+            .await;
+        cleanup_single_repo_job(&pool, job_id, conn_id).await;
+    }
+
     #[tokio::test]
     async fn test_the_real_api_cancel_is_what_the_worker_observes_3498() {
         use crate::api::handlers::test_db_helpers as tdh;

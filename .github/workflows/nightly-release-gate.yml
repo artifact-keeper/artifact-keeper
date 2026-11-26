@@ -43,16 +43,15 @@ name: Nightly Release Gate
 # THE SELF-HOSTED POOL, AND WHY A CANDIDATE ALWAYS WINS
 #   The gate's cluster jobs run on ak-e2e-runners, which fit one full gate at
 #   a time. A candidate is release work; the nightly is advisory.
-#   * Schedule: 08:00 UTC. Over the last 55 candidates (2026-09-08 to
-#     2026-11-16) the 08:00-12:00 UTC window held 3 dispatches, the fewest of
-#     any four hours (01:00-08:00 held 25), and it is clear of every other
-#     scheduled user of the pool: cache-correctness-e2e (Mon 04:00),
-#     concurrency-e2e (Mon 06:00) and Docker Publish's rebuild (Mon/Thu
-#     05:23). It is 03:00 US Eastern, after the day's merges.
+#   * Target window: 08:00-12:00 UTC. Over the last 55 candidates
+#     (2026-09-08 to 2026-11-16) it held 3 dispatches, the fewest of any
+#     four hours (01:00-08:00 held 25). It is 03:00 US Eastern, after the
+#     day's merges. See WHEN IT RUNS for how the triggers aim at it.
 #   * Lines run one after another (max-parallel: 1), so the nightly never
 #     loads the pool more than one candidate does.
-#   * Before the gate: `resolve` skips the night when a Release Candidate is
-#     queued, waiting or running (nightly-gate-sentinel.sh --once).
+#   * Before the gate: `resolve` skips the trigger when a Release Candidate
+#     is queued, waiting or running (nightly-gate-sentinel.sh --once). A later
+#     trigger the same night tries again (WHEN IT RUNS).
 #   * During the gate: the `sentinel` jobs poll for a Release Candidate every
 #     3 minutes and, as soon as one exists, CANCEL this run. The gate's
 #     teardown and cleanup are `if: always()`, so they still run and leave no
@@ -64,10 +63,8 @@ name: Nightly Release Gate
 #     deliberately NOT shared with release-candidate.yml, whose group is per
 #     commit (`release-candidate-<sha>`): a shared group would make a
 #     candidate wait for the nightly, which is the wrong way round, and
-#     GitHub groups have no priority. The candidate cannot cancel the nightly
-#     itself either: a maintenance line's candidate requires its
-#     release-candidate.yml to be byte-identical to main's, so touching that
-#     file costs a forward-port on every line. Hence the sentinel: the
+#     GitHub groups have no priority. Nor does the candidate cancel the
+#     nightly: the sentinel keeps that logic out of the candidate's file. The
 #     nightly yields, the candidate does nothing.
 #
 # TRACKING ISSUES (scripts/ci/nightly-gate-report.js)
@@ -100,12 +97,33 @@ name: Nightly Release Gate
 #   A red lane turns the nightly run red even when the gate is green: read
 #   the per-job results (or the issues), not the run's conclusion.
 #
-# NIGHTLY TIMELINE (UTC). 08:00 start; one line of the full gate took
-#   73-114 min across the 2026-11-16 candidates, so main and 1.11.x end by
-#   about 10:30-12:00; the s3 lane adds at most about an hour (budget 60
-#   min). Done by about 13:00 UTC, before 09:00 US Eastern. A 3-hour gate line (the 2026-11-10 worst case) pushes
-#   the end to about 15:00: the lanes then finish into the morning, which
-#   costs nothing but a busy pool.
+# WHEN IT RUNS (#6155). GitHub starts this repository's scheduled workflows
+#   hours late. The old single `0 8 * * *` started at 17:20, 16:55, 17:00,
+#   16:39 and 15:52 UTC on 2026-11-17..21 (7h52m-9h20m late; the 17th was
+#   late, not dropped), and the weekly crons (cache-correctness-e2e,
+#   concurrency-e2e, Docker Publish's rebuild) were 7-9 hours late as well.
+#   Moving the minute off :00 does not change that. So the start is no
+#   longer left to one trigger:
+#   * Three triggers, 23:17, 03:17 and 07:17 UTC. At the lag measured above
+#     the first lands at about 07:00-08:40 UTC, in the target window; if
+#     GitHub catches up it lands at 23:17 UTC instead, which costs nothing
+#     but a busier pool (a candidate still wins).
+#   * The first trigger that gets through `resolve` runs the gate; a later
+#     one skips once a gate has been REPORTED in the last 12 hours
+#     (scripts/ci/nightly-gate-once.sh). A trigger GitHub drops, one skipped
+#     because a candidate held the pool, or one a candidate pre-empted, is
+#     therefore retried by the next trigger instead of losing the night.
+#     The window keeps a 4-hour margin either way: one night's triggers span
+#     8 hours, and the next night's first is 16 hours after its last.
+#   * Each scheduled run's `resolve` summary prints how late it started, so
+#     a change in the lag shows up there (and as a missing
+#     `release-gate/nightly` status in release preflight check 8).
+#   Duration: a whole night (main, then 1.11.x, then the s3 lane) took
+#   52-71 min on 2026-11-17..21; one line of the gate alone took 73-114 min
+#   across the 2026-11-16 candidates, so a slow night runs about 4 hours.
+#   From a 07:00-08:40 start that is done by about 08:00-12:30 UTC.
+#   A backstop trigger that has to run the gate (the first one was dropped
+#   or skipped) starts about 4 or 8 hours later.
 #
 # RE-RUNS. As for a candidate (#3774), "Re-run failed jobs" cannot re-run the
 # gate: its deploy job's first-attempt outputs are replayed and every suite
@@ -120,8 +138,13 @@ name: Nightly Release Gate
 # ══════════════════════════════════════════════════════════════════════════════
 
 on:
+  # Three triggers, four hours apart; the first to arrive runs the gate and
+  # the later two skip in `resolve` (scripts/ci/nightly-gate-once.sh). See
+  # WHEN IT RUNS in the header for the times and why there are three.
   schedule:
-    - cron: '0 8 * * *'
+    - cron: '17 23 * * *'
+    - cron: '17 3 * * *'
+    - cron: '17 7 * * *'
   workflow_dispatch:
     inputs:
       lines:
@@ -240,9 +263,24 @@ jobs:
       - name: Fetch the maintenance lines
         run: git fetch --no-tags origin '+refs/heads/release/*:refs/remotes/origin/release/*'
 
+      # Scheduled runs only: the later triggers of a night are backstops and
+      # skip once one trigger has reported a gate (#6155). A dispatch always
+      # runs. Also logs how late GitHub started this trigger.
+      - name: Run the gate once a night
+        id: once
+        if: github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ONCE_REPO: ${{ github.repository }}
+          ONCE_RUN_ID: ${{ github.run_id }}
+          ONCE_CRON: ${{ github.event.schedule }}
+        run: |
+          rc=0; scripts/ci/nightly-gate-once.sh || rc=$?
+          [[ "$rc" -eq 3 ]] || exit 0
+
       - name: Give way to a release candidate in flight
         id: outranked
-        if: inputs.self_test_run == ''
+        if: inputs.self_test_run == '' && steps.once.outputs.already != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           SENTINEL_REPO: ${{ github.repository }}
@@ -254,7 +292,7 @@ jobs:
           echo "A release candidate is in flight; it runs the same gate on the same pool and outranks the nightly." >> "$GITHUB_STEP_SUMMARY"
 
       - name: Checkout the gate's tests (artifact-keeper-test@main)
-        if: steps.outranked.outputs.outranked != 'true'
+        if: steps.once.outputs.already != 'true' && steps.outranked.outputs.outranked != 'true'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: artifact-keeper/artifact-keeper-test
@@ -264,7 +302,7 @@ jobs:
 
       - name: Resolve each line's image and tests ref
         id: lines
-        if: steps.outranked.outputs.outranked != 'true'
+        if: steps.once.outputs.already != 'true' && steps.outranked.outputs.outranked != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           GHCR_TOKEN: ${{ github.token }}
@@ -314,9 +352,10 @@ jobs:
     permissions:
       contents: read
       packages: read
-    # Still @main, like release-candidate.yml: the nightly measures the gate a
-    # candidate would run today.
-    uses: artifact-keeper/artifact-keeper-test/.github/workflows/release-gate.yml@main
+    # The same artifact-keeper-test sha as release-candidate.yml (#6170): the
+    # nightly measures the gate a candidate would run today, so a bump moves
+    # both together. scripts/ci/check-gate-workflow-pins.sh enforces it.
+    uses: artifact-keeper/artifact-keeper-test/.github/workflows/release-gate.yml@1c4552bd7ef12cbc05541f18dbba5868c4444b5b # artifact-keeper-test main as of 2026-11-19
     with:
       backend_tag: sha-${{ matrix.short }}
       backend_digest: ${{ matrix.digest }}
@@ -451,7 +490,8 @@ jobs:
     permissions:
       contents: read
       packages: read
-    uses: artifact-keeper/artifact-keeper-test/.github/workflows/nightly-s3-formats.yml@main
+    # Same pinned sha as the gate above (#6170).
+    uses: artifact-keeper/artifact-keeper-test/.github/workflows/nightly-s3-formats.yml@1c4552bd7ef12cbc05541f18dbba5868c4444b5b # artifact-keeper-test main as of 2026-11-19
     with:
       backend_tag: sha-${{ needs.resolve.outputs.main_short }}
       backend_digest: ${{ needs.resolve.outputs.main_digest }}

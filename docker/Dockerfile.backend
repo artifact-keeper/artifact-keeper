@@ -11,6 +11,19 @@ FROM registry.access.redhat.com/ubi9/ubi:9.8 AS rust-base
 # dead weight. scripts/ci/check-toolchain-pin.sh does not cover Dockerfiles.
 ARG RUST_VERSION=1.98.0
 ARG PROTOC_VERSION=36.1
+# Build tools at exact versions, so the builder stage is reproducible (#6180).
+# cargo-chef is installed from crates.io with its own lockfile (`--locked`);
+# >= 0.1.32 accepts `cook --locked`. cargo-auditable is the upstream release's
+# prebuilt static (musl) binary, pinned by sha256 per architecture: compiling it
+# here cost ~4 minutes of every cold image build. CARGO_AUDITABLE_VERSION must
+# match release.yml's and release-cli-caches.yml's `cargo-auditable@` pin, so
+# the image binary and the release tarballs embed their dependency graph with
+# the same tool. Refresh both sums when the version moves, from the release's
+# cargo-auditable-<arch>-unknown-linux-musl.tar.xz.sha256 assets.
+ARG CARGO_CHEF_VERSION=0.1.78
+ARG CARGO_AUDITABLE_VERSION=0.7.7
+ARG CARGO_AUDITABLE_SHA256_X86_64=7676443367c5e33d9fb22acef63cccb5e9202de12dae1b0579995eb3e2bc7a18
+ARG CARGO_AUDITABLE_SHA256_AARCH64=c324af56990601354bbf40080f582ba46f8ec8b807a1388e25bb7e429d285c18
 
 # sha256 of the protoc release assets, per architecture. Fetching over HTTPS
 # authenticates the host, not the bytes; these pin the bytes. Refresh both when
@@ -22,12 +35,12 @@ ARG PROTOC_SHA256_AARCH64=237a68856edf1bd28b6204bddd0596c1cf46d298bc29c620012540
 RUN dnf install -y --nodocs \
     gcc gcc-c++ make pkg-config perl-core \
     openssl-devel zlib-devel xz-devel bzip2-devel \
-    unzip \
+    unzip xz \
     && dnf clean all && \
     ARCH=$(uname -m) && \
     case "$ARCH" in \
-      x86_64)  PROTOC_ARCH="linux-x86_64";   PROTOC_SHA256="${PROTOC_SHA256_X86_64}" ;; \
-      aarch64) PROTOC_ARCH="linux-aarch_64"; PROTOC_SHA256="${PROTOC_SHA256_AARCH64}" ;; \
+      x86_64)  PROTOC_ARCH="linux-x86_64";   PROTOC_SHA256="${PROTOC_SHA256_X86_64}";  AUDITABLE_SHA256="${CARGO_AUDITABLE_SHA256_X86_64}" ;; \
+      aarch64) PROTOC_ARCH="linux-aarch_64"; PROTOC_SHA256="${PROTOC_SHA256_AARCH64}"; AUDITABLE_SHA256="${CARGO_AUDITABLE_SHA256_AARCH64}" ;; \
       *)       echo "Unsupported architecture: $ARCH" && exit 1 ;; \
     esac && \
     curl --proto '=https' --tlsv1.2 -sSfL "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-${PROTOC_ARCH}.zip" \
@@ -36,7 +49,14 @@ RUN dnf install -y --nodocs \
     unzip -q /tmp/protoc.zip -d /usr/local && rm /tmp/protoc.zip && \
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain ${RUST_VERSION} && \
     . "$HOME/.cargo/env" && \
-    cargo install cargo-chef --locked
+    cargo install cargo-chef --locked --version "${CARGO_CHEF_VERSION}" && \
+    AUDITABLE_DIR="cargo-auditable-${ARCH}-unknown-linux-musl" && \
+    curl --proto '=https' --tlsv1.2 -sSfL "https://github.com/rust-secure-code/cargo-auditable/releases/download/v${CARGO_AUDITABLE_VERSION}/${AUDITABLE_DIR}.tar.xz" \
+      -o /tmp/cargo-auditable.tar.xz && \
+    echo "${AUDITABLE_SHA256}  /tmp/cargo-auditable.tar.xz" | sha256sum -c - && \
+    tar -xJf /tmp/cargo-auditable.tar.xz -C /root/.cargo/bin --strip-components=1 "${AUDITABLE_DIR}/cargo-auditable" && \
+    rm /tmp/cargo-auditable.tar.xz && \
+    cargo auditable --version
 ENV PATH="/root/.cargo/bin:${PATH}"
 
 # ---------- Stage 1: Plan dependencies ----------
@@ -88,11 +108,13 @@ ARG CARGO_PROFILE=release
 # also run on 64 KiB-page arm64 kernels (RHEL's kernel-64k, NVIDIA Grace), so
 # aarch64 builds jemalloc for 64 KiB pages, which also works on 4 KiB kernels.
 # The builder stage sets the same value; a mismatch rebuilds jemalloc there.
+# `--locked` here and on the build below (#6180): the image is built from the
+# committed Cargo.lock, the one `cargo audit` checked, or not at all.
 RUN if [ "$(uname -m)" = aarch64 ]; then export JEMALLOC_SYS_WITH_LG_PAGE=16; fi && \
     if [ -n "$CARGO_FEATURES" ]; then \
-      cargo chef cook --profile "$CARGO_PROFILE" --features "$CARGO_FEATURES" --recipe-path recipe.json; \
+      cargo chef cook --locked --profile "$CARGO_PROFILE" --features "$CARGO_FEATURES" --recipe-path recipe.json; \
     else \
-      cargo chef cook --profile "$CARGO_PROFILE" --recipe-path recipe.json; \
+      cargo chef cook --locked --profile "$CARGO_PROFILE" --recipe-path recipe.json; \
     fi
 
 # ---------- Stage 3: Build binary ----------
@@ -106,7 +128,6 @@ COPY backend ./backend
 ARG GIT_SHA=unknown
 # Same allocator as the deps stage above (#5130); the two must match.
 ARG CARGO_FEATURES="jemalloc"
-ARG APP_VERSION=""
 # Same cap as the deps stage above.
 ARG CARGO_BUILD_JOBS=8
 # Same profile as the deps stage above; the two must match or the cooked
@@ -116,15 +137,23 @@ ENV SQLX_OFFLINE=true
 ENV GIT_SHA=${GIT_SHA}
 ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
 # Same jemalloc page size as the deps stage above.
+#
+# `cargo auditable build` (#6180) embeds the resolved dependency graph in the
+# binary (`.dep-v0`, which survives `strip = true`), as the release tarballs do,
+# so `cargo audit bin`, Trivy and Syft can list the crates in
+# /usr/local/bin/artifact-keeper. It only wraps the workspace crates' rustc, so
+# the dependencies cooked above are reused unchanged.
+#
+# The version the binary reports is the committed Cargo.toml's. This stage used
+# to rewrite Cargo.toml from an APP_VERSION build arg on tag builds; with
+# `--locked` that fails whenever the tag differs from the committed version, and
+# the certified sha-<sha> images never ran it, so it could only make a tag build
+# differ from what was certified. The release-prep PR sets the version.
 RUN if [ "$(uname -m)" = aarch64 ]; then export JEMALLOC_SYS_WITH_LG_PAGE=16; fi && \
-    if [ -n "${APP_VERSION}" ]; then \
-      CLEAN_VERSION=$(echo "${APP_VERSION}" | sed 's/^v//'); \
-      sed -i "s/^version = \".*\"/version = \"${CLEAN_VERSION}\"/" Cargo.toml; \
-    fi && \
     if [ -n "$CARGO_FEATURES" ]; then \
-      cargo build --profile "$CARGO_PROFILE" --features "$CARGO_FEATURES" --bin artifact-keeper; \
+      cargo auditable build --locked --profile "$CARGO_PROFILE" --features "$CARGO_FEATURES" --bin artifact-keeper; \
     else \
-      cargo build --profile "$CARGO_PROFILE" --bin artifact-keeper; \
+      cargo auditable build --locked --profile "$CARGO_PROFILE" --bin artifact-keeper; \
     fi
 
 # ---------- Stage 4: Build minimal rootfs ----------
@@ -643,8 +672,8 @@ RUN set -eu; \
 # version anchore/grype v0.121.3 pins itself (see grype-bin), so this stays the
 # Go team's own fix release rather than a version of our choosing. The grype
 # x/net block this override's reasoning was modelled on is retired by the same
-# change (see its tombstone in grype-bin), so this is now the only dependency
-# override in the image.
+# change (see its tombstone in grype-bin), so this was then the only dependency
+# override in the image (the containerd override below, #6394, is the second).
 #
 # MVS consequences, measured 2026-11-09 on the v0.33.1 tree: the declared set
 # is still the same seven golang.org/x modules, now landing one step further on:
@@ -662,17 +691,50 @@ RUN set -eu; \
 # grype-bin. Going back to copying moby/buildkit's binary is NOT the removal
 # condition: the stdlib half of this finding is the half no tag bump can fix,
 # which is the whole lesson of #3352.
+#
+# CONTAINERD OVERRIDE v2.3.6 -> v2.3.7 (2026-11-20, #6394). Docker Publish's
+# gate failed on main from at least a5ed1433 (run 44839775004) with one HIGH,
+# fixed finding against usr/local/bin/buildctl:
+#   github.com/containerd/containerd/v2 v2.3.6  CVE-2026-95839
+#     fixed in 2.2.10, 2.3.7, 2.4.2 (image-triggered daemon crash via a
+#     malformed digest in a subject-annotated descriptor)
+# Lever 1, the tag move #4780 used, does not reach it on this line: v0.33.1
+# is still the newest v0.33.x release, and it vendors v2.3.6. v0.34.2,
+# v0.35.0 and v0.35.1 vendor v2.4.2, but they are minor releases, which this
+# stage does not take for a CVE fix (see the v0.34.0 note above). So, as for
+# x/net, the fix is an override to containerd's own patch release on the line
+# upstream already ships: v2.3.7 is the containerd project's fix for this
+# advisory on the 2.3 branch. REACHABILITY: buildctl links containerd's
+# client-side packages (content, images, remotes, platforms) for pushing and
+# exporting images; the advisory names the daemon, which buildctl is not, so
+# we do not claim a reachable path. The gate is not reachability-aware, so the
+# finding blocks the publish either way.
+#
+# MVS consequences, measured 2026-11-20 on the v0.33.1 tree after the x/net
+# override: none. `go get github.com/containerd/containerd/v2@v2.3.7` moves
+# only that module, so the declared set in the guard gains exactly it.
+# CONTAINERD_MIN rises to v2.3.7 with it, so the build-info floor now also
+# covers CVE-2026-95839.
+#
+# REMOVAL CONDITION for the containerd override: delete it, and the
+# CONTAINERD_FROM/CONTAINERD_TO ARGs (keep CONTAINERD_MIN), when
+# BUILDKIT_VERSION moves to a release whose go.mod pins
+# github.com/containerd/containerd/v2 >= v2.3.7 (v0.34.2 and later do):
+#   git show <tag>:go.mod | grep containerd/containerd/v2
+# The guard fails the build when the source stops pinning ${CONTAINERD_FROM}.
 FROM --platform=$BUILDPLATFORM golang:1.27-alpine AS buildkit-bin
 ARG TARGETOS
 ARG TARGETARCH
 ARG BUILDKIT_VERSION=0.33.1
 ARG BUILDKIT_COMMIT=8c91502cf280bd70a0c50912ce251c46a8881d9f
 ARG GO_MIN_PATCH=1.27.3
-# The one declared divergence from upstream buildkit at this tag.
+# The two declared divergences from upstream buildkit at this tag.
 ARG XNET_FROM=v0.58.0
 ARG XNET_TO=v0.62.0
-# Floor for the vendored containerd (#4780), asserted on the build info below.
-ARG CONTAINERD_MIN=v2.3.6
+ARG CONTAINERD_FROM=v2.3.6
+ARG CONTAINERD_TO=v2.3.7
+# Floor for the vendored containerd (#4780, #6394), asserted on the build info below.
+ARG CONTAINERD_MIN=v2.3.7
 
 RUN apk add --no-cache git ca-certificates
 
@@ -713,19 +775,34 @@ RUN set -eu; \
       echo "ERROR: override did not take: go.mod pins golang.org/x/net ${got}." >&2; \
       exit 1; \
     fi; \
+    ctrd_pin() { sed -n 's|^[[:space:]]*github\.com/containerd/containerd/v2 \(v[^ ]*\).*|\1|p' go.mod | head -n1; }; \
+    have="$(ctrd_pin)"; \
+    if [ "${have}" != "${CONTAINERD_FROM}" ]; then \
+      echo "ERROR: buildkit v${BUILDKIT_VERSION} pins github.com/containerd/containerd/v2 ${have}, not ${CONTAINERD_FROM}." >&2; \
+      echo "       This override was written against ${CONTAINERD_FROM}. If upstream now" >&2; \
+      echo "       ships >= ${CONTAINERD_TO}, DELETE the containerd override in this stage." >&2; \
+      echo "       If it moved to some other version, re-review it." >&2; \
+      exit 1; \
+    fi; \
+    go get "github.com/containerd/containerd/v2@${CONTAINERD_TO}"; \
+    got="$(ctrd_pin)"; \
+    if [ "${got}" != "${CONTAINERD_TO}" ]; then \
+      echo "ERROR: override did not take: go.mod pins github.com/containerd/containerd/v2 ${got}." >&2; \
+      exit 1; \
+    fi; \
     moved="$(git --no-pager diff --unified=0 go.mod \
              | sed -n 's|^+[[:space:]]*\([^ ]*\) v.*|\1|p' | sort -u | tr '\n' ' ')"; \
-    expected="golang.org/x/crypto golang.org/x/mod golang.org/x/net golang.org/x/sync golang.org/x/sys golang.org/x/term golang.org/x/text "; \
+    expected="github.com/containerd/containerd/v2 golang.org/x/crypto golang.org/x/mod golang.org/x/net golang.org/x/sync golang.org/x/sys golang.org/x/term golang.org/x/text "; \
     if [ "${moved}" != "${expected}" ]; then \
       echo "ERROR: go get moved an undeclared set of modules." >&2; \
       echo "       expected: ${expected}" >&2; \
       echo "       actual:   ${moved}" >&2; \
-      echo "       Re-review the x/net override and update the declared set." >&2; \
+      echo "       Re-review the x/net and containerd overrides and update the declared set." >&2; \
       exit 1; \
     fi; \
     go mod verify; \
     go mod vendor; \
-    echo "buildctl build: override applied — golang.org/x/net ${XNET_FROM} -> ${XNET_TO}"
+    echo "buildctl build: overrides applied — golang.org/x/net ${XNET_FROM} -> ${XNET_TO}, containerd/v2 ${CONTAINERD_FROM} -> ${CONTAINERD_TO}"
 
 # ldflags are upstream's (moby/buildkit Dockerfile, `buildkit-version` stage),
 # with the version and revision the clean tag would have produced.
@@ -763,7 +840,7 @@ RUN set -eu; \
     lowest="$(printf '%s\n%s\n' "${ctrd#v}" "${CONTAINERD_MIN#v}" | sort -V | head -n1)"; \
     if [ -z "${ctrd}" ] || [ "${lowest}" != "${CONTAINERD_MIN#v}" ]; then \
       echo "ERROR: compiled buildctl records github.com/containerd/containerd/v2 '${ctrd}'," >&2; \
-      echo "       below the ${CONTAINERD_MIN} floor (CVE-2026-53493, -53495, -95838; #4780)." >&2; \
+      echo "       below the ${CONTAINERD_MIN} floor (CVE-2026-53493, -53495, -95838, #4780; CVE-2026-95839, #6394)." >&2; \
       exit 1; \
     fi; \
     echo "buildctl build: build info verified — $(printf '%s\n' "${info}" | head -n1 | sed 's|^/buildctl: ||'), golang.org/x/net ${xnet}, containerd/v2 ${ctrd} across ${deps} deps"
