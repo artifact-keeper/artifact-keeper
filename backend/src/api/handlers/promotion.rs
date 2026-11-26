@@ -252,6 +252,16 @@ pub fn validate_promotion_target_and_format(
     Ok(())
 }
 
+/// The per-item error of a bulk promotion whose copy failed. A disk-threshold
+/// refusal (#5191) names its code, so the item reads as refused for disk
+/// rather than as an internal error, and the rest of the batch goes on.
+fn bulk_copy_failure_message(e: &AppError) -> String {
+    match e {
+        AppError::QuotaRefused(refusal) => format!("{} ({})", refusal.message, refusal.code()),
+        e => crate::api::handlers::internal_err_message("Failed to copy artifact", e).to_string(),
+    }
+}
+
 /// Copy an artifact body from `source` storage to `target` storage by streaming
 /// rather than buffering the whole object in memory (#1608, Core Invariant ①).
 ///
@@ -267,16 +277,6 @@ pub fn validate_promotion_target_and_format(
 /// matching the storage NotFound contract (#1016). Returns the
 /// [`PutStreamResult`](crate::storage::PutStreamResult) so callers can verify
 /// the streamed digest/byte count if desired.
-/// The per-item error of a bulk promotion whose copy failed. A disk-threshold
-/// refusal (#5191) names its code, so the item reads as refused for disk
-/// rather than as an internal error, and the rest of the batch goes on.
-fn bulk_copy_failure_message(e: &AppError) -> String {
-    match e {
-        AppError::QuotaRefused(refusal) => format!("{} ({})", refusal.message, refusal.code()),
-        e => crate::api::handlers::internal_err_message("Failed to copy artifact", e).to_string(),
-    }
-}
-
 pub async fn stream_copy_artifact(
     source: &dyn crate::storage::StorageBackend,
     target: &dyn crate::storage::StorageBackend,
