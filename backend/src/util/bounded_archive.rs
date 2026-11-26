@@ -159,10 +159,11 @@ fn read_le_u64(bytes: &[u8], at: usize) -> Option<u64> {
     Some(u64::from_le_bytes(bytes.get(at..at + 8)?.try_into().ok()?))
 }
 
-/// Find the EOCD whose comment length ends exactly at `tail`'s end. Searching
-/// backwards skips an EOCD-like signature inside the archive comment; when no
-/// record ends the tail (a caller sliced off a signed trailer, for instance),
-/// return `None` and let `ZipArchive::new` decide whether the bytes are a ZIP.
+/// Find the EOCD whose comment ends at or before `tail`'s end. Searching
+/// backwards skips an EOCD-like signature inside the archive comment; trailing
+/// bytes after the comment are valid to `zip`, so they must not make the
+/// pre-parse check miss the record. When no record fits in the tail, return
+/// `None` and let `ZipArchive::new` decide whether the bytes are a ZIP.
 fn find_zip_eocd(tail: &[u8]) -> Option<usize> {
     let mut end = tail.len();
     while end >= ZIP_EOCD_LEN {
@@ -171,7 +172,7 @@ fn find_zip_eocd(tail: &[u8]) -> Option<usize> {
             .rposition(|w| w == ZIP_EOCD_SIGNATURE)?;
         if at + ZIP_EOCD_LEN <= tail.len() {
             let comment_len = read_le_u16(tail, at + 20)? as usize;
-            if at + ZIP_EOCD_LEN + comment_len == tail.len() {
+            if at + ZIP_EOCD_LEN + comment_len <= tail.len() {
                 return Some(at);
             }
         }
@@ -1997,6 +1998,19 @@ mod tests {
             Some(123)
         );
         assert_eq!(declared_zip_entry_count_from_tail(&[]), None);
+    }
+
+    /// `zip` accepts data after the EOCD comment, so one trailing byte must not
+    /// make the declared count invisible to the pre-parse check (#5526).
+    #[test]
+    fn trailing_bytes_do_not_hide_declared_zip_count_5526() {
+        let mut tail = zip_eocd_tail(20, 5);
+        tail.extend_from_slice(b"trailing");
+        assert_eq!(declared_zip_entry_count_from_tail(&tail), Some(20));
+
+        let err = check_declared_zip_entry_count_limited(&mut std::io::Cursor::new(&tail), 5)
+            .expect_err("trailing bytes must not skip the declared-count check");
+        assert!(err.to_string().contains("too many entries"), "{err}");
     }
 
     #[test]
