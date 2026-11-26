@@ -1943,10 +1943,11 @@ fn compact_index_etag(upstream_etag: Option<&str>, content: &[u8]) -> String {
 
 /// `Repr-Digest` over the bytes we actually serve. The proxy caches the
 /// selected representation (including its content coding), so the same hash
-/// stays correct for a full serve and for a 206 slice of it.
+/// stays correct for a full serve and for a 206 slice of it. RFC 9530 uses
+/// byte-sequence syntax, which Bundler 2.5+ expects on the Compact Index.
 fn compact_index_repr_digest(content: &[u8]) -> String {
     let digest = Sha256::digest(content);
-    format!("sha-256=\"{}\"", BASE64_STANDARD.encode(digest))
+    format!("sha-256=:{}:", BASE64_STANDARD.encode(digest))
 }
 
 struct CompactIndexResponse {
@@ -2169,7 +2170,7 @@ mod tests {
         );
         assert_eq!(
             compact_index_repr_digest(b"abc"),
-            "sha-256=\"ungWv48Bz+pBQUDeXa4iI7ADYaOWF3qctBD/YfIAFa0=\""
+            "sha-256=:ungWv48Bz+pBQUDeXa4iI7ADYaOWF3qctBD/YfIAFa0=:"
         );
     }
 
