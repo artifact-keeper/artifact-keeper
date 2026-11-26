@@ -1872,6 +1872,13 @@ fn unfilterable_gated_metadata_response(
     proxy_helpers::age_gate_unavailable_response(repo_key, package)
 }
 
+/// Whether a metadata document carries a version index the gate must filter.
+/// Group-level plugin-prefix metadata has neither block, so its missing GAV
+/// ids are not an unparseable version list (#6411).
+fn metadata_declares_versions(xml: &str) -> bool {
+    xml.contains("<versioning") || xml.contains("<versions")
+}
+
 /// Rewrite a gated listing, or refuse it when the rewrite cannot be produced.
 /// `None` means the document parsed for dating but the rewriter could not
 /// reproduce it (or a decision named a version it does not list): the gate
@@ -1897,10 +1904,12 @@ fn rewrite_gated_listing(
 /// never resolve to a version whose download would be refused. Returns the
 /// bytes unchanged when nothing is withheld (the checksum then still matches
 /// the upstream's). The `.sha1` (and the other digests) of the metadata are
-/// computed from what this returns. A gated document that cannot be decoded,
-/// parsed or rewritten is refused with the gate's retryable 503 (#6382): a
-/// lenient client seeing those unfiltered bytes could select a version whose
-/// download the gate withholds. A pass that leaves versions undated (see
+/// computed from what this returns. A gated version index that cannot be
+/// decoded, parsed or rewritten is refused with the gate's retryable 503
+/// (#6382): a lenient client seeing those unfiltered bytes could select a
+/// version whose download the gate withholds. A document with no version
+/// index, such as group-level plugin-prefix metadata, is served unchanged
+/// (#6411). A pass that leaves versions undated (see
 /// below) is memoized for [`crate::services::age_gate_maven::LISTING_MEMO_TTL`]
 /// and reused by the next calls for the same upstream document, so the body
 /// and its checksum sidecars come from the same filtered bytes (#6284)
@@ -1953,6 +1962,9 @@ async fn maven_filter_listing(
         ));
     };
     let Some(doc) = gate::metadata_versions(xml) else {
+        if !metadata_declares_versions(xml) {
+            return Ok(FilteredListing::whole(content));
+        }
         return Err(unfilterable_gated_metadata_response(
             upstream.repo_key,
             &package,
@@ -18987,6 +18999,56 @@ mod age_gate_4702_tests {
         }
     }
 
+    /// #6411: group-level plugin-prefix metadata has no version index or GAV
+    /// ids, so it is not an unparseable listing. A gated Remote and a gated
+    /// Virtual member must keep serving it, or `mvn prefix:goal` breaks.
+    #[tokio::test]
+    async fn plugin_prefix_metadata_is_served_by_gated_remote_and_virtual_6411() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        const PLUGIN_PATH: &str = "org/apache/maven/plugins/maven-metadata.xml";
+        let body = b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<metadata>\n  <plugins>\n    \
+                     <plugin>\n      <name>Maven Compiler Plugin</name>\n      \
+                     <prefix>compiler</prefix>\n      \
+                     <artifactId>maven-compiler-plugin</artifactId>\n    </plugin>\n  \
+                     </plugins>\n</metadata>\n"
+            .to_vec();
+        let mock = upstream_with_metadata_at(PLUGIN_PATH, body.clone()).await;
+        let (id, key, dir) = gated_remote(&pool, &mock, "upstream_publish_time").await;
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), dir.to_str().unwrap());
+        let state =
+            tdh::build_state_with_proxy_and_age_gate(pool.clone(), dir.to_str().unwrap(), proxy);
+
+        let remote = get(&state, &key, PLUGIN_PATH).await;
+        let (virtual_id, virtual_key, _) = tdh::create_repo(&pool, "virtual", "maven").await;
+        tdh::link_virtual_member(&pool, virtual_id, id, 0).await;
+        tdh::publish_repo(&pool, virtual_id).await;
+        let virtual_meta = get(&state, &virtual_key, PLUGIN_PATH).await;
+        drop_repo(&pool, virtual_id).await;
+        drop_repo(&pool, id).await;
+
+        assert_eq!(
+            remote.0,
+            StatusCode::OK,
+            "Remote: {}",
+            String::from_utf8_lossy(&remote.1)
+        );
+        assert_eq!(remote.1, Bytes::from(body));
+        assert_eq!(
+            virtual_meta.0,
+            StatusCode::OK,
+            "Virtual: {}",
+            String::from_utf8_lossy(&virtual_meta.1)
+        );
+        let xml = String::from_utf8_lossy(&virtual_meta.1);
+        assert!(xml.contains("<prefix>compiler</prefix>"), "{xml}");
+        assert!(
+            xml.contains("<artifactId>maven-compiler-plugin</artifactId>"),
+            "{xml}"
+        );
+    }
+
     /// #6382: non-UTF-8 bytes cannot be checked for withheld versions, so a
     /// gated listing refuses them instead of serving them verbatim.
     #[tokio::test]
@@ -19070,9 +19132,14 @@ mod age_gate_4702_tests {
     /// An upstream serving `body` as this GA's `maven-metadata.xml`, for the
     /// fail-closed cases of #6382.
     async fn upstream_with_metadata(body: Vec<u8>) -> MockServer {
+        upstream_with_metadata_at(&format!("{G}/widget/maven-metadata.xml"), body).await
+    }
+
+    /// An upstream serving `body` as `path`'s `maven-metadata.xml`.
+    async fn upstream_with_metadata_at(path: &str, body: Vec<u8>) -> MockServer {
         let mock = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(wm_path(format!("/{G}/widget/maven-metadata.xml")))
+            .and(wm_path(format!("/{path}")))
             .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
             .mount(&mock)
             .await;
