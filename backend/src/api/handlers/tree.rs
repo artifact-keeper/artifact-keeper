@@ -507,12 +507,15 @@ pub async fn get_content(
         Err(refusal) => return Ok(refusal),
     };
 
-    let content = storage.get(&artifact.storage_key).await?;
-
-    // Truncate to max_bytes if specified
+    // #6465: a preview reads only its first `max_bytes`, a download streams,
+    // so neither holds the whole object in memory
     let body = match params.max_bytes {
-        Some(max) if max >= 0 && (max as usize) < content.len() => content.slice(..max as usize),
-        _ => content,
+        Some(max) if max >= 0 && max < artifact.size_bytes => axum::body::Body::from(
+            storage
+                .get_range(&artifact.storage_key, 0, max as usize)
+                .await?,
+        ),
+        _ => axum::body::Body::from_stream(storage.get_stream(&artifact.storage_key).await?),
     };
 
     // Detect content type: use the stored value, fall back to mime_guess
@@ -1448,6 +1451,81 @@ mod tests {
             private_anon.0,
             StatusCode::NOT_FOUND,
             "unchanged: an anonymous caller still cannot browse a private tree"
+        );
+    }
+}
+
+#[cfg(ak_test_shard = "handlers-2")]
+#[cfg(test)]
+mod content_streaming_tests_6465 {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use axum::http::StatusCode;
+    use bytes::Bytes;
+    use http_body::Body as _;
+    use tower::ServiceExt;
+
+    /// #6465: a download streams the stored object instead of reading it whole
+    /// into memory first, and a preview reads only its first `max_bytes`
+    #[tokio::test]
+    async fn content_streams_downloads_and_range_reads_previews_6465() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _username) = tdh::create_user(&pool).await;
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "local", "generic").await;
+        tdh::publish_repo(&pool, repo_id).await;
+        let state = tdh::build_state(pool.clone(), dir.to_str().unwrap());
+        let info = tdh::make_repo_info(repo_id, &key, &dir, "local", None);
+        let content = Bytes::from_static(b"tree-content-streamed-6465");
+        tdh::seed_artifact(
+            &state,
+            &pool,
+            &info,
+            "pkg/big.bin",
+            "pkg/big.bin",
+            "big.bin",
+            "1.0.0",
+            "application/octet-stream",
+            content.clone(),
+            user_id,
+        )
+        .await;
+
+        let download = tdh::router_anon(router(), state.clone())
+            .oneshot(tdh::get(format!(
+                "/content?repository_key={key}&path=pkg/big.bin"
+            )))
+            .await
+            .expect("download");
+        let download_status = download.status();
+        let streamed = download.body().size_hint().exact().is_none();
+        let download_bytes = axum::body::to_bytes(download.into_body(), usize::MAX)
+            .await
+            .expect("download body");
+        let (preview_status, preview, headers) = tdh::send_with_headers(
+            tdh::router_anon(router(), state),
+            tdh::get(format!(
+                "/content?repository_key={key}&path=pkg/big.bin&max_bytes=4"
+            )),
+        )
+        .await;
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(download_status, StatusCode::OK);
+        assert!(
+            streamed,
+            "the download body is a stream, not a buffer holding the whole object"
+        );
+        assert_eq!(download_bytes, content);
+        assert_eq!(preview_status, StatusCode::OK);
+        assert_eq!(&preview[..], b"tree");
+        assert_eq!(
+            headers.get("x-content-size").and_then(|v| v.to_str().ok()),
+            Some(content.len().to_string().as_str()),
+            "the preview still reports the full size"
         );
     }
 }
