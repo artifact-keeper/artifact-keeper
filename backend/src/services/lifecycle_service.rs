@@ -76,6 +76,40 @@ mod assignments;
 mod derived_state;
 pub use derived_state::SweepDerivedState;
 
+/// Owe a format handler's bulk soft delete the per-artifact delete's
+/// remaining steps (peer delete tasks, audit rows, `artifact.deleted` events,
+/// search deletes), the way a lifecycle sweep does (#6489). Call inside the
+/// delete's transaction, after the UPDATE, and pass the returned stamp to
+/// [`finish_bulk_delete`] once it commits. A restart in between leaves the
+/// pending row for the next lifecycle tick
+pub(crate) async fn owe_bulk_delete_fanout(
+    conn: &mut sqlx::PgConnection,
+    repository_id: Uuid,
+) -> sqlx::Result<DateTime<Utc>> {
+    // The `deleted_at` trigger (migration 261) stamps NOW(), the transaction's
+    // start, on every row this transaction soft-deletes
+    let deleted_at: DateTime<Utc> = sqlx::query_scalar("SELECT NOW()")
+        .fetch_one(&mut *conn)
+        .await?;
+    derived_state::record_pending_fanout(conn, repository_id, deleted_at).await?;
+    Ok(deleted_at)
+}
+
+/// Run the steps [`owe_bulk_delete_fanout`] recorded
+pub(crate) async fn finish_bulk_delete(
+    state: &crate::api::AppState,
+    repository_id: Uuid,
+    deleted_at: DateTime<Utc>,
+) {
+    derived_state::finish_swept_deletes(
+        &state.db,
+        &SweepDerivedState::from_state(state),
+        repository_id,
+        deleted_at,
+    )
+    .await;
+}
+
 /// SQL fragment implementing a policy's exclusion ("keep") list.
 ///
 /// Appended to the WHERE clause of *every* candidate-selection query and to

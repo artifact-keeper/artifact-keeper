@@ -1456,11 +1456,22 @@ async fn delete_chart(
     // Soft-delete the chart together with its provenance: leaving an orphaned
     // .prov behind would let a later re-upload serve provenance for a chart it
     // does not describe.
-    sqlx::query("UPDATE artifacts SET is_deleted = true, updated_at = NOW() WHERE id = ANY($1)")
-        .bind(&artifact_ids)
-        .execute(&state.db)
+    let mut tx = state
+        .db
+        .begin()
         .await
         .map_err(crate::api::handlers::db_err)?;
+    sqlx::query("UPDATE artifacts SET is_deleted = true, updated_at = NOW() WHERE id = ANY($1)")
+        .bind(&artifact_ids)
+        .execute(&mut *tx)
+        .await
+        .map_err(crate::api::handlers::db_err)?;
+    // #6489: the peer, audit, event and search steps a per-artifact delete runs
+    let deleted_at = crate::services::lifecycle_service::owe_bulk_delete_fanout(&mut tx, repo.id)
+        .await
+        .map_err(crate::api::handlers::db_err)?;
+    tx.commit().await.map_err(crate::api::handlers::db_err)?;
+    crate::services::lifecycle_service::finish_bulk_delete(&state, repo.id, deleted_at).await;
 
     // Update repository timestamp
     let _ = sqlx::query!(
@@ -3137,6 +3148,62 @@ wsDcBAEBCgAQBQJqWW7VCRA8wAoTVPCkgwAAVAoMACmQbvnhlkWncOkVJXfissGD\n\
         }
 
         f.teardown().await;
+    }
+
+    /// #6489: the native delete runs the per-artifact delete's remaining
+    /// steps, one `ARTIFACT_DELETED` audit row per removed row here, and
+    /// leaves no pending fan-out behind
+    #[tokio::test]
+    async fn test_helm_delete_chart_audits_each_removed_row_6489() {
+        let Some(f) = tdh::Fixture::setup("local", "helm").await else {
+            return;
+        };
+        let tgz = signed_chart_tgz();
+        let (status, _) = upload_parts(
+            &f,
+            &[
+                ("chart", "provchart-0.1.0.tgz", &tgz),
+                ("prov", "provchart-0.1.0.tgz.prov", REAL_PROV),
+            ],
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let ids: Vec<uuid::Uuid> = sqlx::query_scalar(
+            "SELECT id FROM artifacts WHERE repository_id = $1 AND is_deleted = false",
+        )
+        .bind(f.repo_id)
+        .fetch_all(&f.pool)
+        .await
+        .expect("chart rows");
+
+        let app = f.router_with_auth(super::router());
+        let req = axum::http::Request::builder()
+            .method("DELETE")
+            .uri(format!("/{}/api/charts/provchart/0.1.0", f.repo_key))
+            .body(Body::empty())
+            .unwrap();
+        let (status, _) = tdh::send(app, req).await;
+        let audited: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_log \
+             WHERE action = 'ARTIFACT_DELETED' AND resource_id = ANY($1)",
+        )
+        .bind(&ids)
+        .fetch_one(&f.pool)
+        .await
+        .expect("audit rows");
+        let pending: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM lifecycle_sweep_fanouts WHERE repository_id = $1",
+        )
+        .bind(f.repo_id)
+        .fetch_one(&f.pool)
+        .await
+        .expect("pending fan-outs");
+        f.teardown().await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(ids.len(), 2, "the chart and its provenance");
+        assert_eq!(audited, 2, "one ARTIFACT_DELETED row per removed row");
+        assert_eq!(pending, 0, "the fan-out finished");
     }
 
     #[tokio::test]
