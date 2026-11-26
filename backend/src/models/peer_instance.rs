@@ -13,7 +13,6 @@ pub enum InstanceStatus {
     Offline,
     Syncing,
     Degraded,
-    Unhealthy,
 }
 
 /// Peer instance entity for distributed artifact caching.

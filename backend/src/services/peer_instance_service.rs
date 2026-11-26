@@ -329,7 +329,6 @@ pub enum InstanceStatus {
     Offline,
     Syncing,
     Degraded,
-    Unhealthy,
 }
 
 /// Replication mode for peer replication policies.
@@ -470,7 +469,6 @@ impl std::fmt::Display for InstanceStatus {
             InstanceStatus::Offline => write!(f, "offline"),
             InstanceStatus::Syncing => write!(f, "syncing"),
             InstanceStatus::Degraded => write!(f, "degraded"),
-            InstanceStatus::Unhealthy => write!(f, "unhealthy"),
         }
     }
 }
@@ -1176,16 +1174,13 @@ impl PeerInstanceService {
         Ok(subs)
     }
 
-    /// Mark stale nodes as offline.
-    ///
-    /// A peer that stops heartbeating is unreachable regardless of whether it
-    /// was mid-sync or already degraded by failed probes/transfers (#6030).
+    /// Mark stale nodes as offline
     pub async fn mark_stale_offline(&self, stale_threshold_minutes: i32) -> Result<u64> {
         let result = sqlx::query(
             r#"
             UPDATE peer_instances
             SET status = 'offline', updated_at = NOW()
-            WHERE status IN ('online', 'syncing', 'degraded', 'unhealthy')
+            WHERE status IN ('online', 'syncing', 'degraded')
               AND last_heartbeat_at < NOW() - make_interval(mins => $1)
             "#,
         )
@@ -2500,11 +2495,6 @@ mod tests {
     }
 
     #[test]
-    fn test_instance_status_display_unhealthy() {
-        assert_eq!(InstanceStatus::Unhealthy.to_string(), "unhealthy");
-    }
-
-    #[test]
     fn test_instance_status_equality() {
         assert_eq!(InstanceStatus::Online, InstanceStatus::Online);
         assert_ne!(InstanceStatus::Online, InstanceStatus::Offline);
@@ -2579,14 +2569,6 @@ mod tests {
         assert_eq!(
             resolve_heartbeat_status(Some(InstanceStatus::Offline)),
             InstanceStatus::Offline
-        );
-    }
-
-    #[test]
-    fn test_resolve_heartbeat_status_some_unhealthy() {
-        assert_eq!(
-            resolve_heartbeat_status(Some(InstanceStatus::Unhealthy)),
-            InstanceStatus::Unhealthy
         );
     }
 

@@ -266,7 +266,6 @@ fn parse_status(s: &str) -> Option<InstanceStatus> {
         "offline" => Some(InstanceStatus::Offline),
         "syncing" => Some(InstanceStatus::Syncing),
         "degraded" => Some(InstanceStatus::Degraded),
-        "unhealthy" => Some(InstanceStatus::Unhealthy),
         _ => None,
     }
 }
@@ -985,14 +984,6 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_status_unhealthy() {
-        assert!(matches!(
-            parse_status("unhealthy"),
-            Some(InstanceStatus::Unhealthy)
-        ));
-    }
-
-    #[test]
     fn test_parse_status_case_insensitive() {
         assert!(matches!(
             parse_status("ONLINE"),
@@ -1009,10 +1000,6 @@ mod tests {
         assert!(matches!(
             parse_status("DEGRADED"),
             Some(InstanceStatus::Degraded)
-        ));
-        assert!(matches!(
-            parse_status("UnHeAlThY"),
-            Some(InstanceStatus::Unhealthy)
         ));
     }
 
