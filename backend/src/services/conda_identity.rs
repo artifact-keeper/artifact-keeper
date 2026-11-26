@@ -2993,6 +2993,16 @@ mod tests {
     }
 
     #[test]
+    fn configured_urls_redact_password_without_username() {
+        let raw = "https://:token@mirror.example.test/aliases.json?key=abc";
+        let redacted = redact_configured_url(raw);
+        assert_eq!(
+            redacted,
+            "https://REDACTED@mirror.example.test/aliases.json?key=REDACTED"
+        );
+    }
+
+    #[test]
     fn status_returns_the_redacted_refresh_url() {
         let runtime = AliasMapRuntime::new();
         let raw = "https://operator:secret@mirror.example.test/aliases.json?token=abc";
