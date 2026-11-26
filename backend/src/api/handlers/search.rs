@@ -4009,9 +4009,6 @@ mod reindex_single_flight_tests {
     use std::sync::Arc;
     use wiremock::MockServer;
 
-    /// The reindex claim is process-wide, so these tests take turns
-    static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
     /// Wait for a reindex this test started in the background to give the
     /// lease back, then release it
     async fn wait_until_free(pool: &sqlx::PgPool) {
@@ -4029,7 +4026,7 @@ mod reindex_single_flight_tests {
     /// another, the trigger answers 409 instead of starting a second one
     #[tokio::test]
     async fn reindex_trigger_answers_409_while_one_runs_6404() {
-        let _serial = SERIAL.lock().await;
+        let _serial = tdh::reindex_serial_lock().await;
         let Some(pool) = tdh::try_pool().await else {
             return;
         };
@@ -4066,7 +4063,7 @@ mod reindex_single_flight_tests {
     /// The admin endpoint runs inline and answers 409 the same way
     #[tokio::test]
     async fn admin_reindex_answers_409_while_one_runs_6404() {
-        let _serial = SERIAL.lock().await;
+        let _serial = tdh::reindex_serial_lock().await;
         let Some(pool) = tdh::try_pool().await else {
             return;
         };
@@ -4101,7 +4098,7 @@ mod reindex_single_flight_tests {
     /// so the next trigger is not refused until the TTL runs out
     #[tokio::test]
     async fn a_failed_leased_reindex_frees_the_lease_6404() {
-        let _serial = SERIAL.lock().await;
+        let _serial = tdh::reindex_serial_lock().await;
         let Some(pool) = tdh::try_pool().await else {
             return;
         };
