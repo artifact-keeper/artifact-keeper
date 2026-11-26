@@ -122,11 +122,16 @@ pub fn check_zip_entry_count<R: Read + Seek>(archive: &zip::ZipArchive<R>) -> Re
     check_zip_entry_count_value(archive.len() as u64, max_ingest_archive_entries())
 }
 
+/// Stand-in for a ZIP64 count that cannot be read from the scanned tail. A
+/// real count this large cannot be represented by `zip`, so the comparison
+/// helper always rejects it instead of skipping the pre-parse guard (#5526).
+const UNREADABLE_ZIP64_ENTRY_COUNT: u64 = u64::MAX;
+
 /// Compare a parsed or declared ZIP entry count with an explicit ceiling. The
 /// one error shape keeps the pre-parse refusal (#5526) indistinguishable from
 /// the authoritative post-parse `archive.len()` refusal.
 fn check_zip_entry_count_value(entry_count: u64, max_entries: u64) -> Result<()> {
-    if entry_count > max_entries {
+    if entry_count == UNREADABLE_ZIP64_ENTRY_COUNT || entry_count > max_entries {
         return Err(AppError::Validation(format!(
             "ZIP archive contains too many entries (> {}); refusing suspected decompression bomb",
             max_entries
@@ -207,7 +212,8 @@ fn find_zip64_eocd_before(tail: &[u8], before: usize) -> Option<usize> {
 /// Read the declared central-directory entry count from an EOCD (and ZIP64
 /// EOCD where the 16-bit fields are sentinels). `None` means the tail is not a
 /// recognisable ZIP end record; the caller then relies on the post-parse
-/// `archive.len()` check.
+/// `archive.len()` check. A sentinel whose ZIP64 record cannot be read is
+/// reported as [`UNREADABLE_ZIP64_ENTRY_COUNT`] so the caller refuses it.
 pub fn declared_zip_entry_count_from_tail(tail: &[u8]) -> Option<u64> {
     let eocd = find_zip_eocd(tail)?;
     let total16 = read_le_u16(tail, eocd + 10)? as u64;
@@ -218,15 +224,19 @@ pub fn declared_zip_entry_count_from_tail(tail: &[u8]) -> Option<u64> {
     }
 
     // A ZIP64 archive stores the real total in the ZIP64 EOCD, pointed to by
-    // the locator directly before the EOCD. A missing locator is malformed but
-    // harmless here: the 16-bit sentinel is already above every configured
-    // ceiling, and `ZipArchive::new` will refuse the archive if needed.
-    let locator = eocd.checked_sub(ZIP64_LOCATOR_LEN)?;
-    if tail.get(locator..locator + 4)? != ZIP64_LOCATOR_SIGNATURE {
-        return Some(total16);
+    // the locator directly before the EOCD. If either is outside the scanned
+    // tail, refuse instead of falling back to the placeholder: a raised entry
+    // ceiling could otherwise accept the placeholder and skip this guard.
+    let Some(locator) = eocd.checked_sub(ZIP64_LOCATOR_LEN) else {
+        return Some(UNREADABLE_ZIP64_ENTRY_COUNT);
+    };
+    if tail.get(locator..locator + 4) != Some(ZIP64_LOCATOR_SIGNATURE.as_slice()) {
+        return Some(UNREADABLE_ZIP64_ENTRY_COUNT);
     }
-    let zip64 = find_zip64_eocd_before(tail, locator)?;
-    read_le_u64(tail, zip64 + 32)
+    let Some(zip64) = find_zip64_eocd_before(tail, locator) else {
+        return Some(UNREADABLE_ZIP64_ENTRY_COUNT);
+    };
+    Some(read_le_u64(tail, zip64 + 32).unwrap_or(UNREADABLE_ZIP64_ENTRY_COUNT))
 }
 
 /// Read the declared entry count from the end of `reader` without consuming
@@ -1716,8 +1726,12 @@ mod tests {
 
     /// ZIP64 end records with the 16-bit sentinels in the ordinary EOCD.
     fn zip64_tail(entries: u64) -> Vec<u8> {
+        zip64_tail_with_extensible_data(entries, 0)
+    }
+
+    fn zip64_tail_with_extensible_data(entries: u64, extra_len: usize) -> Vec<u8> {
         let mut tail = ZIP64_EOCD_SIGNATURE.to_vec();
-        tail.extend_from_slice(&44u64.to_le_bytes()); // size of remaining record
+        tail.extend_from_slice(&(44u64 + extra_len as u64).to_le_bytes()); // record size
         tail.extend_from_slice(&45u16.to_le_bytes()); // version made by
         tail.extend_from_slice(&45u16.to_le_bytes()); // version needed
         tail.extend_from_slice(&0u32.to_le_bytes()); // this disk
@@ -1726,6 +1740,7 @@ mod tests {
         tail.extend_from_slice(&entries.to_le_bytes()); // total entries
         tail.extend_from_slice(&0u64.to_le_bytes()); // central dir size
         tail.extend_from_slice(&0u64.to_le_bytes()); // central dir offset
+        tail.extend(vec![0; extra_len]); // extensible data sector
         tail.extend_from_slice(ZIP64_LOCATOR_SIGNATURE);
         tail.extend_from_slice(&0u32.to_le_bytes()); // disk with ZIP64 EOCD
         tail.extend_from_slice(&0u64.to_le_bytes()); // ZIP64 EOCD offset
@@ -2037,6 +2052,34 @@ mod tests {
                 1024 * 1024,
             )
             .expect_err("an over-cap declared count must be refused before parsing");
+            assert!(err.to_string().contains("too many entries"), "{err}");
+        }
+    }
+
+    /// #5526: a sentinel in the ordinary EOCD must fail closed when the ZIP64
+    /// record is outside the scanned tail or its locator is missing. Falling
+    /// back to the 16-bit placeholder would let a raised ceiling skip the
+    /// pre-parse guard.
+    #[test]
+    fn unreadable_zip64_declared_count_is_refused_5526() {
+        let large_record = zip64_tail_with_extensible_data(20, ZIP_END_SCAN_BYTES);
+        let scanned_tail = &large_record[large_record.len() - ZIP_END_SCAN_BYTES..];
+        assert_eq!(
+            declared_zip_entry_count_from_tail(scanned_tail),
+            Some(UNREADABLE_ZIP64_ENTRY_COUNT)
+        );
+
+        let mut no_locator = zip64_tail(20);
+        let locator_at = no_locator.len() - ZIP_EOCD_LEN - ZIP64_LOCATOR_LEN;
+        no_locator.drain(locator_at..locator_at + ZIP64_LOCATOR_LEN);
+        assert_eq!(
+            declared_zip_entry_count_from_tail(&no_locator),
+            Some(UNREADABLE_ZIP64_ENTRY_COUNT)
+        );
+
+        for bytes in [large_record, no_locator] {
+            let err = check_declared_zip_entry_count_limited(&mut std::io::Cursor::new(&bytes), 5)
+                .expect_err("an unreadable ZIP64 count must fail closed");
             assert!(err.to_string().contains("too many entries"), "{err}");
         }
     }
