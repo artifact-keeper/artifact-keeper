@@ -1919,7 +1919,7 @@ fn redact_configured_url(raw: &str) -> String {
     let Ok(mut url) = Url::parse(raw) else {
         return "<unparseable URL>".to_string();
     };
-    if !url.username().is_empty() {
+    if !url.username().is_empty() || url.password().is_some() {
         let _ = url.set_username("REDACTED");
         let _ = url.set_password(None);
     }
