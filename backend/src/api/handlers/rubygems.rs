@@ -1933,12 +1933,15 @@ fn if_range_matches(value: Option<&HeaderValue>, etag: &str) -> bool {
     }
 }
 
-fn compact_index_etag(upstream_etag: Option<&str>, content: &[u8]) -> String {
+/// Bundler <= 2.4 reads the Compact Index `ETag` as the MD5 of the whole
+/// document and verifies appended ranges against it. Without an upstream
+/// validator there is no safe value to replay, so serve no `ETag` at all, as
+/// `main` does, and disable conditional and range handling for that body.
+fn compact_index_etag(upstream_etag: Option<&str>) -> Option<String> {
     upstream_etag
         .map(str::trim)
         .filter(|etag| !etag.is_empty())
         .map(str::to_string)
-        .unwrap_or_else(|| cache_headers::compute_etag(content))
 }
 
 /// `Repr-Digest` over the bytes we actually serve. The proxy caches the
@@ -1955,7 +1958,7 @@ struct CompactIndexResponse {
     content_type: String,
     content_encoding: Option<String>,
     stale_since: Option<chrono::DateTime<chrono::Utc>>,
-    etag: String,
+    etag: Option<String>,
     repr_digest: String,
     cache_control: &'static str,
     allow_ranges: bool,
@@ -1970,26 +1973,28 @@ impl CompactIndexResponse {
         stale_since: Option<chrono::DateTime<chrono::Utc>>,
         request: &CompactIndexRequest<'_>,
     ) -> Self {
-        let etag = compact_index_etag(upstream_etag, &content);
+        let etag = compact_index_etag(upstream_etag);
         let repr_digest = compact_index_repr_digest(&content);
         Self {
             content,
             content_type: content_type.unwrap_or_else(|| request.default_content_type.to_string()),
             content_encoding,
             stale_since,
+            allow_ranges: request.allow_ranges && etag.is_some(),
             etag,
             repr_digest,
             cache_control: cache_headers::negotiated_cache_control(request.headers),
-            allow_ranges: request.allow_ranges,
         }
     }
 
     fn base(&self, status: StatusCode) -> axum::http::response::Builder {
         let mut builder = Response::builder()
             .status(status)
-            .header(ETAG, &self.etag)
             .header("repr-digest", &self.repr_digest)
             .header(CACHE_CONTROL, self.cache_control);
+        if let Some(etag) = &self.etag {
+            builder = builder.header(ETAG, etag);
+        }
         if self.allow_ranges {
             builder = builder.header(ACCEPT_RANGES, "bytes");
         }
@@ -2059,10 +2064,17 @@ fn forward_compact_index(
         stale_since,
         request,
     );
-    if if_none_matches(request.headers, &response.etag) {
+    if response
+        .etag
+        .as_deref()
+        .is_some_and(|etag| if_none_matches(request.headers, etag))
+    {
         return response.not_modified();
     }
-    if request.allow_ranges {
+    if response.allow_ranges {
+        let Some(etag) = response.etag.as_deref() else {
+            return response.full();
+        };
         let range = request
             .headers
             .get(RANGE)
@@ -2071,7 +2083,7 @@ fn forward_compact_index(
         let Some(range) = range else {
             return response.full();
         };
-        if !if_range_matches(request.headers.get(IF_RANGE), &response.etag) {
+        if !if_range_matches(request.headers.get(IF_RANGE), etag) {
             return response.full();
         }
         return match resolve_byte_range(range, response.content.len()) {
@@ -2161,16 +2173,40 @@ mod tests {
     #[test]
     fn test_compact_index_validators() {
         assert_eq!(
-            compact_index_etag(Some("\"upstream-v1\""), b"body"),
-            "\"upstream-v1\""
+            compact_index_etag(Some("\"upstream-v1\"")),
+            Some("\"upstream-v1\"".to_string())
         );
-        assert_eq!(
-            compact_index_etag(Some("  "), b"body"),
-            cache_headers::compute_etag(b"body")
-        );
+        assert_eq!(compact_index_etag(Some("  ")), None);
+        assert_eq!(compact_index_etag(None), None);
         assert_eq!(
             compact_index_repr_digest(b"abc"),
             "sha-256=:ungWv48Bz+pBQUDeXa4iI7ADYaOWF3qctBD/YfIAFa0=:"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_forward_compact_index_omits_validator_without_upstream_etag() {
+        let fallback = crate::api::handlers::cache_headers::compute_etag(b"versions body");
+        let mut headers = HeaderMap::new();
+        headers.insert(IF_NONE_MATCH, HeaderValue::from_str(&fallback).unwrap());
+        headers.insert(RANGE, HeaderValue::from_static("bytes=0-3"));
+        headers.insert(IF_RANGE, HeaderValue::from_str(&fallback).unwrap());
+
+        let response = forward_compact_index(
+            Bytes::from_static(b"versions body"),
+            None,
+            None,
+            None,
+            None,
+            &compact_request(&headers, true),
+        );
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().get(ETAG).is_none());
+        assert!(response.headers().get(ACCEPT_RANGES).is_none());
+        assert_eq!(
+            response_body(response).await,
+            Bytes::from_static(b"versions body")
         );
     }
 
@@ -3582,17 +3618,24 @@ mod db_cov_tests {
         uri: String,
     }
 
-    async fn remote_versions_with_etag(etag: &str, body: &[u8]) -> Option<VersionsFixture> {
+    async fn remote_versions(etag: Option<&str>, body: &[u8]) -> Option<VersionsFixture> {
         let fx = tdh::Fixture::setup("remote", "rubygems").await?;
         let upstream = wiremock::MockServer::start().await;
-        mount_doc_with_etag(
-            &upstream,
-            "/versions",
-            "text/plain; charset=utf-8",
-            body,
-            etag,
-        )
-        .await;
+        match etag {
+            Some(etag) => {
+                mount_doc_with_etag(
+                    &upstream,
+                    "/versions",
+                    "text/plain; charset=utf-8",
+                    body,
+                    etag,
+                )
+                .await;
+            }
+            None => {
+                mount_doc(&upstream, "/versions", "text/plain; charset=utf-8", body).await;
+            }
+        }
         let (state, cache_dir) = tdh::rewire_remote_proxy(&fx, &upstream.uri()).await;
         let uri = format!("/{}/versions", fx.repo_key);
         Some(VersionsFixture {
@@ -3675,7 +3718,7 @@ mod db_cov_tests {
     /// upstream gave us. A hit must be a bodyless 304, not another 24 MB.
     #[tokio::test]
     async fn test_rubygems_compact_index_answers_304_for_matching_etag() {
-        let Some(fixture) = remote_versions_with_etag("\"v1\"", VERSIONS_DOC).await else {
+        let Some(fixture) = remote_versions(Some("\"v1\""), VERSIONS_DOC).await else {
             return;
         };
 
@@ -3714,11 +3757,38 @@ mod db_cov_tests {
         );
     }
 
+    /// Bundler <= 2.4 reads the `ETag` as the MD5 of the local `versions`
+    /// file. An upstream without an ETag must not get a generated validator
+    /// or a partial response it cannot verify (#5974).
+    #[tokio::test]
+    async fn test_rubygems_compact_index_without_upstream_etag_serves_full_body() {
+        let Some(fixture) = remote_versions(None, VERSIONS_DOC).await else {
+            return;
+        };
+        let fallback = crate::api::handlers::cache_headers::compute_etag(VERSIONS_DOC);
+
+        let app = tdh::router_anon(super::router(), fixture.state.clone());
+        let (status, body, headers) = tdh::send_with_headers(
+            app,
+            get_with_headers(
+                fixture.uri,
+                &[("if-none-match", &fallback), ("range", "bytes=0-9")],
+            ),
+        )
+        .await;
+        fixture.fx.teardown().await;
+
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(&body[..], VERSIONS_DOC);
+        assert!(headers.get(axum::http::header::ETAG).is_none());
+        assert!(headers.get(axum::http::header::ACCEPT_RANGES).is_none());
+    }
+
     /// #5974: Bundler appends to its local `/versions` copy with a single
     /// open-ended byte range guarded by the ETag it already has.
     #[tokio::test]
     async fn test_rubygems_compact_index_answers_206_for_range_on_versions() {
-        let Some(fixture) = remote_versions_with_etag("\"v1\"", VERSIONS_DOC).await else {
+        let Some(fixture) = remote_versions(Some("\"v1\""), VERSIONS_DOC).await else {
             return;
         };
 
@@ -3766,7 +3836,7 @@ mod db_cov_tests {
     /// the client's now-stale ETag.
     #[tokio::test]
     async fn test_rubygems_compact_index_full_200_when_cached_copy_changed() {
-        let Some(fixture) = remote_versions_with_etag("\"v1\"", VERSIONS_DOC).await else {
+        let Some(fixture) = remote_versions(Some("\"v1\""), VERSIONS_DOC).await else {
             return;
         };
         expire_mutable_paths(&fixture.fx.pool, fixture.fx.repo_id).await;
