@@ -131,6 +131,8 @@ async fn list_grouped(state: &SharedState, key: &str) -> ArtifactListResponse {
         group_by: Some("docker_tag".to_string()),
         cursor: None,
         count: Some("exact".to_string()),
+        sort_by: None,
+        sort_order: None,
     };
     list_artifacts(
         State(state.clone()),
