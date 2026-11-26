@@ -1948,6 +1948,8 @@ fn compact_index_etag(upstream_etag: Option<&str>) -> Option<String> {
 /// selected representation (including its content coding), so the same hash
 /// stays correct for a full serve and for a 206 slice of it. RFC 9530 uses
 /// byte-sequence syntax, which Bundler 2.5+ expects on the Compact Index.
+/// Callers invoke it only when a body is sent, so 304 and 416 answers do not
+/// hash the ~24 MB `/versions` document.
 fn compact_index_repr_digest(content: &[u8]) -> String {
     let digest = Sha256::digest(content);
     format!("sha-256=:{}:", BASE64_STANDARD.encode(digest))
@@ -1959,7 +1961,6 @@ struct CompactIndexResponse {
     content_encoding: Option<String>,
     stale_since: Option<chrono::DateTime<chrono::Utc>>,
     etag: Option<String>,
-    repr_digest: String,
     cache_control: &'static str,
     allow_ranges: bool,
 }
@@ -1974,7 +1975,6 @@ impl CompactIndexResponse {
         request: &CompactIndexRequest<'_>,
     ) -> Self {
         let etag = compact_index_etag(upstream_etag);
-        let repr_digest = compact_index_repr_digest(&content);
         Self {
             content,
             content_type: content_type.unwrap_or_else(|| request.default_content_type.to_string()),
@@ -1982,7 +1982,6 @@ impl CompactIndexResponse {
             stale_since,
             allow_ranges: request.allow_ranges && etag.is_some(),
             etag,
-            repr_digest,
             cache_control: cache_headers::negotiated_cache_control(request.headers),
         }
     }
@@ -1990,7 +1989,6 @@ impl CompactIndexResponse {
     fn base(&self, status: StatusCode) -> axum::http::response::Builder {
         let mut builder = Response::builder()
             .status(status)
-            .header("repr-digest", &self.repr_digest)
             .header(CACHE_CONTROL, self.cache_control);
         if let Some(etag) = &self.etag {
             builder = builder.header(ETAG, etag);
@@ -2010,6 +2008,7 @@ impl CompactIndexResponse {
     fn full(&self) -> Response {
         let mut builder = self
             .base(StatusCode::OK)
+            .header("repr-digest", compact_index_repr_digest(&self.content))
             .header(CONTENT_TYPE, &self.content_type)
             .header(CONTENT_LENGTH, self.content.len().to_string());
         if let Some(encoding) = &self.content_encoding {
@@ -2025,6 +2024,7 @@ impl CompactIndexResponse {
         let total = self.content.len();
         let mut builder = self
             .base(StatusCode::PARTIAL_CONTENT)
+            .header("repr-digest", compact_index_repr_digest(&self.content))
             .header(CONTENT_TYPE, &self.content_type)
             .header(CONTENT_LENGTH, slice.len().to_string())
             .header(CONTENT_RANGE, format!("bytes {start}-{end}/{total}"));
@@ -2269,15 +2269,7 @@ mod tests {
             response.headers().get(ETAG).unwrap().to_str().unwrap(),
             "\"v1\""
         );
-        assert_eq!(
-            response
-                .headers()
-                .get("repr-digest")
-                .unwrap()
-                .to_str()
-                .unwrap(),
-            compact_index_repr_digest(b"versions body")
-        );
+        assert!(response.headers().get("repr-digest").is_none());
         assert_eq!(
             response
                 .headers()
@@ -2313,6 +2305,15 @@ mod tests {
                 .to_str()
                 .unwrap(),
             "bytes 2-5/10"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("repr-digest")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            compact_index_repr_digest(b"0123456789")
         );
         assert_eq!(response_body(response).await, Bytes::from_static(b"2345"));
     }
@@ -2391,6 +2392,7 @@ mod tests {
                 .unwrap(),
             "bytes */5"
         );
+        assert!(response.headers().get("repr-digest").is_none());
         assert!(response_body(response).await.is_empty());
     }
 
@@ -3751,10 +3753,7 @@ mod db_cov_tests {
                 .unwrap(),
             etag
         );
-        assert_eq!(
-            headers.get("repr-digest").unwrap().to_str().unwrap(),
-            super::compact_index_repr_digest(VERSIONS_DOC)
-        );
+        assert!(headers.get("repr-digest").is_none());
     }
 
     /// Bundler <= 2.4 reads the `ETag` as the MD5 of the local `versions`
