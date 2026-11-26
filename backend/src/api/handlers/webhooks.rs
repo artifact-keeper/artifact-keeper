@@ -84,14 +84,15 @@ async fn read_bounded_response_body(response: reqwest::Response, limit: usize) -
             break;
         };
         let chunk = chunk.ok()?;
-        if kept.len() == limit {
-            // One chunk past the cap tells an exact-cap body from a truncated
-            // one when the receiver omits Content-Length.
-            overflow = !chunk.is_empty();
+        let remaining = limit - kept.len();
+        if chunk.len() > remaining {
+            kept.extend_from_slice(&chunk[..remaining]);
+            // The cap can be crossed inside one chunk, not only by a chunk
+            // arriving after the cap is full.
+            overflow = true;
             break;
         }
-        let remaining = limit - kept.len();
-        kept.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+        kept.extend_from_slice(&chunk);
     }
 
     let truncated =
