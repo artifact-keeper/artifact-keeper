@@ -414,15 +414,12 @@ async fn simple_root(
         // zero anchors (B8 / #1377). Proxy-cached artifacts are not recorded
         // in `artifacts` (#1278), making the cache the only local record of
         // which projects exist for a Remote repo.
-        if let Some(proxy) = state.proxy_service.as_ref() {
-            merged.extend(
-                proxy
-                    .list_cached_pypi_packages(&repo.key)
-                    .await
-                    .into_iter()
-                    .map(|n| normalize_pep503(&n)),
-            );
-        }
+        merged.extend(
+            cached_pypi_projects(&state, repo.id, &repo.key)
+                .await
+                .into_iter()
+                .map(|n| normalize_pep503(&n)),
+        );
     }
 
     // Virtual repos have no artifacts of their own. Aggregate package names
@@ -459,21 +456,51 @@ async fn simple_root(
                 {
                     merged.extend(names);
                 }
-                if let Some(proxy) = state.proxy_service.as_ref() {
-                    merged.extend(
-                        proxy
-                            .list_cached_pypi_packages(&member.key)
-                            .await
-                            .into_iter()
-                            .map(|n| normalize_pep503(&n)),
-                    );
-                }
+                merged.extend(
+                    cached_pypi_projects(&state, member.id, &member.key)
+                        .await
+                        .into_iter()
+                        .map(|n| normalize_pep503(&n)),
+                );
             }
         }
     }
 
     let packages: Vec<String> = merged.into_iter().collect();
     build_simple_root_response(&headers, &repo_key, &packages)
+}
+
+/// The projects a Remote has a cached `simple/<name>/` index for, read from
+/// the `proxy_cache_artifacts` catalog: one indexed query instead of a
+/// storage LIST of the whole cache prefix on every root index request
+/// (#6402). Only a repository with no cataloged project index, a cache filled
+/// before the catalog existed, still lists storage
+async fn cached_pypi_projects(
+    state: &SharedState,
+    repo_id: uuid::Uuid,
+    repo_key: &str,
+) -> Vec<String> {
+    match sqlx::query_scalar::<_, String>(
+        "SELECT DISTINCT split_part(path, '/', 2) FROM proxy_cache_artifacts \
+         WHERE repository_id = $1 AND path LIKE 'simple/%/%' \
+           AND split_part(path, '/', 2) <> ''",
+    )
+    .bind(repo_id)
+    .fetch_all(&state.db)
+    .await
+    {
+        Ok(names) if !names.is_empty() => return names,
+        Ok(_) => {}
+        Err(e) => tracing::debug!(
+            repo_key = %repo_key,
+            error = %e,
+            "reading cached pypi projects from the catalog failed; listing storage"
+        ),
+    }
+    match state.proxy_service.as_ref() {
+        Some(proxy) => proxy.list_cached_pypi_packages(repo_key).await,
+        None => Vec::new(),
+    }
 }
 
 /// Maximum size of an upstream PEP 503 root simple-index body we will parse.
@@ -16216,6 +16243,71 @@ mod tests {
     const _MAX_CAP: usize = 64 * 1024 * 1024; // 64 MiB
     const _: () = assert!(super::MAX_SIMPLE_ROOT_BODY_BYTES >= _MIN_CAP);
     const _: () = assert!(super::MAX_SIMPLE_ROOT_BODY_BYTES <= _MAX_CAP);
+
+    /// #6402: the projects a Remote already cached come from the catalog, so
+    /// the root index lists them without walking the storage prefix. The
+    /// storage here is empty and the upstream has no root index, so only the
+    /// catalog can name them
+    #[tokio::test]
+    async fn test_simple_root_lists_cached_projects_from_the_catalog_6402() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
+            return;
+        };
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&mock_server)
+            .await;
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(mock_server.uri())
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("update upstream_url");
+        for path in [
+            "simple/cataloged-proj/",
+            "simple/cataloged-proj/cataloged_proj-1.0-py3-none-any.whl",
+            "simple/other-proj/",
+        ] {
+            crate::services::proxy_catalog::upsert(
+                &fx.pool, fx.repo_id, path, path, path, 1, None, None, None, None,
+            )
+            .await
+            .expect("catalog row");
+        }
+
+        let proxy =
+            tdh::build_proxy_service_with_fs(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
+        let state =
+            tdh::build_state_with_proxy(fx.pool.clone(), fx.storage_dir.to_str().unwrap(), proxy);
+        let result = super::simple_root(
+            axum::extract::State(state),
+            axum::Extension(None),
+            axum::extract::Path(fx.repo_key.clone()),
+            HeaderMap::new(),
+        )
+        .await;
+        let body = match result {
+            Ok(r) => axum::body::to_bytes(r.into_body(), 1024 * 1024)
+                .await
+                .expect("body"),
+            Err(r) => bytes::Bytes::from(format!("status {}", r.status())),
+        };
+        let body = String::from_utf8_lossy(&body).into_owned();
+        tdh::cleanup(&fx.pool, fx.repo_id, fx.user_id).await;
+        let _ = std::fs::remove_dir_all(&fx.storage_dir);
+
+        for project in ["cataloged-proj", "other-proj"] {
+            assert!(
+                body.contains(&format!(">{project}<")),
+                "the root index lists the cataloged project {project}: {body}"
+            );
+        }
+    }
 
     /// Regression: a Remote PyPI repo with NO local artifacts must proxy
     /// upstream `/simple/` and return the upstream's package list. Before
