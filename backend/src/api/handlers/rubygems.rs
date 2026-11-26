@@ -1621,7 +1621,8 @@ async fn proxy_remote_document(
 /// Compact Index variant of [`proxy_remote_document`] (#5974): same cached
 /// bytes and budget, but the response carries the upstream validator and
 /// honours the client's conditional and range headers. Only `/versions` is
-/// appended to by Bundler, so only that document advertises byte ranges.
+/// appended to by Bundler, so only that identity-encoded document with an
+/// upstream ETag advertises byte ranges.
 async fn proxy_compact_document(
     state: &SharedState,
     repo: &RepoInfo,
@@ -1901,6 +1902,13 @@ fn resolve_byte_range(range: ByteRange, len: usize) -> Option<(usize, usize)> {
     }
 }
 
+fn is_identity_content_encoding(content_encoding: Option<&str>) -> bool {
+    content_encoding.is_none_or(|value| {
+        let value = value.trim();
+        value.is_empty() || value.eq_ignore_ascii_case("identity")
+    })
+}
+
 fn strip_weak_prefix(etag: &str) -> &str {
     etag.strip_prefix("W/").unwrap_or(etag)
 }
@@ -1975,12 +1983,15 @@ impl CompactIndexResponse {
         request: &CompactIndexRequest<'_>,
     ) -> Self {
         let etag = compact_index_etag(upstream_etag);
+        let allow_ranges = request.allow_ranges
+            && etag.is_some()
+            && is_identity_content_encoding(content_encoding.as_deref());
         Self {
             content,
             content_type: content_type.unwrap_or_else(|| request.default_content_type.to_string()),
             content_encoding,
             stale_since,
-            allow_ranges: request.allow_ranges && etag.is_some(),
+            allow_ranges,
             etag,
             cache_control: cache_headers::negotiated_cache_control(request.headers),
         }
@@ -2045,9 +2056,9 @@ impl CompactIndexResponse {
 }
 
 /// Build a Compact Index response that reuses the cached upstream validator
-/// and serves ranges of the cached bytes. `If-None-Match` wins over `Range`,
-/// `If-Range` guards the 206, and an unusable range falls back to the full
-/// document rather than an error.
+/// and serves ranges of identity-encoded cached bytes. `If-None-Match` wins
+/// over `Range`, `If-Range` guards the 206, and an unusable range falls back
+/// to the full document rather than an error.
 fn forward_compact_index(
     content: Bytes,
     content_type: Option<String>,
@@ -2207,6 +2218,45 @@ mod tests {
         assert_eq!(
             response_body(response).await,
             Bytes::from_static(b"versions body")
+        );
+    }
+
+    #[test]
+    fn test_is_identity_content_encoding() {
+        assert!(is_identity_content_encoding(None));
+        assert!(is_identity_content_encoding(Some(" identity ")));
+        assert!(!is_identity_content_encoding(Some("gzip")));
+    }
+
+    #[tokio::test]
+    async fn test_forward_compact_index_ignores_range_for_coded_body() {
+        let mut headers = HeaderMap::new();
+        headers.insert(RANGE, HeaderValue::from_static("bytes=0-3"));
+        headers.insert(IF_RANGE, HeaderValue::from_static("\"v1\""));
+
+        let response = forward_compact_index(
+            Bytes::from_static(b"gzip bytes"),
+            None,
+            Some("gzip".to_string()),
+            Some("\"v1\""),
+            None,
+            &compact_request(&headers, true),
+        );
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().get(ACCEPT_RANGES).is_none());
+        assert_eq!(
+            response
+                .headers()
+                .get(CONTENT_ENCODING)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "gzip"
+        );
+        assert_eq!(
+            response_body(response).await,
+            Bytes::from_static(b"gzip bytes")
         );
     }
 
