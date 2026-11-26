@@ -119,6 +119,7 @@ the remaining actions is an incremental follow-up.
 | --- | --- |
 | `REPOSITORY_CREATED` / `_UPDATED` / `_DELETED` | `RepositoryDetails` (`actor_id`, `key`, `is_public`, structured format/policy fields; `upstream_change` / `upstream_auth_change` on credential changes, secrets never carried; on `_UPDATED`, `project_change` `{previous_project_id, project_id}` when the project assignment changed, `project_id: null` for a cleared assignment, #4026; an age-gate policy change adds `age_gate_change`: the replaced policy, `actor_tier`, and `relaxed`; a `PUT .../upstream-mode` adds `upstream_mode_change` `{previous_upstream_mode, upstream_mode}`, #5282) |
 | `AGE_GATE_LOCK_SET` / `AGE_GATE_LOCK_RELEASED` | `lock` (`policy` / `review`), `actor_tier`, `repository_key`, and the policy (`age_gate_*`) or review (`review_id`, `package`, `version`, `status`) at that moment. A release is always a relaxation. |
+| `AGE_GATE_REBASELINED` | `repository_key`, `channels_reset`: a conda Remote's age-gate sighting ledger was dropped on purpose, so each subdir records a new baseline on its next read (#6526). |
 | `ROLE_ASSIGNED` / `_REVOKED`, `REPOSITORY_PERMISSION_CHANGED` | `PermissionDetails` (`actor_id`, `role_id`, `grantee_id`, `repository_id?`) |
 | `API_TOKEN_CREATED` / `_REVOKED` | `TokenDetails` (`token_id`, `token_name?`, `surface`, `expires_at?`, `policy_applied?`) |
 | `LOGIN_FAILED`, `PERMISSION_DENIED`, `LOGIN_RATE_LIMITED` | `AuthDetails` (`username?`, `path?`, `method?`, `reason?`, federated labels?) |

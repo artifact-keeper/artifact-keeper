@@ -11056,7 +11056,7 @@ pub(crate) fn age_gate_repo_type_from_str(
 /// Map a `repositories.format` string onto the age-gate format alias space:
 /// npm-family clients (yarn/pnpm) gate as npm, pypi-family (poetry) as pypi,
 /// Go gates as Go, VS Code gates as VS Code, Cargo gates as Cargo, Maven and
-/// Gradle gate as Maven, and everything else as `Generic` (not in the
+/// Gradle gate as Maven, conda gates as conda, and everything else as `Generic` (not in the
 /// enforceable matrix).
 ///
 /// Every format carrying an entry in the age-gate capability registry
@@ -11078,6 +11078,7 @@ pub(crate) fn age_gate_format_from_str(
         "vscode" => RepositoryFormat::Vscode,
         "cargo" => RepositoryFormat::Cargo,
         "mcp" => RepositoryFormat::Mcp,
+        "conda" => RepositoryFormat::Conda,
         // #4702: Gradle repositories gate as Maven (same layout and handler).
         "maven" | "gradle" => RepositoryFormat::Maven,
         other if other.starts_with("npm") || other == "yarn" || other == "pnpm" => {
@@ -29703,6 +29704,7 @@ mod tests {
             RepositoryFormat::Cargo,
             RepositoryFormat::Maven,
             RepositoryFormat::Mcp,
+            RepositoryFormat::Conda,
         ] {
             let spec = crate::formats::age_gate_spec(&canonical)
                 .expect("format must carry an age-gate capability spec");

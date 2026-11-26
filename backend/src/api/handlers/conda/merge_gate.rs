@@ -303,6 +303,12 @@ pub(super) struct MergedDocument {
     /// For a shard index merge: where every listed shard comes from, so a
     /// shard request is routed from the kept merge (#4607).
     pub shard_index: Option<super::VirtualShardIndex>,
+    /// For a gated Remote's `repodata.json` (#6526): the records the age gate
+    /// left out, so the package route refuses exactly what the index withholds.
+    pub withheld: Option<super::age_gate::Withheld>,
+    /// For the shard index derived from a gated `repodata.json` (#6526): every
+    /// shard it lists, by address.
+    pub derived_shards: Option<HashMap<Vec<u8>, Bytes>>,
     /// When the merge finished; the document is fresh for the cache TTL
     /// from here (and while its validators hold).
     built_at: Instant,
@@ -337,6 +343,8 @@ impl MergedDocument {
             gzip: tokio::sync::OnceCell::new(),
             renderings: None,
             shard_index: None,
+            withheld: None,
+            derived_shards: None,
             built_at: Instant::now(),
             stale_since: OnceLock::new(),
             cache_key: OnceLock::new(),
@@ -407,12 +415,30 @@ impl MergedDocument {
         self
     }
 
+    /// Attach what a gated Remote's document withheld (#6526).
+    pub(super) fn with_withheld(mut self, withheld: super::age_gate::Withheld) -> Self {
+        self.withheld = Some(withheld);
+        self
+    }
+
+    /// Attach the shards a derived shard index lists (#6526).
+    pub(super) fn with_derived_shards(mut self, shards: HashMap<Vec<u8>, Bytes>) -> Self {
+        self.derived_shards = Some(shards);
+        self
+    }
+
     /// Cache weight in bytes: the body plus every rendering built so far. A
     /// rendering built after the document was kept re-weighs its cache entry
     /// ([`MergeGate::reweigh`]), so the weight is what the document holds.
     fn weight(&self) -> u32 {
         let len = |cell: &tokio::sync::OnceCell<Bytes>| cell.get().map_or(0, Bytes::len);
         let mut bytes = self.body.len().saturating_add(len(&self.gzip));
+        if let Some(w) = &self.withheld {
+            bytes = bytes.saturating_add(w.weight());
+        }
+        if let Some(shards) = &self.derived_shards {
+            bytes = bytes.saturating_add(shards.iter().map(|(k, v)| k.len() + v.len()).sum());
+        }
         if let Some(r) = &self.renderings {
             bytes = bytes
                 .saturating_add(len(&r.json))

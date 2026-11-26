@@ -594,6 +594,22 @@ static MCP_AGE_GATE_SPEC: AgeGateFormatSpec = AgeGateFormatSpec {
     publish_time_resolver: false,
 };
 
+static CONDA_AGE_GATE_SPEC: AgeGateFormatSpec = AgeGateFormatSpec {
+    canonical: RepositoryFormat::Conda,
+    label: "conda",
+    // A conda channel never replaces a published `(subdir, filename)`: the
+    // file name spells name, version and build, and a repodata patch edits a
+    // record's metadata, never its bytes. So a first sighting of a filename
+    // binds elapsed time to fixed content.
+    immutable_coordinates: true,
+    // The CEP 47 `indexed_timestamp` the channel server stamps on a record
+    // when it enters the index. Records without it are aged from this
+    // server's first sighting of the file instead (#6526,
+    // `api::handlers::conda::age_gate`); the builder-controlled `timestamp`
+    // is never trusted.
+    publish_time_resolver: true,
+};
+
 pub fn age_gate_spec(format: &RepositoryFormat) -> Option<&'static AgeGateFormatSpec> {
     match format {
         RepositoryFormat::Npm | RepositoryFormat::Yarn | RepositoryFormat::Pnpm => {
@@ -612,6 +628,9 @@ pub fn age_gate_spec(format: &RepositoryFormat) -> Option<&'static AgeGateFormat
         // Remote MCP registries gate server versions in the `/v0.1` read path
         // (`services::mcp_curation`), not a download handler.
         RepositoryFormat::Mcp => Some(&MCP_AGE_GATE_SPEC),
+        // Remote conda channels gate records in the served repodata, current
+        // repodata and CEP-16 shards, and the package route (#6526).
+        RepositoryFormat::Conda => Some(&CONDA_AGE_GATE_SPEC),
         _ => None,
     }
 }

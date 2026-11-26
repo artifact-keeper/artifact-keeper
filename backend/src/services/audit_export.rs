@@ -158,6 +158,7 @@ impl AuditAction {
             | AuditAction::AgeGateReopened
             | AuditAction::AgeGateLockSet
             | AuditAction::AgeGateLockReleased
+            | AuditAction::AgeGateRebaselined
             | AuditAction::CurationSyncTriggered
             | AuditAction::CurationVersionCreated
             | AuditAction::CurationVersionPublished

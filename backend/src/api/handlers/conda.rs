@@ -68,6 +68,7 @@ use crate::services::conda_identity::{
 use crate::services::curation::attestation_verify::{self, cep27};
 use crate::services::signing_service::SigningService;
 
+mod age_gate;
 mod current_repodata;
 #[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
@@ -2559,6 +2560,123 @@ async fn record_upstream_patch_generation(
     Some(generation)
 }
 
+/// Whether a hosted (non-Remote) member among `members` holds the package
+/// at `artifact_path` (#6526).
+async fn hosted_member_has_file(
+    db: &sqlx::PgPool,
+    members: &[crate::models::repository::Repository],
+    artifact_path: &str,
+) -> Result<bool, Response> {
+    let hosted: Vec<uuid::Uuid> = members
+        .iter()
+        .filter(|m| m.repo_type != RepositoryType::Remote)
+        .map(|m| m.id)
+        .collect();
+    if hosted.is_empty() {
+        return Ok(false);
+    }
+    sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM artifacts \
+                         WHERE repository_id = ANY($1) AND path = $2 AND NOT is_deleted)",
+    )
+    .bind(&hosted)
+    .bind(artifact_path)
+    .fetch_one(db)
+    .await
+    .map_err(virtual_merge::internal_error)
+}
+
+/// One file a gated conda Remote withholds (#6526), as the admin lookup
+/// reports it.
+pub type CondaWithheldFile = age_gate::WithheldReport;
+
+/// Every file a gated conda Remote's `subdir` withholds (or just
+/// `filename`); `Ok(None)` when the repository is not a gated conda Remote.
+pub(crate) async fn conda_withheld_files(
+    state: &SharedState,
+    repo_id: uuid::Uuid,
+    subdir: &str,
+    filename: Option<&str>,
+) -> Result<Option<Vec<CondaWithheldFile>>, Response> {
+    validate_read_subdir(subdir)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid subdir: {}", e)).into_response())?;
+    age_gate::withheld_report(state, repo_id, subdir, filename).await
+}
+
+/// Drop a conda Remote's age-gate sighting ledger (#6526).
+pub(crate) async fn conda_rebaseline(
+    state: &SharedState,
+    repo_id: uuid::Uuid,
+) -> Result<u64, Response> {
+    age_gate::rebaseline(&state.db, repo_id).await
+}
+
+/// The gate of a Remote conda repository when it is gated (#6526). The
+/// resolved row's flag is the cheap pre-check; the policy itself is re-read.
+async fn remote_gate(
+    state: &SharedState,
+    repo: &RepoInfo,
+) -> Result<Option<Arc<age_gate::ChannelGate>>, Response> {
+    if repo.repo_type != RepositoryType::Remote || !repo.age_gate_enabled {
+        return Ok(None);
+    }
+    age_gate::load_gate(&state.db, repo.id).await
+}
+
+/// The proxy model of a Remote, for the gated document builder.
+fn remote_model(repo: &RepoInfo) -> Result<crate::models::repository::Repository, Response> {
+    match repo.upstream_url.as_deref() {
+        Some(upstream_url) => Ok(proxy_helpers::build_remote_repo_with_format(
+            repo.id,
+            &repo.key,
+            upstream_url,
+            RepositoryFormat::Conda,
+        )),
+        None => Err((
+            StatusCode::NOT_FOUND,
+            format!("Remote conda repository '{}' has no upstream", repo.key),
+        )
+            .into_response()),
+    }
+}
+
+/// A gated Remote's age-gated `repodata.json` for `subdir` (#6526); `404`
+/// when the upstream publishes none.
+async fn gated_remote_repodata(
+    state: &SharedState,
+    repo: &RepoInfo,
+    gate: Arc<age_gate::ChannelGate>,
+    subdir: &str,
+) -> Result<Arc<merge_gate::MergedDocument>, Response> {
+    validate_read_subdir(subdir)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid subdir: {}", e)).into_response())?;
+    let model = remote_model(repo)?;
+    let doc =
+        age_gate::gated_repodata(&state.db, state.proxy_service.clone(), &model, gate, subdir)
+            .await?;
+    if !doc.withheld.as_ref().is_some_and(|w| w.published) {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!(
+                "Upstream of conda repository '{}' publishes no {subdir}/repodata.json",
+                repo.key
+            ),
+        )
+            .into_response());
+    }
+    Ok(doc)
+}
+
+/// Name how many records the age gate left out of a served document.
+fn mark_age_gated(response: &mut Response, withheld: Option<usize>) {
+    if let Some(count) = withheld {
+        response.headers_mut().insert(
+            age_gate::WITHHELD_HEADER,
+            axum::http::HeaderValue::from(count),
+        );
+    }
+}
+
 async fn serve_repodata(
     state: &SharedState,
     auth: Option<AuthExtension>,
@@ -2611,6 +2729,27 @@ async fn serve_repodata(
     // buffer while N concurrent requests could still drive resident memory to
     // N * 128 MiB; the budget bounds the sum. The buffered `Bytes` is then moved
     // straight into the response instead of being copied via `to_vec()`.
+    // #6526: a gated Remote serves its upstream document with the records
+    // younger than the gate left out, built and kept once for every encoding.
+    if let Some(gate) = remote_gate(state, &repo).await? {
+        let merged = gated_remote_repodata(state, &repo, gate, subdir).await?;
+        let withheld = age_gate::withheld_count(&merged);
+        let document = format!("{subdir}/{}", encoding.upstream_filename());
+        let mut response = serve_virtual_merge_encoded(
+            &state.db,
+            repo.id,
+            repo_key,
+            &document,
+            merged,
+            Some(encoding),
+            ct,
+            headers,
+        )
+        .await?;
+        mark_age_gated(&mut response, withheld);
+        return Ok(response);
+    }
+
     if repo.repo_type == RepositoryType::Remote {
         if let Some(ref upstream_url) = repo.upstream_url {
             if let Some(ref proxy) = state.proxy_service {
@@ -2808,6 +2947,16 @@ async fn repodata_json_sig(
     let mut partial = None;
     let json_bytes: Bytes = match RepositoryType::from_db_str(&repo.repo_type) {
         Some(RepositoryType::Remote) => {
+            // #6526: a gated Remote rewrites its upstream's repodata, so the
+            // upstream signature no longer covers what it serves.
+            if remote_gate(&state, &repo).await?.is_some() {
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    "This remote's repodata.json is filtered by its age gate; the upstream \
+                     signature does not cover it",
+                )
+                    .into_response());
+            }
             return serve_remote_subdir_document(
                 &state,
                 &repo,
@@ -3084,6 +3233,25 @@ async fn current_repodata_json(
     Path((repo_key, subdir)): Path<(String, String)>,
 ) -> Result<Response, Response> {
     let repo = resolve_conda_repo(&state.db, &repo_key).await?;
+    // #6526: a gated Remote derives it from its age-gated repodata.json.
+    if let Some(gate) = remote_gate(&state, &repo).await? {
+        let merged = gated_remote_repodata(&state, &repo, gate, &subdir).await?;
+        let withheld = age_gate::withheld_count(&merged);
+        let document = format!("{subdir}/current_repodata.json");
+        let current = derive_current_repodata(repo.id, &document, merged).await?;
+        let mut response = serve_virtual_merge(
+            &state.db,
+            repo.id,
+            &repo_key,
+            &document,
+            current,
+            "application/json",
+            &headers,
+        )
+        .await?;
+        mark_age_gated(&mut response, withheld);
+        return Ok(response);
+    }
     match RepositoryType::from_db_str(&repo.repo_type) {
         Some(RepositoryType::Remote) => {
             return serve_remote_subdir_document(
@@ -3792,6 +3960,26 @@ async fn serve_remote_shard_index(
     subdir: &str,
     headers: &HeaderMap,
 ) -> Result<Response, Response> {
+    // #6526: a gated Remote's shards are derived from its age-gated
+    // repodata.json, never proxied, so they list exactly what it serves.
+    if let Some(gate) = remote_gate(state, repo).await? {
+        let merged = gated_remote_repodata(state, repo, gate, subdir).await?;
+        let withheld = age_gate::withheld_count(&merged);
+        let shards = age_gate::derived_shards(repo.id, subdir, merged).await?;
+        let document = format!("{subdir}/{SHARD_INDEX_FILE}");
+        let mut response = serve_virtual_merge(
+            &state.db,
+            repo.id,
+            &repo.key,
+            &document,
+            shards,
+            CEP16_CONTENT_TYPE,
+            headers,
+        )
+        .await?;
+        mark_age_gated(&mut response, withheld);
+        return Ok(response);
+    }
     let (proxy, upstream_url) = remote_upstream(state, repo)?;
     let document = format!("{subdir}/{SHARD_INDEX_FILE}");
     let upstream = match fetch_upstream_shard_index(proxy, repo.id, &repo.key, upstream_url, subdir)
@@ -3836,6 +4024,13 @@ async fn serve_remote_shard(
     subdir: &str,
     hash_hex: &str,
 ) -> Result<Response, Response> {
+    // #6526: a gated Remote serves only the shards derived from its
+    // age-gated repodata.json.
+    if let Some(gate) = remote_gate(state, repo).await? {
+        let merged = gated_remote_repodata(state, repo, gate, subdir).await?;
+        let shards = age_gate::derived_shards(repo.id, subdir, merged).await?;
+        return derived_shard_response(&shards, hash_hex);
+    }
     let (proxy, upstream_url) = remote_upstream(state, repo)?;
     let document = format!("{subdir}/shards/{hash_hex}.msgpack.zst");
     let shards_base =
@@ -4488,6 +4683,47 @@ async fn stored_hosted_shards(
 /// Serve a virtual channel's merged shard index under its member-failure
 /// policy (#4192), with the allowlist report header (#4576) as for
 /// `repodata.json`.
+/// One shard of a derived shard index (#6526), by address.
+fn derived_shard_response(
+    shards: &merge_gate::MergedDocument,
+    hash_hex: &str,
+) -> Result<Response, Response> {
+    let address = hex::decode(hash_hex).map_err(virtual_merge::internal_error)?;
+    match shards.derived_shards.as_ref().and_then(|s| s.get(&address)) {
+        Some(shard) => Ok(shard_response(shard.clone())),
+        None => Err(shard_not_found()),
+    }
+}
+
+/// The shard index of a Virtual with a gated Remote member (#6526), derived
+/// from the Virtual's merged, age-gated repodata.json so it lists exactly
+/// what that document serves (an ungated member's upstream shard could list
+/// a file a gated member withholds). `None`: no caller-visible member is
+/// gated, and the ordinary shard merge applies.
+async fn gated_virtual_shards(
+    state: &SharedState,
+    auth: Option<&AuthExtension>,
+    repo: &RepoInfo,
+    subdir: &str,
+) -> Result<Option<std::sync::Arc<merge_gate::MergedDocument>>, Response> {
+    let members = proxy_helpers::authorized_virtual_members(&state.db, auth, repo.id).await?;
+    let remote_ids: Vec<uuid::Uuid> = members
+        .iter()
+        .filter(|m| m.repo_type == RepositoryType::Remote)
+        .map(|m| m.id)
+        .collect();
+    if age_gate::load_gates(&state.db, &remote_ids)
+        .await?
+        .is_empty()
+    {
+        return Ok(None);
+    }
+    let merged = build_virtual_repodata(state, auth, repo.id, &repo.key, subdir).await?;
+    Ok(Some(
+        age_gate::derived_shards(repo.id, subdir, merged).await?,
+    ))
+}
+
 async fn serve_virtual_shard_index(
     state: &SharedState,
     auth: Option<&AuthExtension>,
@@ -4496,6 +4732,18 @@ async fn serve_virtual_shard_index(
     headers: &HeaderMap,
 ) -> Result<Response, Response> {
     let document = format!("{subdir}/{SHARD_INDEX_FILE}");
+    if let Some(shards) = gated_virtual_shards(state, auth, repo, subdir).await? {
+        return serve_virtual_merge(
+            &state.db,
+            repo.id,
+            &repo.key,
+            &document,
+            shards,
+            CEP16_CONTENT_TYPE,
+            headers,
+        )
+        .await;
+    }
     let doc = build_virtual_shard_index(state, auth, repo.id, &repo.key, subdir).await?;
     match &doc.shard_index {
         Some(VirtualShardIndex::MemberWithoutShards(member)) => {
@@ -4850,6 +5098,9 @@ async fn serve_virtual_shard(
     hash_hex: &str,
 ) -> Result<Response, Response> {
     let document = format!("{subdir}/shards/{hash_hex}.msgpack.zst");
+    if let Some(shards) = gated_virtual_shards(state, auth, repo, subdir).await? {
+        return derived_shard_response(&shards, hash_hex);
+    }
     let doc = build_virtual_shard_index(state, auth, repo.id, &repo.key, subdir).await?;
     let merged = match &doc.shard_index {
         Some(VirtualShardIndex::Merged(merged)) => merged,
@@ -5884,7 +6135,7 @@ async fn build_virtual_repodata(
             plain_json: false,
         },
         build_artifact_entry,
-        virtual_merge::merge_repodata,
+        virtual_merge::merge_repodata_withholding,
     )
     .await
 }
@@ -5913,7 +6164,9 @@ async fn build_virtual_run_exports(
             plain_json: true,
         },
         |artifact, _filename, _subdir| run_exports_entry(artifact.metadata.as_ref()),
-        virtual_merge::merge_run_exports,
+        |key, subdir, hosted, remote, owned, allowlist, _withheld| {
+            virtual_merge::merge_run_exports(key, subdir, hosted, remote, owned, allowlist)
+        },
     )
     .await
 }
@@ -5961,6 +6214,7 @@ where
             &[virtual_merge::MemberDocument],
             &std::collections::HashSet<String>,
             Option<&crate::services::conda_allowlist::CompiledAllowlist>,
+            &std::collections::HashSet<String>,
         ) -> virtual_merge::PackageMerge
         + Send
         + 'static,
@@ -6013,6 +6267,62 @@ where
         policy_epoch_part(&mut key, listing_policy_epoch(&state.db, *id).await?);
     }
 
+    // #6526: a gated Remote member contributes its age-gated repodata.json,
+    // built (or reused) here, outside this merge, and keyed by its ETag; the
+    // files it withholds are served by no remote member.
+    let mut gated: HashMap<uuid::Uuid, virtual_merge::GatedMember> = HashMap::new();
+    if kind == merge_gate::MergeKind::Repodata {
+        let remote_ids: Vec<uuid::Uuid> = members
+            .iter()
+            .filter(|m| m.repo_type == RepositoryType::Remote)
+            .map(|m| m.id)
+            .collect();
+        let gates = age_gate::load_gates(&state.db, &remote_ids).await?;
+        for member in members
+            .iter()
+            .filter(|m| m.repo_type == RepositoryType::Remote)
+        {
+            let Some(gate) = gates.get(&member.id) else {
+                continue;
+            };
+            key.part(b"gated-member").part(member.id.as_bytes());
+            let outcome = age_gate::gated_repodata(
+                &state.db,
+                state.proxy_service.clone(),
+                member,
+                Arc::clone(gate),
+                subdir,
+            )
+            .await;
+            let entry = match outcome {
+                Ok(doc) => {
+                    key.part(doc.etag.as_bytes());
+                    Ok(doc)
+                }
+                Err(response) => {
+                    key.part(b"failed");
+                    let status = response.status();
+                    Err(virtual_merge::MemberFailure {
+                        member: member.key.clone(),
+                        kind: if status.is_server_error() {
+                            "fetch"
+                        } else {
+                            "parse"
+                        },
+                        reason: format!("age-gated repodata could not be built: {status}"),
+                    })
+                }
+            };
+            gated.insert(member.id, entry);
+        }
+    }
+    let withheld: HashSet<String> = gated
+        .values()
+        .filter_map(|g| g.as_ref().ok())
+        .filter_map(|doc| doc.withheld.as_ref())
+        .flat_map(|w| w.records.keys().cloned())
+        .collect();
+
     let db = state.db.clone();
     let proxy = state.proxy_service.clone();
     let validate_proxy = proxy.clone();
@@ -6057,13 +6367,14 @@ where
                         });
                     }
                 }
-                let (documents, mut failed, published) = virtual_merge::fetch_remote_members(
+                let (documents, mut failed, published) = virtual_merge::fetch_remote_members_gated(
                     proxy.as_deref(),
                     &members,
                     &candidates,
                     virtual_merge::MemberLimits::from_env(),
                     true,
                     &mut account,
+                    &gated,
                 )
                 .await;
                 // No member to serve and one that could not answer: 503, not
@@ -6094,6 +6405,7 @@ where
                         &documents,
                         &owned,
                         allowlist.as_deref(),
+                        &withheld,
                     )
                 })
                 .await
@@ -6175,8 +6487,18 @@ async fn build_virtual_current_repodata(
 ) -> Result<std::sync::Arc<merge_gate::MergedDocument>, Response> {
     let merged =
         build_virtual_repodata(state, auth, virtual_repo_id, virtual_repo_key, subdir).await?;
-    let kind = merge_gate::MergeKind::CurrentRepodata;
     let document = format!("{subdir}/current_repodata.json");
+    derive_current_repodata(virtual_repo_id, &document, merged).await
+}
+
+/// Derive `current_repodata.json` from a kept merged (or age-gated, #6526)
+/// `repodata.json` of `repo_id`, or reuse the derivation kept for it.
+async fn derive_current_repodata(
+    virtual_repo_id: uuid::Uuid,
+    document: &str,
+    merged: std::sync::Arc<merge_gate::MergedDocument>,
+) -> Result<std::sync::Arc<merge_gate::MergedDocument>, Response> {
+    let kind = merge_gate::MergeKind::CurrentRepodata;
     let mut key = merge_gate::MergeKeyBuilder::new(kind);
     key.part(virtual_repo_id.as_bytes())
         .part(document.as_bytes())
@@ -6958,6 +7280,19 @@ async fn download_package(
         return serve_sidecar(&state, auth.as_ref(), &repo, &subdir, &filename, request).await;
     }
 
+    // #6526: a gated Remote refuses a package its age-gated index withholds,
+    // from the proxy cache as well as from the upstream.
+    if is_conda_package(&filename) && repo.upstream_url.is_some() {
+        if let Some(gate) = remote_gate(&state, &repo).await? {
+            let model = remote_model(&repo)?;
+            if let age_gate::DownloadVerdict::Unlisted =
+                age_gate::check_download(&state, &model, gate, &subdir, &filename).await?
+            {
+                return Err(age_gate::unlisted_response(&filename));
+            }
+        }
+    }
+
     // #6433: a proxy-cache row is served only after its cache sidecar is
     // checked; one nothing vouches for is no row, so a Remote resolves the
     // package through its proxy path below.
@@ -7145,6 +7480,50 @@ async fn download_package(
                 .await?;
                 if had_members && members.is_empty() {
                     return Err(proxy_helpers::no_accessible_members_response());
+                }
+                // #6526: a file a gated Remote member withholds is served by
+                // no remote member, as the merged index does not list it; a
+                // gated member whose index does not list the file is left out
+                // of the walk, so it never fetches an undated file upstream.
+                let mut members = members;
+                if proxy_service.is_some() && is_conda_package(&filename) {
+                    let remote_ids: Vec<uuid::Uuid> = members
+                        .iter()
+                        .filter(|m| m.repo_type == RepositoryType::Remote)
+                        .map(|m| m.id)
+                        .collect();
+                    let gates = age_gate::load_gates(&state.db, &remote_ids).await?;
+                    let mut unlisted = HashSet::new();
+                    // A hosted member that holds the same file serves it, as
+                    // the merged index lists it (hosted records come first and
+                    // are never gated): the gated members step out of the walk
+                    // and record no review.
+                    if !gates.is_empty()
+                        && hosted_member_has_file(&state.db, &members, &artifact_path).await?
+                    {
+                        unlisted.extend(gates.keys().copied());
+                    } else {
+                        for member in members
+                            .iter()
+                            .filter(|m| m.repo_type == RepositoryType::Remote)
+                        {
+                            let Some(gate) = gates.get(&member.id) else {
+                                continue;
+                            };
+                            if let age_gate::DownloadVerdict::Unlisted = age_gate::check_download(
+                                &state,
+                                member,
+                                Arc::clone(gate),
+                                &subdir,
+                                &filename,
+                            )
+                            .await?
+                            {
+                                unlisted.insert(member.id);
+                            }
+                        }
+                    }
+                    members.retain(|m| !unlisted.contains(&m.id));
                 }
                 let validator = virtual_package_validator(
                     &state.db,
