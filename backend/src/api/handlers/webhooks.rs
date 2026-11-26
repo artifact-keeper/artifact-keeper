@@ -3676,6 +3676,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_read_bounded_response_body_marks_single_chunk_overflow() {
+        let limit = 8;
+        let response = chunked_response(vec![format!("{}z", "y".repeat(limit))]).await;
+        assert_eq!(
+            response.content_length(),
+            None,
+            "no declared length to rely on"
+        );
+
+        let body = read_bounded_response_body(response, limit)
+            .await
+            .expect("response body");
+        assert!(body.contains("[truncated, 8+ bytes]"));
+    }
+
+    #[tokio::test]
     async fn test_read_bounded_response_body_keeps_small_body_verbatim() {
         use wiremock::matchers::method;
         use wiremock::{Mock, MockServer, ResponseTemplate};
