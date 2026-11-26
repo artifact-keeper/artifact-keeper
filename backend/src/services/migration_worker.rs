@@ -3966,6 +3966,10 @@ fn migration_artifact_path(
         // #4657: Debian packages live under `pool/<component>/`, the layout
         // `Packages` indexes and `apt` downloads from.
         "debian" => debian_destination_path(artifact_path, None),
+        // #6532: a channel is `<subdir>/<file>`, the layout `repodata.json`
+        // is built from. `<name>/<version>/<file>` filed the package under a
+        // subdir named after it, so no index listed it
+        "conda" | "conda_native" => artifact_path.to_string(),
         _ => match version {
             Some(ver) if !ver.is_empty() => format!("{}/{}/{}", parsed_name, ver, filename),
             _ => artifact_path.to_string(),
@@ -5166,6 +5170,43 @@ mod tests {
             duplicate_lookup_path("maven", "org/ex/lib/1.0/lib-1.0.jar", None),
             "org/ex/lib/1.0/lib-1.0.jar"
         );
+    }
+
+    /// #6532: a conda package keeps its `<subdir>/<file>` path, the layout
+    /// the channel's `repodata.json` is built from, for the row and for the
+    /// duplicate check alike
+    #[test]
+    fn test_conda_package_keeps_its_subdir_path_6532() {
+        for package_type in ["conda", "conda_native"] {
+            for source in [
+                "noarch/tzdata-2024a-h0c530f3_0.conda",
+                "linux-64/zlib-1.3.1-hb9d3cd8_2.tar.bz2",
+            ] {
+                let filename = source.rsplit('/').next().unwrap();
+                let parsed = crate::services::artifact_metadata::parse_name_and_version(
+                    package_type,
+                    filename,
+                    source,
+                );
+                assert!(parsed.version.is_some(), "{source} parses with a version");
+                let identity = migration_artifact_identity(
+                    package_type,
+                    &OciRole::NotOci,
+                    None,
+                    &parsed,
+                    filename,
+                    source,
+                    None,
+                )
+                .expect("a conda package produces a row");
+                assert_eq!(identity.path, source, "{package_type}: row path");
+                assert_eq!(
+                    duplicate_lookup_path(package_type, source, None),
+                    source,
+                    "{package_type}: duplicate check path"
+                );
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
