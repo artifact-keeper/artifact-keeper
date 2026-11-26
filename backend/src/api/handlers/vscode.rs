@@ -3400,6 +3400,9 @@ fn hosted_extension_json(
         "extensionName": extension.name,
         "displayName": extension.display_name.as_deref().unwrap_or(&extension.name),
         "shortDescription": extension.description.as_deref().unwrap_or_default(),
+        // VS Code and VSCodium read `flags` as a string to tell preview
+        // extensions apart, a missing one fails the whole search (#6514)
+        "flags": "public",
         "versions": versions,
         "statistics": [],
         "tags": [],
@@ -9335,6 +9338,10 @@ mod hosted_gallery_tests {
         assert!(version["lastUpdated"].is_string());
         assert_eq!(json["displayName"], "Acme Demo");
         assert_eq!(json["shortDescription"], "Demonstrates things.");
+        assert_eq!(
+            json["flags"], "public",
+            "#6514: clients read `flags` as a string, null fails their search"
+        );
         assert_eq!(json["categories"], serde_json::json!(["Linters"]));
 
         // A platform-independent build omits `targetPlatform`.
