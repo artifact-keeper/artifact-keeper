@@ -8958,7 +8958,7 @@ mod age_gate_tests {
             return;
         };
         let _private = private_rig.add_remote(1, true, false).await;
-        let (private_status, private_bytes, private_headers) = private_rig
+        let (private_status, _, private_headers) = private_rig
             .get(private_rig.download_uri("hidden-crate", "1.0.0"))
             .await;
 
