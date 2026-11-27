@@ -2,6 +2,8 @@
 //!
 //! Manages build lifecycle: creation, status updates, and artifact attachment.
 
+use std::collections::HashMap;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgPool};
@@ -45,7 +47,18 @@ pub struct BuildArtifact {
     pub path: String,
     pub checksum_sha256: String,
     pub size_bytes: i64,
+    /// The stored artifact this entry points at, `None` for a free-form entry
+    /// or once that artifact is purged
+    pub artifact_id: Option<Uuid>,
     pub created_at: DateTime<Utc>,
+}
+
+/// A build record removed by [`BuildService::delete`]
+#[derive(Debug, Clone, FromRow)]
+pub struct DeletedBuild {
+    pub id: Uuid,
+    pub name: String,
+    pub build_number: i32,
 }
 
 /// Input for creating a new build.
@@ -81,6 +94,9 @@ pub struct BuildArtifactInput {
     pub path: String,
     pub checksum_sha256: String,
     pub size_bytes: i64,
+    /// A stored artifact the caller resolved and may read
+    #[serde(default)]
+    pub artifact_id: Option<Uuid>,
 }
 
 impl BuildService {
@@ -135,6 +151,32 @@ impl BuildService {
                 .map_err(|e| AppError::Database(e.to_string()))?;
         row.map(|(owner,)| owner)
             .ok_or_else(|| AppError::NotFound(format!("Build {} not found", build_id)))
+    }
+
+    /// The creator of each of `build_ids` that exists. A missing build has no
+    /// entry, a build created before the creator was recorded maps to `None`
+    pub async fn owners(&self, build_ids: &[Uuid]) -> Result<HashMap<Uuid, Option<Uuid>>> {
+        let rows: Vec<(Uuid, Option<Uuid>)> =
+            sqlx::query_as("SELECT id, created_by FROM builds WHERE id = ANY($1)")
+                .bind(build_ids)
+                .fetch_all(&self.db)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
+        Ok(rows.into_iter().collect())
+    }
+
+    /// Delete the build records `build_ids`. Their `build_artifacts` rows go
+    /// with them (`ON DELETE CASCADE`), the artifacts in repositories are not
+    /// touched. Returns the builds that were deleted
+    pub async fn delete(&self, build_ids: &[Uuid]) -> Result<Vec<DeletedBuild>> {
+        if build_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        sqlx::query_as("DELETE FROM builds WHERE id = ANY($1) RETURNING id, name, build_number")
+            .bind(build_ids)
+            .fetch_all(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))
     }
 
     /// Update build status and compute duration_ms if finished_at is provided.
@@ -206,11 +248,11 @@ impl BuildService {
         let mut rows: Vec<BuildArtifact> = sqlx::query_as(
             r#"
             SELECT a.id, a.build_id, a.module_name, a.name, a.path,
-                   a.checksum_sha256, a.size_bytes, a.created_at
+                   a.checksum_sha256, a.size_bytes, a.artifact_id, a.created_at
             FROM unnest($1::uuid[]) AS b(id)
             CROSS JOIN LATERAL (
                 SELECT ba.id, ba.build_id, ba.module_name, ba.name, ba.path,
-                       ba.checksum_sha256, ba.size_bytes, ba.created_at
+                       ba.checksum_sha256, ba.size_bytes, ba.artifact_id, ba.created_at
                 FROM build_artifacts ba
                 WHERE ba.build_id = b.id
                 LIMIT $2
@@ -265,9 +307,11 @@ impl BuildService {
 
             let row: BuildArtifact = sqlx::query_as(
                 r#"
-                INSERT INTO build_artifacts (build_id, module_name, name, path, checksum_sha256, size_bytes)
-                VALUES ($1, $2, $3, $4, $5, $6)
-                RETURNING id, build_id, module_name, name, path, checksum_sha256, size_bytes, created_at
+                INSERT INTO build_artifacts (build_id, module_name, name, path, checksum_sha256,
+                                             size_bytes, artifact_id)
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                RETURNING id, build_id, module_name, name, path, checksum_sha256, size_bytes,
+                          artifact_id, created_at
                 "#,
             )
             .bind(build_id)
@@ -276,6 +320,7 @@ impl BuildService {
             .bind(&artifact.path)
             .bind(&artifact.checksum_sha256)
             .bind(artifact.size_bytes)
+            .bind(artifact.artifact_id)
             .fetch_one(&self.db)
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
@@ -488,6 +533,7 @@ mod tests {
             path: "core/target/core.jar".to_string(),
             checksum_sha256: "sha256hash".to_string(),
             size_bytes: 2_097_152,
+            artifact_id: None,
             created_at: Utc::now(),
         };
         let json = serde_json::to_value(&artifact).unwrap();
@@ -525,6 +571,7 @@ mod tests {
             path: "some/path".to_string(),
             checksum_sha256: "abc".to_string(),
             size_bytes: 100,
+            artifact_id: None,
         };
         assert!(artifact.name.is_empty());
     }
@@ -537,6 +584,7 @@ mod tests {
             path: "".to_string(),
             checksum_sha256: "abc".to_string(),
             size_bytes: 100,
+            artifact_id: None,
         };
         assert!(artifact.path.is_empty());
     }

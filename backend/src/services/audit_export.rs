@@ -173,6 +173,7 @@ impl AuditAction {
             | AuditAction::GroupDeleted
             | AuditAction::GroupMembersAdded
             | AuditAction::GroupMembersRemoved
+            | AuditAction::BuildDeleted
             | AuditAction::RepositoryAllowlistChanged
             | AuditAction::QuarantineReleased
             | AuditAction::FindingAcknowledged
@@ -1122,6 +1123,7 @@ mod tests {
             AuditAction::EnvironmentRegistered,
             AuditAction::EnvironmentDeleted,
             AuditAction::ExternalFindingsIngested,
+            AuditAction::BuildDeleted,
         ] {
             assert_eq!(a.outcome(), Outcome::Success, "{}", a.as_str());
         }

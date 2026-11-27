@@ -88,6 +88,18 @@ pub(crate) async fn check_artifact_visibility(
         return Err(AppError::NotFound("Artifact not found".to_string()));
     }
 
+    check_repo_visibility(auth, repo_id, visibility, db, action).await
+}
+
+/// The repository half of [`check_artifact_visibility`], for a caller that
+/// already has the artifact's repository id and visibility
+pub(crate) async fn check_repo_visibility(
+    auth: &Option<AuthExtension>,
+    repo_id: Uuid,
+    visibility: crate::models::repository::RepositoryVisibility,
+    db: &sqlx::PgPool,
+    action: &str,
+) -> Result<()> {
     match auth {
         Some(ext) => {
             // #3704: a public repository confers a read baseline that the token
