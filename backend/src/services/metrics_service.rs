@@ -614,6 +614,23 @@ pub fn record_conda_attestation(repo_key: &str, outcome: &'static str) {
 /// The bounded `outcome` label values of `ak_conda_attestation_total`.
 pub const CONDA_ATTESTATION_OUTCOMES: [&str; 4] = ["verified", "failed", "absent", "rejected"];
 
+/// A hosted conda upload whose builder `timestamp` lies past the allowed
+/// clock skew (#6529, CEP 47 timestamp validation). `action` is one of
+/// [`CONDA_FUTURE_TIMESTAMP_ACTIONS`]: `flagged` (accepted, the default) or
+/// `rejected` (refused 400 under `CONDA_FUTURE_TIMESTAMP=reject`).
+pub fn record_conda_future_timestamp(repo_key: &str, action: &'static str) {
+    debug_assert!(CONDA_FUTURE_TIMESTAMP_ACTIONS.contains(&action));
+    counter!(
+        "ak_conda_future_timestamp_total",
+        "repository" => repo_key.to_string(),
+        "action" => action,
+    )
+    .increment(1);
+}
+
+/// The bounded `action` label values of `ak_conda_future_timestamp_total`.
+pub const CONDA_FUTURE_TIMESTAMP_ACTIONS: [&str; 2] = ["flagged", "rejected"];
+
 /// Install scripts found in an uploaded conda package's payload (#4711).
 /// `kind` is the conda hook the script implements (`pre-link`, `post-link`,
 /// `pre-unlink`), as `conda_scripts::classify_script_path` classifies it.

@@ -10410,6 +10410,108 @@ fn resolve_upload_subdir(
     }
 }
 
+/// What a hosted upload does with a package whose builder `timestamp`
+/// (`info/index.json`) lies in the future (#6529). CEP 47: a channel server
+/// SHOULD reject or flag it, since a client without `indexed_timestamp`
+/// falls back to that builder-controlled value for its cooldown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FutureTimestampAction {
+    /// No check.
+    Off,
+    /// Accept, and record it: a warning header on the 201, the
+    /// `ak_conda_future_timestamp_total{action="flagged"}` metric, a
+    /// `future_timestamp` block in the upload's audit details and a log line.
+    /// The default, so existing publishers keep working.
+    Warn,
+    /// Refuse with 400 (and count `action="rejected"`).
+    Reject,
+}
+
+/// `CONDA_FUTURE_TIMESTAMP` (`warn` | `reject` | `off`) and
+/// `CONDA_FUTURE_TIMESTAMP_SKEW_SECS` (allowed clock skew, default 600 s).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FutureTimestampPolicy {
+    action: FutureTimestampAction,
+    skew_secs: i64,
+}
+
+/// Default allowed clock skew between a build machine and this server.
+const FUTURE_TIMESTAMP_DEFAULT_SKEW_SECS: i64 = 600;
+
+impl FutureTimestampPolicy {
+    fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Self {
+        let action = match get("CONDA_FUTURE_TIMESTAMP")
+            .map(|v| v.trim().to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("reject") => FutureTimestampAction::Reject,
+            Some("off") | Some("false") | Some("0") => FutureTimestampAction::Off,
+            _ => FutureTimestampAction::Warn,
+        };
+        let skew_secs = get("CONDA_FUTURE_TIMESTAMP_SKEW_SECS")
+            .and_then(|v| v.trim().parse::<i64>().ok())
+            .unwrap_or(FUTURE_TIMESTAMP_DEFAULT_SKEW_SECS)
+            .clamp(0, 366 * 24 * 3600);
+        Self { action, skew_secs }
+    }
+
+    fn get() -> Self {
+        static POLICY: std::sync::OnceLock<FutureTimestampPolicy> = std::sync::OnceLock::new();
+        *POLICY.get_or_init(|| Self::from_lookup(|k| std::env::var(k).ok()))
+    }
+}
+
+/// A conda `timestamp` in Unix milliseconds. conda-build writes
+/// milliseconds; old packages carry seconds, which conda itself tells apart
+/// the same way (a value below 10^11 cannot be a millisecond time after 1973).
+fn builder_timestamp_millis(ts: u64) -> i64 {
+    let ts = i64::try_from(ts).unwrap_or(i64::MAX);
+    if ts < 100_000_000_000 {
+        ts.saturating_mul(1000)
+    } else {
+        ts
+    }
+}
+
+/// The builder `timestamp` of `info/index.json` as an integer. Some build
+/// tools write it as a JSON float; a negative or non-finite value is none.
+fn builder_timestamp_value(v: &serde_json::Value) -> Option<u64> {
+    v.as_u64().or_else(|| {
+        v.as_f64()
+            .filter(|f| f.is_finite() && *f >= 0.0)
+            .map(|f| f as u64)
+    })
+}
+
+/// How far (ms) the builder `timestamp` lies past `now` plus the allowed
+/// skew, or `None` when it does not (or the package has none).
+fn future_timestamp_excess(
+    timestamp: Option<u64>,
+    now: chrono::DateTime<chrono::Utc>,
+    skew_secs: i64,
+) -> Option<i64> {
+    let ts = builder_timestamp_millis(timestamp?);
+    let limit = now
+        .timestamp_millis()
+        .saturating_add(skew_secs.saturating_mul(1000));
+    (ts > limit).then(|| ts - now.timestamp_millis())
+}
+
+/// Response header naming a flagged future builder `timestamp` (#6529).
+const FUTURE_TIMESTAMP_WARNING_HEADER: &str = "X-Conda-Timestamp-Warning";
+
+/// The message a flagged or refused future `timestamp` reports.
+fn future_timestamp_message(ts: u64, ahead_ms: i64, skew_secs: i64) -> String {
+    let at = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(builder_timestamp_millis(ts))
+        .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+        .unwrap_or_else(|| ts.to_string());
+    format!(
+        "package timestamp {at} is {}s in the future (allowed clock skew {skew_secs}s); \
+         check the build machine's clock",
+        ahead_ms / 1000
+    )
+}
+
 async fn store_conda_package(
     state: &SharedState,
     repo: &RepoInfo,
@@ -10467,6 +10569,39 @@ async fn store_conda_package(
     // Validate package structure before storing (under `ingest_permit`).
     validate_conda_package(&content, filename)
         .map_err(|e| (StatusCode::BAD_REQUEST, e).into_response())?;
+
+    // #6529 (CEP 47 timestamp validation): a builder `timestamp` past the
+    // allowed clock skew is flagged (default) or refused before anything is
+    // stored.
+    let future_policy = FutureTimestampPolicy::get();
+    let builder_timestamp = extracted
+        .as_ref()
+        .and_then(|m| m.get("timestamp"))
+        .and_then(builder_timestamp_value);
+    let future_timestamp = match future_policy.action {
+        FutureTimestampAction::Off => None,
+        _ => future_timestamp_excess(
+            builder_timestamp,
+            chrono::Utc::now(),
+            future_policy.skew_secs,
+        )
+        .zip(builder_timestamp)
+        .map(|(ahead_ms, ts)| (ts, ahead_ms)),
+    };
+    if let Some((ts, ahead_ms)) = future_timestamp {
+        let message = future_timestamp_message(ts, ahead_ms, future_policy.skew_secs);
+        if future_policy.action == FutureTimestampAction::Reject {
+            crate::services::metrics_service::record_conda_future_timestamp(&repo.key, "rejected");
+            tracing::warn!(repository = %repo.key, filename, %message, "conda upload refused: future timestamp");
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("Conda upload refused: {message}"),
+            )
+                .into_response());
+        }
+        crate::services::metrics_service::record_conda_future_timestamp(&repo.key, "flagged");
+        tracing::warn!(repository = %repo.key, filename, %message, "conda upload accepted with a future timestamp");
+    }
 
     // The install scripts, still under `ingest_permit`, so this best-effort
     // analysis neither queues for a second slot nor is skipped during a
@@ -10737,19 +10872,39 @@ async fn store_conda_package(
             digest: Some(format!("sha256:{computed_sha256}")),
             uploaded_by: Some(user_id),
         },
-        conda_audit_package(
-            Some(&pkg_name),
-            Some(&pkg_version),
-            Some(&build_string),
-            subdir,
-            filename,
-        ),
+        {
+            let mut package = conda_audit_package(
+                Some(&pkg_name),
+                Some(&pkg_version),
+                Some(&build_string),
+                subdir,
+                filename,
+            );
+            if let (Some((ts, ahead_ms)), Some(map)) = (future_timestamp, package.as_object_mut()) {
+                map.insert(
+                    "future_timestamp".to_string(),
+                    serde_json::json!({
+                        "timestamp_ms": builder_timestamp_millis(ts),
+                        "ahead_ms": ahead_ms,
+                        "allowed_skew_secs": future_policy.skew_secs,
+                    }),
+                );
+            }
+            package
+        },
     )
     .await;
 
-    Ok(Response::builder()
+    let mut response = Response::builder()
         .status(StatusCode::CREATED)
-        .header(CONTENT_TYPE, "application/json")
+        .header(CONTENT_TYPE, "application/json");
+    if let Some((ts, ahead_ms)) = future_timestamp {
+        response = response.header(
+            FUTURE_TIMESTAMP_WARNING_HEADER,
+            future_timestamp_message(ts, ahead_ms, future_policy.skew_secs),
+        );
+    }
+    Ok(response
         .body(Body::from(
             build_conda_upload_response(
                 &pkg_name,
@@ -14198,6 +14353,97 @@ mod tests {
         assert_eq!(entry["size"], 8192);
         assert_eq!(entry["license"], "MIT");
         assert!(!entry["depends"].as_array().unwrap().is_empty());
+    }
+
+    /// #6529: the builder `timestamp` is compared in milliseconds, seconds
+    /// values (old packages) normalised first.
+    #[test]
+    fn future_timestamp_excess_6529() {
+        let now =
+            chrono::DateTime::<chrono::Utc>::from_timestamp_millis(1_800_000_000_000).unwrap();
+        let skew = 600;
+        assert_eq!(future_timestamp_excess(None, now, skew), None);
+        // Now, and inside the skew: fine.
+        assert_eq!(
+            future_timestamp_excess(Some(1_800_000_000_000), now, skew),
+            None
+        );
+        assert_eq!(
+            future_timestamp_excess(Some(1_800_000_000_000 + 599_000), now, skew),
+            None
+        );
+        // A day ahead, in ms and in seconds.
+        let day = 86_400_000_i64;
+        assert_eq!(
+            future_timestamp_excess(Some((1_800_000_000_000 + day) as u64), now, skew),
+            Some(day)
+        );
+        assert_eq!(
+            future_timestamp_excess(Some(1_800_000_000 + 86_400), now, skew),
+            Some(day)
+        );
+        // A past timestamp in seconds is not mistaken for 1970 ms.
+        assert_eq!(
+            future_timestamp_excess(Some(1_600_000_000), now, skew),
+            None
+        );
+        // No skew: one ms ahead is flagged.
+        assert_eq!(
+            future_timestamp_excess(Some(1_800_000_000_001), now, 0),
+            Some(1)
+        );
+        // A float timestamp is read too; garbage is not a timestamp.
+        assert_eq!(
+            builder_timestamp_value(&serde_json::json!(1_800_086_400_000.0_f64)),
+            Some(1_800_086_400_000)
+        );
+        assert_eq!(builder_timestamp_value(&serde_json::json!(-1.0)), None);
+        assert_eq!(builder_timestamp_value(&serde_json::json!("x")), None);
+    }
+
+    /// #6529: warn is the default; reject and off are opt-in; the skew
+    /// defaults to 10 minutes.
+    #[test]
+    fn future_timestamp_policy_from_env_6529() {
+        let policy = |pairs: &'static [(&'static str, &'static str)]| {
+            FutureTimestampPolicy::from_lookup(|k| {
+                pairs
+                    .iter()
+                    .find(|(n, _)| *n == k)
+                    .map(|(_, v)| v.to_string())
+            })
+        };
+        assert_eq!(
+            policy(&[]),
+            FutureTimestampPolicy {
+                action: FutureTimestampAction::Warn,
+                skew_secs: 600
+            }
+        );
+        assert_eq!(
+            policy(&[("CONDA_FUTURE_TIMESTAMP", "REJECT")]).action,
+            FutureTimestampAction::Reject
+        );
+        assert_eq!(
+            policy(&[("CONDA_FUTURE_TIMESTAMP", "off")]).action,
+            FutureTimestampAction::Off
+        );
+        assert_eq!(
+            policy(&[("CONDA_FUTURE_TIMESTAMP", "bogus")]).action,
+            FutureTimestampAction::Warn
+        );
+        assert_eq!(
+            policy(&[("CONDA_FUTURE_TIMESTAMP_SKEW_SECS", "30")]).skew_secs,
+            30
+        );
+        assert_eq!(
+            policy(&[("CONDA_FUTURE_TIMESTAMP_SKEW_SECS", "-5")]).skew_secs,
+            0
+        );
+        assert_eq!(
+            policy(&[("CONDA_FUTURE_TIMESTAMP_SKEW_SECS", "x")]).skew_secs,
+            600
+        );
     }
 
     /// CEP-47: the server-set `indexed_timestamp` is the artifact's indexing
