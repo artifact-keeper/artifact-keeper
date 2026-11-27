@@ -257,6 +257,10 @@ pub struct AqlResult {
     pub size: Option<i64>,
     pub created: Option<String>,
     pub modified: Option<String>,
+    /// When the source last served the file. Nexus only, Artifactory keeps it
+    /// in its stats endpoint (#6519).
+    #[serde(default)]
+    pub last_downloaded: Option<String>,
     pub sha256: Option<String>,
     pub actual_sha1: Option<String>,
     /// The source could not rule out having listed this row already in the

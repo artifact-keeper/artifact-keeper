@@ -470,11 +470,58 @@ pub struct NexusAsset {
     pub file_size: Option<i64>,
     /// Nexus repository format of the asset (`raw`, `maven2`, `npm`, ...).
     pub format: Option<String>,
-    /// When the asset was last modified (RFC 3339). Read for the migration's
-    /// date window (#6195); `blobCreated` is not, because Nexus 3.68 emits it
-    /// twice per asset.
+    /// When the asset's current content was stored (RFC 3339), the UI's "Blob
+    /// updated". Read for the migration's date window (#6195).
     #[serde(rename = "lastModified", default)]
     pub last_modified: Option<String>,
+    /// The UI's "Last downloaded" (RFC 3339), imported with
+    /// `import_source_timestamps` (#6519).
+    #[serde(rename = "lastDownloaded", default)]
+    pub last_downloaded: Option<String>,
+    /// `blobCreated`, which Nexus 3.68 emits twice per asset, so a plain field
+    /// fails the whole page on the duplicate key.
+    #[serde(flatten)]
+    pub blob_created: BlobCreated,
+}
+
+/// The earliest non-null `blobCreated` of an asset, whatever the order of its
+/// duplicated keys (#6519). Values that do not parse as RFC 3339 are dropped.
+#[derive(Debug, Default)]
+pub struct BlobCreated(pub Option<String>);
+
+impl<'de> Deserialize<'de> for BlobCreated {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Earliest;
+        impl<'de> serde::de::Visitor<'de> for Earliest {
+            type Value = BlobCreated;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("an asset object")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<BlobCreated, A::Error> {
+                let mut earliest: Option<(chrono::DateTime<chrono::FixedOffset>, String)> = None;
+                while let Some(key) = map.next_key::<String>()? {
+                    if key != "blobCreated" {
+                        map.next_value::<serde::de::IgnoredAny>()?;
+                        continue;
+                    }
+                    let Some(raw) = map.next_value::<Option<String>>()? else {
+                        continue;
+                    };
+                    let Ok(at) = chrono::DateTime::parse_from_rfc3339(&raw) else {
+                        continue;
+                    };
+                    if earliest.as_ref().is_none_or(|(e, _)| at < *e) {
+                        earliest = Some((at, raw));
+                    }
+                }
+                Ok(BlobCreated(earliest.map(|(_, raw)| raw)))
+            }
+        }
+        deserializer.deserialize_map(Earliest)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -867,11 +914,26 @@ impl NexusClient {
             path: dir,
             name,
             size: asset.file_size,
-            created: None,
+            created: Self::asset_created(asset),
             modified: asset.last_modified.clone(),
+            last_downloaded: asset.last_downloaded.clone(),
             sha256: asset.checksum.as_ref().and_then(|c| c.sha256.clone()),
             actual_sha1: asset.checksum.as_ref().and_then(|c| c.sha1.clone()),
         }
+    }
+
+    /// The earlier of `blobCreated` and `lastModified`, the date the Nexus UI
+    /// shows as "Blob created" to work around NEXUS-31391 (#6519).
+    fn asset_created(asset: &NexusAsset) -> Option<String> {
+        [
+            asset.blob_created.0.as_deref(),
+            asset.last_modified.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .filter_map(|raw| Some((chrono::DateTime::parse_from_rfc3339(raw).ok()?, raw)))
+        .min_by_key(|(at, _)| *at)
+        .map(|(_, raw)| raw.to_string())
     }
 
     /// Whether an asset outside every component is a file someone stored, not
@@ -3373,6 +3435,82 @@ mod tests {
             asset.last_modified.as_deref(),
             Some("2024-02-02T00:00:00.000+00:00")
         );
+        assert_eq!(
+            asset.blob_created.0.as_deref(),
+            Some("2024-01-01T00:00:00.000+00:00")
+        );
+    }
+
+    /// #6519: whatever the order of the duplicated `blobCreated` keys, the
+    /// earliest non-null value wins.
+    #[test]
+    fn test_nexus_asset_keeps_the_earliest_blob_created_6519() {
+        let parse = |pair: &str| -> Option<String> {
+            let json = format!(r#"{{"id": "a1", {pair}}}"#);
+            let asset: NexusAsset = serde_json::from_str(&json).expect("asset parses");
+            asset.blob_created.0
+        };
+        let day = "2024-01-01T00:00:00.000+00:00";
+        let later = "2024-03-01T00:00:00.000+00:00";
+        assert_eq!(
+            parse(&format!(r#""blobCreated": null, "blobCreated": "{day}""#)).as_deref(),
+            Some(day)
+        );
+        assert_eq!(
+            parse(&format!(r#""blobCreated": "{day}", "blobCreated": null"#)).as_deref(),
+            Some(day)
+        );
+        assert_eq!(
+            parse(&format!(
+                r#""blobCreated": "{later}", "blobCreated": "{day}""#
+            ))
+            .as_deref(),
+            Some(day)
+        );
+        assert_eq!(parse(r#""blobCreated": null"#), None);
+        assert_eq!(parse(r#""blobCreated": "yesterday""#), None);
+    }
+
+    /// #6519: an asset's creation date is the earlier of `blobCreated` and
+    /// `lastModified` (NEXUS-31391), either alone, or none.
+    #[test]
+    fn test_asset_to_result_created_is_the_earlier_date_6519() {
+        let created = |extra: &str| -> Option<String> {
+            let json =
+                format!(r#"{{"id": "a1", "lastDownloaded": "2025-01-01T00:00:00Z"{extra}}}"#);
+            let asset: NexusAsset = serde_json::from_str(&json).expect("asset parses");
+            let result = NexusClient::asset_to_result("r", "x/y.bin", &asset);
+            assert_eq!(
+                result.last_downloaded.as_deref(),
+                Some("2025-01-01T00:00:00Z")
+            );
+            result.created
+        };
+        let early = "2023-01-01T00:00:00Z";
+        let late = "2024-01-01T00:00:00Z";
+        assert_eq!(
+            created(&format!(
+                r#", "blobCreated": "{late}", "lastModified": "{early}""#
+            ))
+            .as_deref(),
+            Some(early)
+        );
+        assert_eq!(
+            created(&format!(
+                r#", "blobCreated": "{early}", "lastModified": "{late}""#
+            ))
+            .as_deref(),
+            Some(early)
+        );
+        assert_eq!(
+            created(&format!(r#", "lastModified": "{late}""#)).as_deref(),
+            Some(late)
+        );
+        assert_eq!(
+            created(&format!(r#", "blobCreated": "{late}""#)).as_deref(),
+            Some(late)
+        );
+        assert_eq!(created(""), None);
     }
 
     // -----------------------------------------------------------------------

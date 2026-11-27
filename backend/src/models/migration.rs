@@ -147,6 +147,12 @@ pub struct MigrationConfig {
     /// to return inaccurate digests (issue #856).
     #[serde(default = "default_true")]
     pub verify_checksums: bool,
+    /// Keep the source's creation and last-download dates instead of the
+    /// import time (#6519). Off by default: old, never-downloaded artifacts
+    /// become eligible for `max_age` and `no_downloads_days` lifecycle
+    /// policies straight away. See `docs/migration-source-timestamps.md`.
+    #[serde(default)]
+    pub import_source_timestamps: bool,
     /// Migrate only artifacts modified strictly after this instant. The bound
     /// is exclusive on both Artifactory (AQL `$gt`) and Nexus sources: an
     /// artifact modified exactly at `date_from` is not listed. When chaining
