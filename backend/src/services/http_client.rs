@@ -825,57 +825,73 @@ mod tests {
         }
     }
 
-    /// #5193: rebuilding every shared HTTP trust class retains its resolver
-    /// and per-hop redirect policy, rather than falling back to a bare client.
+    /// #5193: plain snapshots and retained pools enforce the same outbound
+    /// policy, including after a CA refresh rebuilds the retained pool.
     #[tokio::test]
-    async fn test_ca_rotation_preserves_ssrf_policies() {
+    async fn test_snapshot_and_reloaded_clients_enforce_the_same_policy() {
         use tokio::net::TcpListener;
+        type SnapshotBuilder = fn() -> reqwest::ClientBuilder;
+        let request_timeout = Duration::from_millis(500);
         let pem = include_str!("../../tests/fixtures/test-ca.pem");
-        for make in [
-            base_client_builder as fn() -> ClientBuilder,
-            internal_service_client_builder,
-            webhook_client_builder,
-            sso_client_builder,
+        for (retained_builder, snapshot_builder) in [
+            (
+                base_client_builder as fn() -> ClientBuilder,
+                Some(super::base_client_builder as SnapshotBuilder),
+            ),
+            (internal_service_client_builder, None),
+            (webhook_client_builder, Some(super::webhook_client_builder)),
+            (sso_client_builder, Some(super::sso_client_builder)),
         ] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("ca.pem");
             std::fs::write(&path, pem).unwrap();
-            let client = build_client_outside_proxy_env_window(|| {
-                make()
-                    .no_proxy()
-                    .timeout(Duration::from_millis(500))
+            let (retained, snapshot) = with_env_proxy_5459(&[], || {
+                let retained = retained_builder()
+                    .timeout(request_timeout)
                     .build_with_ca_path_for_test(path.clone())
-                    .unwrap()
+                    .unwrap();
+                let snapshot = snapshot_builder
+                    .map(|build| Client::from(build().timeout(request_timeout).build().unwrap()));
+                (retained, snapshot)
             });
             let dns_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let blocked_url = format!(
+                "http://localhost:{}/",
+                dns_listener.local_addr().unwrap().port()
+            );
             let redirect_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let redirect_addr = redirect_listener.local_addr().unwrap();
+            let redirect_response = format!(
+                "HTTP/1.1 302 Found\r\nLocation: {blocked_url}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            let stalled_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let stalled_url = format!("http://{}/", stalled_listener.local_addr().unwrap());
+            let expected_redirects = 2 + usize::from(snapshot.is_some());
             let server = tokio::spawn(async move {
-                for _ in 0..2 {
+                for _ in 0..expected_redirects {
                     let (mut socket, _) = redirect_listener.accept().await.unwrap();
                     let mut bytes = [0; 2048];
                     let _ = socket.read(&mut bytes).await;
-                    let _ = socket.write_all(b"HTTP/1.1 302 Found\r\nLocation: http://169.254.169.254/latest/meta-data/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                    socket
+                        .write_all(redirect_response.as_bytes())
+                        .await
+                        .unwrap();
                 }
             });
-            for rotate in [false, true] {
+            for (rotate, client) in snapshot
+                .iter()
+                .map(|client| (false, client))
+                .chain([(false, &retained), (true, &retained)])
+            {
                 if rotate {
                     let mut update = tempfile::NamedTempFile::new_in(dir.path()).unwrap();
                     writeln!(update, "{pem}").unwrap();
                     update.persist(&path).unwrap();
                     assert!(client.refresh_custom_ca_for_test());
                 }
-                let err = client
-                    .get(format!(
-                        "http://localhost:{}/",
-                        dns_listener.local_addr().unwrap().port()
-                    ))
-                    .send()
-                    .await
-                    .unwrap_err();
-                assert!(
-                    !err.is_timeout(),
-                    "resolver must refuse before a connection timeout: {err}"
+                assert_ssrf_refusal_5459(
+                    client.get(&blocked_url).send().await,
+                    "resolver must refuse a hostname that resolves to loopback",
                 );
                 assert!(
                     tokio::time::timeout(Duration::from_millis(50), dns_listener.accept())
@@ -889,9 +905,14 @@ mod tests {
                     .await
                     .unwrap_err();
                 assert!(
-                    err.is_redirect(),
-                    "metadata redirect must be refused: {err}"
+                    err.is_redirect() && crate::services::ssrf_refusal::is_ssrf_refusal_error(&err),
+                    "redirect to loopback must be refused by the redirect policy: {err:?}"
                 );
+                let result =
+                    tokio::time::timeout(Duration::from_secs(2), client.get(&stalled_url).send())
+                        .await
+                        .expect("client timeout must fire first");
+                assert!(result.unwrap_err().is_timeout());
             }
             join_loopback_server(server).await;
         }
@@ -1226,19 +1247,23 @@ mod tests {
     /// were set, which is what this reads.
     #[test]
     fn test_sso_client_builder_sets_connect_and_request_timeouts_5485() {
+        let assert_timeouts = |builder: reqwest::ClientBuilder| {
+            let debug = format!("{builder:?}");
+            assert!(
+                debug.contains(&format!("connect_timeout: {SSO_CONNECT_TIMEOUT:?}")),
+                "SSO client has no connect timeout: {debug}"
+            );
+            assert!(
+                debug.contains(&format!(" timeout: {SSO_REQUEST_TIMEOUT:?}")),
+                "SSO client has no request timeout: {debug}"
+            );
+            builder
+        };
+        assert_timeouts(super::sso_client_builder())
+            .build()
+            .expect("build one-shot SSO client with bounded timeouts");
         sso_client_builder()
-            .configure(|builder| {
-                let debug = format!("{builder:?}");
-                assert!(
-                    debug.contains(&format!("connect_timeout: {SSO_CONNECT_TIMEOUT:?}")),
-                    "SSO client has no connect timeout: {debug}"
-                );
-                assert!(
-                    debug.contains(&format!(" timeout: {SSO_REQUEST_TIMEOUT:?}")),
-                    "SSO client has no request timeout: {debug}"
-                );
-                builder
-            })
+            .configure(assert_timeouts)
             .build()
             .expect("build SSO client with bounded timeouts");
         assert!(SSO_CONNECT_TIMEOUT <= SSO_REQUEST_TIMEOUT);

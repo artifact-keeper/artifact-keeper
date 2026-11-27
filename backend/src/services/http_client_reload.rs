@@ -4,6 +4,7 @@
 //! every replacement before publishing any of them; old request builders and
 //! in-flight responses may finish, but new requests cannot select an old pool.
 
+use std::ffi::OsStr;
 use std::fs::File;
 use std::io::Read;
 use std::path::PathBuf;
@@ -14,7 +15,8 @@ use reqwest::{Certificate, IntoUrl, Method, Request, RequestBuilder, Response};
 use rustls::pki_types::{pem::PemObject, CertificateDer};
 use sha2::{Digest, Sha256};
 
-const POLL_INTERVAL: Duration = Duration::from_secs(5);
+const POLL_INTERVAL_ENV: &str = "CUSTOM_CA_RELOAD_POLL_INTERVAL_SECS";
+const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const ERROR_INTERVAL: Duration = Duration::from_secs(60);
 const MAX_BUNDLE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_CERTIFICATES: usize = 2048;
@@ -243,6 +245,24 @@ fn custom_ca_path() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+fn poll_interval(value: Option<&OsStr>) -> Option<Duration> {
+    match value {
+        None => Some(DEFAULT_POLL_INTERVAL),
+        Some(value) => match value.to_str().and_then(|value| value.parse::<u64>().ok()) {
+            Some(0) => None,
+            Some(seconds) => Some(Duration::from_secs(seconds)),
+            None => {
+                tracing::warn!(
+                    setting = POLL_INTERVAL_ENV,
+                    default_seconds = DEFAULT_POLL_INTERVAL.as_secs(),
+                    "Invalid custom CA poll interval; using the default"
+                );
+                Some(DEFAULT_POLL_INTERVAL)
+            }
+        },
+    }
+}
+
 fn manager_for(path: PathBuf) -> Arc<TrustManager> {
     let registry = MANAGERS.get_or_init(|| Mutex::new(Vec::new()));
     let mut managers = registry.lock().unwrap_or_else(|e| e.into_inner());
@@ -253,21 +273,24 @@ fn manager_for(path: PathBuf) -> Arc<TrustManager> {
     managers.push(manager.clone());
     static WORKER: Once = Once::new();
     WORKER.call_once(|| {
-        std::thread::Builder::new()
+        let Some(interval) = poll_interval(std::env::var_os(POLL_INTERVAL_ENV).as_deref()) else {
+            return;
+        };
+        if let Err(error) = std::thread::Builder::new()
             .name("custom-ca-reload".into())
-            .spawn(|| loop {
-                std::thread::sleep(POLL_INTERVAL);
-                let managers = MANAGERS
-                    .get()
-                    .unwrap()
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .clone();
+            .spawn(move || loop {
+                std::thread::sleep(interval);
+                let managers = registry.lock().unwrap_or_else(|e| e.into_inner()).clone();
                 for manager in managers {
                     manager.refresh();
                 }
             })
-            .expect("start custom CA reload worker");
+        {
+            tracing::warn!(
+                %error,
+                "Could not start custom CA reload worker; keeping startup trust until restart"
+            );
+        }
     });
     manager
 }
