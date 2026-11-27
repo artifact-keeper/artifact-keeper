@@ -1252,6 +1252,23 @@ async fn complete_session_commit(
     // commit (or an ambiguous commit error): a retry would then hit the
     // immutability gate on the path this session already wrote.
     //
+    // #6525: a hosted conda package's upload hold, applied in the row's own
+    // transaction below. Only read for a conda repository.
+    let conda_hold_until = if matches!(
+        repo.format,
+        crate::models::repository::RepositoryFormat::Conda
+            | crate::models::repository::RepositoryFormat::CondaNative
+    ) {
+        Some(
+            crate::services::quarantine_service::upload_hold_until(
+                &state.db,
+                session.repository_id,
+            )
+            .await,
+        )
+    } else {
+        None
+    };
     // #4980: the transaction opens behind the storage GC commit guard, so the
     // object written or deduplicated above cannot be collected before this
     // row commits. Both refusals are retryable and release the lease: while a
@@ -1384,7 +1401,11 @@ async fn complete_session_commit(
             ON CONFLICT (repository_id, path) DO UPDATE SET
                 name = $3, version = $4, size_bytes = $5, checksum_sha256 = $6,
                 content_type = $7, storage_key = $8, uploaded_by = $9,
-                updated_at = NOW(), is_deleted = false
+                updated_at = NOW(), is_deleted = false,
+                indexed_at = CASE
+                    WHEN LOWER(artifacts.checksum_sha256) = LOWER(EXCLUDED.checksum_sha256)
+                    THEN artifacts.indexed_at END,
+                index_pending = false
             WHERE (artifacts.is_deleted
                 OR $10
                 OR artifacts.version IS DISTINCT FROM EXCLUDED.version
@@ -1450,6 +1471,16 @@ async fn complete_session_commit(
             &mut tx, &repo, &old_key,
         )
         .await
+        {
+            drop(tx);
+            return Err(release_after_precommit_failure(&state.db, &session, e).await);
+        }
+    }
+    // #6525: a hosted conda package's hold and indexing time, decided with
+    // the row, as on the conda upload route.
+    if let Some(hold_until) = conda_hold_until {
+        if let Err(e) =
+            crate::services::index_time::settle_written_row(&mut tx, artifact_id, hold_until).await
         {
             drop(tx);
             return Err(release_after_precommit_failure(&state.db, &session, e).await);

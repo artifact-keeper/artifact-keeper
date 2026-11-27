@@ -31,7 +31,10 @@ use futures::TryStreamExt;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use super::{build_artifact_entry, is_conda_package, is_conda_v2, is_withdrawn, CondaArtifact};
+use super::{
+    build_artifact_entry, is_conda_package, is_conda_v2, is_withdrawn, CondaArtifact,
+    CondaArtifactRow, CONDA_ARTIFACT_ROW_COLUMNS,
+};
 
 /// Rows fetched and written per chunk of the second pass.
 const ROWS_PER_CHUNK: usize = 512;
@@ -264,50 +267,24 @@ struct Writers {
     current: PrettyDoc,
 }
 
-/// Rows of `ids`, as the full listing carries them.
+/// Rows of `ids`, as the full listing carries them. Every one is listed (the
+/// first pass left out the held and policy-refused rows), so a pending row
+/// among them is stamped here (#6525), as [`super::list_conda_artifacts`]
+/// does.
 async fn rows_by_id(db: &PgPool, ids: &[Uuid]) -> Result<HashMap<Uuid, CondaArtifact>, Response> {
-    #[derive(sqlx::FromRow)]
-    struct Row {
-        id: Uuid,
-        path: String,
-        name: String,
-        version: Option<String>,
-        size_bytes: i64,
-        checksum_sha256: String,
-        storage_key: String,
-        metadata: Option<serde_json::Value>,
-        created_at: DateTime<Utc>,
-    }
-    let rows: Vec<Row> = sqlx::query_as(
-        "SELECT a.id, a.path, a.name, a.version, a.size_bytes, a.checksum_sha256, \
-                a.storage_key, am.metadata, a.created_at \
+    let sql = format!(
+        "SELECT {CONDA_ARTIFACT_ROW_COLUMNS} \
            FROM artifacts a \
            LEFT JOIN artifact_metadata am ON am.artifact_id = a.id \
-          WHERE a.id = ANY($1)",
-    )
-    .bind(ids)
-    .fetch_all(db)
-    .await
-    .map_err(failed)?;
-    Ok(rows
-        .into_iter()
-        .map(|r| {
-            (
-                r.id,
-                CondaArtifact {
-                    id: r.id,
-                    path: r.path,
-                    name: r.name,
-                    version: r.version,
-                    size_bytes: r.size_bytes,
-                    checksum_sha256: r.checksum_sha256,
-                    storage_key: r.storage_key,
-                    metadata: r.metadata,
-                    indexed_at: Some(r.created_at),
-                },
-            )
-        })
-        .collect())
+          WHERE a.id = ANY($1)"
+    );
+    let mut rows: Vec<CondaArtifactRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
+        .bind(ids)
+        .fetch_all(db)
+        .await
+        .map_err(failed)?;
+    super::stamp_listed_rows(db, &mut rows, true, "render").await;
+    Ok(rows.iter().map(|r| (r.id, r.to_artifact())).collect())
 }
 
 /// The documents of a subdir no row has ever named: the bytes

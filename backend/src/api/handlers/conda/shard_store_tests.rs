@@ -1646,3 +1646,383 @@ async fn conda_dirty_mark_migration_takes_no_access_exclusive_6090() {
     );
     tx.rollback().await.unwrap();
 }
+
+/// The `indexed_timestamp` (ms) `filename` carries in `doc` (a decoded
+/// repodata document or shard), from either package section.
+fn indexed_ms_6525(doc: &serde_json::Value, filename: &str) -> Option<i64> {
+    ["packages", "packages.conda"]
+        .iter()
+        .find_map(|s| doc[*s].get(filename))
+        .and_then(|r| r["indexed_timestamp"].as_i64())
+}
+
+/// `indexed_timestamp` of `filename` in `repodata.json`, its `.zst`, and the
+/// package's shard (`None` where it is not listed).
+async fn served_indexed_ms_6525(
+    fx: &tdh::Fixture,
+    subdir: &str,
+    name: &str,
+    filename: &str,
+) -> [Option<i64>; 3] {
+    let (_, json, _) = get(fx, &format!("{subdir}/repodata.json")).await;
+    let json: serde_json::Value = serde_json::from_slice(&json).unwrap();
+    let (_, zst, _) = get(fx, &format!("{subdir}/repodata.json.zst")).await;
+    let zst: serde_json::Value =
+        serde_json::from_slice(&zstd::decode_all(&zst[..]).unwrap()).unwrap();
+    let (_, index, _) = get(fx, &format!("{subdir}/repodata_shards.msgpack.zst")).await;
+    let shard = match decode_index(&index).remove(name) {
+        None => None,
+        Some(address) => {
+            let (status, body, _) = get(
+                fx,
+                &format!("{subdir}/shards/{}.msgpack.zst", hex::encode(address)),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            // Shards hold binary digests, so decode only what is compared.
+            #[derive(serde::Deserialize)]
+            struct Rec {
+                indexed_timestamp: Option<i64>,
+            }
+            #[derive(serde::Deserialize)]
+            struct Shard {
+                #[serde(default)]
+                packages: BTreeMap<String, Rec>,
+                #[serde(default, rename = "packages.conda")]
+                packages_conda: BTreeMap<String, Rec>,
+            }
+            let shard: Shard =
+                rmp_serde::from_slice(&zstd::decode_all(&body[..]).unwrap()).unwrap();
+            shard
+                .packages
+                .get(filename)
+                .or_else(|| shard.packages_conda.get(filename))
+                .and_then(|r| r.indexed_timestamp)
+        }
+    };
+    [
+        indexed_ms_6525(&json, filename),
+        indexed_ms_6525(&zst, filename),
+        shard,
+    ]
+}
+
+async fn db_now_ms_6525(fx: &tdh::Fixture) -> i64 {
+    let now: chrono::DateTime<chrono::Utc> = sqlx::query_scalar("SELECT NOW()")
+        .fetch_one(&fx.pool)
+        .await
+        .unwrap();
+    now.timestamp_millis()
+}
+
+/// #6525: a package held from its upload is indexed when the hold is
+/// released, not when it was uploaded, and every encoding and the shard
+/// agree on that value across rebuilds.
+#[tokio::test]
+async fn a_held_package_is_indexed_at_its_release_6525() {
+    let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
+        return;
+    };
+    let held = upload(&fx, "noarch", "ix-held", "1.0").await;
+    // Held from the upload: the state the upload hold leaves the row in.
+    sqlx::query(
+        "UPDATE artifacts SET quarantine_status = 'quarantined', \
+                quarantine_until = NOW() + INTERVAL '1 hour', \
+                indexed_at = NULL, index_pending = true, \
+                created_at = NOW() - INTERVAL '7 days' \
+          WHERE repository_id = $1 AND path = $2",
+    )
+    .bind(fx.repo_id)
+    .bind(format!("noarch/{held}"))
+    .execute(&fx.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        served_indexed_ms_6525(&fx, "noarch", "ix-held", &held).await,
+        [None, None, None],
+        "held: not listed"
+    );
+
+    let released_at = db_now_ms_6525(&fx).await;
+    sqlx::query(
+        "UPDATE artifacts SET quarantine_status = 'released', quarantine_until = NULL \
+          WHERE repository_id = $1 AND path = $2",
+    )
+    .bind(fx.repo_id)
+    .bind(format!("noarch/{held}"))
+    .execute(&fx.pool)
+    .await
+    .unwrap();
+    let first = served_indexed_ms_6525(&fx, "noarch", "ix-held", &held).await;
+    let at = first[0].expect("listed after the release");
+    assert!(
+        at >= released_at,
+        "indexed {at} before the release {released_at}"
+    );
+    assert_eq!(first, [Some(at); 3], "json, zst and the shard agree");
+
+    // A later write to the channel rebuilds everything; the value stays.
+    upload(&fx, "noarch", "ix-other", "1.0").await;
+    assert_eq!(
+        served_indexed_ms_6525(&fx, "noarch", "ix-held", &held).await,
+        [Some(at); 3]
+    );
+}
+
+/// #6525: a package a scan policy refused from its upload is indexed when
+/// the policy stops refusing it. A sharded client sees it (with that time)
+/// even if nothing fetches `repodata.json` first.
+#[tokio::test]
+async fn a_policy_blocked_package_is_indexed_when_the_policy_lifts_6525() {
+    let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
+        return;
+    };
+    sqlx::query(
+        "INSERT INTO scan_policies (name, repository_id, max_severity, block_unscanned, \
+                                    block_on_fail, is_enabled) \
+         VALUES ($1, $2, 'critical', true, false, true)",
+    )
+    .bind(format!("ix-6525-{}", fx.repo_id))
+    .bind(fx.repo_id)
+    .execute(&fx.pool)
+    .await
+    .unwrap();
+    crate::services::quarantine_service::invalidate_listing_decisions();
+    let pkg = upload(&fx, "noarch", "ix-pol", "1.0").await;
+    assert_eq!(
+        served_indexed_ms_6525(&fx, "noarch", "ix-pol", &pkg).await,
+        [None, None, None],
+        "refused: not listed"
+    );
+    let pending: bool = sqlx::query_scalar(
+        "SELECT index_pending FROM artifacts WHERE repository_id = $1 AND path = $2",
+    )
+    .bind(fx.repo_id)
+    .bind(format!("noarch/{pkg}"))
+    .fetch_one(&fx.pool)
+    .await
+    .unwrap();
+    assert!(pending, "a refused upload waits for its first listing");
+
+    let lifted_at = db_now_ms_6525(&fx).await;
+    sqlx::query("DELETE FROM scan_policies WHERE repository_id = $1")
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .unwrap();
+    crate::services::quarantine_service::invalidate_listing_decisions();
+    crate::services::index_time::mark_pending_conda_rows_dirty(fx.pool.clone()).await;
+
+    // The shard first, as a sharded client asks.
+    let listed = shard_of(&fx, "noarch", "ix-pol").await;
+    assert_eq!(listed, Some(vec![pkg.clone()]));
+    let served = served_indexed_ms_6525(&fx, "noarch", "ix-pol", &pkg).await;
+    let at = served[2].expect("in the shard");
+    assert!(
+        at >= lifted_at,
+        "indexed {at} before the policy lifted {lifted_at}"
+    );
+    assert_eq!(served, [Some(at); 3]);
+}
+
+/// #6525: a restore (`index_time::RELIST_SET_SQL`, as the trash restore
+/// writes it) keeps the time of a package that was already listed (the same
+/// bytes, a value clients saw), and dates one that was never stamped (a row
+/// from before migration 426) to its return. A pre-migration row that stays
+/// live keeps being served with its creation time.
+#[tokio::test]
+async fn a_restore_keeps_a_stamp_and_redates_an_unstamped_row_6525() {
+    let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
+        return;
+    };
+    let legacy = upload(&fx, "noarch", "ix-legacy", "1.0").await;
+    let kept = upload(&fx, "noarch", "ix-kept", "1.0").await;
+    let restored = upload(&fx, "noarch", "ix-restored", "1.0").await;
+    let path = |f: &str| format!("noarch/{f}");
+    let created: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
+        "UPDATE artifacts SET indexed_at = NULL, index_pending = false, \
+                created_at = date_trunc('milliseconds', NOW() - INTERVAL '30 days') \
+          WHERE repository_id = $1 AND path = $2 RETURNING created_at",
+    )
+    .bind(fx.repo_id)
+    .bind(path(&legacy))
+    .fetch_one(&fx.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        served_indexed_ms_6525(&fx, "noarch", "ix-legacy", &legacy).await,
+        [Some(created.timestamp_millis()); 3]
+    );
+
+    let kept_first = served_indexed_ms_6525(&fx, "noarch", "ix-kept", &kept).await;
+    assert!(kept_first[0].is_some());
+    // The other one predates the migration: no stamp, created long ago.
+    sqlx::query(
+        "UPDATE artifacts SET indexed_at = NULL, created_at = NOW() - INTERVAL '30 days' \
+          WHERE repository_id = $1 AND path = $2",
+    )
+    .bind(fx.repo_id)
+    .bind(path(&restored))
+    .execute(&fx.pool)
+    .await
+    .unwrap();
+    for f in [&kept, &restored] {
+        sqlx::query(
+            "UPDATE artifacts SET is_deleted = true WHERE repository_id = $1 AND path = $2",
+        )
+        .bind(fx.repo_id)
+        .bind(path(f))
+        .execute(&fx.pool)
+        .await
+        .unwrap();
+    }
+    let restored_at = db_now_ms_6525(&fx).await;
+    let sql = format!(
+        "UPDATE artifacts SET is_deleted = false, {} WHERE repository_id = $1 AND path = $2",
+        crate::services::index_time::RELIST_SET_SQL
+    );
+    for f in [&kept, &restored] {
+        sqlx::query(sqlx::AssertSqlSafe(sql.clone()))
+            .bind(fx.repo_id)
+            .bind(path(f))
+            .execute(&fx.pool)
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        served_indexed_ms_6525(&fx, "noarch", "ix-kept", &kept).await,
+        kept_first,
+        "a listed package keeps its time across a restore"
+    );
+    let served = served_indexed_ms_6525(&fx, "noarch", "ix-restored", &restored).await;
+    let at = served[0].expect("listed after the restore");
+    assert!(
+        at >= restored_at,
+        "indexed {at} before the restore {restored_at}"
+    );
+    assert_eq!(served, [Some(at); 3]);
+}
+
+/// #6525 (review): an upload under the repository's quarantine is held and
+/// pending in the row's own transaction, so no build can date it at its
+/// upload; and a write that settles a row already stamped never moves the
+/// stamp.
+#[tokio::test]
+async fn an_upload_hold_is_atomic_and_a_stamp_is_never_rewritten_6525() {
+    let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
+        return;
+    };
+    for (k, v) in [
+        ("quarantine_enabled", "true"),
+        ("quarantine_duration_minutes", "60"),
+    ] {
+        sqlx::query(
+            "INSERT INTO repository_config (repository_id, key, value) VALUES ($1, $2, $3)",
+        )
+        .bind(fx.repo_id)
+        .bind(k)
+        .bind(v)
+        .execute(&fx.pool)
+        .await
+        .unwrap();
+    }
+    crate::services::quarantine_service::invalidate_config_cache(fx.repo_id);
+    let held = upload(&fx, "noarch", "ix-atomic", "1.0").await;
+    let (status, pending, indexed): (Option<String>, bool, Option<chrono::DateTime<chrono::Utc>>) =
+        sqlx::query_as(
+            "SELECT quarantine_status, index_pending, indexed_at FROM artifacts \
+              WHERE repository_id = $1 AND path = $2",
+        )
+        .bind(fx.repo_id)
+        .bind(format!("noarch/{held}"))
+        .fetch_one(&fx.pool)
+        .await
+        .unwrap();
+    assert_eq!(status.as_deref(), Some("quarantined"));
+    assert!(
+        pending && indexed.is_none(),
+        "held at upload: waits for its first listing"
+    );
+
+    // A stamped row settled again (a re-upload of the same bytes) keeps it.
+    let id: uuid::Uuid = sqlx::query_scalar(
+        "UPDATE artifacts SET quarantine_status = 'released', quarantine_until = NULL, \
+                indexed_at = NOW() + INTERVAL '1 hour', index_pending = false \
+          WHERE repository_id = $1 AND path = $2 RETURNING id",
+    )
+    .bind(fx.repo_id)
+    .bind(format!("noarch/{held}"))
+    .fetch_one(&fx.pool)
+    .await
+    .unwrap();
+    let before: chrono::DateTime<chrono::Utc> =
+        sqlx::query_scalar("SELECT indexed_at FROM artifacts WHERE id = $1")
+            .bind(id)
+            .fetch_one(&fx.pool)
+            .await
+            .unwrap();
+    let mut conn = fx.pool.acquire().await.unwrap();
+    crate::services::index_time::settle_written_row(&mut conn, id, None)
+        .await
+        .unwrap();
+    let after: chrono::DateTime<chrono::Utc> =
+        sqlx::query_scalar("SELECT indexed_at FROM artifacts WHERE id = $1")
+            .bind(id)
+            .fetch_one(&fx.pool)
+            .await
+            .unwrap();
+    assert_eq!(after, before);
+}
+
+/// #6525 (review): a build that cannot stamp a pending row (its lock held
+/// past the stamp's lock timeout) still answers 200, leaves the row out, and
+/// the next build after the lock is gone lists and dates it.
+#[tokio::test]
+async fn a_stamp_that_cannot_lock_leaves_the_row_out_and_the_next_build_stamps_6525() {
+    let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
+        return;
+    };
+    let pkg = upload(&fx, "noarch", "ix-locked", "1.0").await;
+    let id: uuid::Uuid = sqlx::query_scalar(
+        "UPDATE artifacts SET indexed_at = NULL, index_pending = true \
+          WHERE repository_id = $1 AND path = $2 RETURNING id",
+    )
+    .bind(fx.repo_id)
+    .bind(format!("noarch/{pkg}"))
+    .fetch_one(&fx.pool)
+    .await
+    .unwrap();
+    // Touch the key so the next read rebuilds it.
+    sqlx::query("UPDATE artifacts SET version = version WHERE id = $1")
+        .bind(id)
+        .execute(&fx.pool)
+        .await
+        .unwrap();
+    let mut blocker = fx.pool.begin().await.unwrap();
+    sqlx::query("SELECT id FROM artifacts WHERE id = $1 FOR UPDATE")
+        .bind(id)
+        .execute(&mut *blocker)
+        .await
+        .unwrap();
+    let (status, body, _) = get(&fx, "noarch/repodata.json").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a failed stamp does not fail the read"
+    );
+    let doc: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        indexed_ms_6525(&doc, &pkg),
+        None,
+        "left out while it cannot be dated"
+    );
+    blocker.rollback().await.unwrap();
+    // The failed build marks the rows again shortly after it.
+    tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+
+    let after_ms = db_now_ms_6525(&fx).await;
+    let served = served_indexed_ms_6525(&fx, "noarch", "ix-locked", &pkg).await;
+    let at = served[0].expect("stamped by the next build");
+    assert!(at >= after_ms - 1000, "stamped {at}");
+    assert_eq!(served, [Some(at); 3]);
+}

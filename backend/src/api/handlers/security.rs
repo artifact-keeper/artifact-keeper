@@ -2654,6 +2654,12 @@ async fn update_policy(
         .await?;
     // #4288: generated listings stop (or resume) advertising what it decides.
     crate::services::quarantine_service::invalidate_listing_decisions();
+    // #6525: a disabled, rescoped or deleted policy hands the repository
+    // back to its stored conda shards, which left out the rows still waiting
+    // for their first listing; rebuild those.
+    tokio::spawn(crate::services::index_time::mark_pending_conda_rows_dirty(
+        state.db.clone(),
+    ));
 
     Ok(Json(PolicyResponse::from(p)))
 }
@@ -2681,6 +2687,12 @@ async fn delete_policy(
     let svc = PolicyService::new(state.db.clone());
     svc.delete_policy(id).await?;
     crate::services::quarantine_service::invalidate_listing_decisions();
+    // #6525: a disabled, rescoped or deleted policy hands the repository
+    // back to its stored conda shards, which left out the rows still waiting
+    // for their first listing; rebuild those.
+    tokio::spawn(crate::services::index_time::mark_pending_conda_rows_dirty(
+        state.db.clone(),
+    ));
     Ok(Json(serde_json::json!({ "deleted": true })))
 }
 

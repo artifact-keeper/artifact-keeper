@@ -604,6 +604,7 @@ pub const CONCURRENT_INDEX_MIGRATIONS: &[(i64, &str)] = &[
     (336, "idx_mcp_version_tombstones_name_ci"),
     (341, "idx_sync_tasks_artifact_id"),
     (417, "idx_webhook_deliveries_pending_by_webhook"),
+    (428, "idx_artifacts_index_pending"),
 ];
 
 /// The index names from `table` whose migration version is not in

@@ -1679,6 +1679,24 @@ impl ArtifactService {
             None
         };
 
+        // #6525: a hosted conda package's upload hold, applied in the row's
+        // own transaction below (`index_time::settle_written_row`). Only read
+        // for a conda repository.
+        let conda_hold_until = if repo_for_upload.as_ref().is_some_and(|r| {
+            matches!(
+                r.format,
+                crate::models::repository::RepositoryFormat::Conda
+                    | crate::models::repository::RepositoryFormat::CondaNative
+            )
+        }) {
+            Some(
+                crate::services::quarantine_service::upload_hold_until(&self.db, repository_id)
+                    .await,
+            )
+        } else {
+            None
+        };
+
         // Atomic quota admission (#2523). The authoritative quota check runs
         // here, in the same transaction as the artifact INSERT, holding a
         // `FOR UPDATE` lock on the repository's usage-ledger row. This closes
@@ -1782,7 +1800,11 @@ impl ArtifactService {
                     storage_key = EXCLUDED.storage_key,
                     uploaded_by = EXCLUDED.uploaded_by,
                     is_deleted = false,
-                    updated_at = NOW()
+                    updated_at = NOW(),
+                    indexed_at = CASE
+                        WHEN LOWER(artifacts.checksum_sha256) = LOWER(EXCLUDED.checksum_sha256)
+                        THEN artifacts.indexed_at END,
+                    index_pending = false
                 WHERE (artifacts.is_deleted
                     OR $12
                     OR artifacts.version IS DISTINCT FROM EXCLUDED.version
@@ -1844,6 +1866,14 @@ impl ArtifactService {
                 }
             }
         };
+
+        // #6525: a hosted conda package's hold and indexing time, decided
+        // with the row (the same bytes revived keep their indexing time).
+        if let Some(hold_until) = conda_hold_until {
+            crate::services::index_time::settle_written_row(&mut tx, artifact.id, hold_until)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
+        }
 
         // #6317: format metadata the package is served from commits with its
         // row. A failure here rolls the whole upload back, so the client's

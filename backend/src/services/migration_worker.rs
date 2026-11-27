@@ -2762,7 +2762,16 @@ impl MigrationWorker {
                                 checksum_sha1 = EXCLUDED.checksum_sha1,
                                 storage_key = EXCLUDED.storage_key,
                                 is_deleted = false,
-                                updated_at = NOW()
+                                updated_at = NOW(),
+                                -- #6525: the same bytes keep their indexing
+                                -- time; other bytes drop it. No NOW() stamp:
+                                -- the served CEP 47 indexed_timestamp then
+                                -- falls back to created_at, which the import
+                                -- seeds from the source registry (#6528).
+                                indexed_at = CASE
+                                    WHEN LOWER(artifacts.checksum_sha256) = LOWER(EXCLUDED.checksum_sha256)
+                                    THEN artifacts.indexed_at END,
+                                index_pending = false
                             RETURNING id
                             "#,
                         )

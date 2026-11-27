@@ -1154,6 +1154,10 @@ async fn insert_promoted_artifact_row(
             .register_in_tx(&mut tx, target_repo_id, uploaded_by)
             .await?;
     }
+    // #6525: a conda package promoted into a hosted channel is indexed there
+    // when it is visible there: now, or (under the target's scan policy) at
+    // its first listing. A promotion is not an upload, so no upload hold.
+    crate::services::index_time::settle_written_row(&mut tx, new_artifact_id, None).await?;
     Ok(tx.commit().await?)
 }
 

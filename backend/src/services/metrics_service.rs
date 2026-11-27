@@ -645,6 +645,15 @@ pub fn record_conda_allowlist_dropped(virtual_repo_key: &str, member: &str, coun
     .increment(count);
 }
 
+/// A conda first-listing stamp (#6525) that failed, by the build that tried
+/// (`site`: `listing`, `render`, `shard_store`, `member_merge`,
+/// `replication`). The rows stay pending and out of that build; the next one
+/// stamps them, so a steady non-zero rate means stamps keep failing (lock
+/// waits past 500 ms, or the database refusing writes).
+pub fn record_conda_index_stamp_failure(site: &'static str) {
+    counter!("ak_conda_index_stamp_failures_total", "site" => site).increment(1);
+}
+
 /// Record a lookup against the npm attestation negative cache (#3764),
 /// which memoises the `404`s that `npm audit signatures` provokes on the
 /// `/-/npm/v1/attestations/{pkg}@{ver}` proxy path.
