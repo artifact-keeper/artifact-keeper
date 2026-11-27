@@ -1211,6 +1211,11 @@ impl MigrationWorker {
                 // only sha256 locally would cause a false mismatch whenever
                 // the source advertises only sha1 (issue #856).
                 let expected_sha256 = artifact.sha256.clone();
+                let source_created = source_created_at(
+                    artifact.created.as_deref(),
+                    artifact.modified.as_deref(),
+                    chrono::Utc::now(),
+                );
                 let expected_sha1 = artifact.actual_sha1.clone();
                 // Prefer sha256 for bookkeeping/dedup since that is what
                 // Artifact Keeper uses internally.
@@ -1248,6 +1253,7 @@ impl MigrationWorker {
                         &artifact_path,
                         &source_path,
                         &ExpectedChecksums {
+                            source_created,
                             sha256: expected_sha256.clone(),
                             sha1: expected_sha1.clone(),
                         },
@@ -1320,6 +1326,7 @@ impl MigrationWorker {
                     &source_path,
                     size,
                     ExpectedChecksums {
+                        source_created,
                         sha256: expected_sha256,
                         sha1: expected_sha1,
                     },
@@ -2750,10 +2757,29 @@ impl MigrationWorker {
                         // conflict: a re-migration must not downgrade a row a
                         // native publish has since typed (e.g. a `.whl` stored
                         // as `application/zip`).
+                        // #6528: a conda row's `created_at` is its CEP 47
+                        // `indexed_timestamp`. The initial import of a row is
+                        // seeded from the source's creation time (the
+                        // operator's own registry) instead of the import time,
+                        // which made every migrated package look brand new. A
+                        // soft-deleted row revived here becomes visible now,
+                        // so it counts from now, unless this server's age-gate
+                        // sighting ledger already holds the same bytes
+                        // (sha256), which keep that first sighting. A live row
+                        // keeps the time it was first indexed at, as CEP 47
+                        // requires. Other formats keep the import time.
+                        let seeded_created: Option<chrono::DateTime<chrono::Utc>> = if package_type
+                            .eq_ignore_ascii_case("conda")
+                            || package_type.eq_ignore_ascii_case("conda_native")
+                        {
+                            Some(expected.source_created.unwrap_or_else(chrono::Utc::now))
+                        } else {
+                            None
+                        };
                         let id: Uuid = sqlx::query_scalar(
                             r#"
-                            INSERT INTO artifacts (repository_id, path, name, version, size_bytes, checksum_sha256, checksum_sha1, storage_key, content_type, origin)
-                            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                            INSERT INTO artifacts (repository_id, path, name, version, size_bytes, checksum_sha256, checksum_sha1, storage_key, content_type, origin, created_at)
+                            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, COALESCE($11, NOW()))
                             ON CONFLICT (repository_id, path) DO UPDATE SET
                                 name = EXCLUDED.name,
                                 version = EXCLUDED.version,
@@ -2761,6 +2787,16 @@ impl MigrationWorker {
                                 checksum_sha256 = EXCLUDED.checksum_sha256,
                                 checksum_sha1 = EXCLUDED.checksum_sha1,
                                 storage_key = EXCLUDED.storage_key,
+                                created_at = CASE
+                                    WHEN artifacts.is_deleted AND $11::timestamptz IS NOT NULL
+                                        THEN COALESCE(
+                                            (SELECT min(f.first_seen_at)
+                                               FROM conda_record_first_seen f
+                                              WHERE f.sha256 = EXCLUDED.checksum_sha256
+                                                AND f.sha256 <> ''),
+                                            NOW())
+                                    ELSE artifacts.created_at
+                                END,
                                 is_deleted = false,
                                 updated_at = NOW(),
                                 -- #6525: the same bytes keep their indexing
@@ -2785,6 +2821,7 @@ impl MigrationWorker {
                         .bind(&storage_key)
                         .bind(&identity.content_type)
                         .bind(&origin)
+                        .bind(seeded_created)
                         .fetch_one(&mut *tx)
                         .await?;
                         // #3654: a repository imported before the fix holds
@@ -3605,6 +3642,33 @@ struct TransferResult {
 pub(crate) struct ExpectedChecksums {
     pub sha256: Option<String>,
     pub sha1: Option<String>,
+    /// When the source says the item was created (Artifactory `created`,
+    /// else `modified`; Nexus `lastModified`). Seeds a migrated conda row's
+    /// `created_at`, which is its CEP 47 `indexed_timestamp` (#6528).
+    pub source_created: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// The creation time a source reports for one listed item (#6528):
+/// Artifactory's `created`, else `modified`; Nexus only reports
+/// `lastModified`. RFC 3339, or an ISO 8601 offset without a colon
+/// (`+0000`, which Artifactory emits); a time in the future is clamped to now, so
+/// a skewed source clock never makes a package look published later than it
+/// was imported.
+pub(crate) fn source_created_at(
+    created: Option<&str>,
+    modified: Option<&str>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    [created, modified]
+        .into_iter()
+        .flatten()
+        .find_map(|raw| {
+            let raw = raw.trim();
+            chrono::DateTime::parse_from_rfc3339(raw)
+                .or_else(|_| chrono::DateTime::parse_from_str(raw, "%Y-%m-%dT%H:%M:%S%.f%z"))
+                .ok()
+        })
+        .map(|t| t.with_timezone(&chrono::Utc).min(now))
 }
 
 impl ExpectedChecksums {
@@ -5619,8 +5683,52 @@ mod tests {
     // only through the integration path.
     // -----------------------------------------------------------------------
 
+    /// #6528: the source's creation time seeds a migrated conda row.
+    #[test]
+    fn source_created_at_prefers_created_then_modified_and_clamps_the_future() {
+        use chrono::TimeZone;
+        let now = chrono::Utc.with_ymd_and_hms(2026, 11, 25, 0, 0, 0).unwrap();
+        let jan = chrono::Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let feb = chrono::Utc.with_ymd_and_hms(2026, 2, 1, 0, 0, 0).unwrap();
+        // Artifactory `created`, with millis and `Z`.
+        assert_eq!(
+            source_created_at(
+                Some("2026-01-01T00:00:00.000Z"),
+                Some("2026-02-01T00:00:00Z"),
+                now
+            ),
+            Some(jan)
+        );
+        // Nexus reports only `lastModified`, with an offset.
+        assert_eq!(
+            source_created_at(None, Some("2026-02-01T00:00:00.000+00:00"), now),
+            Some(feb)
+        );
+        // An offset without a colon (`+0000`) is accepted.
+        assert_eq!(
+            source_created_at(Some("2026-01-01T00:00:00.000+0000"), None, now),
+            Some(jan)
+        );
+        assert_eq!(
+            source_created_at(Some("2026-01-01T01:00:00+0100"), None, now),
+            Some(jan)
+        );
+        // An unparseable `created` falls through to `modified`.
+        assert_eq!(
+            source_created_at(Some("yesterday"), Some("2026-02-01T00:00:00Z"), now),
+            Some(feb)
+        );
+        // A source clock ahead of ours never dates a package after the import.
+        assert_eq!(
+            source_created_at(Some("2030-01-01T00:00:00Z"), None, now),
+            Some(now)
+        );
+        assert_eq!(source_created_at(None, None, now), None);
+    }
+
     fn checksums(sha256: Option<&str>, sha1: Option<&str>) -> ExpectedChecksums {
         ExpectedChecksums {
+            source_created: None,
             sha256: sha256.map(String::from),
             sha1: sha1.map(String::from),
         }
@@ -6601,6 +6709,7 @@ mod tests {
         // When verification is disabled the function must never report a
         // mismatch, even if the advertised and computed digests differ.
         let expected = ExpectedChecksums {
+            source_created: None,
             sha256: Some("deadbeef".into()),
             sha1: Some("feedface".into()),
         };
@@ -6618,6 +6727,7 @@ mod tests {
     fn test_verify_expected_checksums_sha256_match() {
         let (sha256, sha1) = compute_dual_checksums(b"hello world");
         let expected = ExpectedChecksums {
+            source_created: None,
             sha256: Some(sha256.clone()),
             sha1: None,
         };
@@ -6632,6 +6742,7 @@ mod tests {
         // against the advertised sha1, guaranteeing a false mismatch.
         let (_sha256, sha1) = compute_dual_checksums(b"hello world");
         let expected = ExpectedChecksums {
+            source_created: None,
             sha256: None,
             sha1: Some(sha1.clone()),
         };
@@ -6655,6 +6766,7 @@ mod tests {
         // actually disagreed, and sha256 must never be compared against an
         // advertised sha1.
         let expected = ExpectedChecksums {
+            source_created: None,
             sha256: None,
             sha1: Some("0692b094dbd155ac5885d8369b32d4cb8dadf74d".into()),
         };
@@ -6678,6 +6790,7 @@ mod tests {
     fn test_verify_expected_checksums_both_advertised_both_match() {
         let (sha256, sha1) = compute_dual_checksums(b"payload");
         let expected = ExpectedChecksums {
+            source_created: None,
             sha256: Some(sha256.clone()),
             sha1: Some(sha1.clone()),
         };
@@ -6689,6 +6802,7 @@ mod tests {
         // When both digests are advertised and sha256 is the one that
         // disagrees, the reported error must call out sha256.
         let expected = ExpectedChecksums {
+            source_created: None,
             sha256: Some("00".into()),
             sha1: Some("11".into()),
         };
@@ -6702,6 +6816,7 @@ mod tests {
         // Nexus and Artifactory have both been observed emitting digests in
         // uppercase hex on older releases. Comparison must ignore case.
         let expected = ExpectedChecksums {
+            source_created: None,
             sha256: None,
             sha1: Some("DA39A3EE5E6B4B0D3255BFEF95601890AFD80709".into()),
         };
@@ -6723,6 +6838,7 @@ mod tests {
         // If the source advertises a sha1 but for some reason the worker
         // has no local sha1, fail loudly instead of silently passing.
         let expected = ExpectedChecksums {
+            source_created: None,
             sha256: None,
             sha1: Some("da39a3ee5e6b4b0d3255bfef95601890afd80709".into()),
         };
@@ -6734,11 +6850,13 @@ mod tests {
     fn test_expected_checksums_has_any() {
         assert!(!ExpectedChecksums::default().has_any());
         assert!(ExpectedChecksums {
+            source_created: None,
             sha256: Some("x".into()),
             sha1: None,
         }
         .has_any());
         assert!(ExpectedChecksums {
+            source_created: None,
             sha256: None,
             sha1: Some("y".into()),
         }
@@ -9299,6 +9417,7 @@ mod tests {
         // expected to something else so verify_expected_checksums returns
         // Some(mismatch).
         let expected = ExpectedChecksums {
+            source_created: None,
             sha256: Some("0000000000000000000000000000000000000000000000000000000000000000".into()),
             sha1: None,
         };
@@ -9501,6 +9620,7 @@ mod tests {
         // No expected checksums -> verification passes; worker proceeds
         // through the storage write path.
         let expected = ExpectedChecksums {
+            source_created: None,
             sha256: None,
             sha1: None,
         };
@@ -9857,6 +9977,7 @@ mod tests {
                 path,
                 false,
                 &ExpectedChecksums {
+                    source_created: None,
                     sha256: None,
                     sha1: None,
                 },
@@ -9906,6 +10027,7 @@ mod tests {
                 artifact_path,
                 body.len() as i64,
                 ExpectedChecksums {
+                    source_created: None,
                     sha256: None,
                     sha1: None,
                 },
@@ -11007,6 +11129,7 @@ mod tests {
             .unwrap();
 
         let expected = ExpectedChecksums {
+            source_created: None,
             sha256: Some(manifest_hex.clone()),
             sha1: None,
         };
@@ -11154,6 +11277,7 @@ mod tests {
             .expect("blob import must succeed");
 
         let index_expected = ExpectedChecksums {
+            source_created: None,
             sha256: Some(index_hex.clone()),
             sha1: None,
         };
@@ -11213,6 +11337,7 @@ mod tests {
                 &blob_path,
                 &blob_source_path,
                 &ExpectedChecksums {
+                    source_created: None,
                     sha256: Some(config_hex.clone()),
                     sha1: None,
                 },
@@ -11295,6 +11420,7 @@ mod tests {
                 &manifest_path,
                 &format!("{repo_key}/{manifest_path}"),
                 &ExpectedChecksums {
+                    source_created: None,
                     sha256: Some(manifest_hex.clone()),
                     sha1: None,
                 },
@@ -11348,6 +11474,7 @@ mod tests {
                 &manifest_path,
                 &format!("{repo_key}/{manifest_path}"),
                 &ExpectedChecksums {
+                    source_created: None,
                     sha256: Some(manifest_hex),
                     sha1: None,
                 },
@@ -11480,6 +11607,7 @@ mod tests {
                 &list_path,
                 false,
                 &ExpectedChecksums {
+                    source_created: None,
                     sha256: None,
                     sha1: None,
                 },
@@ -11961,6 +12089,7 @@ mod tests {
             .expect("seed CAS object");
 
         let expected = ExpectedChecksums {
+            source_created: None,
             sha256: Some(body_hex.clone()),
             sha1: None,
         };
@@ -13073,6 +13202,7 @@ mod tests {
                     path,
                     body.len() as i64,
                     ExpectedChecksums {
+                        source_created: None,
                         sha256: None,
                         sha1: None,
                     },
@@ -13144,6 +13274,7 @@ mod tests {
                 &build_source_path(&repo_key, source_rel),
                 body.len() as i64,
                 ExpectedChecksums {
+                    source_created: None,
                     sha256: Some(body_hex),
                     sha1: None,
                 },
@@ -13365,6 +13496,7 @@ mod tests {
                     path,
                     false,
                     &ExpectedChecksums {
+                        source_created: None,
                         sha256: None,
                         sha1: None,
                     },

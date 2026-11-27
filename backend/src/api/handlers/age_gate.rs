@@ -47,10 +47,136 @@ pub fn admin_router() -> Router<SharedState> {
 }
 
 pub fn repo_config_routes() -> Router<SharedState> {
-    Router::new().route(
-        "/:key/age-gate",
-        get(get_repo_age_gate).put(update_repo_age_gate),
+    Router::new()
+        .route(
+            "/:key/age-gate",
+            get(get_repo_age_gate).put(update_repo_age_gate),
+        )
+        // #6526: why a gated conda Remote withholds a file, and the explicit
+        // re-baseline of its sighting ledger.
+        .route("/:key/age-gate/conda/withheld", get(get_conda_withheld))
+        .route("/:key/age-gate/conda/rebaseline", post(rebaseline_conda))
+}
+
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+pub struct CondaWithheldQuery {
+    /// The conda subdir, e.g. `noarch` or `linux-64`.
+    pub subdir: String,
+    /// Only this file; every withheld file of the subdir when absent.
+    pub filename: Option<String>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct CondaWithheldResponse {
+    pub repository_key: String,
+    pub subdir: String,
+    pub withheld: Vec<crate::api::handlers::conda::CondaWithheldFile>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct CondaRebaselineResponse {
+    pub repository_key: String,
+    /// Subdirs whose ledger was dropped; each takes a new baseline on its
+    /// next read.
+    pub channels_reset: u64,
+}
+
+/// Why a gated conda Remote withholds files (#6526): each withheld file of
+/// `subdir` (or just `filename`) with its reason, age basis (`indexed`,
+/// `first_seen`, `baseline`, `none`) and the date it becomes available.
+#[utoipa::path(
+    get,
+    path = "/{key}/age-gate/conda/withheld",
+    context_path = "/api/v1/repositories",
+    tag = "age-gate",
+    params(("key" = String, Path, description = "Repository key"), CondaWithheldQuery),
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, body = CondaWithheldResponse),
+        (status = 404, description = "Not a gated conda Remote")
     )
+)]
+pub async fn get_conda_withheld(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path(key): Path<String>,
+    Query(q): Query<CondaWithheldQuery>,
+) -> std::result::Result<Json<CondaWithheldResponse>, axum::response::Response> {
+    use axum::response::IntoResponse;
+    let auth = require_auth(auth).map_err(IntoResponse::into_response)?;
+    auth.require_scope("read:repositories")
+        .map_err(IntoResponse::into_response)?;
+    let repo = authorize_repo_age_gate(&state, &auth, &key)
+        .await
+        .map_err(IntoResponse::into_response)?;
+    let withheld = crate::api::handlers::conda::conda_withheld_files(
+        &state,
+        repo.id,
+        &q.subdir,
+        q.filename.as_deref(),
+    )
+    .await?
+    .ok_or_else(|| {
+        AppError::NotFound(format!(
+            "'{key}' is not a conda Remote with its age gate on"
+        ))
+        .into_response()
+    })?;
+    Ok(Json(CondaWithheldResponse {
+        repository_key: key,
+        subdir: q.subdir,
+        withheld,
+    }))
+}
+
+/// Re-baseline a conda Remote's age gate (#6526): drop its sighting ledger
+/// so each subdir records a new baseline on its next read. A repoint or a
+/// gate toggle never does this on its own; it is audited as
+/// `AGE_GATE_REBASELINED`.
+#[utoipa::path(
+    post,
+    path = "/{key}/age-gate/conda/rebaseline",
+    context_path = "/api/v1/repositories",
+    tag = "age-gate",
+    params(("key" = String, Path, description = "Repository key")),
+    security(("bearer_auth" = [])),
+    responses((status = 200, body = CondaRebaselineResponse))
+)]
+pub async fn rebaseline_conda(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path(key): Path<String>,
+) -> std::result::Result<Json<CondaRebaselineResponse>, axum::response::Response> {
+    use axum::response::IntoResponse;
+    let auth = require_auth(auth).map_err(IntoResponse::into_response)?;
+    auth.require_scope("write:repositories")
+        .map_err(IntoResponse::into_response)?;
+    let repo = authorize_repo_age_gate(&state, &auth, &key)
+        .await
+        .map_err(IntoResponse::into_response)?;
+    if repo.repo_type != RepositoryType::Remote
+        || !matches!(
+            repo.format,
+            crate::models::repository::RepositoryFormat::Conda
+        )
+    {
+        return Err(AppError::Validation(format!("'{key}' is not a conda Remote")).into_response());
+    }
+    let channels_reset = crate::api::handlers::conda::conda_rebaseline(&state, repo.id).await?;
+    let entry = AuditEntry::new(AuditAction::AgeGateRebaselined, ResourceType::Repository)
+        .user(auth.user_id)
+        .resource(repo.id)
+        .actor_name(auth.username.clone())
+        .resource_name(key.clone())
+        .details(serde_json::json!({
+            "repository_key": key,
+            "channels_reset": channels_reset,
+        }));
+    let _ = AuditService::new(state.db.clone()).log(entry).await;
+    Ok(Json(CondaRebaselineResponse {
+        repository_key: key,
+        channels_reset,
+    }))
 }
 
 /// The repository-scoped review queue (#4238).
@@ -908,9 +1034,14 @@ pub async fn decide_repo_review(
         update_repo_age_gate,
         list_repo_reviews,
         get_repo_review,
-        decide_repo_review
+        decide_repo_review,
+        get_conda_withheld,
+        rebaseline_conda
     ),
     components(schemas(
+        CondaWithheldResponse,
+        CondaRebaselineResponse,
+        crate::api::handlers::conda::CondaWithheldFile,
         AgeGateReviewResponse,
         AgeGateReviewListResponse,
         ReviewActionRequest,

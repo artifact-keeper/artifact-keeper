@@ -616,6 +616,35 @@ pub(super) async fn fetch_remote_members(
     missing_is_empty: bool,
     account: &mut super::merge_gate::MergeAccount,
 ) -> (Vec<MemberDocument>, Vec<MemberFailure>, bool) {
+    fetch_remote_members_gated(
+        proxy,
+        members,
+        candidates,
+        limits,
+        missing_is_empty,
+        account,
+        &std::collections::HashMap::new(),
+    )
+    .await
+}
+
+/// A gated Remote member's document, already filtered by its age gate
+/// (#6526), or why it could not be built.
+pub(super) type GatedMember =
+    Result<std::sync::Arc<super::merge_gate::MergedDocument>, MemberFailure>;
+
+/// [`fetch_remote_members`], taking the document of each member in `gated`
+/// from its gated `repodata.json` (decoded from the kept zstd body) instead
+/// of from its upstream, in the same member order.
+pub(super) async fn fetch_remote_members_gated(
+    proxy: Option<&ProxyService>,
+    members: &[Repository],
+    candidates: &[(String, FileCodec)],
+    limits: MemberLimits,
+    missing_is_empty: bool,
+    account: &mut super::merge_gate::MergeAccount,
+    gated: &std::collections::HashMap<uuid::Uuid, GatedMember>,
+) -> (Vec<MemberDocument>, Vec<MemberFailure>, bool) {
     let mut documents = Vec::new();
     let mut failures = Vec::new();
     let mut published = false;
@@ -623,6 +652,44 @@ pub(super) async fn fetch_remote_members(
         .iter()
         .filter(|m| m.repo_type == RepositoryType::Remote)
     {
+        if let Some(pre) = gated.get(&member.id) {
+            match pre {
+                Err(failure) => failures.push(failure.clone()),
+                Ok(doc) => {
+                    let member_published = doc.withheld.as_ref().is_some_and(|w| w.published);
+                    let body = doc.body.clone();
+                    let decoded = tokio::task::spawn_blocking(move || {
+                        zstd::stream::decode_all(body.as_ref())
+                    })
+                    .await;
+                    match decoded {
+                        Ok(Ok(json)) => {
+                            account.track(json.len());
+                            published |= member_published;
+                            documents.push(MemberDocument {
+                                member: member.key.clone(),
+                                json,
+                                validator: doc
+                                    .cacheable
+                                    .then(|| doc.validators.first().cloned())
+                                    .flatten(),
+                            });
+                        }
+                        Ok(Err(e)) => failures.push(MemberFailure {
+                            member: member.key.clone(),
+                            kind: "decode",
+                            reason: format!("gated repodata does not decode: {e}"),
+                        }),
+                        Err(e) => failures.push(MemberFailure {
+                            member: member.key.clone(),
+                            kind: "decode",
+                            reason: format!("decoder task failed: {e}"),
+                        }),
+                    }
+                }
+            }
+            continue;
+        }
         let Some(proxy) = proxy else {
             failures.push(MemberFailure {
                 member: member.key.clone(),
@@ -818,6 +885,7 @@ type PackageMaps<'a> = (
 /// ownership and allowlist rules cannot drift between them. Allowlist drops
 /// are counted per member in `ak_conda_allowlist_dropped_total` under
 /// `virtual_repo_key` (#4711).
+#[allow(clippy::too_many_arguments)]
 fn merge_package_maps<'a>(
     virtual_repo_key: &str,
     subdir: &str,
@@ -825,6 +893,7 @@ fn merge_package_maps<'a>(
     parsed: &'a [(&'a str, UpstreamRepodata<'a>)],
     owned: &HashSet<String>,
     allowlist: Option<&CompiledAllowlist>,
+    withheld: &HashSet<String>,
     dropped: &mut MergeDrops,
 ) -> PackageMaps<'a> {
     let mut packages: BTreeMap<&str, &RawValue> = BTreeMap::new();
@@ -856,6 +925,12 @@ fn merge_package_maps<'a>(
             (&p.packages_conda, &mut packages_conda),
         ] {
             for (filename, raw) in source {
+                // #6526: a file a gated Remote member withholds is served by
+                // no remote member, so the index lists what the package
+                // route serves.
+                if withheld.contains(filename.as_str()) {
+                    continue;
+                }
                 if remote_record_is_owned(filename, raw, owned) {
                     dropped.owned += 1;
                     continue;
@@ -924,6 +999,7 @@ pub(super) type PackageMerge = (Result<MergedBody, Response>, Vec<MemberFailure>
 /// thread. A member document that does not parse is reported as that member's
 /// failure; the others still merge. Allowlist drops are counted per member in
 /// `ak_conda_allowlist_dropped_total` under `virtual_repo_key` (#4711).
+#[cfg(test)]
 pub(super) fn merge_repodata(
     virtual_repo_key: &str,
     subdir: &str,
@@ -931,6 +1007,28 @@ pub(super) fn merge_repodata(
     remote: &[MemberDocument],
     owned: &HashSet<String>,
     allowlist: Option<&CompiledAllowlist>,
+) -> PackageMerge {
+    merge_repodata_withholding(
+        virtual_repo_key,
+        subdir,
+        hosted,
+        remote,
+        owned,
+        allowlist,
+        &HashSet::new(),
+    )
+}
+
+/// [`merge_repodata`], leaving out every remote record whose filename is in
+/// `withheld` (the files a gated Remote member's age gate withholds, #6526).
+pub(super) fn merge_repodata_withholding(
+    virtual_repo_key: &str,
+    subdir: &str,
+    hosted: &[HostedRecord],
+    remote: &[MemberDocument],
+    owned: &HashSet<String>,
+    allowlist: Option<&CompiledAllowlist>,
+    withheld: &HashSet<String>,
 ) -> PackageMerge {
     let mut dropped = MergeDrops::default();
     let (parsed, failures) = parse_member_package_maps(remote, "repodata");
@@ -941,6 +1039,7 @@ pub(super) fn merge_repodata(
         &parsed,
         owned,
         allowlist,
+        withheld,
         &mut dropped,
     );
     let merged = MergedRepodata {
@@ -996,6 +1095,7 @@ pub(super) fn merge_run_exports(
         &parsed,
         owned,
         allowlist,
+        &HashSet::new(),
         &mut dropped,
     );
     let merged = MergedRunExports {
