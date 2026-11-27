@@ -1461,6 +1461,8 @@ async fn delete_chart(
         .execute(&state.db)
         .await
         .map_err(crate::api::handlers::db_err)?;
+    // #5244: no `artifact.deleted` from here, so refresh the score directly
+    crate::services::scan_result_service::refresh_existing_score(&state.db, repo.id).await;
 
     // Update repository timestamp
     let _ = sqlx::query!(
@@ -3137,6 +3139,39 @@ wsDcBAEBCgAQBQJqWW7VCRA8wAoTVPCkgwAAVAoMACmQbvnhlkWncOkVJXfissGD\n\
         }
 
         f.teardown().await;
+    }
+
+    /// #5244: deleting a scanned chart takes its findings out of the
+    /// repository's security score
+    #[tokio::test]
+    async fn test_helm_delete_chart_refreshes_security_score_5244() {
+        let Some(f) = tdh::Fixture::setup("local", "helm").await else {
+            return;
+        };
+        let tgz = signed_chart_tgz();
+        let (status, _) = upload_parts(&f, &[("chart", "provchart-0.1.0.tgz", &tgz)]).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let artifact_id: uuid::Uuid = sqlx::query_scalar(
+            "SELECT id FROM artifacts WHERE repository_id = $1 AND is_deleted = false",
+        )
+        .bind(f.repo_id)
+        .fetch_one(&f.pool)
+        .await
+        .expect("chart row");
+        tdh::score_one_high_finding(&f.pool, f.repo_id, artifact_id).await;
+
+        let app = f.router_with_auth(super::router());
+        let req = axum::http::Request::builder()
+            .method("DELETE")
+            .uri(format!("/{}/api/charts/provchart/0.1.0", f.repo_key))
+            .body(Body::empty())
+            .unwrap();
+        let (status, _) = tdh::send(app, req).await;
+        let score = tdh::score_findings(&f.pool, f.repo_id).await;
+        f.teardown().await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(score, (0, 0));
     }
 
     #[tokio::test]
