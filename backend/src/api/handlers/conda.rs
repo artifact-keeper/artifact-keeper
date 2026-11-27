@@ -7427,6 +7427,7 @@ async fn serve_scanned_conda_package(
     let file = CondaScannedPackage {
         proxy,
         upstream_url,
+        streaming_fill_mode: crate::services::proxy_service::StreamingFillMode::DetachOnDrop,
     };
     proxy_helpers::serve_scanned_proxy_file(state, proxy, &req, &file).await
 }
@@ -7515,11 +7516,13 @@ pub(crate) async fn warm_remote_package(
                 let file = CondaScannedPackage {
                     proxy,
                     upstream_url,
+                    streaming_fill_mode:
+                        crate::services::proxy_service::StreamingFillMode::StopOnDrop,
                 };
                 return proxy_helpers::serve_scanned_proxy_file(state, proxy, &req, &file).await;
             }
         }
-        proxy_helpers::proxy_fetch_streaming_with_disposition_and_format(
+        proxy_helpers::proxy_fetch_streaming_with_disposition_and_format_with_mode(
             proxy,
             remote.id,
             &remote.key,
@@ -7529,6 +7532,7 @@ pub(crate) async fn warm_remote_package(
             Some(filename),
             crate::models::repository::RepositoryFormat::Conda,
             false,
+            crate::services::proxy_service::StreamingFillMode::StopOnDrop,
         )
         .await
     }
@@ -7580,6 +7584,9 @@ pub(crate) async fn warm_scan_policy(
 struct CondaScannedPackage<'a> {
     proxy: &'a crate::services::proxy_service::ProxyService,
     upstream_url: &'a str,
+    /// A warm enforces its own item deadline, so its over-cap fill must stop
+    /// with the body (#6488). A client download keeps the detached drain.
+    streaming_fill_mode: crate::services::proxy_service::StreamingFillMode,
 }
 
 #[async_trait::async_trait]
@@ -7640,7 +7647,7 @@ impl proxy_helpers::ScannedProxyFile for CondaScannedPackage<'_> {
         // UNRECORDED-PROXY-SERVE: counted by the caller,
         // `proxy_helpers::serve_scanned_proxy_file`, which records this
         // over-cap serve once it resolves.
-        proxy_helpers::proxy_fetch_streaming_with_disposition_and_format(
+        proxy_helpers::proxy_fetch_streaming_with_disposition_and_format_with_mode(
             self.proxy,
             req.repo_id,
             req.repo_key,
@@ -7650,6 +7657,7 @@ impl proxy_helpers::ScannedProxyFile for CondaScannedPackage<'_> {
             Some(req.filename),
             crate::models::repository::RepositoryFormat::Conda,
             req.is_head(),
+            self.streaming_fill_mode,
         )
         .await
     }
@@ -28549,6 +28557,7 @@ mod duplicate_entry_tests {
         let file = CondaScannedPackage {
             proxy: &proxy,
             upstream_url: "http://upstream.invalid",
+            streaming_fill_mode: crate::services::proxy_service::StreamingFillMode::DetachOnDrop,
         };
         let good: &[u8] = br#"{"name":"demo","version":"1.0.0"}"#;
         let other: &[u8] = br#"{"name":"other","version":"9.9.9"}"#;

@@ -4,6 +4,8 @@
 //! Implements cache TTL, ETag validation, and transparent proxying.
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -678,6 +680,63 @@ impl From<StreamHandle> for StreamingFetchResult {
 /// HEAD or a client gone before any byte), or after every byte its
 /// `Content-Length` announced (hyper never polls a fixed-length body for its
 /// end), is dropped as before too.
+///
+/// What a streaming fetch does with its cache fill when its client goes away.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StreamingFillMode {
+    /// Client traffic keeps the historical detached drain (#5509).
+    DetachOnDrop,
+    /// A bounded caller cancels the fill with its body, so it cannot outlive
+    /// the caller's deadline (#6488).
+    StopOnDrop,
+}
+
+/// Upstream body bytes consumed under the current task (#6488).
+///
+/// A warm fetch scopes one meter around the whole download so bytes count even
+/// when the status is not 2xx, the body is cut short by the item deadline, or
+/// the scan gate buffers and refuses the object. The optional total is the
+/// running job budget, incremented as bytes arrive rather than after the item
+/// settles.
+#[derive(Clone)]
+pub(crate) struct UpstreamByteMeter {
+    bytes: Arc<AtomicU64>,
+    total: Option<Arc<AtomicU64>>,
+}
+
+tokio::task_local! {
+    static UPSTREAM_BYTE_METER: UpstreamByteMeter;
+}
+
+impl UpstreamByteMeter {
+    pub(crate) fn new(total: Option<Arc<AtomicU64>>) -> Self {
+        Self {
+            bytes: Arc::new(AtomicU64::new(0)),
+            total,
+        }
+    }
+
+    fn current() -> Option<Self> {
+        UPSTREAM_BYTE_METER.try_with(|meter| meter.clone()).ok()
+    }
+
+    pub(crate) fn add(&self, bytes: usize) {
+        let bytes = bytes as u64;
+        self.bytes.fetch_add(bytes, Ordering::Relaxed);
+        if let Some(total) = &self.total {
+            total.fetch_add(bytes, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn bytes(&self) -> u64 {
+        self.bytes.load(Ordering::Relaxed)
+    }
+
+    pub(crate) async fn scope<F: Future>(meter: Self, future: F) -> F::Output {
+        UPSTREAM_BYTE_METER.scope(meter, future).await
+    }
+}
+
 struct FinishFillOnDrop {
     body: Option<BoxStream<'static, Result<Bytes>>>,
     /// Bytes handed to the client so far.
@@ -705,7 +764,22 @@ struct FinishFillLimits {
 impl FinishFillOnDrop {
     /// Wrap a leader handle that feeds a cache write; other handles (follower
     /// replays, the over-quota bypass) are returned unchanged.
+    #[cfg(test)]
     fn wrap(handle: StreamHandle, limits: FinishFillLimits) -> StreamHandle {
+        Self::wrap_with_mode(handle, limits, StreamingFillMode::DetachOnDrop)
+    }
+
+    /// A caller that bounds the fetch itself drops its body at that bound. It
+    /// must not hand the rest of the upstream body to the shared detached pool,
+    /// which would keep downloading after the caller released its slot (#6488).
+    fn wrap_with_mode(
+        handle: StreamHandle,
+        limits: FinishFillLimits,
+        mode: StreamingFillMode,
+    ) -> StreamHandle {
+        if mode == StreamingFillMode::StopOnDrop {
+            return handle;
+        }
         let Some(cache_published) = handle.cache_published.clone() else {
             return handle;
         };
@@ -5538,6 +5612,7 @@ impl UpstreamClient {
         // reject the moment the total would exceed `max`. No un-bounded
         // full-body read (`response.bytes()`) is ever issued.
         let mut stream = response.bytes_stream();
+        let meter = UpstreamByteMeter::current();
         let mut buf = bytes::BytesMut::new();
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|e| {
@@ -5546,6 +5621,9 @@ impl UpstreamClient {
                     e.without_url()
                 ))
             })?;
+            if let Some(meter) = &meter {
+                meter.add(chunk.len());
+            }
             if buf.len().saturating_add(chunk.len()) > max {
                 tracing::warn!(
                     "Upstream metadata body from {} exceeded the {}-byte ceiling; aborting buffered read",
@@ -5817,8 +5895,14 @@ impl UpstreamClient {
         validate_upstream_response_status(response.status(), response.headers(), url)?;
         let headers = extract_streaming_headers(response.headers());
 
-        let body = response.bytes_stream().map(|r| {
-            r.map_err(|e| {
+        let meter = UpstreamByteMeter::current();
+        let body = response.bytes_stream().map(move |r| {
+            r.inspect(|bytes| {
+                if let Some(meter) = &meter {
+                    meter.add(bytes.len());
+                }
+            })
+            .map_err(|e| {
                 AppError::Storage(format!(
                     "Failed to read upstream stream: {}",
                     e.without_url()
@@ -8546,7 +8630,13 @@ impl ProxyService {
                 .await?
             else {
                 return self
-                    .streaming_gated_fetch(repo, fetch_path, cache_path, expected_checksum)
+                    .streaming_gated_fetch(
+                        repo,
+                        fetch_path,
+                        cache_path,
+                        expected_checksum,
+                        StreamingFillMode::DetachOnDrop,
+                    )
                     .await;
             };
 
@@ -8584,6 +8674,20 @@ impl ProxyService {
         cache_path: &str,
     ) -> Result<StreamingFetchResult> {
         self.fetch_artifact_streaming_with_cache_path_gated(repo, fetch_path, cache_path, None)
+            .await
+    }
+
+    /// Streaming fetch whose caller imposes its own deadline (#6488). With
+    /// [`StreamingFillMode::StopOnDrop`], dropping the body stops the upstream
+    /// fill instead of handing it to the shared detached pool.
+    pub(crate) async fn fetch_artifact_streaming_with_cache_path_with_mode(
+        &self,
+        repo: &Repository,
+        fetch_path: &str,
+        cache_path: &str,
+        mode: StreamingFillMode,
+    ) -> Result<StreamingFetchResult> {
+        self.streaming_gated_fetch(repo, fetch_path, cache_path, None, mode)
             .await
     }
 
@@ -8632,6 +8736,7 @@ impl ProxyService {
             fetch_path,
             cache_path,
             expected_checksum.map(ExpectedCommitDigest::Resolved),
+            StreamingFillMode::DetachOnDrop,
         )
         .await
     }
@@ -8663,6 +8768,7 @@ impl ProxyService {
             fetch_path,
             cache_path,
             Some(ExpectedCommitDigest::Deferred { algorithm, digest }),
+            StreamingFillMode::DetachOnDrop,
         )
         .await
     }
@@ -8686,6 +8792,7 @@ impl ProxyService {
         fetch_path: &str,
         cache_path: &str,
         expected_checksum: Option<ExpectedCommitDigest>,
+        mode: StreamingFillMode,
     ) -> Result<StreamingFetchResult> {
         // #4506: the Remote's origin policy, before any cache read or upstream contact.
         self.ensure_origin_policy_allows(repo).await?;
@@ -8716,6 +8823,7 @@ impl ProxyService {
                     fetch_path,
                     cache_path,
                     expected_checksum.clone(),
+                    mode,
                 )
                 .await?
             {
@@ -8724,8 +8832,14 @@ impl ProxyService {
         }
         // Exhausted re-enters (pathological contention): do one final
         // uncoordinated attempt so the request never spuriously fails.
-        self.fetch_artifact_streaming_uncoordinated(repo, fetch_path, cache_path, expected_checksum)
-            .await
+        self.fetch_artifact_streaming_uncoordinated(
+            repo,
+            fetch_path,
+            cache_path,
+            expected_checksum,
+            mode,
+        )
+        .await
     }
 
     /// Streaming cache probe: serve `cache_path` straight from the proxy
@@ -8783,6 +8897,7 @@ impl ProxyService {
         fetch_path: &str,
         cache_path: &str,
         expected_checksum: Option<ExpectedCommitDigest>,
+        mode: StreamingFillMode,
     ) -> Result<Option<StreamingFetchResult>> {
         let cache_key = Self::cache_storage_key(&self.cache_scope, &repo.key, cache_path)?;
         let metadata_key = Self::cache_metadata_key(&self.cache_scope, &repo.key, cache_path)?;
@@ -8825,10 +8940,9 @@ impl ProxyService {
             .await?;
 
         match handle {
-            Some(handle) => Ok(Some(StreamingFetchResult::from(FinishFillOnDrop::wrap(
-                handle,
-                self.finish_fill_limits(),
-            )))),
+            Some(handle) => Ok(Some(StreamingFetchResult::from(
+                FinishFillOnDrop::wrap_with_mode(handle, self.finish_fill_limits(), mode),
+            ))),
             None => {
                 forget_cached_sidecar_miss(&metadata_key).await;
                 Ok(None)
@@ -9887,6 +10001,7 @@ impl ProxyService {
         fetch_path: &str,
         cache_path: &str,
         expected_checksum: Option<ExpectedCommitDigest>,
+        mode: StreamingFillMode,
     ) -> Result<StreamingFetchResult> {
         let cache_key = Self::cache_storage_key(&self.cache_scope, &repo.key, cache_path)?;
         let metadata_key = Self::cache_metadata_key(&self.cache_scope, &repo.key, cache_path)?;
@@ -9915,10 +10030,9 @@ impl ProxyService {
                 expected_checksum,
             )
             .await?;
-        Ok(StreamingFetchResult::from(FinishFillOnDrop::wrap(
-            handle,
-            self.finish_fill_limits(),
-        )))
+        Ok(StreamingFetchResult::from(
+            FinishFillOnDrop::wrap_with_mode(handle, self.finish_fill_limits(), mode),
+        ))
     }
 
     /// Check if upstream has a newer version of the artifact.
@@ -23956,7 +24070,13 @@ mod tests {
             let repo = repo.clone();
             tokio::spawn(async move {
                 proxy
-                    .try_fetch_artifact_streaming_once(&repo, artifact, artifact, None)
+                    .try_fetch_artifact_streaming_once(
+                        &repo,
+                        artifact,
+                        artifact,
+                        None,
+                        StreamingFillMode::DetachOnDrop,
+                    )
                     .await
                     .map(|r| r.is_none())
             })
@@ -32742,7 +32862,7 @@ mod cache_read_overlap_tests {
 #[cfg(test)]
 mod finish_fill_on_drop_5509 {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
     /// A leader handle over `chunks` chunks that counts how many were read,
     /// plus the sender of its `cache_published` signal.
@@ -32781,6 +32901,20 @@ mod finish_fill_on_drop_5509 {
         }
     }
 
+    #[tokio::test]
+    async fn upstream_bytes_count_to_both_the_item_and_the_job() {
+        let total = Arc::new(AtomicU64::new(0));
+        let meter = UpstreamByteMeter::new(Some(Arc::clone(&total)));
+        UpstreamByteMeter::scope(meter.clone(), async {
+            UpstreamByteMeter::current()
+                .expect("meter is in scope")
+                .add(7);
+        })
+        .await;
+        assert_eq!(meter.bytes(), 7);
+        assert_eq!(total.load(Ordering::Relaxed), 7);
+    }
+
     async fn permits_back(permits: &Semaphore, want: usize) -> usize {
         for _ in 0..200 {
             if permits.available_permits() == want {
@@ -32816,6 +32950,24 @@ mod finish_fill_on_drop_5509 {
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
+        assert_eq!(permits.available_permits(), 1);
+    }
+
+    /// A caller that enforces its own deadline (#6488) drops the body without
+    /// handing the rest of the object to the detached pool.
+    #[tokio::test]
+    async fn a_warm_body_dropped_mid_object_is_not_drained() {
+        let permits = Arc::new(Semaphore::new(1));
+        let (handle, read, _published) = leader(8);
+        let mut unwrapped = FinishFillOnDrop::wrap_with_mode(
+            handle,
+            limits(&permits),
+            StreamingFillMode::StopOnDrop,
+        );
+        assert!(unwrapped.body.next().await.unwrap().is_ok());
+        drop(unwrapped);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(read.load(Ordering::SeqCst), 1);
         assert_eq!(permits.available_permits(), 1);
     }
 
