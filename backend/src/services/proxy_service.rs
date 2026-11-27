@@ -13672,6 +13672,25 @@ mod tests {
         );
     }
 
+    /// #6499: the route hands the decoded path (`^`), and the request-target
+    /// must carry it encoded. url 2.5.8 sent `^` raw and strict upstreams
+    /// answered 400, 2.5.9 (#6434) encodes it
+    #[test]
+    fn upstream_request_encodes_a_caret_in_the_path_6499() {
+        let url = ProxyService::build_upstream_url(
+            "http://upstream/maven2",
+            "org/example/test/^1.0/test-^1.0.pom",
+        );
+        let request = reqwest::Client::new()
+            .get(&url)
+            .build()
+            .expect("build upstream request");
+        assert_eq!(
+            request.url().path(),
+            "/maven2/org/example/test/%5E1.0/test-%5E1.0.pom"
+        );
+    }
+
     #[test]
     fn test_build_upstream_url_both_slashes() {
         // Both trailing slash on base and leading slash on path
