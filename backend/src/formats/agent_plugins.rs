@@ -582,10 +582,13 @@ pub fn analyze_entries(
 /// before anything is inflated, and only manifest files are ever read.
 /// Callers hold an ingest-extraction permit.
 pub fn analyze_zip<R: Read + Seek>(
-    reader: R,
+    mut reader: R,
     slug: &str,
     version: &str,
 ) -> std::result::Result<PluginMetadata, String> {
+    // #5526: the declared entry count is checked before the central directory
+    // is parsed; `reject_unsafe_zip_entry_names` checks the parsed count below.
+    bounded_archive::check_declared_zip_entry_count(&mut reader).map_err(validation_message)?;
     let mut archive =
         zip::ZipArchive::new(reader).map_err(|e| format!("Invalid ZIP archive: {e}"))?;
     bounded_archive::reject_unsafe_zip_entry_names(&archive).map_err(validation_message)?;

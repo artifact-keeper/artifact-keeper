@@ -21,7 +21,12 @@
 //!    byte budget and stops),
 //! 2. an **entry-count cap** (default 10 000, env
 //!    [`MAX_INGEST_ARCHIVE_ENTRIES_ENV`]) — defence-in-depth against
-//!    inode/entry-count bombs with a clearer error,
+//!    inode/entry-count bombs with a clearer error. For ZIPs the count declared
+//!    in the end-of-central-directory record (or ZIP64 EOCD) is checked BEFORE
+//!    [`zip::ZipArchive::new`] parses the central directory, so a body near the
+//!    upload cap with millions of tiny entries is refused without that
+//!    temporary parse (#5526); the post-parse `archive.len()` check stays as the
+//!    authoritative second line for the parsed central directory,
 //! 3. an **8 MiB per-metadata-entry cap** ([`MAX_INGEST_METADATA_ENTRY_BYTES`])
 //!    — a metadata file larger than this is itself a bomb.
 //!
@@ -41,7 +46,7 @@
 //! than silently truncating or hanging.
 
 use std::collections::HashMap;
-use std::io::{self, Read, Seek};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
@@ -114,20 +119,174 @@ pub fn max_ingest_archive_entries() -> u64 {
 /// readers such as MCPB's manifest lookup that do not go through
 /// [`read_metadata_from_zip`].
 pub fn check_zip_entry_count<R: Read + Seek>(archive: &zip::ZipArchive<R>) -> Result<()> {
-    check_zip_entry_count_limited(archive.len() as u64, max_ingest_archive_entries())
+    check_zip_entry_count_value(archive.len() as u64, max_ingest_archive_entries())
 }
 
-/// `_limited` seam for [`check_zip_entry_count`] with an explicit ceiling
-/// ([`read_metadata_from_zip_limited`] callers such as proxy identity probing
-/// raise it for their name walk).
-fn check_zip_entry_count_limited(entry_count: u64, max_entries: u64) -> Result<()> {
-    if entry_count > max_entries {
+/// Stand-in for a ZIP64 count that cannot be read from the scanned tail. A
+/// real count this large cannot be represented by `zip`, so the comparison
+/// helper always rejects it instead of skipping the pre-parse guard (#5526).
+const UNREADABLE_ZIP64_ENTRY_COUNT: u64 = u64::MAX;
+
+/// Compare a parsed or declared ZIP entry count with an explicit ceiling. The
+/// one error shape keeps the pre-parse refusal (#5526) indistinguishable from
+/// the authoritative post-parse `archive.len()` refusal.
+fn check_zip_entry_count_value(entry_count: u64, max_entries: u64) -> Result<()> {
+    if entry_count == UNREADABLE_ZIP64_ENTRY_COUNT || entry_count > max_entries {
         return Err(AppError::Validation(format!(
             "ZIP archive contains too many entries (> {}); refusing suspected decompression bomb",
             max_entries
         )));
     }
     Ok(())
+}
+
+const ZIP_EOCD_SIGNATURE: &[u8; 4] = b"PK\x05\x06";
+const ZIP64_LOCATOR_SIGNATURE: &[u8; 4] = b"PK\x06\x07";
+const ZIP64_EOCD_SIGNATURE: &[u8; 4] = b"PK\x06\x06";
+const ZIP_EOCD_LEN: usize = 22;
+const ZIP64_LOCATOR_LEN: usize = 20;
+const ZIP64_EOCD_MIN_LEN: usize = 56;
+/// An EOCD, its maximum-length comment, a ZIP64 locator and a minimum ZIP64
+/// EOCD all fit in this tail. No other part of the archive is needed to read
+/// the declared entry count.
+const ZIP_END_SCAN_BYTES: usize =
+    ZIP_EOCD_LEN + u16::MAX as usize + ZIP64_LOCATOR_LEN + ZIP64_EOCD_MIN_LEN;
+
+fn read_le_u16(bytes: &[u8], at: usize) -> Option<u16> {
+    Some(u16::from_le_bytes(bytes.get(at..at + 2)?.try_into().ok()?))
+}
+
+fn read_le_u32(bytes: &[u8], at: usize) -> Option<u32> {
+    Some(u32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?))
+}
+
+fn read_le_u64(bytes: &[u8], at: usize) -> Option<u64> {
+    Some(u64::from_le_bytes(bytes.get(at..at + 8)?.try_into().ok()?))
+}
+
+/// Find the EOCD whose comment ends at or before `tail`'s end. Searching
+/// backwards skips an EOCD-like signature inside the archive comment; trailing
+/// bytes after the comment are valid to `zip`, so they must not make the
+/// pre-parse check miss the record. When no record fits in the tail, return
+/// `None` and let `ZipArchive::new` decide whether the bytes are a ZIP.
+fn find_zip_eocd(tail: &[u8]) -> Option<usize> {
+    let mut end = tail.len();
+    while end >= ZIP_EOCD_LEN {
+        let at = tail[..end]
+            .windows(4)
+            .rposition(|w| w == ZIP_EOCD_SIGNATURE)?;
+        if at + ZIP_EOCD_LEN <= tail.len() {
+            let comment_len = read_le_u16(tail, at + 20)? as usize;
+            if at + ZIP_EOCD_LEN + comment_len <= tail.len() {
+                return Some(at);
+            }
+        }
+        end = at;
+    }
+    None
+}
+
+/// Find the ZIP64 EOCD immediately preceding the locator at `before`. Its
+/// `size` field includes an optional extensible-data sector, so the record
+/// start is located by matching the signature whose record ends at `before`
+/// rather than assuming the minimum 56-byte length.
+fn find_zip64_eocd_before(tail: &[u8], before: usize) -> Option<usize> {
+    if before < ZIP64_EOCD_MIN_LEN {
+        return None;
+    }
+    for at in (0..=before - ZIP64_EOCD_MIN_LEN).rev() {
+        if tail.get(at..at + 4)? != ZIP64_EOCD_SIGNATURE {
+            continue;
+        }
+        let size = usize::try_from(read_le_u64(tail, at + 4)?).ok()?;
+        if size < 44 {
+            continue;
+        }
+        if at.checked_add(12)?.checked_add(size)? == before {
+            return Some(at);
+        }
+    }
+    None
+}
+
+/// Read the declared central-directory entry count from an EOCD (and ZIP64
+/// EOCD where the 16-bit fields are sentinels). `None` means the tail is not a
+/// recognisable ZIP end record; the caller then relies on the post-parse
+/// `archive.len()` check. A sentinel whose ZIP64 record cannot be read is
+/// reported as [`UNREADABLE_ZIP64_ENTRY_COUNT`] so the caller refuses it.
+pub fn declared_zip_entry_count_from_tail(tail: &[u8]) -> Option<u64> {
+    let eocd = find_zip_eocd(tail)?;
+    let total16 = read_le_u16(tail, eocd + 10)? as u64;
+    let cd_size = read_le_u32(tail, eocd + 12)?;
+    let cd_offset = read_le_u32(tail, eocd + 16)?;
+    if total16 != u16::MAX as u64 && cd_size != u32::MAX && cd_offset != u32::MAX {
+        return Some(total16);
+    }
+
+    // A ZIP64 archive stores the real total in the ZIP64 EOCD, pointed to by
+    // the locator directly before the EOCD. If either is outside the scanned
+    // tail, refuse instead of falling back to the placeholder: a raised entry
+    // ceiling could otherwise accept the placeholder and skip this guard.
+    let Some(locator) = eocd.checked_sub(ZIP64_LOCATOR_LEN) else {
+        return Some(UNREADABLE_ZIP64_ENTRY_COUNT);
+    };
+    if tail.get(locator..locator + 4) != Some(ZIP64_LOCATOR_SIGNATURE.as_slice()) {
+        return Some(UNREADABLE_ZIP64_ENTRY_COUNT);
+    }
+    let Some(zip64) = find_zip64_eocd_before(tail, locator) else {
+        return Some(UNREADABLE_ZIP64_ENTRY_COUNT);
+    };
+    Some(read_le_u64(tail, zip64 + 32).unwrap_or(UNREADABLE_ZIP64_ENTRY_COUNT))
+}
+
+/// Read the declared entry count from the end of `reader` without consuming
+/// it. The reader is rewound to its original position even when the tail is
+/// malformed, so `ZipArchive::new` still sees the same bytes.
+pub fn declared_zip_entry_count<R: Read + Seek>(reader: &mut R) -> Option<u64> {
+    let pos = reader.stream_position().ok()?;
+    let len = reader.seek(SeekFrom::End(0)).ok()?;
+    let tail_len = usize::try_from(len.min(ZIP_END_SCAN_BYTES as u64)).ok()?;
+    let tail = (|| -> io::Result<Vec<u8>> {
+        reader.seek(SeekFrom::End(-(tail_len as i64)))?;
+        let mut tail = vec![0u8; tail_len];
+        reader.read_exact(&mut tail)?;
+        Ok(tail)
+    })();
+    let _ = reader.seek(SeekFrom::Start(pos));
+    declared_zip_entry_count_from_tail(&tail.ok()?)
+}
+
+/// Refuse a declared entry count above `max_entries` before a ZIP is parsed.
+/// Call this on an already-buffered tail (MCPB's inspection holds one) or via
+/// [`check_declared_zip_entry_count_limited`] on a reader.
+pub fn check_declared_zip_entry_count_in_tail(tail: &[u8], max_entries: u64) -> Result<()> {
+    if let Some(count) = declared_zip_entry_count_from_tail(tail) {
+        check_zip_entry_count_value(count, max_entries)?;
+    }
+    Ok(())
+}
+
+/// [`check_declared_zip_entry_count_in_tail`] with the shared ceiling.
+pub fn check_declared_zip_entry_count_from_tail(tail: &[u8]) -> Result<()> {
+    check_declared_zip_entry_count_in_tail(tail, max_ingest_archive_entries())
+}
+
+/// Pre-parse counterpart of [`check_zip_entry_count`] with an explicit ceiling.
+/// Readers that raise the ceiling for a name walk use this so the declared
+/// count is checked against the same limit as the post-parse one.
+pub fn check_declared_zip_entry_count_limited<R: Read + Seek>(
+    reader: &mut R,
+    max_entries: u64,
+) -> Result<()> {
+    if let Some(count) = declared_zip_entry_count(reader) {
+        check_zip_entry_count_value(count, max_entries)?;
+    }
+    Ok(())
+}
+
+/// [`check_declared_zip_entry_count_limited`] with the shared ceiling.
+pub fn check_declared_zip_entry_count<R: Read + Seek>(reader: &mut R) -> Result<()> {
+    check_declared_zip_entry_count_limited(reader, max_ingest_archive_entries())
 }
 
 // ---------------------------------------------------------------------------
@@ -1393,15 +1552,18 @@ pub fn read_metadata_from_zip<R: Read + Seek>(
 
 /// `_limited` seam for [`read_metadata_from_zip`].
 pub fn read_metadata_from_zip_limited<R: Read + Seek>(
-    reader: R,
+    mut reader: R,
     matches: impl Fn(&str) -> bool,
     max_entries: u64,
     max_entry: u64,
 ) -> Result<Option<Vec<u8>>> {
+    // #5526: refuse an over-ceiling declared count before `ZipArchive::new`
+    // parses the whole central directory. The parsed check below stays.
+    check_declared_zip_entry_count_limited(&mut reader, max_entries)?;
     let mut archive = zip::ZipArchive::new(reader)
         .map_err(|e| AppError::Validation(format!("Invalid ZIP archive: {}", e)))?;
 
-    check_zip_entry_count_limited(archive.len() as u64, max_entries)?;
+    check_zip_entry_count_value(archive.len() as u64, max_entries)?;
 
     for i in 0..archive.len() {
         // Match on the central-directory name BEFORE opening the entry, so an
@@ -1545,6 +1707,53 @@ mod tests {
             w.finish().unwrap();
         }
         cursor.into_inner()
+    }
+
+    /// A ZIP end record with no central directory, used to prove the declared
+    /// count is refused before `ZipArchive::new` tries to parse the body.
+    fn zip_eocd_tail(entries: u16, comment_len: u16) -> Vec<u8> {
+        let mut tail = ZIP_EOCD_SIGNATURE.to_vec();
+        tail.extend_from_slice(&0u16.to_le_bytes()); // this disk
+        tail.extend_from_slice(&0u16.to_le_bytes()); // disk with central dir
+        tail.extend_from_slice(&entries.to_le_bytes()); // entries on this disk
+        tail.extend_from_slice(&entries.to_le_bytes()); // total entries
+        tail.extend_from_slice(&0u32.to_le_bytes()); // central dir size
+        tail.extend_from_slice(&0u32.to_le_bytes()); // central dir offset
+        tail.extend_from_slice(&comment_len.to_le_bytes());
+        tail.extend(vec![b'c'; comment_len as usize]);
+        tail
+    }
+
+    /// ZIP64 end records with the 16-bit sentinels in the ordinary EOCD.
+    fn zip64_tail(entries: u64) -> Vec<u8> {
+        zip64_tail_with_extensible_data(entries, 0)
+    }
+
+    fn zip64_tail_with_extensible_data(entries: u64, extra_len: usize) -> Vec<u8> {
+        let mut tail = ZIP64_EOCD_SIGNATURE.to_vec();
+        tail.extend_from_slice(&(44u64 + extra_len as u64).to_le_bytes()); // record size
+        tail.extend_from_slice(&45u16.to_le_bytes()); // version made by
+        tail.extend_from_slice(&45u16.to_le_bytes()); // version needed
+        tail.extend_from_slice(&0u32.to_le_bytes()); // this disk
+        tail.extend_from_slice(&0u32.to_le_bytes()); // disk with central dir
+        tail.extend_from_slice(&entries.to_le_bytes()); // entries on this disk
+        tail.extend_from_slice(&entries.to_le_bytes()); // total entries
+        tail.extend_from_slice(&0u64.to_le_bytes()); // central dir size
+        tail.extend_from_slice(&0u64.to_le_bytes()); // central dir offset
+        tail.extend(vec![0; extra_len]); // extensible data sector
+        tail.extend_from_slice(ZIP64_LOCATOR_SIGNATURE);
+        tail.extend_from_slice(&0u32.to_le_bytes()); // disk with ZIP64 EOCD
+        tail.extend_from_slice(&0u64.to_le_bytes()); // ZIP64 EOCD offset
+        tail.extend_from_slice(&1u32.to_le_bytes()); // total disks
+        tail.extend_from_slice(ZIP_EOCD_SIGNATURE);
+        tail.extend_from_slice(&0u16.to_le_bytes()); // this disk
+        tail.extend_from_slice(&0u16.to_le_bytes()); // disk with central dir
+        tail.extend_from_slice(&u16::MAX.to_le_bytes()); // entries on this disk
+        tail.extend_from_slice(&u16::MAX.to_le_bytes()); // total entries
+        tail.extend_from_slice(&u32::MAX.to_le_bytes()); // central dir size
+        tail.extend_from_slice(&u32::MAX.to_le_bytes()); // central dir offset
+        tail.extend_from_slice(&0u16.to_le_bytes()); // comment length
+        tail
     }
 
     fn is_chart(p: &Path) -> bool {
@@ -1787,6 +1996,112 @@ mod tests {
         let err =
             read_metadata_from_zip_limited(cursor, |n| n.ends_with(".nuspec"), 5, 1024 * 1024);
         assert!(err.is_err(), "zip entry-count breach must reject");
+    }
+
+    #[test]
+    fn declared_zip_entry_count_reads_eocd_and_zip64_5526() {
+        assert_eq!(
+            declared_zip_entry_count_from_tail(&zip_eocd_tail(7, 0)),
+            Some(7)
+        );
+        assert_eq!(
+            declared_zip_entry_count_from_tail(&zip_eocd_tail(9, 11)),
+            Some(9)
+        );
+        assert_eq!(
+            declared_zip_entry_count_from_tail(&zip64_tail(123)),
+            Some(123)
+        );
+        assert_eq!(declared_zip_entry_count_from_tail(&[]), None);
+    }
+
+    /// `zip` accepts data after the EOCD comment, so one trailing byte must not
+    /// make the declared count invisible to the pre-parse check (#5526).
+    #[test]
+    fn trailing_bytes_do_not_hide_declared_zip_count_5526() {
+        let mut tail = zip_eocd_tail(20, 5);
+        tail.extend_from_slice(b"trailing");
+        assert_eq!(declared_zip_entry_count_from_tail(&tail), Some(20));
+
+        let err = check_declared_zip_entry_count_limited(&mut std::io::Cursor::new(&tail), 5)
+            .expect_err("trailing bytes must not skip the declared-count check");
+        assert!(err.to_string().contains("too many entries"), "{err}");
+    }
+
+    #[test]
+    fn declared_count_check_rewinds_reader_5526() {
+        let mut cursor = std::io::Cursor::new(zip_eocd_tail(1, 0));
+        assert_eq!(declared_zip_entry_count(&mut cursor), Some(1));
+        assert_eq!(
+            cursor.position(),
+            0,
+            "the pre-parse peek must not consume the ZIP"
+        );
+    }
+
+    /// #5526: the body is not a readable ZIP at all, but its declared count
+    /// already exceeds the cap, so the refusal must name the count rather than
+    /// reach `ZipArchive::new` and report a generic format error.
+    #[test]
+    fn over_cap_declared_zip_count_is_refused_before_parsing_5526() {
+        for tail in [zip_eocd_tail(20, 0), zip64_tail(20)] {
+            let err = read_metadata_from_zip_limited(
+                std::io::Cursor::new(&tail),
+                |_| false,
+                5,
+                1024 * 1024,
+            )
+            .expect_err("an over-cap declared count must be refused before parsing");
+            assert!(err.to_string().contains("too many entries"), "{err}");
+        }
+    }
+
+    /// #5526: a sentinel in the ordinary EOCD must fail closed when the ZIP64
+    /// record is outside the scanned tail or its locator is missing. Falling
+    /// back to the 16-bit placeholder would let a raised ceiling skip the
+    /// pre-parse guard.
+    #[test]
+    fn unreadable_zip64_declared_count_is_refused_5526() {
+        let large_record = zip64_tail_with_extensible_data(20, ZIP_END_SCAN_BYTES);
+        let scanned_tail = &large_record[large_record.len() - ZIP_END_SCAN_BYTES..];
+        assert_eq!(
+            declared_zip_entry_count_from_tail(scanned_tail),
+            Some(UNREADABLE_ZIP64_ENTRY_COUNT)
+        );
+
+        let mut no_locator = zip64_tail(20);
+        let locator_at = no_locator.len() - ZIP_EOCD_LEN - ZIP64_LOCATOR_LEN;
+        no_locator.drain(locator_at..locator_at + ZIP64_LOCATOR_LEN);
+        assert_eq!(
+            declared_zip_entry_count_from_tail(&no_locator),
+            Some(UNREADABLE_ZIP64_ENTRY_COUNT)
+        );
+
+        for bytes in [large_record, no_locator] {
+            let err = check_declared_zip_entry_count_limited(&mut std::io::Cursor::new(&bytes), 5)
+                .expect_err("an unreadable ZIP64 count must fail closed");
+            assert!(err.to_string().contains("too many entries"), "{err}");
+        }
+    }
+
+    /// The parsed count stays authoritative: the comparison helper must still
+    /// refuse a real `ZipArchive` over the cap, independent of the pre-parse
+    /// tail check. `zip` sizes its parsed directory from the declared count, so
+    /// a forged low declaration cannot be used to exercise this directly.
+    #[test]
+    fn parsed_zip_entry_count_check_stays_authoritative_5526() {
+        let entries: Vec<(String, Vec<u8>)> =
+            (0..20).map(|i| (format!("f{i}.txt"), vec![b'a'])).collect();
+        let refs: Vec<(&str, &[u8])> = entries
+            .iter()
+            .map(|(n, d)| (n.as_str(), d.as_slice()))
+            .collect();
+        let archive = zip::ZipArchive::new(std::io::Cursor::new(zip_bytes(&refs))).unwrap();
+        assert_eq!(archive.len(), 20);
+
+        let err = check_zip_entry_count_value(archive.len() as u64, 5)
+            .expect_err("the parsed count remains the authoritative check");
+        assert!(err.to_string().contains("too many entries"), "{err}");
     }
 
     // -----------------------------------------------------------------------

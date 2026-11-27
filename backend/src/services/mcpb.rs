@@ -254,8 +254,16 @@ pub fn read_manifest(archive: &[u8]) -> Result<serde_json::Value, BundleError> {
 }
 
 fn read_manifest_from<R: std::io::Read + std::io::Seek>(
-    archive: R,
+    mut archive: R,
 ) -> Result<serde_json::Value, BundleError> {
+    // #5526: refuse an over-ceiling declared count before the whole central
+    // directory is parsed. `inspect_file_with` checks its buffered tail too.
+    crate::util::bounded_archive::check_declared_zip_entry_count(&mut archive).map_err(
+        |error| match error {
+            crate::error::AppError::Validation(message) => bad(message),
+            other => bad(other.to_string()),
+        },
+    )?;
     let mut zip =
         zip::ZipArchive::new(archive).map_err(|e| bad(format!("not a ZIP archive: {e}")))?;
     crate::util::bounded_archive::check_zip_entry_count(&zip).map_err(|error| match error {
@@ -1127,6 +1135,14 @@ pub fn inspect_file_with(
         .take(TAIL_BYTES)
         .read_to_end(&mut tail)
         .map_err(io)?;
+    // #5526: the end record is already in this tail; check its declared count
+    // before `read_manifest_from` opens the ZIP as well.
+    crate::util::bounded_archive::check_declared_zip_entry_count_from_tail(&tail).map_err(
+        |error| match error {
+            crate::error::AppError::Validation(message) => bad(message),
+            other => bad(other.to_string()),
+        },
+    )?;
     let split = split_signature(&tail);
     if split.block_len > 0 && block_has_zip_records(&tail[split.archive.len()..]) {
         return Err(bad("the signature block carries ZIP records"));
