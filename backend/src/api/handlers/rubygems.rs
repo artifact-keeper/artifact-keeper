@@ -887,6 +887,11 @@ async fn serve_specs_index(
 /// its gems (#4192). A virtual with a single remote member and no hosted gems
 /// passes the upstream bytes through without decoding.
 ///
+/// Each member fetch reserves its buffered index against the RubyGems family's
+/// sub-budget inside a bounded wait (#5977). Members are fetched one at a time
+/// and each reservation is released before the next, so one merge needs no
+/// more than one reservation and cannot shed against itself.
+///
 /// The merge of a full rubygems.org index is ~1.7M entries and ~0.5 s of CPU,
 /// so the finished gzip is cached and built at most once per state: see
 /// [`MERGED_SPECS_CACHE`] and [`build_merged_specs`].
@@ -896,6 +901,26 @@ async fn serve_virtual_specs_index(
     auth: Option<&AuthExtension>,
     upstream_path: &str,
     sql: &str,
+) -> Result<Response, Response> {
+    serve_virtual_specs_index_in(
+        state,
+        repo,
+        auth,
+        upstream_path,
+        sql,
+        RemoteDocumentBudget::process(),
+    )
+    .await
+}
+
+/// [`serve_virtual_specs_index`] against the given metadata budget.
+async fn serve_virtual_specs_index_in(
+    state: &SharedState,
+    repo: &RepoInfo,
+    auth: Option<&AuthExtension>,
+    upstream_path: &str,
+    sql: &str,
+    budget: RemoteDocumentBudget,
 ) -> Result<Response, Response> {
     // Caller-authorized member walk (#3323): the spec index is content.
     let members = proxy_helpers::authorized_virtual_members(&state.db, auth, repo.id).await?;
@@ -919,9 +944,10 @@ async fn serve_virtual_specs_index(
     let (hosted_count, hosted_latest) = hosted_fingerprint(&state.db, &members).await?;
     if let ([member], 0) = (remotes.as_slice(), hosted_count) {
         // Nothing to merge: the one upstream index, byte for byte.
-        let (content, content_type, _budget) = fetch_member_specs(proxy, member, upstream_path)
-            .await
-            .map_err(|e| e.to_response())?;
+        let (content, content_type, _budget) =
+            fetch_member_specs(proxy, member, upstream_path, budget)
+                .await
+                .map_err(|e| e.to_response())?;
         return Ok(index_bytes_response(content, content_type.as_deref()));
     }
 
@@ -938,7 +964,15 @@ async fn serve_virtual_specs_index(
     let gz = MERGED_SPECS_CACHE
         .try_get_with(
             key,
-            build_merged_specs(&state.db, proxy, repo.id, &members, upstream_path, sql),
+            build_merged_specs(
+                &state.db,
+                proxy,
+                repo.id,
+                &members,
+                upstream_path,
+                sql,
+                budget,
+            ),
         )
         .await
         .map_err(|e| e.to_response())?;
@@ -1072,7 +1106,7 @@ async fn hosted_fingerprint(
 /// are ever in memory at once and read load never sheds uploads. Decoding,
 /// merging, Marshal encoding and gzip run on the blocking pool, not the async
 /// executor. Each upstream body and its metadata-budget reservation are
-/// released as soon as that member is merged.
+/// released as soon as that member is merged (#5977).
 async fn build_merged_specs(
     db: &PgPool,
     proxy: &crate::services::proxy_service::ProxyService,
@@ -1080,6 +1114,7 @@ async fn build_merged_specs(
     members: &[Repository],
     upstream_path: &str,
     sql: &str,
+    budget: RemoteDocumentBudget,
 ) -> Result<Bytes, SpecsBuildError> {
     let _slot = crate::util::bounded_archive::acquire_registry_extraction().map_err(|e| {
         let message = e.to_string();
@@ -1107,8 +1142,8 @@ async fn build_merged_specs(
     drop(local);
 
     for member in members.iter().filter(|m| is_remote_with_upstream(m)) {
-        let (content, _content_type, budget) =
-            fetch_member_specs(proxy, member, upstream_path).await?;
+        let (content, _content_type, permit) =
+            fetch_member_specs(proxy, member, upstream_path, budget).await?;
         let member_key = member.key.clone();
         let path = upstream_path.to_string();
         merged = tokio::task::spawn_blocking(move || {
@@ -1120,7 +1155,7 @@ async fn build_merged_specs(
         })
         .await
         .map_err(build_task_failed)??;
-        drop(budget);
+        drop(permit);
     }
 
     tokio::task::spawn_blocking(move || {
@@ -1224,20 +1259,27 @@ fn decode_upstream_specs(body: &[u8]) -> Result<Vec<SpecEntry>, String> {
 
 /// Fetch one remote member's specs index. Any failure is the member's failure:
 /// 502 naming it (#4192), never a skip.
+///
+/// The buffered body reserves from the RubyGems family sub-budget with a
+/// bounded wait (#5977), the same accounting a Remote specs document uses. The
+/// caller must drop the returned permit before fetching the next member.
 async fn fetch_member_specs(
     proxy: &crate::services::proxy_service::ProxyService,
     member: &Repository,
     path: &str,
-) -> Result<(Bytes, Option<String>, tokio::sync::OwnedSemaphorePermit), SpecsBuildError> {
+    budget: RemoteDocumentBudget,
+) -> Result<(Bytes, Option<String>, proxy_helpers::FamilyMetadataPermit), SpecsBuildError> {
     let upstream = member.upstream_url.as_deref().unwrap_or_default();
-    proxy_helpers::proxy_fetch_capped_budgeted(
+    let fetched = proxy_helpers::proxy_fetch_capped_family_budgeted_in(
+        budget.shared,
+        budget.family,
+        budget.wait,
         proxy,
         member.id,
         &member.key,
         upstream,
         path,
         LARGE_METADATA_MAX_BYTES,
-        RepositoryFormat::Rubygems,
     )
     .await
     .map_err(|resp| {
@@ -1246,7 +1288,20 @@ async fn fetch_member_specs(
             path,
             &format!("upstream fetch failed with status {}", resp.status()),
         )
-    })
+    })?;
+    match fetched {
+        proxy_helpers::CappedMetadataGet::Buffered {
+            content,
+            content_type,
+            budget_permit,
+            ..
+        } => Ok((content, content_type, budget_permit)),
+        proxy_helpers::CappedMetadataGet::OverCap => Err(virtual_member_failure(
+            &member.key,
+            path,
+            &format!("upstream body exceeded {LARGE_METADATA_MAX_BYTES} bytes"),
+        )),
+    }
 }
 
 fn virtual_member_failure(member_key: &str, path: &str, reason: &str) -> SpecsBuildError {
@@ -1610,7 +1665,11 @@ async fn proxy_remote_document(
     .await
 }
 
-/// Where a Remote document's buffered bytes are accounted (#5973).
+/// Where RubyGems buffered metadata is accounted (#5973, #5977).
+///
+/// Used for both Remote documents and the member fetches of a Virtual specs
+/// merge: both are anonymously reachable and must not park every other format
+/// behind the same unbounded shared-budget queue.
 ///
 /// Bundler fetches `/versions` (about 24 MB on rubygems.org) on every run, and
 /// the Remote routes are reachable anonymously on a public Remote. Each fetch
@@ -3907,12 +3966,13 @@ mod duplicate_entry_tests {
     }
 }
 
-/// #5973: RubyGems Remote documents draw on a family sub-budget of the shared
-/// buffered-metadata budget, wait for it within a bound, and reserve a cached
-/// document's own size rather than the full cap.
+/// #5973 / #5977: RubyGems Remote documents and Virtual specs member fetches
+/// draw on a family sub-budget of the shared buffered-metadata budget, wait for
+/// it within a bound, and reserve a cached document's own size rather than the
+/// full cap.
 #[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
-mod remote_document_budget_5973 {
+mod rubygems_metadata_budget_tests {
     use super::*;
     use crate::api::handlers::proxy_helpers::{
         metadata_sub_budget_bytes, MetadataBudgetFamily, MetadataSubBudget, ProxyMetadataBudget,
@@ -3924,11 +3984,10 @@ mod remote_document_budget_5973 {
     const VERSIONS_DOC: &[u8] =
         b"created_at: 2026-11-01T00:00:04Z\n---\nrexml 3.4.3,3.4.4 0123456789abcdef0123456789abcdef\n";
 
-    /// A shared budget of the default size and a RubyGems sub-budget of its
-    /// default share, private to the test so the process-wide budgets that
-    /// other tests use are never held.
-    fn default_sized_budget(wait: Duration) -> RemoteDocumentBudget {
-        let total = DEFAULT_PROXY_METADATA_BUDGET_BYTES;
+    /// A private shared budget of `total` bytes and a RubyGems sub-budget of
+    /// its default share, so the process-wide budgets other tests use are
+    /// never held.
+    fn budget_with_total(total: usize, wait: Duration) -> RemoteDocumentBudget {
         let family = MetadataBudgetFamily::RubygemsRemote;
         RemoteDocumentBudget {
             shared: Box::leak(Box::new(ProxyMetadataBudget::new(total))),
@@ -3938,6 +3997,10 @@ mod remote_document_budget_5973 {
             ))),
             wait,
         }
+    }
+
+    fn default_sized_budget(wait: Duration) -> RemoteDocumentBudget {
+        budget_with_total(DEFAULT_PROXY_METADATA_BUDGET_BYTES, wait)
     }
 
     /// Mount `body` at `path`, answered after `delay` (a slow upstream).
@@ -4274,5 +4337,228 @@ mod remote_document_budget_5973 {
             StatusCode::SERVICE_UNAVAILABLE,
             "an uncached document reserves the full cap"
         );
+    }
+
+    fn specs_gz(member: usize) -> Vec<u8> {
+        let name = format!("virtual-member-{member}");
+        let marshal =
+            crate::formats::rubygems::marshal_specs_index(&[(name.as_str(), "1.0.0", "ruby")]);
+        super::gzip_compress(&marshal).expect("gzip specs")
+    }
+
+    fn variant_specs_path(variant: usize) -> String {
+        if variant == 0 {
+            "specs.4.8.gz".to_string()
+        } else {
+            format!("specs-{variant}.4.8.gz")
+        }
+    }
+
+    /// A public Virtual with `members` public Remote members on one delayable
+    /// upstream. `path_variants` gives the slow builds distinct cache paths so
+    /// they all hold cold reservations instead of sharing one proxy cache hit.
+    struct VirtualSpecsRig {
+        fx: tdh::Fixture,
+        state: SharedState,
+        virtual_id: uuid::Uuid,
+        virtual_key: String,
+        repos: Vec<(uuid::Uuid, std::path::PathBuf)>,
+        _upstream: wiremock::MockServer,
+        _cache_dir: tempfile::TempDir,
+    }
+
+    impl VirtualSpecsRig {
+        async fn new(members: usize, path_variants: usize, delay: Duration) -> Self {
+            let fx = tdh::Fixture::setup("remote", "rubygems")
+                .await
+                .expect("fixture");
+            let upstream = wiremock::MockServer::start().await;
+            use wiremock::matchers::{method, path as exact_path};
+            use wiremock::{Mock, ResponseTemplate};
+
+            for member in 0..members {
+                for variant in 0..path_variants {
+                    let file = variant_specs_path(variant);
+                    Mock::given(method("GET"))
+                        .and(exact_path(format!("/m{member}/{file}")))
+                        .respond_with(
+                            ResponseTemplate::new(200)
+                                .set_body_bytes(specs_gz(member))
+                                .insert_header("content-type", "application/gzip")
+                                .set_delay(delay),
+                        )
+                        .mount(&upstream)
+                        .await;
+                }
+            }
+
+            let (state, cache_dir) = tdh::rewire_remote_proxy(&fx, &upstream.uri()).await;
+            let (virtual_id, virtual_key, virtual_dir) =
+                tdh::create_repo(&fx.pool, "virtual", "rubygems").await;
+            tdh::publish_repo(&fx.pool, virtual_id).await;
+            let mut repos = vec![(virtual_id, virtual_dir)];
+            for member in 0..members {
+                let (id, _, dir) = tdh::create_repo(&fx.pool, "remote", "rubygems").await;
+                sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+                    .bind(format!("{}/m{member}", upstream.uri()))
+                    .bind(id)
+                    .execute(&fx.pool)
+                    .await
+                    .expect("point virtual member at upstream");
+                tdh::link_virtual_member(&fx.pool, virtual_id, id, member as i32).await;
+                tdh::publish_repo(&fx.pool, id).await;
+                repos.push((id, dir));
+            }
+
+            Self {
+                fx,
+                state,
+                virtual_id,
+                virtual_key,
+                repos,
+                _upstream: upstream,
+                _cache_dir: cache_dir,
+            }
+        }
+
+        async fn teardown(self) {
+            for (id, _) in &self.repos {
+                let _ = sqlx::query(
+                    "DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1 \
+                     OR member_repo_id = $1",
+                )
+                .bind(id)
+                .execute(&self.fx.pool)
+                .await;
+                let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                    .bind(id)
+                    .execute(&self.fx.pool)
+                    .await;
+            }
+            for (_, dir) in &self.repos {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+            self.fx.teardown().await;
+        }
+    }
+
+    /// #5977: several concurrent Virtual merges over N Remote members may hold
+    /// at most the family's share of the shared budget, so another format's
+    /// metadata reservation is admitted while they are in flight. Each merge
+    /// is still served: the bounded wait is long enough for the queue to drain.
+    #[tokio::test]
+    async fn test_virtual_specs_merge_cannot_starve_other_formats_5977() {
+        const MEMBERS: usize = 3;
+        const MERGES: usize = 3;
+        let rig = VirtualSpecsRig::new(MEMBERS, MERGES, Duration::from_millis(800)).await;
+        let cap = LARGE_METADATA_MAX_BYTES;
+        let budget = budget_with_total(MERGES * cap, Duration::from_secs(30));
+        let proxy = rig.state.proxy_service.as_ref().expect("proxy").clone();
+        let members =
+            proxy_helpers::authorized_virtual_members(&rig.state.db, None, rig.virtual_id)
+                .await
+                .expect("public virtual members");
+        let builds = (0..MERGES)
+            .map(|variant| {
+                let (state, proxy, members) = (rig.state.clone(), proxy.clone(), members.clone());
+                let path = variant_specs_path(variant);
+                tokio::spawn(async move {
+                    super::build_merged_specs(
+                        &state.db,
+                        &proxy,
+                        uuid::Uuid::new_v4(),
+                        &members,
+                        &path,
+                        super::SPECS_QUERY,
+                        budget,
+                    )
+                    .await
+                })
+            })
+            .collect::<Vec<_>>();
+
+        // Let the cold builds take every reservation they can while upstream
+        // stalls, then ask for one cap as another format would.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let held = reserved_bytes(budget.shared);
+        let other_format =
+            tokio::time::timeout(Duration::from_millis(500), budget.shared.reserve(cap)).await;
+        let other_format_admitted = other_format.is_ok();
+        drop(other_format);
+        let results = futures::future::join_all(builds).await;
+        rig.teardown().await;
+
+        let share = budget.family.budget().total_bytes();
+        assert_eq!(
+            share, cap,
+            "a three-cap shared budget leaves one cap per family"
+        );
+        assert!(
+            held <= share,
+            "the Virtual merges held {held} bytes of the shared budget, more than their \
+             {share}-byte family share"
+        );
+        assert!(
+            other_format_admitted,
+            "another format's metadata reservation must not queue behind Virtual specs merges"
+        );
+        for result in results {
+            let built = result.expect("merge task");
+            assert!(
+                built.is_ok(),
+                "every merge is served once its turn in the family share comes: {:?}",
+                built.err()
+            );
+        }
+        assert_eq!(budget.shared.available_bytes(), budget.shared.total_bytes());
+        assert_eq!(budget.family.saturation(), 0.0);
+    }
+
+    /// #5977: one merge fetches its members one at a time, so even a share
+    /// floored at one cap and an almost-immediate wait never sheds against the
+    /// merge's own later members.
+    #[tokio::test]
+    async fn test_virtual_specs_merge_never_sheds_against_itself_5977() {
+        const MEMBERS: usize = 4;
+        let rig = VirtualSpecsRig::new(MEMBERS, 1, Duration::from_millis(300)).await;
+        let cap = LARGE_METADATA_MAX_BYTES;
+        let budget = budget_with_total(2 * cap, Duration::from_millis(100));
+        let repo = super::resolve_rubygems_repo(&rig.state.db, &rig.virtual_key)
+            .await
+            .expect("virtual repo resolves");
+
+        let response = super::serve_virtual_specs_index_in(
+            &rig.state,
+            &repo,
+            None,
+            "specs.4.8.gz",
+            super::SPECS_QUERY,
+            budget,
+        )
+        .await
+        .unwrap_or_else(|resp| resp);
+        let status = response.status();
+        let body = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .expect("merged body")
+            .to_bytes();
+        rig.teardown().await;
+
+        assert_eq!(status, StatusCode::OK);
+        let names = super::decode_upstream_specs(&body)
+            .expect("merged index is gzipped Marshal")
+            .into_iter()
+            .map(|(name, _, _)| name.to_string())
+            .collect::<Vec<_>>();
+        for member in 0..MEMBERS {
+            assert!(
+                names
+                    .iter()
+                    .any(|name| name == &format!("virtual-member-{member}")),
+                "the merge must carry every member: {names:?}"
+            );
+        }
+        assert_eq!(budget.shared.available_bytes(), budget.shared.total_bytes());
+        assert_eq!(budget.family.saturation(), 0.0);
     }
 }

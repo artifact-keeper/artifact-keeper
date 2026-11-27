@@ -25410,6 +25410,29 @@ mod tests {
     );
     budget_pin_test!(test_pypi_buffered_metadata_reserves_budget_2684, "pypi.rs");
 
+    /// #5977: the RubyGems Virtual specs merge is an anonymously reachable
+    /// buffered-metadata path too. Its member fetch MUST use the family helper,
+    /// not the shared-only helper: N merges would otherwise hold the whole
+    /// shared budget and park every other format behind them.
+    #[test]
+    fn rubygems_virtual_specs_member_fetch_uses_family_budget_5977() {
+        let src = include_str!("rubygems.rs");
+        let start = src
+            .find("async fn fetch_member_specs(")
+            .expect("rubygems.rs defines fetch_member_specs");
+        let body = item_body(src, start);
+        assert!(
+            body.contains("proxy_fetch_capped_family_budgeted_in("),
+            "fetch_member_specs MUST reserve from the RubyGems family sub-budget \
+             with a bounded wait (#5977)"
+        );
+        assert!(
+            !body.contains("proxy_fetch_capped_budgeted("),
+            "fetch_member_specs MUST NOT fall back to the shared-only budgeted \
+             helper: it has no family cap or wait bound (#5977)"
+        );
+    }
+
     /// Debian buffers its index directly through `ProxyService` (it verifies
     /// the bytes against the signed `Release`, so it cannot stream — #2684
     /// constraint), so its pin asserts it reserves against the shared budget
