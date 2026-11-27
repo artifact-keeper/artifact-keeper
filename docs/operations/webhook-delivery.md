@@ -50,12 +50,23 @@ delivered send, a payload rejection, or re-enabling the webhook clears it.
 With the defaults, a receiver that is down gets about 12 sends an hour, and a
 receiver that comes back gets its queue within 5 minutes.
 
+## Receiver response bodies
+
+Only the status code decides whether a delivery succeeded. For troubleshooting,
+the worker keeps the first 4 KiB of the receiver's response in
+`response_body` and stops reading the rest; a truncated body gets a marker that
+reports how many bytes were kept and, when the receiver sent a `Content-Length`,
+how many it announced. The same bound applies to manual redeliveries and test
+deliveries. Set `WEBHOOK_RESPONSE_BODY_MAX_BYTES` to change the cap; empty,
+invalid, or zero values use the 4 KiB default.
+
 ## Settings
 
 | Variable | Default | Effect |
 |---|---|---|
 | `WEBHOOK_DELIVERY_POLL_SECS` | `5` | Idle poll interval, at least 1 s. Also the shortest endpoint backoff. |
 | `WEBHOOK_ENDPOINT_BACKOFF_MAX_SECS` | `300` | Longest endpoint backoff. `0` leaves only the poll-interval floor: one attempt per poll per failing endpoint. |
+| `WEBHOOK_RESPONSE_BODY_MAX_BYTES` | `4096` | Maximum receiver response bytes kept for troubleshooting; the rest is not read. |
 
 For the cadence before 1.13 (a 30 s tick, a failing endpoint tried once per
 tick), set `WEBHOOK_DELIVERY_POLL_SECS=30` and
