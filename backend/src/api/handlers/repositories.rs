@@ -4484,6 +4484,7 @@ fn parse_format(s: &str) -> Result<RepositoryFormat> {
         "vagrant" => Ok(RepositoryFormat::Vagrant),
         "opkg" => Ok(RepositoryFormat::Opkg),
         "pacman" => Ok(RepositoryFormat::Pacman),
+        "homebrew" => Ok(RepositoryFormat::Homebrew),
         "mcp" => Ok(RepositoryFormat::Mcp),
         "p2" => Ok(RepositoryFormat::P2),
         "bazel" => Ok(RepositoryFormat::Bazel),
@@ -20173,6 +20174,7 @@ mod tests {
             "bazel",
             "protobuf",
             "pacman",
+            "homebrew",
             "agentplugins",
             "mcp",
         ];

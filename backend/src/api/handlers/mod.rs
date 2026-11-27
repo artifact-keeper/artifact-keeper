@@ -643,6 +643,7 @@ pub mod groups;
 pub mod health;
 pub mod helm;
 pub mod hex;
+pub mod homebrew;
 pub mod huggingface;
 pub mod image_builds;
 pub mod incus;

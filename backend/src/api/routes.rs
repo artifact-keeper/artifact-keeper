@@ -108,6 +108,7 @@ pub fn create_router(state: SharedState) -> Router {
         .nest("/conan", handlers::conan::router())
         .nest("/alpine", handlers::alpine::router())
         .nest("/pacman", handlers::pacman::router())
+        .nest("/homebrew", handlers::homebrew::router())
         .nest("/conda", handlers::conda::router())
         .nest("/conda/t", handlers::conda::token_router())
         // rattler (pixi `auth login --conda-token`) puts the token in FRONT of
