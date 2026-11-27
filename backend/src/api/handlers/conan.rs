@@ -3977,12 +3977,14 @@ impl RemoveTarget<'_> {
 
 /// Soft-delete every artifact `target` covers in one statement, returning how
 /// many were removed. The rows go the way every other delete path sends them
-/// (`is_deleted = true`), so storage GC reclaims their bytes.
+/// (`is_deleted = true`), so storage GC reclaims their bytes, and get the
+/// per-artifact delete's peer, audit, event and search steps (#6489).
 async fn soft_delete_conan_artifacts(
-    db: &PgPool,
+    state: &SharedState,
     repository_id: uuid::Uuid,
     target: &RemoveTarget<'_>,
 ) -> Result<u64, sqlx::Error> {
+    let mut tx = state.db.begin().await?;
     let result = sqlx::query(
         r#"
         UPDATE artifacts SET is_deleted = true, updated_at = NOW()
@@ -4013,8 +4015,15 @@ async fn soft_delete_conan_artifacts(
     .bind(target.packages_only || target.package_id.is_some())
     .bind(target.package_id)
     .bind(target.pkg_revision)
-    .execute(db)
+    .execute(&mut *tx)
     .await?;
+    let deleted_at =
+        crate::services::lifecycle_service::owe_bulk_delete_fanout(&mut tx, repository_id).await?;
+    tx.commit().await?;
+    if result.rows_affected() > 0 {
+        crate::services::lifecycle_service::finish_bulk_delete(state, repository_id, deleted_at)
+            .await;
+    }
     Ok(result.rows_affected())
 }
 
@@ -4062,7 +4071,7 @@ async fn conan_remove(
             .into_response());
     }
 
-    let removed = soft_delete_conan_artifacts(&state.db, repo.id, &target)
+    let removed = soft_delete_conan_artifacts(state, repo.id, &target)
         .await
         .map_err(map_db_err)?;
     if removed == 0 {
@@ -11815,6 +11824,63 @@ mod remove_4333 {
         .fetch_one(pool)
         .await
         .unwrap()
+    }
+
+    /// #6489: a `conan remove` runs the per-artifact delete's remaining
+    /// steps, one `ARTIFACT_DELETED` audit row per removed row, and leaves no
+    /// pending fan-out behind
+    #[tokio::test]
+    async fn remove_recipe_revision_audits_each_removed_row_6489() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let (user_id, _u, _p) = create_user(&pool).await;
+        let (repo_id, repo_key, dir) = create_conan_repo(&pool, "local").await;
+        let state = build_state(pool.clone(), dir.to_str().unwrap());
+        let auth = make_auth(user_id, "u");
+        publish(&state, &auth, &repo_key, "rrA", &["pidA"]).await;
+        let ids: Vec<uuid::Uuid> = sqlx::query_scalar(
+            "SELECT id FROM artifacts WHERE repository_id = $1 AND is_deleted = false",
+        )
+        .bind(repo_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+
+        let app = router_with_auth(state, auth);
+        let (status, body) = send(
+            app,
+            delete(format!("/{repo_key}/v2/conans/rmme/1.0/_/_/revisions/rrA")),
+        )
+        .await;
+        let audited: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_log \
+             WHERE action = 'ARTIFACT_DELETED' AND resource_id = ANY($1)",
+        )
+        .bind(&ids)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let pending: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM lifecycle_sweep_fanouts WHERE repository_id = $1",
+        )
+        .bind(repo_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let live = live_rows(&pool, repo_id).await;
+        cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(live, 0, "the recipe revision and its binaries are removed");
+        assert!(!ids.is_empty());
+        assert_eq!(
+            audited,
+            ids.len() as i64,
+            "one ARTIFACT_DELETED row per removed row"
+        );
+        assert_eq!(pending, 0, "the fan-out finished");
     }
 
     #[tokio::test]
