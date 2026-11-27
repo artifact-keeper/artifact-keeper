@@ -440,6 +440,7 @@ mod tests {
                     size: Some(1),
                     created: None,
                     modified: None,
+                    last_downloaded: None,
                     sha256: None,
                     actual_sha1: None,
                 })

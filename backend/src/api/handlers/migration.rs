@@ -596,6 +596,7 @@ fn spawn_migration_worker(
         // so the documented API flag actually disables verification
         // (issue #856).
         verify_checksums: config.verify_checksums,
+        import_source_timestamps: config.import_source_timestamps,
         // Spill streamed artifact bodies onto the durable STORAGE_PATH volume
         // rather than the pod's ephemeral `/tmp` (issue #1608).
         staging_path: state.config.storage_path.clone(),

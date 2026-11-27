@@ -38,6 +38,8 @@ pub struct WorkerConfig {
     pub verify_checksums: bool,
     /// Dry-run mode - preview changes without making them
     pub dry_run: bool,
+    /// Keep the source's creation and last-download dates (#6519)
+    pub import_source_timestamps: bool,
     /// Filesystem base under which streamed artifact bodies are spilled while
     /// checksums are computed and before the storage put. This MUST live on
     /// the same durable volume as `STORAGE_PATH` (not the pod's ephemeral
@@ -61,6 +63,7 @@ impl Default for WorkerConfig {
             batch_size: 1000,
             verify_checksums: true,
             dry_run: false,
+            import_source_timestamps: false,
             // Empty => fall back to the OS temp dir. Production call sites
             // override this with `STORAGE_PATH` so spills land on the durable
             // storage volume rather than the pod's ephemeral `/tmp`.
@@ -300,6 +303,8 @@ impl MigrationWorker {
                 a.content_type,
                 a.size_bytes,
                 a.created_at,
+                (SELECT COUNT(*) FROM download_statistics ds WHERE ds.artifact_id = a.id)
+                    AS download_count,
                 r.key AS repository_key,
                 r.name AS repository_name,
                 r.format::text AS format,
@@ -340,7 +345,7 @@ impl MigrationWorker {
             repository_name: row.repository_name,
             content_type: row.content_type,
             size_bytes: row.size_bytes,
-            download_count: 0,
+            download_count: row.download_count,
             is_public: row.is_public,
             created_at: row.created_at.timestamp(),
         };
@@ -1273,6 +1278,16 @@ impl MigrationWorker {
                             &artifact_path,
                         )
                         .await;
+                        // #6519: a delta run picks up downloads made in the
+                        // source since the last run.
+                        self.import_source_timestamps(
+                            keys.target.as_str(),
+                            package_type,
+                            &artifact_path,
+                            debian_component.as_deref(),
+                            artifact,
+                        )
+                        .await;
                     }
                     *skipped += 1;
                     continue;
@@ -1332,6 +1347,14 @@ impl MigrationWorker {
                     debian_component.as_deref(),
                 )
                 .await?;
+                self.import_source_timestamps(
+                    keys.target.as_str(),
+                    package_type,
+                    &artifact_path,
+                    debian_component.as_deref(),
+                    artifact,
+                )
+                .await;
 
                 // Update progress
                 self.migration_service
@@ -1698,6 +1721,81 @@ impl MigrationWorker {
                 );
                 false
             }
+        }
+    }
+
+    /// With `import_source_timestamps`, move a migrated artifact's
+    /// `created_at` back to the source's creation date and keep one
+    /// `download_statistics` marker row at the source's last download (#6519).
+    /// Both only move one way (earlier, later) and are clamped to now, so a
+    /// re-run never adds a second marker row and a skewed source clock never
+    /// dates anything in the future. Only rows the migration wrote
+    /// (`origin.kind = 'migration'`) are touched; OCI is out of scope.
+    async fn import_source_timestamps(
+        &self,
+        target_key: &str,
+        package_type: &str,
+        artifact_path: &str,
+        debian_component: Option<&str>,
+        source: &crate::services::artifactory_client::AqlResult,
+    ) {
+        if !self.config.import_source_timestamps || is_oci_package_type(package_type) {
+            return;
+        }
+        let parse = |raw: &Option<String>| {
+            raw.as_deref()
+                .and_then(|r| chrono::DateTime::parse_from_rfc3339(r).ok())
+                .map(|at| at.with_timezone(&chrono::Utc))
+        };
+        let created = parse(&source.created);
+        let last_downloaded = parse(&source.last_downloaded);
+        if created.is_none() && last_downloaded.is_none() {
+            return;
+        }
+        let stored_path = duplicate_lookup_path(package_type, artifact_path, debian_component);
+        let result = sqlx::query_scalar::<_, Uuid>(
+            "WITH target AS ( \
+                 SELECT a.id, a.repository_id FROM artifacts a \
+                 JOIN repositories r ON r.id = a.repository_id \
+                 WHERE r.key = $1 AND a.path = $2 AND a.is_deleted = false \
+                   AND a.origin->>'kind' = 'migration' \
+             ), dated AS ( \
+                 UPDATE artifacts a SET created_at = LEAST(a.created_at, $3, NOW()) \
+                 FROM target t WHERE a.id = t.id AND $3::TIMESTAMPTZ IS NOT NULL \
+             ), moved AS ( \
+                 UPDATE download_statistics ds \
+                 SET downloaded_at = GREATEST(ds.downloaded_at, LEAST($4, NOW())) \
+                 FROM target t \
+                 WHERE ds.artifact_id = t.id AND ds.user_agent = $5 \
+                   AND $4::TIMESTAMPTZ IS NOT NULL \
+             ), marked AS ( \
+                 INSERT INTO download_statistics (artifact_id, user_agent, downloaded_at) \
+                 SELECT t.id, $5, LEAST($4, NOW()) FROM target t \
+                 WHERE $4::TIMESTAMPTZ IS NOT NULL AND NOT EXISTS ( \
+                     SELECT 1 FROM download_statistics ds \
+                     WHERE ds.artifact_id = t.id AND ds.user_agent = $5) \
+             ) \
+             SELECT repository_id FROM target",
+        )
+        .bind(target_key)
+        .bind(&stored_path)
+        .bind(created)
+        .bind(last_downloaded)
+        .bind(SOURCE_LAST_DOWNLOADED_AGENT)
+        .fetch_optional(&self.db)
+        .await;
+        match result {
+            Ok(Some(repository_id)) => {
+                self.index_migrated_artifact(repository_id, &stored_path)
+                    .await
+            }
+            Ok(None) => {}
+            Err(e) => tracing::warn!(
+                repo = %target_key,
+                path = %artifact_path,
+                error = %e,
+                "could not import the source timestamps of a migrated artifact"
+            ),
         }
     }
 
@@ -3593,6 +3691,11 @@ struct TransferResult {
     metadata: Option<std::collections::HashMap<String, Vec<String>>>,
 }
 
+/// `user_agent` of the one `download_statistics` row that carries a migrated
+/// artifact's last download in the source (#6519).
+pub(crate) const SOURCE_LAST_DOWNLOADED_AGENT: &str =
+    "artifact-keeper-migration/nexus (lastDownloaded)";
+
 /// Digests that the source registry declared for an artifact.
 ///
 /// Both fields are optional because sources vary in what they report.
@@ -4210,6 +4313,7 @@ struct MigratedArtifactIndexRow {
     content_type: String,
     size_bytes: i64,
     created_at: chrono::DateTime<chrono::Utc>,
+    download_count: i64,
     repository_key: String,
     repository_name: String,
     format: String,
@@ -5809,6 +5913,7 @@ mod tests {
             batch_size: 500,
             verify_checksums: false,
             dry_run: true,
+            import_source_timestamps: true,
             staging_path: "/var/lib/artifact-keeper/artifacts".to_string(),
         };
         assert_eq!(config.concurrency, 8);
@@ -7115,6 +7220,7 @@ mod tests {
                         size: Some(ARTIFACT_SIZE),
                         created: None,
                         modified: None,
+                        last_downloaded: None,
                         sha256: None,
                         actual_sha1: None,
                     }],
@@ -7387,6 +7493,7 @@ mod tests {
                     size: Some(1234),
                     created: None,
                     modified: None,
+                    last_downloaded: None,
                     sha256: None,
                     actual_sha1: None,
                 }],
@@ -7917,6 +8024,7 @@ mod tests {
                 size: Some(*size),
                 created: None,
                 modified: None,
+                last_downloaded: None,
                 sha256: None,
                 actual_sha1: None,
             })
@@ -12663,6 +12771,7 @@ mod tests {
                     size: Some(3),
                     created: None,
                     modified: None,
+                    last_downloaded: None,
                     sha256: None,
                     actual_sha1: None,
                 })
@@ -12701,6 +12810,351 @@ mod tests {
         fn source_type(&self) -> &'static str {
             "maven-mock"
         }
+    }
+
+    /// A one-file Maven source whose listing carries source dates (#6519),
+    /// changeable between runs.
+    struct DatedSource {
+        repo_key: String,
+        dates: std::sync::Mutex<(Option<String>, Option<String>)>,
+    }
+
+    impl DatedSource {
+        const DIR: &'static str = "com/example/dated/1.0.0";
+        const NAME: &'static str = "dated-1.0.0.jar";
+
+        fn set(&self, created: Option<&str>, last_downloaded: Option<&str>) {
+            *self.dates.lock().expect("dates lock") =
+                (created.map(String::from), last_downloaded.map(String::from));
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::services::source_registry::SourceRegistry for DatedSource {
+        async fn ping(
+            &self,
+        ) -> Result<bool, crate::services::artifactory_client::ArtifactoryError> {
+            Ok(true)
+        }
+        async fn get_version(
+            &self,
+        ) -> Result<
+            crate::services::artifactory_client::SystemVersionResponse,
+            crate::services::artifactory_client::ArtifactoryError,
+        > {
+            unimplemented!("not called by process_job")
+        }
+        async fn list_repositories(
+            &self,
+        ) -> Result<
+            Vec<crate::services::artifactory_client::RepositoryListItem>,
+            crate::services::artifactory_client::ArtifactoryError,
+        > {
+            Ok(vec![mk_source_repo(&self.repo_key, "LOCAL", "maven2")])
+        }
+        async fn list_artifacts(
+            &self,
+            repo_key: &str,
+            offset: i64,
+            _limit: i64,
+        ) -> Result<
+            crate::services::artifactory_client::AqlResponse,
+            crate::services::artifactory_client::ArtifactoryError,
+        > {
+            use crate::services::artifactory_client::{AqlRange, AqlResponse, AqlResult};
+            let (created, last_downloaded) = self.dates.lock().expect("dates lock").clone();
+            let results = if offset == 0 {
+                vec![AqlResult {
+                    possible_duplicate: false,
+                    repo: repo_key.to_string(),
+                    path: Self::DIR.to_string(),
+                    name: Self::NAME.to_string(),
+                    size: Some(3),
+                    created,
+                    modified: None,
+                    last_downloaded,
+                    sha256: None,
+                    actual_sha1: None,
+                }]
+            } else {
+                Vec::new()
+            };
+            let page = results.len() as i64;
+            Ok(AqlResponse {
+                incomplete: false,
+                results,
+                range: AqlRange {
+                    start_pos: offset,
+                    end_pos: offset + page,
+                    total: 1,
+                },
+            })
+        }
+        async fn download_artifact(
+            &self,
+            _repo_key: &str,
+            _path: &str,
+        ) -> Result<bytes::Bytes, crate::services::artifactory_client::ArtifactoryError> {
+            Ok(bytes::Bytes::from_static(b"jar"))
+        }
+        async fn get_properties(
+            &self,
+            _repo_key: &str,
+            _path: &str,
+        ) -> Result<
+            crate::services::artifactory_client::PropertiesResponse,
+            crate::services::artifactory_client::ArtifactoryError,
+        > {
+            Ok(crate::services::artifactory_client::PropertiesResponse {
+                properties: None,
+                uri: None,
+            })
+        }
+        fn source_type(&self) -> &'static str {
+            "dated-mock"
+        }
+    }
+
+    /// `(created_at, updated_at)` of the dated artifact and its marker rows'
+    /// `downloaded_at`.
+    async fn source_dates_state(
+        pool: &sqlx::PgPool,
+        repo_id: Uuid,
+    ) -> (
+        chrono::DateTime<chrono::Utc>,
+        chrono::DateTime<chrono::Utc>,
+        Vec<chrono::DateTime<chrono::Utc>>,
+    ) {
+        let (id, created, updated): (Uuid, _, _) = sqlx::query_as(
+            "SELECT id, created_at, updated_at FROM artifacts \
+             WHERE repository_id = $1 AND path LIKE '%dated-1.0.0.jar'",
+        )
+        .bind(repo_id)
+        .fetch_one(pool)
+        .await
+        .expect("dated artifact row");
+        let markers = sqlx::query_scalar(
+            "SELECT downloaded_at FROM download_statistics \
+             WHERE artifact_id = $1 AND user_agent = $2",
+        )
+        .bind(id)
+        .bind(SOURCE_LAST_DOWNLOADED_AGENT)
+        .fetch_all(pool)
+        .await
+        .expect("marker rows");
+        (created, updated, markers)
+    }
+
+    async fn rerun_job(pool: &sqlx::PgPool, conn_id: Uuid, repo_key: &str) -> Uuid {
+        sqlx::query_scalar(
+            "INSERT INTO migration_jobs (source_connection_id, job_type, config) \
+             VALUES ($1, 'full', $2) RETURNING id",
+        )
+        .bind(conn_id)
+        .bind(serde_json::json!({ "include_repos": [repo_key] }))
+        .fetch_one(pool)
+        .await
+        .expect("seed re-run job")
+    }
+
+    async fn dated_destination(pool: &sqlx::PgPool, repo_key: &str, dir: &std::path::Path) -> Uuid {
+        sqlx::query_scalar(
+            "INSERT INTO repositories (key, name, storage_path, repo_type, format, is_public) \
+             VALUES ($1, $1, $2, 'local', 'maven'::repository_format, true) RETURNING id",
+        )
+        .bind(repo_key)
+        .bind(dir.to_str().expect("utf-8 tempdir"))
+        .fetch_one(pool)
+        .await
+        .expect("seed maven destination")
+    }
+
+    /// #6519 through `process_job` with `import_source_timestamps`: the source
+    /// creation date lands in `created_at`, `updated_at` stays the import
+    /// time, and the last download becomes one marker row. A delta run moves
+    /// that row forward through the duplicate-skip path instead of adding one.
+    #[tokio::test]
+    async fn test_job_imports_source_timestamps_when_asked_6519() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_key, conn_id, job_id) = seed_single_repo_job(&pool, "mig6519-on").await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo_id = dated_destination(&pool, &repo_key, tmp.path()).await;
+        let source = Arc::new(DatedSource {
+            repo_key: repo_key.clone(),
+            dates: Default::default(),
+        });
+        source.set(
+            Some("2020-01-02T03:04:05.000Z"),
+            Some("2024-05-06T00:00:00Z"),
+        );
+        let config = WorkerConfig {
+            throttle_delay_ms: 0,
+            import_source_timestamps: true,
+            ..WorkerConfig::default()
+        };
+        let at = |raw: &str| chrono::DateTime::parse_from_rfc3339(raw).unwrap().to_utc();
+
+        let started = chrono::Utc::now();
+        run_job_with_source(&pool, job_id, source.clone(), config.clone()).await;
+        let (created, updated, markers) = source_dates_state(&pool, repo_id).await;
+        assert_eq!(created, at("2020-01-02T03:04:05Z"));
+        assert!(
+            updated >= started - chrono::Duration::seconds(5),
+            "{updated}"
+        );
+        assert_eq!(markers, vec![at("2024-05-06T00:00:00Z")]);
+
+        // Delta run: an older creation date and a newer download in the source.
+        source.set(Some("2019-01-01T00:00:00Z"), Some("2025-01-01T00:00:00Z"));
+        let rerun = rerun_job(&pool, conn_id, &repo_key).await;
+        run_job_with_source(&pool, rerun, source.clone(), config.clone()).await;
+        let (created, _, markers) = source_dates_state(&pool, repo_id).await;
+        assert_eq!(created, at("2019-01-01T00:00:00Z"));
+        assert_eq!(
+            markers,
+            vec![at("2025-01-01T00:00:00Z")],
+            "moved, not added"
+        );
+
+        // An older download and a later creation date move nothing.
+        source.set(Some("2021-01-01T00:00:00Z"), Some("2023-01-01T00:00:00Z"));
+        let third = rerun_job(&pool, conn_id, &repo_key).await;
+        run_job_with_source(&pool, third, source, config).await;
+        let (created, _, markers) = source_dates_state(&pool, repo_id).await;
+        assert_eq!(created, at("2019-01-01T00:00:00Z"));
+        assert_eq!(markers, vec![at("2025-01-01T00:00:00Z")]);
+
+        for id in [rerun, third] {
+            let _ = sqlx::query("DELETE FROM migration_jobs WHERE id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await;
+        }
+        cleanup_repo(&pool, repo_id).await;
+        cleanup_single_repo_job(&pool, job_id, conn_id).await;
+    }
+
+    /// #6519: without the flag a job keeps today's behaviour, import-time
+    /// dates and no marker row, whatever the source lists.
+    #[tokio::test]
+    async fn test_job_keeps_import_time_without_the_flag_6519() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_key, conn_id, job_id) = seed_single_repo_job(&pool, "mig6519-off").await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo_id = dated_destination(&pool, &repo_key, tmp.path()).await;
+        let source = Arc::new(DatedSource {
+            repo_key: repo_key.clone(),
+            dates: Default::default(),
+        });
+        source.set(Some("2020-01-02T03:04:05Z"), Some("2024-05-06T00:00:00Z"));
+        let config = WorkerConfig {
+            throttle_delay_ms: 0,
+            ..WorkerConfig::default()
+        };
+
+        let started = chrono::Utc::now();
+        run_job_with_source(&pool, job_id, source, config).await;
+        let (created, _, markers) = source_dates_state(&pool, repo_id).await;
+        assert!(
+            created >= started - chrono::Duration::seconds(5),
+            "{created}"
+        );
+        assert!(markers.is_empty());
+
+        cleanup_repo(&pool, repo_id).await;
+        cleanup_single_repo_job(&pool, job_id, conn_id).await;
+    }
+
+    /// #6519: a future source date is clamped to now, and a row the migration
+    /// did not write keeps its own dates.
+    #[tokio::test]
+    async fn test_source_timestamps_clamp_and_skip_native_rows_6519() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (mut worker, storage, _tmp, repo_id, repo_key) =
+            setup_repo_for_import(&pool, "mig6519-clamp", "maven").await;
+        worker.config.import_source_timestamps = true;
+        let path = format!("{}/{}", DatedSource::DIR, DatedSource::NAME);
+        let mut files = std::collections::HashMap::new();
+        files.insert(path.clone(), bytes::Bytes::from_static(b"jar"));
+        transfer_one(&worker, &storage, &files, &repo_key, "maven", &path)
+            .await
+            .expect("maven transfer must succeed");
+        let listed =
+            |created: &str, downloaded: &str| crate::services::artifactory_client::AqlResult {
+                possible_duplicate: false,
+                repo: repo_key.clone(),
+                path: DatedSource::DIR.to_string(),
+                name: DatedSource::NAME.to_string(),
+                size: Some(3),
+                created: Some(created.to_string()),
+                modified: None,
+                last_downloaded: Some(downloaded.to_string()),
+                sha256: None,
+                actual_sha1: None,
+            };
+
+        worker
+            .import_source_timestamps(
+                &repo_key,
+                "maven",
+                &path,
+                None,
+                &listed("2999-01-01T00:00:00Z", "2999-01-01T00:00:00Z"),
+            )
+            .await;
+        let (created, _, markers) = source_dates_state(&pool, repo_id).await;
+        // The database clock, give or take a minute of skew from this host.
+        let near_now =
+            |at: chrono::DateTime<chrono::Utc>| (at - chrono::Utc::now()).num_seconds().abs() < 60;
+        assert!(near_now(created), "{created}");
+        assert_eq!(markers.len(), 1);
+        assert!(near_now(markers[0]), "{markers:?}");
+
+        let native_path = "com/example/dated/1.0.0/native-1.0.0.jar";
+        let native: (Uuid, chrono::DateTime<chrono::Utc>) = sqlx::query_as(
+            "INSERT INTO artifacts (repository_id, path, name, size_bytes, checksum_sha256, \
+             content_type, storage_key, origin) \
+             VALUES ($1, $2, 'native', 3, repeat('a', 64), 'application/java-archive', $2, \
+             '{\"kind\":\"hosted\"}'::jsonb) RETURNING id, created_at",
+        )
+        .bind(repo_id)
+        .bind(native_path)
+        .fetch_one(&pool)
+        .await
+        .expect("seed a native row");
+        worker
+            .import_source_timestamps(
+                &repo_key,
+                "maven",
+                native_path,
+                None,
+                &listed("2001-01-01T00:00:00Z", "2002-01-01T00:00:00Z"),
+            )
+            .await;
+        let (created_after, markers_after): (chrono::DateTime<chrono::Utc>, i64) = sqlx::query_as(
+            "SELECT a.created_at, (SELECT COUNT(*) FROM download_statistics ds \
+                 WHERE ds.artifact_id = a.id) FROM artifacts a WHERE a.id = $1",
+        )
+        .bind(native.0)
+        .fetch_one(&pool)
+        .await
+        .expect("native row");
+        assert_eq!(
+            created_after, native.1,
+            "a native row keeps its creation date"
+        );
+        assert_eq!(markers_after, 0);
+
+        cleanup_repo(&pool, repo_id).await;
     }
 
     /// #3927 end to end through `process_job`: the first run records the
