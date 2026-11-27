@@ -464,6 +464,7 @@ async fn list_releases(
             content_type,
             content_encoding,
             stale_since,
+            ..
         } = proxy_helpers::proxy_fetch_capped_encoded(
             proxy,
             repo.id,

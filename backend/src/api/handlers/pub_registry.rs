@@ -1077,6 +1077,7 @@ async fn proxy_pub_meta_get(
         content_type,
         content_encoding,
         stale_since,
+        ..
     } = match result {
         Ok(body) => body,
         Err(_) => return None,

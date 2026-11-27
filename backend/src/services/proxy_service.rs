@@ -2488,9 +2488,16 @@ fn parse_http_date(value: &str) -> Option<DateTime<Utc>> {
 /// upstream.
 enum CacheReadOutcome {
     /// Serve this cached (or freshly revalidated) body, content type, content
-    /// coding, and — under `stale-if-error` (#4581) — the instant its freshness
-    /// lapsed (`Some`) or `None` for a fresh/revalidated serve.
-    Hit(Bytes, Option<String>, Option<String>, Option<DateTime<Utc>>),
+    /// coding, upstream validator, and — under `stale-if-error` (#4581) — the
+    /// instant its freshness lapsed (`Some`) or `None` for a
+    /// fresh/revalidated serve.
+    Hit(
+        Bytes,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<DateTime<Utc>>,
+    ),
     /// A negative-cached upstream 404 is still within its TTL: respond 404.
     NegativeHit,
     /// No usable entry; the caller must fetch from upstream.
@@ -3199,6 +3206,11 @@ pub struct CachedBody {
     /// `Content-Encoding` of the bytes in `content`, when coded — see
     /// [`UpstreamResponse::content_encoding`].
     pub content_encoding: Option<String>,
+    /// Upstream `ETag` recorded with these bytes. Callers that expose a
+    /// validator to their own clients must replay this one (#5974): a locally
+    /// computed digest would change whenever the proxy's stored bytes change
+    /// representation, breaking `If-None-Match` against a previous serve.
+    pub upstream_etag: Option<String>,
     /// #4581: when this body is served under the RFC 5861 `stale-if-error`
     /// grace, the instant its freshness lapsed (the sidecar's stamped
     /// `expires_at`). `None` on a fresh (or freshly revalidated) serve. The
@@ -3212,11 +3224,13 @@ impl CachedBody {
         content: Bytes,
         content_type: Option<String>,
         content_encoding: Option<String>,
+        upstream_etag: Option<String>,
     ) -> Self {
         Self {
             content,
             content_type,
             content_encoding,
+            upstream_etag,
             stale_since: None,
         }
     }
@@ -3549,6 +3563,7 @@ impl CacheStore {
                     content,
                     content_type: metadata.content_type,
                     content_encoding: metadata.content_encoding,
+                    upstream_etag: metadata.upstream_etag,
                     stale_since,
                 }))
             }
@@ -7836,7 +7851,13 @@ impl ProxyService {
             )
             .await?
         {
-            CacheReadOutcome::Hit(content, content_type, content_encoding, stale_since) => {
+            CacheReadOutcome::Hit(
+                content,
+                content_type,
+                content_encoding,
+                upstream_etag,
+                stale_since,
+            ) => {
                 let verified = match check {
                     Some(check) => check(content.clone(), content_encoding.clone()).await,
                     None => true,
@@ -7846,6 +7867,7 @@ impl ProxyService {
                         content,
                         content_type,
                         content_encoding,
+                        upstream_etag,
                         stale_since,
                     });
                 }
@@ -8246,6 +8268,7 @@ impl ProxyService {
                 // write as best-effort: log at warn and still serve the bytes
                 // we fetched. The cache self-heals on the next request (the
                 // streaming path already documents this self-healing).
+                let upstream_etag = resp.etag.clone();
                 if !checksum_ok || !quota_ok {
                     // Guard tripped above: skip the cache write entirely
                     // (do not index into the package catalog either --
@@ -8274,7 +8297,7 @@ impl ProxyService {
                         metadata_key,
                         &resp.content,
                         resp.content_type.clone(),
-                        resp.etag,
+                        upstream_etag.clone(),
                         resp.last_modified,
                         upstream_encoding.clone(),
                         resp.commit_sha,
@@ -8324,6 +8347,7 @@ impl ProxyService {
                     resp.content,
                     resp.content_type,
                     upstream_encoding,
+                    upstream_etag,
                 ))
             }
             Err(upstream_err) => {
@@ -11893,6 +11917,7 @@ impl ProxyService {
                         body.content,
                         body.content_type,
                         body.content_encoding,
+                        body.upstream_etag,
                         body.stale_since,
                     )),
                     None => Ok(CacheReadOutcome::Miss),
@@ -12018,6 +12043,7 @@ impl ProxyService {
                             body.content,
                             body.content_type,
                             body.content_encoding,
+                            body.upstream_etag,
                             None,
                         ))
                     }
@@ -12037,6 +12063,7 @@ impl ProxyService {
                         body.content,
                         body.content_type,
                         body.content_encoding,
+                        body.upstream_etag,
                         None,
                     ));
                 }
@@ -12061,6 +12088,7 @@ impl ProxyService {
                         body.content,
                         body.content_type,
                         body.content_encoding,
+                        body.upstream_etag,
                         body.stale_since.or(Some(metadata.expires_at)),
                     ));
                 }

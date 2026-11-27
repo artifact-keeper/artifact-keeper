@@ -1583,6 +1583,10 @@ pub enum CappedMetadataGet<P = OwnedSemaphorePermit> {
         content: Bytes,
         content_type: Option<String>,
         content_encoding: Option<String>,
+        /// Upstream `ETag` the proxy cache stored with these bytes (#5974).
+        /// Handlers that expose a validator to their clients must replay this
+        /// rather than compute one from the body.
+        upstream_etag: Option<String>,
         /// #4581: set when the member/upstream body was served under the
         /// `stale-if-error` grace, so the caller can mark its response (and a
         /// virtual merge can decide how to represent the member's staleness).
@@ -1652,11 +1656,13 @@ pub async fn proxy_fetch_capped_with_encoding_reserved<P>(
             content,
             content_type,
             content_encoding,
+            upstream_etag,
             stale_since,
         }) => Ok(CappedMetadataGet::Buffered {
             content,
             content_type,
             content_encoding,
+            upstream_etag,
             stale_since,
             budget_permit,
         }),
@@ -1776,6 +1782,7 @@ pub async fn proxy_fetch_capped_family_reserved_in(
             content,
             content_type,
             content_encoding,
+            upstream_etag,
             stale_since,
             mut budget_permit,
         } => {
@@ -1798,6 +1805,7 @@ pub async fn proxy_fetch_capped_family_reserved_in(
                 content,
                 content_type,
                 content_encoding,
+                upstream_etag,
                 stale_since,
                 budget_permit,
             })
@@ -2605,6 +2613,7 @@ pub async fn proxy_fetch_or_redirect(
         content_type,
         content_encoding,
         stale_since,
+        ..
     } = proxy_fetch_with_cache_key(proxy_service, repo_id, repo_key, upstream_url, path, path)
         .await?;
 
@@ -5362,6 +5371,7 @@ where
                     content_type,
                     content_encoding,
                     stale_since,
+                    ..
                 })) => {
                     match transform(
                         content,
@@ -5445,6 +5455,7 @@ where
                     content_type,
                     content_encoding,
                     stale_since,
+                    ..
                 }) => match transform(
                     content,
                     content_type,

@@ -356,6 +356,7 @@ async fn package_info(
                 content_type,
                 content_encoding,
                 stale_since,
+                ..
             } = proxy_helpers::proxy_fetch_capped_encoded(
                 proxy,
                 repo.id,
@@ -1179,6 +1180,7 @@ async fn list_names(
                 content_type,
                 content_encoding,
                 stale_since,
+                ..
             } = proxy_helpers::proxy_fetch_capped_encoded(
                 proxy,
                 repo.id,
@@ -1350,6 +1352,7 @@ async fn list_versions(
                 content_type,
                 content_encoding,
                 stale_since,
+                ..
             } = proxy_helpers::proxy_fetch_capped_encoded(
                 proxy,
                 repo.id,

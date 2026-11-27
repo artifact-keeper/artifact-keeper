@@ -2755,6 +2755,7 @@ async fn serve_remote_metadata(
         content_type: _,
         content_encoding,
         stale_since,
+        ..
     })) = proxy
         .cached_metadata_if_servable(
             &proxy_helpers::build_remote_repo_with_format(
@@ -2812,6 +2813,7 @@ async fn serve_remote_metadata(
             content_type: _,
             content_encoding,
             stale_since,
+            ..
         }) => Ok(pep658_metadata_response(
             content,
             content_encoding.as_deref(),

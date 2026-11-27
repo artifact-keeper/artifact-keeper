@@ -2917,6 +2917,7 @@ async fn proxy_v3_flatcontainer(
             content_type,
             content_encoding,
             stale_since,
+            ..
         } = proxy_helpers::proxy_fetch_capped_with_cache_key_encoded(
             proxy,
             fetch_repo_id,
