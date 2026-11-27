@@ -2,6 +2,7 @@
 
 use axum::{
     extract::{Extension, Path, Query, State},
+    http::StatusCode,
     routing::{get, post},
     Router,
 };
@@ -21,10 +22,14 @@ use crate::api::extractors::Json;
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
+use crate::models::access_scope::AccessScope;
 use crate::models::repository::RepositoryVisibility;
+use crate::services::audit_service::{
+    audit_fire_and_forget, AuditAction, AuditEntry, ResourceType,
+};
 use crate::services::build_service::{
     Build, BuildArtifact as StoredBuildArtifact, BuildArtifactInput, BuildService,
-    CreateBuildInput, UpdateBuildStatusInput,
+    CreateBuildInput, DeletedBuild, UpdateBuildStatusInput,
 };
 
 /// Require that the request is authenticated, returning an error if not.
@@ -33,19 +38,22 @@ fn require_auth(auth: Option<AuthExtension>) -> Result<AuthExtension> {
 }
 
 /// Build records belong to the principal that created them: changing one
-/// (status, attached artifacts) needs the `write:artifacts` token scope and
-/// either administrator rights or being its creator. A build created before
-/// the creator was recorded is administrator-only (GHSA-mvmh-g8wm-r3cp).
+/// (status, attached artifacts) needs the `write:artifacts` token scope,
+/// deleting one `delete:artifacts`, and either administrator rights
+/// (`is_admin`) or being its creator. A build created before the creator was
+/// recorded is administrator-only (GHSA-mvmh-g8wm-r3cp)
 async fn require_build_owner(
     state: &SharedState,
     auth: &AuthExtension,
     build_id: Uuid,
+    scope: &str,
+    is_admin: bool,
 ) -> Result<()> {
-    auth.require_scope("write:artifacts")?;
+    auth.require_scope(scope)?;
     let owner = BuildService::new(state.db.clone())
         .created_by(build_id)
         .await?;
-    if build_mutation_allowed(auth.is_admin, auth.user_id, owner) {
+    if build_mutation_allowed(is_admin, auth.user_id, owner) {
         Ok(())
     } else {
         Err(AppError::Authorization(
@@ -342,7 +350,11 @@ pub fn router() -> Router<SharedState> {
     Router::new()
         .route("/", get(list_builds).post(create_build))
         .route("/diff", get(get_build_diff))
-        .route("/:id", get(get_build).put(update_build))
+        .route("/delete", post(delete_builds))
+        .route(
+            "/:id",
+            get(get_build).put(update_build).delete(delete_build),
+        )
         .route("/:id/artifacts", post(add_build_artifacts))
 }
 
@@ -354,6 +366,40 @@ pub struct ListBuildsQuery {
     pub search: Option<String>,
     pub sort_by: Option<String>,
     pub sort_order: Option<String>,
+    /// Exact build name
+    pub name: Option<String>,
+    /// Exact VCS branch, matched on the caller's own builds unless the caller
+    /// is an administrator with an unrestricted credential
+    pub branch: Option<String>,
+    /// Exact agent
+    pub agent: Option<String>,
+    /// Builds created at or after this time (RFC 3339)
+    pub created_after: Option<chrono::DateTime<chrono::Utc>>,
+    /// Builds created before this time (RFC 3339)
+    pub created_before: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// The list's `WHERE`, shared by the page and the count: `$1` status, `$2`
+/// search pattern, `$3` to `$7` the exact filters, `$8` the creator a branch
+/// filter is limited to (NULL for an administrator). `vcs_branch` is owner or
+/// admin only on read (#6240), so filtering another user's builds by it would
+/// let a caller guess a hidden branch
+const LIST_FILTER: &str = r#"
+        WHERE ($1::text IS NULL OR status = $1)
+          AND ($2::text IS NULL OR name ILIKE $2 ESCAPE '\')
+          AND ($3::text IS NULL OR name = $3)
+          AND ($4::text IS NULL OR (vcs_branch = $4 AND ($8::uuid IS NULL OR created_by = $8)))
+          AND ($5::text IS NULL OR agent = $5)
+          AND ($6::timestamptz IS NULL OR created_at >= $6)
+          AND ($7::timestamptz IS NULL OR created_at < $7)
+"#;
+
+/// The creator whose builds a branch filter may match: the caller, or nobody
+/// in particular for an administrator with an unrestricted credential. A
+/// repository-scoped token, even an administrator's, matches only its own
+/// builds, the same rule as [`delete_as_admin`]
+fn branch_filter_owner(auth: &AuthExtension) -> Option<Uuid> {
+    (!delete_as_admin(auth)).then_some(auth.user_id)
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -482,6 +528,7 @@ pub struct BuildListResponse {
     security(("bearer_auth" = [])),
     responses(
         (status = 200, description = "List of builds", body = BuildListResponse),
+        (status = 400, description = "A query parameter is not valid, e.g. created_after or created_before is not RFC 3339"),
         (status = 401, description = "Authentication required"),
     )
 )]
@@ -525,6 +572,7 @@ pub async fn list_builds(
     }
 
     let order_clause = list_order_clause(query.sort_by.as_deref(), sort_desc);
+    let branch_owner = branch_filter_owner(&auth);
 
     let sql = format!(
         r#"
@@ -533,37 +581,41 @@ pub async fn list_builds(
                vcs_url, vcs_revision, vcs_branch, vcs_message, metadata,
                created_at, updated_at, created_by
         FROM builds
-        WHERE ($1::text IS NULL OR status = $1)
-          AND ($2::text IS NULL OR name ILIKE $2 ESCAPE '\')
-        {}
-        OFFSET $3
-        LIMIT $4
-        "#,
-        order_clause
+        {LIST_FILTER}
+        {order_clause}
+        OFFSET $9
+        LIMIT $10
+        "#
     );
 
     let builds: Vec<BuildReadRow> = sqlx::query_as(sqlx::AssertSqlSafe(&*sql))
         .bind(&query.status)
         .bind(&search_pattern)
+        .bind(&query.name)
+        .bind(&query.branch)
+        .bind(&query.agent)
+        .bind(query.created_after)
+        .bind(query.created_before)
+        .bind(branch_owner)
         .bind(offset)
         .bind(per_page as i64)
         .fetch_all(&state.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
-    let total: i64 = sqlx::query_scalar(
-        r#"
-        SELECT COUNT(*)
-        FROM builds
-        WHERE ($1::text IS NULL OR status = $1)
-          AND ($2::text IS NULL OR name ILIKE $2 ESCAPE '\')
-        "#,
-    )
-    .bind(&query.status)
-    .bind(&search_pattern)
-    .fetch_one(&state.db)
-    .await
-    .unwrap_or(0);
+    let count_sql = format!("SELECT COUNT(*) FROM builds {LIST_FILTER}");
+    let total: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(&*count_sql))
+        .bind(&query.status)
+        .bind(&search_pattern)
+        .bind(&query.name)
+        .bind(&query.branch)
+        .bind(&query.agent)
+        .bind(query.created_after)
+        .bind(query.created_before)
+        .bind(branch_owner)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
 
     let total_pages = ((total as f64) / (per_page as f64)).ceil() as u32;
 
@@ -813,7 +865,7 @@ pub async fn update_build(
     Json(payload): Json<UpdateBuildRequest>,
 ) -> Result<Json<BuildResponse>> {
     let auth = require_auth(auth)?;
-    require_build_owner(&state, &auth, id).await?;
+    require_build_owner(&state, &auth, id, "write:artifacts", auth.is_admin).await?;
 
     let service = BuildService::new(state.db.clone());
     let build = service
@@ -895,7 +947,7 @@ pub async fn add_build_artifacts(
     Json(payload): Json<AddBuildArtifactsRequest>,
 ) -> Result<Json<AddBuildArtifactsResponse>> {
     let auth = require_auth(auth)?;
-    require_build_owner(&state, &auth, id).await?;
+    require_build_owner(&state, &auth, id, "write:artifacts", auth.is_admin).await?;
 
     let service = BuildService::new(state.db.clone());
     let inputs: Vec<BuildArtifactInput> = payload
@@ -931,6 +983,191 @@ pub async fn add_build_artifacts(
     }))
 }
 
+/// Most builds one `POST /api/v1/builds/delete` takes
+pub const MAX_BULK_DELETE: usize = 100;
+
+/// Whether `auth` may delete builds it did not create. A build can name
+/// artifacts in any repository, so a repository-scoped token, even an
+/// administrator's, deletes only its own builds
+fn delete_as_admin(auth: &AuthExtension) -> bool {
+    auth.is_admin && !matches!(auth.allowed_repo_ids, AccessScope::Restricted(_))
+}
+
+/// Delete a build record (DELETE /api/v1/builds/:id)
+///
+/// Only the record and its attached artifact list are deleted, the artifacts
+/// in repositories stay
+#[utoipa::path(
+    delete,
+    path = "/{id}",
+    context_path = "/api/v1/builds",
+    tag = "builds",
+    params(
+        ("id" = Uuid, Path, description = "Build ID"),
+    ),
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 204, description = "Build deleted"),
+        (status = 403, description = "Caller is neither the build's creator nor an administrator with an unrestricted credential, or the token lacks delete:artifacts"),
+        (status = 401, description = "Authentication required"),
+        (status = 404, description = "Build not found"),
+    )
+)]
+pub async fn delete_build(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path(id): Path<Uuid>,
+) -> Result<StatusCode> {
+    let auth = require_auth(auth)?;
+    require_build_owner(
+        &state,
+        &auth,
+        id,
+        "delete:artifacts",
+        delete_as_admin(&auth),
+    )
+    .await?;
+
+    let deleted = BuildService::new(state.db.clone()).delete(&[id]).await?;
+    if deleted.is_empty() {
+        return Err(AppError::NotFound(format!("Build {} not found", id)));
+    }
+    audit_builds_deleted(&state, &auth, &deleted, false).await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct DeleteBuildsRequest {
+    /// Build ids, at most 100
+    pub ids: Vec<Uuid>,
+}
+
+#[derive(Debug, Serialize, ToSchema, PartialEq)]
+pub struct DeleteBuildFailure {
+    pub id: Uuid,
+    /// `not_found` or `forbidden`
+    pub reason: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct DeleteBuildsResponse {
+    pub deleted: Vec<Uuid>,
+    pub failed: Vec<DeleteBuildFailure>,
+}
+
+/// Delete several build records (POST /api/v1/builds/delete)
+///
+/// Each id is deleted when the caller created it or is an administrator
+/// with an unrestricted credential, an unknown or foreign id is reported in `failed` and does not stop the
+/// others. Only the records go, the artifacts in repositories stay
+#[utoipa::path(
+    post,
+    path = "/delete",
+    context_path = "/api/v1/builds",
+    tag = "builds",
+    request_body = DeleteBuildsRequest,
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Per-id result", body = DeleteBuildsResponse),
+        (status = 400, description = "No ids, or more than 100"),
+        (status = 403, description = "The token lacks delete:artifacts"),
+        (status = 401, description = "Authentication required"),
+    )
+)]
+pub async fn delete_builds(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Json(payload): Json<DeleteBuildsRequest>,
+) -> Result<Json<DeleteBuildsResponse>> {
+    let auth = require_auth(auth)?;
+    auth.require_scope("delete:artifacts")?;
+
+    let mut ids = payload.ids;
+    let mut seen = HashSet::new();
+    ids.retain(|id| seen.insert(*id));
+    if ids.is_empty() || ids.len() > MAX_BULK_DELETE {
+        return Err(AppError::Validation(format!(
+            "ids must hold between 1 and {MAX_BULK_DELETE} build ids"
+        )));
+    }
+
+    let service = BuildService::new(state.db.clone());
+    let owners = service.owners(&ids).await?;
+    let (allowed, mut failed) =
+        partition_bulk_delete(&ids, &owners, delete_as_admin(&auth), auth.user_id);
+    let deleted = service.delete(&allowed).await?;
+
+    // A build deleted by someone else between the two queries is gone too
+    let gone: HashSet<Uuid> = deleted.iter().map(|b| b.id).collect();
+    failed.extend(
+        allowed
+            .iter()
+            .filter(|id| !gone.contains(id))
+            .map(|id| DeleteBuildFailure {
+                id: *id,
+                reason: "not_found".to_string(),
+            }),
+    );
+    audit_builds_deleted(&state, &auth, &deleted, true).await;
+
+    Ok(Json(DeleteBuildsResponse {
+        deleted: allowed.into_iter().filter(|id| gone.contains(id)).collect(),
+        failed,
+    }))
+}
+
+/// Split a bulk delete into the ids the caller may delete and the refused
+/// ones, keeping the request order
+fn partition_bulk_delete(
+    ids: &[Uuid],
+    owners: &HashMap<Uuid, Option<Uuid>>,
+    is_admin: bool,
+    caller: Uuid,
+) -> (Vec<Uuid>, Vec<DeleteBuildFailure>) {
+    let mut allowed = Vec::new();
+    let mut failed = Vec::new();
+    for id in ids {
+        let reason = match owners.get(id) {
+            None => "not_found",
+            Some(owner) if build_mutation_allowed(is_admin, caller, *owner) => {
+                allowed.push(*id);
+                continue;
+            }
+            Some(_) => "forbidden",
+        };
+        failed.push(DeleteBuildFailure {
+            id: *id,
+            reason: reason.to_string(),
+        });
+    }
+    (allowed, failed)
+}
+
+async fn audit_builds_deleted(
+    state: &SharedState,
+    auth: &AuthExtension,
+    deleted: &[DeletedBuild],
+    bulk: bool,
+) {
+    for build in deleted {
+        audit_fire_and_forget(
+            state.db.clone(),
+            AuditEntry::new(AuditAction::BuildDeleted, ResourceType::Build)
+                .user(auth.user_id)
+                .resource(build.id)
+                .actor_name(auth.username.clone())
+                .resource_name(format!("{} #{}", build.name, build.build_number))
+                .with_request_client_ip()
+                .details(serde_json::json!({
+                    "name": build.name,
+                    "build_number": build.build_number,
+                    "bulk": bulk,
+                })),
+        )
+        .await;
+    }
+}
+
 #[derive(OpenApi)]
 #[openapi(
     paths(
@@ -940,6 +1177,8 @@ pub async fn add_build_artifacts(
         create_build,
         update_build,
         add_build_artifacts,
+        delete_build,
+        delete_builds,
     ),
     components(schemas(
         ListBuildsQuery,
@@ -957,6 +1196,9 @@ pub async fn add_build_artifacts(
         BuildArtifactInputPayload,
         BuildArtifactResponse,
         AddBuildArtifactsResponse,
+        DeleteBuildsRequest,
+        DeleteBuildFailure,
+        DeleteBuildsResponse,
     ))
 )]
 pub struct BuildsApiDoc;
@@ -1261,6 +1503,11 @@ mod tests {
             search: None,
             sort_by: None,
             sort_order: None,
+            name: None,
+            branch: None,
+            agent: None,
+            created_after: None,
+            created_before: None,
         };
         let err = list_builds(State(state), Extension(None), Query(query))
             .await
@@ -2443,6 +2690,413 @@ mod tests {
             .execute(&pool)
             .await;
         tdh::cleanup_user(&pool, user_id).await;
+    }
+
+    #[test]
+    fn partition_bulk_delete_keeps_order_and_reports_each_refusal() {
+        let (me, other) = (Uuid::new_v4(), Uuid::new_v4());
+        let (mine, theirs, legacy, unknown) = (
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        );
+        let owners = std::collections::HashMap::from([
+            (mine, Some(me)),
+            (theirs, Some(other)),
+            (legacy, None),
+        ]);
+        let ids = [unknown, mine, theirs, legacy];
+        let (allowed, failed) = partition_bulk_delete(&ids, &owners, false, me);
+        assert_eq!(allowed, [mine]);
+        let failure = |id, reason: &str| DeleteBuildFailure {
+            id,
+            reason: reason.to_string(),
+        };
+        assert_eq!(
+            failed,
+            [
+                failure(unknown, "not_found"),
+                failure(theirs, "forbidden"),
+                failure(legacy, "forbidden"),
+            ]
+        );
+        let (allowed, failed) = partition_bulk_delete(&ids, &owners, true, me);
+        assert_eq!(allowed, [mine, theirs, legacy]);
+        assert_eq!(failed, [failure(unknown, "not_found")]);
+    }
+
+    fn delete_req(uri: &str) -> axum::http::Request<axum::body::Body> {
+        axum::http::Request::builder()
+            .method("DELETE")
+            .uri(uri)
+            .body(axum::body::Body::empty())
+            .unwrap()
+    }
+
+    /// web#618: builds could not be deleted at all, no route answered
+    /// DELETE. A build goes with its artifact list, only its creator or an
+    /// administrator may delete it, a token needs `delete:artifacts`, and a
+    /// bulk delete reports foreign and unknown ids without stopping
+    #[tokio::test]
+    async fn build_delete_single_and_bulk_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::http::StatusCode;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let state = tdh::build_state(pool.clone(), "/tmp/ph-618-delete");
+        let (owner_id, owner_name) = tdh::create_user(&pool).await;
+        let (other_id, other_name) = tdh::create_user(&pool).await;
+        let owner = tdh::make_auth(owner_id, &owner_name);
+        let app = |auth: AuthExtension| tdh::router_with_auth(super::router(), state.clone(), auth);
+        let as_owner = app(owner.clone());
+        let as_other = app(tdh::make_auth(other_id, &other_name));
+        let as_admin = app(tdh::admin_auth(other_id, &other_name));
+        let write_token = app(AuthExtension {
+            is_api_token: true,
+            scopes: Some(vec!["write:artifacts".to_string()]),
+            ..owner.clone()
+        });
+        let prefix = format!("ph-618-del-{}", Uuid::new_v4());
+
+        let create = |app: axum::Router, n: i32| {
+            let name = format!("{prefix}-{n}");
+            async move {
+                let b = send_json(
+                    app,
+                    post_json("/", json!({ "name": name, "build_number": n })),
+                )
+                .await;
+                Uuid::parse_str(b["id"].as_str().expect("id")).expect("uuid")
+            }
+        };
+        let exists = |id: Uuid| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM builds WHERE id = $1)")
+                    .bind(id)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("exists")
+            }
+        };
+
+        let first = create(as_owner.clone(), 1).await;
+        let second = create(as_owner.clone(), 2).await;
+        let foreign = create(as_other.clone(), 3).await;
+        let third = create(as_owner.clone(), 4).await;
+        let own_scoped = create(as_other.clone(), 5).await;
+        send_json(
+            as_owner.clone(),
+            post_json(
+                &format!("/{first}/artifacts"),
+                json!({ "artifacts": [{ "name": "a.jar", "path": "dist/a.jar",
+                    "checksum_sha256": "a".repeat(64), "size_bytes": 1 }] }),
+            ),
+        )
+        .await;
+
+        // Another user and a token without delete:artifacts are refused
+        let (status, _) = tdh::send(as_other.clone(), delete_req(&format!("/{first}"))).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (status, _) = tdh::send(write_token.clone(), delete_req(&format!("/{first}"))).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (status, _) =
+            tdh::send(write_token, post_json("/delete", json!({ "ids": [first] }))).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(exists(first).await);
+
+        // The owner deletes it, its artifact list goes with it
+        let (status, body) = tdh::send(as_owner.clone(), delete_req(&format!("/{first}"))).await;
+        assert_eq!(
+            status,
+            StatusCode::NO_CONTENT,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        assert!(!exists(first).await);
+        let rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM build_artifacts WHERE build_id = $1")
+                .bind(first)
+                .fetch_one(&pool)
+                .await
+                .expect("count");
+        assert_eq!(rows, 0);
+        let (status, _) = tdh::send(as_owner.clone(), tdh::get(format!("/{first}"))).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) = tdh::send(as_owner.clone(), delete_req(&format!("/{first}"))).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let audit = tdh::audit_row_eventually(&pool, first, "BUILD_DELETED").await;
+        assert_eq!(audit.user_id, Some(owner_id));
+        assert_eq!(audit.resource_type, "build");
+        assert_eq!(audit.details["build_number"], 1);
+        assert_eq!(audit.details["bulk"], false);
+
+        // Bulk: own, foreign, unknown and a duplicate in one call
+        let unknown = Uuid::new_v4();
+        let got = send_json(
+            as_owner.clone(),
+            post_json(
+                "/delete",
+                json!({ "ids": [second, foreign, unknown, second] }),
+            ),
+        )
+        .await;
+        assert_eq!(got["deleted"], json!([second]));
+        assert_eq!(
+            got["failed"],
+            json!([
+                { "id": foreign, "reason": "forbidden" },
+                { "id": unknown, "reason": "not_found" },
+            ])
+        );
+        assert!(!exists(second).await);
+        assert!(exists(foreign).await);
+        assert_eq!(
+            tdh::audit_row_eventually(&pool, second, "BUILD_DELETED")
+                .await
+                .details["bulk"],
+            true
+        );
+
+        // Empty and oversized requests are refused whole
+        let (status, _) =
+            tdh::send(as_owner.clone(), post_json("/delete", json!({ "ids": [] }))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let too_many: Vec<Uuid> = (0..=MAX_BULK_DELETE).map(|_| Uuid::new_v4()).collect();
+        let (status, _) =
+            tdh::send(as_owner, post_json("/delete", json!({ "ids": too_many }))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // A repository-scoped admin token deletes only its own builds
+        let scoped_admin = app(AuthExtension {
+            is_api_token: true,
+            allowed_repo_ids: AccessScope::Restricted(vec![Uuid::new_v4()]),
+            ..tdh::admin_auth(other_id, &other_name)
+        });
+        let (status, _) = tdh::send(scoped_admin.clone(), delete_req(&format!("/{third}"))).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let got = send_json(
+            scoped_admin.clone(),
+            post_json("/delete", json!({ "ids": [third, own_scoped] })),
+        )
+        .await;
+        assert_eq!(got["deleted"], json!([own_scoped]));
+        assert_eq!(
+            got["failed"],
+            json!([{ "id": third, "reason": "forbidden" }])
+        );
+        assert!(exists(third).await);
+
+        // An administrator deletes any build, one without a creator included
+        let legacy: Uuid = sqlx::query_scalar(
+            "INSERT INTO builds (name, build_number, status) VALUES ($1, 9, 'running') RETURNING id",
+        )
+        .bind(format!("{prefix}-legacy"))
+        .fetch_one(&pool)
+        .await
+        .expect("legacy build");
+        let got = send_json(
+            as_admin,
+            post_json("/delete", json!({ "ids": [foreign, legacy, third] })),
+        )
+        .await;
+        assert_eq!(got["deleted"], json!([foreign, legacy, third]));
+        assert_eq!(got["failed"], json!([]));
+
+        let _ = sqlx::query("DELETE FROM builds WHERE name LIKE $1")
+            .bind(format!("{prefix}-%"))
+            .execute(&pool)
+            .await;
+        tdh::cleanup_user(&pool, owner_id).await;
+        tdh::cleanup_user(&pool, other_id).await;
+    }
+
+    /// web#618: the list only filtered by status and a name substring. It now
+    /// takes an exact name, branch and agent and a creation time range, and
+    /// the total counts the same rows
+    #[tokio::test]
+    async fn list_builds_filters_by_name_branch_agent_and_time_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let state = tdh::build_state(pool.clone(), "/tmp/ph-618-filter");
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let app = tdh::router_with_auth(super::router(), state, tdh::make_auth(user_id, &username));
+        let p = format!("ph-618-filter-{}", Uuid::new_v4());
+        let (app_name, lib_name) = (format!("{p}-app"), format!("{p}-app-lib"));
+
+        // number, name, branch, agent, created hours ago
+        for (number, name, branch, agent, hours) in [
+            (1, &app_name, "main", "runner-a", 50),
+            (2, &app_name, "feat/x", "runner-b", 26),
+            (3, &app_name, "main", "runner-b", 2),
+            (4, &lib_name, "main", "runner-a", 1),
+        ] {
+            let b = send_json(
+                app.clone(),
+                post_json(
+                    "/",
+                    json!({ "name": name, "build_number": number,
+                            "vcs_branch": branch, "agent": agent }),
+                ),
+            )
+            .await;
+            sqlx::query(
+                "UPDATE builds SET created_at = NOW() - make_interval(hours => $2) WHERE id = $1",
+            )
+            .bind(Uuid::parse_str(b["id"].as_str().expect("id")).expect("uuid"))
+            .bind(hours)
+            .execute(&pool)
+            .await
+            .expect("backdate");
+        }
+
+        let after = (Utc::now() - chrono::Duration::hours(30)).format("%Y-%m-%dT%H:%M:%SZ");
+        let before = (Utc::now() - chrono::Duration::hours(3)).format("%Y-%m-%dT%H:%M:%SZ");
+        let numbers = |filter: String| {
+            let app = app.clone();
+            let p = p.clone();
+            async move {
+                let list = send_json(
+                    app,
+                    tdh::get(format!("/?search={p}&sort_by=build_number&{filter}")),
+                )
+                .await;
+                let items: Vec<i64> = list["items"]
+                    .as_array()
+                    .expect("items")
+                    .iter()
+                    .map(|b| b["number"].as_i64().expect("number"))
+                    .collect();
+                assert_eq!(list["pagination"]["total"], items.len(), "{list}");
+                items
+            }
+        };
+
+        assert_eq!(numbers(String::new()).await, [1, 2, 3, 4]);
+        assert_eq!(numbers(format!("name={app_name}")).await, [1, 2, 3]);
+        assert_eq!(numbers("branch=main".to_string()).await, [1, 3, 4]);
+        assert_eq!(numbers("branch=feat%2Fx".to_string()).await, [2]);
+        assert_eq!(numbers("agent=runner-b".to_string()).await, [2, 3]);
+        assert_eq!(numbers(format!("created_after={after}")).await, [2, 3, 4]);
+        assert_eq!(numbers(format!("created_before={before}")).await, [1, 2]);
+        assert_eq!(
+            numbers(format!("name={app_name}&branch=main&created_after={after}")).await,
+            [3]
+        );
+        assert!(numbers("name=nope".to_string()).await.is_empty());
+
+        let _ = sqlx::query("DELETE FROM builds WHERE name LIKE $1")
+            .bind(format!("{p}-%"))
+            .execute(&pool)
+            .await;
+        tdh::cleanup_user(&pool, user_id).await;
+    }
+
+    /// #6240: `vcs_branch` reads back only to the build's creator or an
+    /// administrator, so the branch filter matches only the caller's own
+    /// builds. Otherwise a non-owner could guess another user's branch from
+    /// whether the filtered list (or its total) is empty
+    #[tokio::test]
+    async fn list_builds_branch_filter_is_owner_gated_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let state = tdh::build_state(pool.clone(), "/tmp/ph-6240-branch");
+        let (owner_id, owner_name) = tdh::create_user(&pool).await;
+        let (other_id, other_name) = tdh::create_user(&pool).await;
+        let (admin_id, admin_name) = tdh::create_user(&pool).await;
+        let owner = tdh::router_with_auth(
+            super::router(),
+            state.clone(),
+            tdh::make_auth(owner_id, &owner_name),
+        );
+        let other = tdh::router_with_auth(
+            super::router(),
+            state.clone(),
+            tdh::make_auth(other_id, &other_name),
+        );
+        let admin = tdh::router_with_auth(
+            super::router(),
+            state.clone(),
+            tdh::admin_auth(admin_id, &admin_name),
+        );
+        // The owner's own read-only API token, scoped to no repository: the
+        // branch filter keys on the creator, not on repository access
+        let owner_token = tdh::router_with_auth(
+            super::router(),
+            state.clone(),
+            AuthExtension {
+                is_api_token: true,
+                scopes: Some(vec!["read:artifacts".to_string()]),
+                allowed_repo_ids: crate::models::access_scope::AccessScope::Restricted(vec![]),
+                ..tdh::make_auth(owner_id, &owner_name)
+            },
+        );
+        let admin_scoped = tdh::router_with_auth(
+            super::router(),
+            state.clone(),
+            AuthExtension {
+                is_api_token: true,
+                scopes: Some(vec!["read:artifacts".to_string()]),
+                allowed_repo_ids: crate::models::access_scope::AccessScope::Restricted(vec![]),
+                ..tdh::admin_auth(admin_id, &admin_name)
+            },
+        );
+        let anon = tdh::router_anon(super::router(), state);
+        let p = format!("ph-6240-branch-{}", Uuid::new_v4());
+        let branch = format!("{p}/secret");
+        for (app, number) in [(&owner, 1), (&other, 2)] {
+            send_json(
+                app.clone(),
+                post_json(
+                    "/",
+                    json!({ "name": p, "build_number": number, "vcs_branch": branch }),
+                ),
+            )
+            .await;
+        }
+
+        let numbers = |app: axum::Router, filter: String| {
+            let p = p.clone();
+            async move {
+                let list = send_json(
+                    app,
+                    tdh::get(format!("/?search={p}&sort_by=build_number&{filter}")),
+                )
+                .await;
+                let items: Vec<i64> = list["items"]
+                    .as_array()
+                    .expect("items")
+                    .iter()
+                    .map(|b| b["number"].as_i64().expect("number"))
+                    .collect();
+                assert_eq!(list["pagination"]["total"], items.len(), "{list}");
+                items
+            }
+        };
+        let by_branch = format!("branch={}", branch.replace('/', "%2F"));
+
+        assert_eq!(numbers(other.clone(), String::new()).await, [1, 2]);
+        assert_eq!(numbers(other, by_branch.clone()).await, [2]);
+        assert_eq!(numbers(owner, by_branch.clone()).await, [1]);
+        assert_eq!(numbers(owner_token, by_branch.clone()).await, [1]);
+        assert_eq!(numbers(admin, by_branch.clone()).await, [1, 2]);
+        assert!(numbers(admin_scoped, by_branch.clone()).await.is_empty());
+        let (status, _) = tdh::send(anon, tdh::get(format!("/?search={p}&{by_branch}"))).await;
+        assert_eq!(status, axum::http::StatusCode::UNAUTHORIZED);
+
+        let _ = sqlx::query("DELETE FROM builds WHERE name = $1")
+            .bind(&p)
+            .execute(&pool)
+            .await;
+        for user in [owner_id, other_id, admin_id] {
+            tdh::cleanup_user(&pool, user).await;
+        }
     }
 
     /// #6046: the list parsed `sort_by` and always ordered by build number.

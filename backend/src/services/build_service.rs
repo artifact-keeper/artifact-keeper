@@ -2,6 +2,8 @@
 //!
 //! Manages build lifecycle: creation, status updates, and artifact attachment.
 
+use std::collections::HashMap;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgPool};
@@ -46,6 +48,14 @@ pub struct BuildArtifact {
     pub checksum_sha256: String,
     pub size_bytes: i64,
     pub created_at: DateTime<Utc>,
+}
+
+/// A build record removed by [`BuildService::delete`]
+#[derive(Debug, Clone, FromRow)]
+pub struct DeletedBuild {
+    pub id: Uuid,
+    pub name: String,
+    pub build_number: i32,
 }
 
 /// Input for creating a new build.
@@ -135,6 +145,32 @@ impl BuildService {
                 .map_err(|e| AppError::Database(e.to_string()))?;
         row.map(|(owner,)| owner)
             .ok_or_else(|| AppError::NotFound(format!("Build {} not found", build_id)))
+    }
+
+    /// The creator of each of `build_ids` that exists. A missing build has no
+    /// entry, a build created before the creator was recorded maps to `None`
+    pub async fn owners(&self, build_ids: &[Uuid]) -> Result<HashMap<Uuid, Option<Uuid>>> {
+        let rows: Vec<(Uuid, Option<Uuid>)> =
+            sqlx::query_as("SELECT id, created_by FROM builds WHERE id = ANY($1)")
+                .bind(build_ids)
+                .fetch_all(&self.db)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
+        Ok(rows.into_iter().collect())
+    }
+
+    /// Delete the build records `build_ids`. Their `build_artifacts` rows go
+    /// with them (`ON DELETE CASCADE`), the artifacts in repositories are not
+    /// touched. Returns the builds that were deleted
+    pub async fn delete(&self, build_ids: &[Uuid]) -> Result<Vec<DeletedBuild>> {
+        if build_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        sqlx::query_as("DELETE FROM builds WHERE id = ANY($1) RETURNING id, name, build_number")
+            .bind(build_ids)
+            .fetch_all(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))
     }
 
     /// Update build status and compute duration_ms if finished_at is provided.

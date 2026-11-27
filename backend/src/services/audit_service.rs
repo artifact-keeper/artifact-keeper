@@ -348,6 +348,9 @@ pub enum AuditAction {
     /// Users were removed from a group. One row per request, listing the
     /// users whose membership existed.
     GroupMembersRemoved,
+    /// A CI build record was deleted. Records only, the artifacts it names
+    /// are not touched
+    BuildDeleted,
 }
 
 impl AuditAction {
@@ -491,6 +494,7 @@ impl AuditAction {
             AuditAction::GroupDeleted => "GROUP_DELETED",
             AuditAction::GroupMembersAdded => "GROUP_MEMBERS_ADDED",
             AuditAction::GroupMembersRemoved => "GROUP_MEMBERS_REMOVED",
+            AuditAction::BuildDeleted => "BUILD_DELETED",
         }
     }
 }
@@ -519,6 +523,8 @@ pub enum ResourceType {
     Environment,
     /// A user group (#5653).
     Group,
+    /// A CI build record (`/api/v1/builds`)
+    Build,
 }
 
 impl ResourceType {
@@ -542,6 +548,7 @@ impl ResourceType {
             ResourceType::SyncPolicy => "sync_policy",
             ResourceType::Environment => "environment",
             ResourceType::Group => "group",
+            ResourceType::Build => "build",
         }
     }
 }
@@ -2192,6 +2199,7 @@ mod proxy_scan_blocked_4777_tests {
             AuditAction::GroupMembersRemoved.as_str(),
             "GROUP_MEMBERS_REMOVED"
         );
+        assert_eq!(AuditAction::BuildDeleted.as_str(), "BUILD_DELETED");
     }
 
     /// #5253: the MCP registry vocabulary is a published contract
@@ -2499,6 +2507,7 @@ mod tests {
         assert_eq!(ResourceType::SyncPolicy.as_str(), "sync_policy");
         assert_eq!(ResourceType::Environment.as_str(), "environment");
         assert_eq!(ResourceType::Group.as_str(), "group");
+        assert_eq!(ResourceType::Build.as_str(), "build");
     }
 
     /// #4710: the core privileged-action vocabulary. The names are a published
