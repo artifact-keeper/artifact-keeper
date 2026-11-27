@@ -450,9 +450,11 @@ async fn max_age_evicts_by_cached_at_within_path_prefix_3734() {
 }
 
 /// #4539: a real lifecycle eviction keeps the evicted entry's download
-/// history. The rows lose their catalog id (ON DELETE SET NULL) but stay keyed
-/// on `(repository_id, path)`, so the per-repository analytics proxy count does
-/// not drop when the cache entry goes.
+/// history. The rows stay keyed on `(repository_id, path)`, so the
+/// per-repository analytics proxy count does not drop when the cache entry
+/// goes. Since #6504 the eviction leaves the rows untouched: they keep the
+/// evicted entry's id, which no longer joins, instead of being rewritten to
+/// NULL one by one.
 #[tokio::test]
 async fn eviction_keeps_proxy_download_history_4539() {
     let Some(cache) = RemoteCache::setup("npm", ProxyCacheScope::unscoped()).await else {
@@ -486,6 +488,14 @@ async fn eviction_keeps_proxy_download_history_4539() {
             .map(|r| r.proxy_download_count)
     };
     let before = proxy_downloads().await;
+    let (entry_id,): (uuid::Uuid,) = sqlx::query_as(
+        "SELECT id FROM proxy_cache_artifacts WHERE repository_id = $1 AND path = $2",
+    )
+    .bind(cache.fx.repo_id)
+    .bind(path)
+    .fetch_one(&cache.fx.pool)
+    .await
+    .expect("cache entry id");
 
     let policy = cache.policy("max_age_days", json!({"days": 30})).await;
     let run = cache
@@ -498,11 +508,12 @@ async fn eviction_keeps_proxy_download_history_4539() {
     cache.assert_entry(&old, false, "evicted").await;
 
     let detached: (i64, i64) = sqlx::query_as(
-        "SELECT COUNT(*), COUNT(*) FILTER (WHERE proxy_cache_id IS NULL) \
+        "SELECT COUNT(*), COUNT(*) FILTER (WHERE proxy_cache_id = $3) \
          FROM proxy_download_statistics WHERE repository_id = $1 AND path = $2",
     )
     .bind(cache.fx.repo_id)
     .bind(path)
+    .bind(entry_id)
     .fetch_one(&cache.fx.pool)
     .await
     .expect("history rows");
@@ -511,7 +522,7 @@ async fn eviction_keeps_proxy_download_history_4539() {
     assert_eq!(
         detached,
         (2, 2),
-        "both rows survive, detached from the catalog"
+        "both rows survive as they were, the eviction rewrites none of them"
     );
     assert_eq!(
         after,

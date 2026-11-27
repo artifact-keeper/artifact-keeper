@@ -2309,8 +2309,8 @@ mod tests {
             .expect("evict");
         assert_eq!(
             history_rows(&pool, repo).await,
-            vec![(true, repo, path.to_string()); 2],
-            "eviction detaches the history from the catalog row, never deletes it"
+            vec![(false, repo, path.to_string()); 2],
+            "eviction leaves the history rows as they were and never deletes them (#6504)"
         );
         assert_eq!(download_count_by_repo(&pool, repo).await.unwrap(), 2);
 
