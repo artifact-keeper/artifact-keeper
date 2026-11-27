@@ -1311,7 +1311,8 @@ pub struct SearchReindexResponse {
 /// Trigger a full reindex of all artifacts and repositories in OpenSearch.
 ///
 /// The reindex runs asynchronously in the background. The endpoint returns
-/// immediately with a confirmation that the task was started.
+/// immediately with a confirmation that the task was started, or 409 while
+/// another full reindex runs on any replica (#6404).
 #[utoipa::path(
     post,
     path = "/reindex",
@@ -1320,6 +1321,7 @@ pub struct SearchReindexResponse {
     operation_id = "trigger_search_reindex",
     responses(
         (status = 200, description = "Reindex started in background", body = SearchReindexResponse),
+        (status = 409, description = "A full reindex is already running"),
         (status = 500, description = "Search engine is not configured"),
     ),
 )]
@@ -1331,11 +1333,13 @@ pub async fn trigger_reindex(
         .as_ref()
         .ok_or_else(|| AppError::Config("Search engine is not configured".to_string()))?;
 
+    let lease = crate::services::opensearch_service::try_acquire_reindex_lease(&state.db)
+        .await
+        .ok_or_else(reindex_running)?;
     let db = state.db.clone();
     let search = search.clone();
     tokio::spawn(async move {
-        // `abort: None` — operator-invoked, not lease-guarded (#3502).
-        match search.full_reindex(&db, None).await {
+        match search.full_reindex_leased(&db, lease).await {
             Ok((a, r)) => {
                 tracing::info!(
                     "Search reindex complete: {} artifacts, {} repositories",
@@ -1351,6 +1355,11 @@ pub async fn trigger_reindex(
         status: "started".to_string(),
         message: "Full reindex of artifacts and repositories triggered in background".to_string(),
     }))
+}
+
+/// The 409 every full-reindex trigger answers while one already runs (#6404)
+pub(crate) fn reindex_running() -> AppError {
+    AppError::Conflict("A full reindex is already running".to_string())
 }
 
 #[derive(OpenApi)]
@@ -3989,5 +3998,129 @@ mod advanced_field_filter_db_tests {
         assert_eq!(count_only.0, axum::http::StatusCode::OK);
         assert_eq!(count_only.2, 2, "per_page=0 total must honour the filter");
         assert_hits(combined, &["a1"], "repository_key and version");
+    }
+}
+
+#[cfg(test)]
+mod reindex_single_flight_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use crate::services::opensearch_service::{try_acquire_reindex_lease, OpenSearchService};
+    use std::sync::Arc;
+    use wiremock::MockServer;
+
+    /// Wait for a reindex this test started in the background to give the
+    /// lease back, then release it
+    async fn wait_until_free(pool: &sqlx::PgPool) {
+        for _ in 0..200 {
+            if let Some(lease) = try_acquire_reindex_lease(pool).await {
+                lease.release(pool).await;
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("the background reindex never gave the lease back");
+    }
+
+    /// #6404: while a full reindex holds the lease, on this replica or
+    /// another, the trigger answers 409 instead of starting a second one
+    #[tokio::test]
+    async fn reindex_trigger_answers_409_while_one_runs_6404() {
+        let _serial = tdh::reindex_serial_lock().await;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("reindex6404-{}", Uuid::new_v4()));
+        let mut state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let server = MockServer::start().await;
+        Arc::get_mut(&mut state)
+            .expect("state is not shared yet")
+            .set_search_service(Arc::new(
+                OpenSearchService::new(&server.uri(), None, None, false)
+                    .expect("opensearch client"),
+            ));
+
+        let running = try_acquire_reindex_lease(&pool)
+            .await
+            .expect("no other reindex holds the lease");
+        let second = trigger_reindex(State(state.clone())).await;
+        running.release(&pool).await;
+
+        assert!(
+            matches!(second, Err(AppError::Conflict(_))),
+            "a trigger during a running reindex must answer 409, got {:?}",
+            second.map(|Json(r)| r.status)
+        );
+        let control = trigger_reindex(State(state)).await;
+        wait_until_free(&pool).await;
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            control.is_ok(),
+            "control: once the lease is free the trigger starts a reindex"
+        );
+    }
+
+    /// The admin endpoint runs inline and answers 409 the same way
+    #[tokio::test]
+    async fn admin_reindex_answers_409_while_one_runs_6404() {
+        let _serial = tdh::reindex_serial_lock().await;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("reindex6404-{}", Uuid::new_v4()));
+        let mut state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let server = MockServer::start().await;
+        Arc::get_mut(&mut state)
+            .expect("state is not shared yet")
+            .set_search_service(Arc::new(
+                OpenSearchService::new(&server.uri(), None, None, false)
+                    .expect("opensearch client"),
+            ));
+
+        let running = try_acquire_reindex_lease(&pool)
+            .await
+            .expect("no other reindex holds the lease");
+        let second = crate::api::handlers::admin::trigger_reindex(
+            State(state),
+            axum::Extension(tdh::admin_auth(Uuid::new_v4(), "admin6404")),
+        )
+        .await;
+        running.release(&pool).await;
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            matches!(second, Err(AppError::Conflict(_))),
+            "the admin trigger during a running reindex must answer 409"
+        );
+    }
+
+    /// A reindex that fails still gives the lease and the process claim back,
+    /// so the next trigger is not refused until the TTL runs out
+    #[tokio::test]
+    async fn a_failed_leased_reindex_frees_the_lease_6404() {
+        let _serial = tdh::reindex_serial_lock().await;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::any())
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let search =
+            OpenSearchService::new(&server.uri(), None, None, false).expect("opensearch client");
+
+        let lease = try_acquire_reindex_lease(&pool)
+            .await
+            .expect("no other reindex holds the lease");
+        let result = search.full_reindex_leased(&pool, lease).await;
+        let next = try_acquire_reindex_lease(&pool).await;
+        let freed = next.is_some();
+        if let Some(next) = next {
+            next.release(&pool).await;
+        }
+
+        assert!(result.is_err(), "the search cluster answered 500");
+        assert!(freed, "the lease is free again after a failed reindex");
     }
 }

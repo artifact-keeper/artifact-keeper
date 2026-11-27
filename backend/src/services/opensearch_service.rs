@@ -26,6 +26,54 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::error::{AppError, Result};
+use crate::services::cluster_work::{try_acquire_scheduler_lease_quiet, SchedulerLease};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// The one cluster-wide lease every full reindex runs under, the startup
+/// reindex and both admin endpoints alike, so they never overlap (#3502,
+/// #6404). Overlapping runs raced each other's refresh-interval changes and
+/// multiplied the load. The name predates the endpoints sharing it
+const REINDEX_LEASE: &str = "opensearch_bootstrap_reindex";
+
+/// Bounds a crashed holder, the renewal keeps a live reindex from becoming
+/// reclaimable mid-stream
+const REINDEX_LEASE_TTL_SECS: f64 = 6.0 * 3600.0;
+
+/// Set while this process holds the reindex lease. The scheduler lease is
+/// re-entrant for its owner, so without it two calls on one replica would both
+/// get the lease
+static REINDEX_IN_PROCESS: AtomicBool = AtomicBool::new(false);
+
+/// The reindex lease and this process's claim on it, the claim ends on drop
+pub struct ReindexLease {
+    lease: Option<SchedulerLease>,
+}
+
+impl ReindexLease {
+    /// Give the lease back so the next reindex need not wait out its TTL
+    pub async fn release(mut self, db: &PgPool) {
+        if let Some(lease) = self.lease.take() {
+            lease.release(db).await;
+        }
+    }
+}
+
+impl Drop for ReindexLease {
+    fn drop(&mut self) {
+        REINDEX_IN_PROCESS.store(false, Ordering::Release);
+    }
+}
+
+/// The reindex lease, `None` while another replica or call holds it
+pub async fn try_acquire_reindex_lease(db: &PgPool) -> Option<ReindexLease> {
+    if REINDEX_IN_PROCESS.swap(true, Ordering::AcqRel) {
+        return None;
+    }
+    let mut claim = ReindexLease { lease: None };
+    claim.lease =
+        Some(try_acquire_scheduler_lease_quiet(db, REINDEX_LEASE, REINDEX_LEASE_TTL_SECS).await?);
+    Some(claim)
+}
 use crate::models::access_scope::AccessScope;
 
 /// Base name of the artifacts index, before any configured prefix is applied.
@@ -840,6 +888,24 @@ impl OpenSearchService {
 
         tracing::info!("Repository reindex complete: {} documents indexed", total);
         Ok(total)
+    }
+
+    /// [`Self::full_reindex`] under the reindex lease, stopped between batches
+    /// if another replica reclaims it, released at the end
+    pub async fn full_reindex_leased(
+        &self,
+        db: &PgPool,
+        lease: ReindexLease,
+    ) -> Result<(usize, usize)> {
+        let (renewal, lost) = lease
+            .lease
+            .as_ref()
+            .expect("an acquired reindex lease")
+            .spawn_renewal_with_cancellation(db.clone(), REINDEX_LEASE_TTL_SECS);
+        let result = self.full_reindex(db, Some(&lost)).await;
+        drop(renewal);
+        lease.release(db).await;
+        result
     }
 
     /// Run a full reindex of both artifacts and repositories.

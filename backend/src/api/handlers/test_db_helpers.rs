@@ -202,6 +202,24 @@ pub(crate) async fn scan_dedup_serial_lock() -> ScanDedupSerialGuard {
     }
 }
 
+/// Advisory-lock key for [`reindex_serial_lock`] (#6404)
+const REINDEX_TEST_LOCK_KEY: i64 = 0x5249_6404; // "RI" + issue #6404
+
+/// Cross-process serialization guard for the full-reindex lease tests (#6404).
+/// They contend for the one cluster-wide reindex lease, so under nextest's
+/// process-per-test runs they have to take turns on a database lock
+pub struct ReindexSerialGuard {
+    _conn: Option<sqlx::PgConnection>,
+}
+
+/// Acquire the reindex test lock, blocking until it is free. Inert without a
+/// database, like [`scan_dedup_serial_lock`]
+pub(crate) async fn reindex_serial_lock() -> ReindexSerialGuard {
+    ReindexSerialGuard {
+        _conn: serial_lock_session(REINDEX_TEST_LOCK_KEY).await,
+    }
+}
+
 /// Advisory-lock key for [`blob_gc_serial_lock`] (#1660).
 ///
 /// Distinct from [`SCAN_DEDUP_TEST_LOCK_KEY`] and from the application
