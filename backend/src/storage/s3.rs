@@ -48,6 +48,10 @@
 //!   reach the object store, when it differs from S3_ENDPOINT (e.g. an
 //!   in-cluster MinIO service name). Presigned URLs are signed for and point
 //!   at this host; the backend's own S3 calls keep S3_ENDPOINT (#4417).
+//! - S3_VIRTUAL_HOSTED_STYLE: Address the bucket in the hostname
+//!   (`https://<bucket>.s3.<region>.amazonaws.com/<key>`) instead of the path
+//!   (default: false). Lets a TLS-inspecting proxy exempt one bucket by host.
+//!   With S3_ENDPOINT/S3_PUBLIC_ENDPOINT set, the endpoint must include the bucket.
 //!
 //! For CloudFront CDN:
 //! - CLOUDFRONT_DISTRIBUTION_URL: CloudFront distribution URL (optional)
@@ -541,6 +545,17 @@ fn endpoint_is_aliyun_oss(endpoint: &str) -> bool {
     })
 }
 
+/// True when `endpoint`'s host does not start with `<bucket>.`. Under
+/// virtual-hosted style a custom endpoint is used as is, so it must already
+/// name the bucket (#6288).
+fn endpoint_host_lacks_bucket(endpoint: &str, bucket: &str) -> bool {
+    let Ok(url) = url::Url::parse(endpoint) else {
+        return true;
+    };
+    !url.host_str()
+        .is_some_and(|host| host.starts_with(&format!("{}.", bucket)))
+}
+
 /// Resolve the provider dialect from the explicit `S3_PROVIDER` setting,
 /// falling back to inferring it from the endpoint host.
 ///
@@ -881,6 +896,10 @@ pub struct S3Config {
     /// #5649). Without them each operation against a gone endpoint retried
     /// 5s connection attempts for up to three minutes.
     pub timeouts: crate::storage::StorageTimeouts,
+    /// Virtual-hosted-style addressing (`S3_VIRTUAL_HOSTED_STYLE`): bucket in
+    /// the hostname rather than the path, for the backend's own requests and
+    /// presigned URLs alike. Default: false (path-style).
+    pub virtual_hosted_style: bool,
 }
 
 /// CloudFront CDN configuration for signed URLs
@@ -948,6 +967,9 @@ impl S3Config {
         let disable_multi_delete = std::env::var("S3_DISABLE_MULTI_DELETE")
             .map(|v| v.to_lowercase() == "true" || v == "1")
             .unwrap_or(false);
+        let virtual_hosted_style = std::env::var("S3_VIRTUAL_HOSTED_STYLE")
+            .map(|v| v.to_lowercase() == "true" || v == "1")
+            .unwrap_or(false);
         let provider = detect_s3_provider(
             std::env::var("S3_PROVIDER").ok().as_deref(),
             endpoint.as_deref(),
@@ -1000,6 +1022,7 @@ impl S3Config {
             max_single_copy_bytes,
             max_parts,
             timeouts: crate::storage::StorageTimeouts::from_env(),
+            virtual_hosted_style,
         })
     }
 
@@ -1071,7 +1094,14 @@ impl S3Config {
             max_single_copy_bytes: S3_MAX_SINGLE_COPY_SIZE,
             max_parts: S3_MULTIPART_MAX_PARTS,
             timeouts: crate::storage::StorageTimeouts::default(),
+            virtual_hosted_style: false,
         }
+    }
+
+    /// Use virtual-hosted-style addressing (`S3_VIRTUAL_HOSTED_STYLE`).
+    pub fn with_virtual_hosted_style(mut self, enabled: bool) -> Self {
+        self.virtual_hosted_style = enabled;
+        self
     }
 
     /// Set storage path format (for Artifactory compatibility)
@@ -1856,6 +1886,9 @@ impl S3Backend {
         if let Some(endpoint) = &config.endpoint {
             builder = builder.with_endpoint(endpoint);
         }
+        if config.virtual_hosted_style {
+            builder = builder.with_virtual_hosted_style_request(true);
+        }
 
         // ECS Fargate task role credentials
         if let Ok(uri) = std::env::var("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI") {
@@ -2130,6 +2163,25 @@ impl S3Backend {
 
         let signing_store = Self::build_signing_store(&config)?;
 
+        if config.virtual_hosted_style {
+            for (var, endpoint) in [
+                ("S3_ENDPOINT", &config.endpoint),
+                ("S3_PUBLIC_ENDPOINT", &config.public_endpoint),
+            ] {
+                if let Some(e) = endpoint {
+                    if endpoint_host_lacks_bucket(e, &config.bucket) {
+                        tracing::warn!(
+                            bucket = %config.bucket,
+                            endpoint = %e,
+                            "S3_VIRTUAL_HOSTED_STYLE is on but {} does not start with \
+                             '<bucket>.', requests go to that host as is (#6288)",
+                            var
+                        );
+                    }
+                }
+            }
+        }
+
         if config.redirect_downloads {
             tracing::info!(
                 bucket = %config.bucket,
@@ -2138,6 +2190,7 @@ impl S3Backend {
                 dedicated_signing_creds = config.presign_access_key.is_some()
                     && config.presign_secret_key.is_some(),
                 public_endpoint = config.public_endpoint.as_deref().unwrap_or("-"),
+                virtual_hosted_style = config.virtual_hosted_style,
                 "S3 redirect downloads enabled"
             );
             if config.endpoint.is_some()
@@ -5079,6 +5132,55 @@ mod tests {
             "{}",
             presigned.url
         );
+    }
+
+    #[tokio::test]
+    async fn test_presigned_url_virtual_hosted_style_puts_bucket_in_host() {
+        let _env = AnonymousS3TestEnv::enter();
+        let config = S3Config::new(
+            "artifacts".into(),
+            "us-east-1".into(),
+            None,
+            Some("artifact-keeper".into()),
+        )
+        .with_virtual_hosted_style(true);
+        let url = presign_with(config, "maven/a.jar").await;
+        let host = "artifacts.s3.us-east-1.amazonaws.com";
+        assert_eq!(url.scheme(), "https");
+        assert_eq!(url.host_str(), Some(host));
+        // Bucket in the host only, never repeated in the path.
+        assert_eq!(url.path(), "/artifact-keeper/maven/a.jar");
+        assert!(presigned_signature_valid_for_host(
+            &url,
+            host,
+            PUBLIC_TEST_SK
+        ));
+    }
+
+    #[test]
+    fn test_endpoint_host_lacks_bucket_6288() {
+        assert!(!endpoint_host_lacks_bucket(
+            "https://artifacts.s3.example.com",
+            "artifacts"
+        ));
+        assert!(endpoint_host_lacks_bucket(
+            "https://s3.example.com",
+            "artifacts"
+        ));
+        assert!(endpoint_host_lacks_bucket(
+            "https://artifacts-old.s3.example.com",
+            "artifacts"
+        ));
+        assert!(endpoint_host_lacks_bucket("not a url", "artifacts"));
+    }
+
+    #[tokio::test]
+    async fn test_presigned_url_default_is_path_style() {
+        let _env = AnonymousS3TestEnv::enter();
+        let config = S3Config::new("artifacts".into(), "us-east-1".into(), None, None);
+        let url = presign_with(config, "maven/a.jar").await;
+        assert_eq!(url.host_str(), Some("s3.us-east-1.amazonaws.com"));
+        assert_eq!(url.path(), "/artifacts/maven/a.jar");
     }
 
     #[tokio::test]
