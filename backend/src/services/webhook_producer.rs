@@ -602,11 +602,14 @@ mod tests {
     ];
 
     /// What counts as an `artifact.uploaded` producer reference in a handler:
-    /// the hosted-publish catalog registration (which emits) and the
-    /// row-holding emit used by promotion, approval, Git LFS and chunked
-    /// upload completion.
-    const ARTIFACT_UPLOADED_PRODUCER_REFS: &[&str] =
-        &["register_published_package", ".emit_artifact_uploaded("];
+    /// the hosted-publish catalog registration (which emits), the
+    /// row-holding emit used by Git LFS and chunked upload completion, and
+    /// the promotion copy's announcement (promotion and approval, #6549).
+    const ARTIFACT_UPLOADED_PRODUCER_REFS: &[&str] = &[
+        "register_published_package",
+        ".emit_artifact_uploaded(",
+        "announce_promoted_copy(",
+    ];
 
     /// True when `src` writes the `artifacts` table: a raw
     /// `INSERT INTO artifacts` (not `artifacts_*` / `artifact_metadata`) or a
