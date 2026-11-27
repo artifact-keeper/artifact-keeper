@@ -1286,7 +1286,7 @@ impl AzureBackend {
         expires_in: Duration,
         signed_permissions: &str,
     ) -> Result<String> {
-        self.generate_sas_token_at(key, expires_in, signed_permissions, Utc::now())
+        self.generate_sas_token_at(key, expires_in, signed_permissions, Utc::now(), None)
     }
 
     /// [`Self::generate_sas_token_with_permissions`] for an explicit issue
@@ -1297,6 +1297,7 @@ impl AzureBackend {
         expires_in: Duration,
         signed_permissions: &str,
         now: chrono::DateTime<Utc>,
+        content_disposition: Option<&str>,
     ) -> Result<String> {
         let decoded_key = match &self.auth {
             AzureAuthMode::SharedKey { decoded_key } => decoded_key,
@@ -1330,8 +1331,9 @@ impl AzureBackend {
         // Service SAS string-to-sign for API version 2021-06-08 (16 fields, 15 newlines):
         // sp, st, se, canonicalizedResource, si, sip, spr, sv, sr,
         // snapshotTime, encryptionScope, rscc, rscd, rsce, rscl, rsct
+        let rscd = content_disposition.unwrap_or_default();
         let string_to_sign = format!(
-            "{}\n{}\n{}\n{}\n\n\n{}\n{}\n{}\n\n\n\n\n\n\n",
+            "{}\n{}\n{}\n{}\n\n\n{}\n{}\n{}\n\n\n\n{}\n\n\n",
             signed_permissions,
             signed_start,
             signed_expiry,
@@ -1343,7 +1345,9 @@ impl AzureBackend {
             signed_resource,
             // snapshotTime - empty
             // encryptionScope - empty
-            // rscc, rscd, rsce, rscl, rsct - empty
+            // rscc - empty
+            rscd,
+            // rsce, rscl, rsct - empty
         );
 
         let mut mac = HmacSha256::new_from_slice(decoded_key)
@@ -1351,7 +1355,7 @@ impl AzureBackend {
         mac.update(string_to_sign.as_bytes());
         let signature = BASE64.encode(mac.finalize().into_bytes());
 
-        let sas_token = format!(
+        let mut sas_token = format!(
             "sv={}&st={}&se={}&sr={}&sp={}&spr={}&sig={}",
             urlencoding::encode(signed_version),
             urlencoding::encode(&signed_start),
@@ -1361,6 +1365,9 @@ impl AzureBackend {
             signed_protocol,
             urlencoding::encode(&signature),
         );
+        if !rscd.is_empty() {
+            sas_token.push_str(&format!("&rscd={}", urlencoding::encode(rscd)));
+        }
 
         Ok(sas_token)
     }
@@ -1374,8 +1381,40 @@ impl AzureBackend {
     /// SAS URL for a client redirect: same token as [`Self::generate_sas_url`],
     /// on [`Self::presented_base_url`]. Backend-internal reads keep
     /// `generate_sas_url` so they never leave the internal endpoint.
-    fn generate_client_sas_url(&self, key: &str, expires_in: Duration) -> Result<String> {
-        self.client_sas_url_at(key, expires_in, Utc::now())
+    /// A SAS URL for a client redirect, `None` when this backend does not
+    /// redirect
+    fn presigned(
+        &self,
+        key: &str,
+        expires_in: Duration,
+        content_disposition: Option<&str>,
+    ) -> Result<Option<PresignedUrl>> {
+        if !self.supports_redirect() {
+            return Ok(None);
+        }
+
+        let url = self.generate_client_sas_url(key, expires_in, content_disposition)?;
+
+        tracing::debug!(
+            key = %key,
+            expires_in = ?expires_in,
+            "Generated Azure SAS URL"
+        );
+
+        Ok(Some(PresignedUrl {
+            url,
+            expires_in,
+            source: PresignedUrlSource::Azure,
+        }))
+    }
+
+    fn generate_client_sas_url(
+        &self,
+        key: &str,
+        expires_in: Duration,
+        content_disposition: Option<&str>,
+    ) -> Result<String> {
+        self.client_sas_url_at(key, expires_in, Utc::now(), content_disposition)
     }
 
     fn client_sas_url_at(
@@ -1383,8 +1422,10 @@ impl AzureBackend {
         key: &str,
         expires_in: Duration,
         now: chrono::DateTime<Utc>,
+        content_disposition: Option<&str>,
     ) -> Result<String> {
-        let sas_token = self.generate_sas_token_at(key, expires_in, "r", now)?;
+        let sas_token =
+            self.generate_sas_token_at(key, expires_in, "r", now, content_disposition)?;
         let url = Self::blob_url_on(&self.presented_base_url(), &self.config.container_name, key);
         Ok(format!("{}?{}", url, sas_token))
     }
@@ -2265,23 +2306,17 @@ impl StorageBackend for AzureBackend {
         key: &str,
         expires_in: Duration,
     ) -> Result<Option<PresignedUrl>> {
-        if !self.supports_redirect() {
-            return Ok(None);
-        }
+        self.presigned(key, expires_in, None)
+    }
 
-        let url = self.generate_client_sas_url(key, expires_in)?;
-
-        tracing::debug!(
-            key = %key,
-            expires_in = ?expires_in,
-            "Generated Azure SAS URL"
-        );
-
-        Ok(Some(PresignedUrl {
-            url,
-            expires_in,
-            source: PresignedUrlSource::Azure,
-        }))
+    #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "client", storage.system = "azure", storage.operation = "get_presigned_download_url"))]
+    async fn get_presigned_download_url(
+        &self,
+        key: &str,
+        expires_in: Duration,
+        content_disposition: &str,
+    ) -> Result<Option<PresignedUrl>> {
+        self.presigned(key, expires_in, Some(content_disposition))
     }
 
     /// Upload a file on disk through [`Self::put_stream`]'s block upload.
@@ -2724,6 +2759,44 @@ mod tests {
         );
     }
 
+    /// #6495: `rscd` goes into its slot of the 2021-06-08 service SAS
+    /// string-to-sign, so Azure answers with the file name
+    #[tokio::test]
+    async fn test_sas_signs_the_content_disposition_6495() {
+        let backend = AzureBackend::new(create_test_config()).await.unwrap();
+        let disposition = "attachment; filename=\"example.tar.gz\"";
+        let presigned = backend
+            .get_presigned_download_url("a/b.bin", Duration::from_secs(60), disposition)
+            .await
+            .unwrap()
+            .unwrap();
+        let url = url::Url::parse(&presigned.url).unwrap();
+        let param = |name: &str| {
+            url.query_pairs()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.into_owned())
+                .unwrap_or_default()
+        };
+        assert_eq!(param("rscd"), disposition);
+
+        let string_to_sign = format!(
+            "r\n{}\n{}\n/blob/testaccount/testcontainer/a/b.bin\n\n\nhttps\n2021-06-08\nb\n\n\n\n{}\n\n\n",
+            param("st"),
+            param("se"),
+            disposition
+        );
+        let key = BASE64
+            .decode(create_test_config().access_key.unwrap())
+            .unwrap();
+        let mut mac = HmacSha256::new_from_slice(&key).unwrap();
+        mac.update(string_to_sign.as_bytes());
+        assert_eq!(
+            param("sig"),
+            BASE64.encode(mac.finalize().into_bytes()),
+            "the override is part of the signature"
+        );
+    }
+
     #[tokio::test]
     async fn test_presigned_url_uses_public_endpoint_4417() {
         for (public, want_prefix) in [
@@ -2755,10 +2828,10 @@ mod tests {
             // internal URL would, on the public base.
             let now = Utc::now();
             let token = backend
-                .generate_sas_token_at("a/b.bin", Duration::from_secs(60), "r", now)
+                .generate_sas_token_at("a/b.bin", Duration::from_secs(60), "r", now, None)
                 .unwrap();
             let client = backend
-                .client_sas_url_at("a/b.bin", Duration::from_secs(60), now)
+                .client_sas_url_at("a/b.bin", Duration::from_secs(60), now, None)
                 .unwrap();
             assert_eq!(client, format!("{want_prefix}{token}"));
             assert_eq!(
