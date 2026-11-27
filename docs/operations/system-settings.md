@@ -12,6 +12,8 @@ admin-only.
 | `retention_days` | yes | `0..=36500` | `POST /api/v1/admin/cleanup` with `cleanup_old_backups`: completed backups older than this many days, beyond the newest `backup_retention_count`, are deleted |
 | `backup_retention_count` | yes | `1..=10000` | the same cleanup: the newest completed backups it always keeps |
 | `edge_stale_threshold_minutes` | yes | `1..=10080` | the background stale-peer detector (re-read every check) and `POST /api/v1/admin/cleanup` with `cleanup_stale_peers`. `PEER_STALE_THRESHOLD_MINUTES` pins it when set |
+| `build_retention_days` | yes | `0..=36500` | the hourly build record retention job: builds that finished (or, never finished, were created) more than this many days ago are deleted with their artifact lists, the artifacts in repositories stay. `0` = off |
+| `build_retention_keep_last` | yes | `0..=100000` | the same job: only the newest this many finished builds per build name are kept. Either rule deletes. `0` = off |
 
 ## Updating
 
