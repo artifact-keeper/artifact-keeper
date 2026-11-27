@@ -616,6 +616,22 @@ fn unchanged_content_does_not_rebuild_but_a_b_a_does() {
     assert_eq!(builds.load(Ordering::SeqCst), 3);
 }
 
+#[test]
+fn poll_interval_defaults_to_five_seconds_and_zero_disables_it() {
+    assert_eq!(poll_interval(None), Some(Duration::from_secs(5)));
+    assert_eq!(
+        poll_interval(Some(OsStr::new("30"))),
+        Some(Duration::from_secs(30))
+    );
+    assert_eq!(poll_interval(Some(OsStr::new("0"))), None);
+    for invalid in ["", "-1", "1.5", "18446744073709551616"] {
+        assert_eq!(
+            poll_interval(Some(OsStr::new(invalid))),
+            Some(DEFAULT_POLL_INTERVAL)
+        );
+    }
+}
+
 #[tokio::test]
 async fn background_poller_observes_an_atomic_replacement() {
     let a = TestCa::new();
@@ -630,7 +646,7 @@ async fn background_poller_observes_an_atomic_replacement() {
     assert!(!succeeds(&client, &server).await);
     publish(&path, &b.pem);
     let expected = Bundle::parse(b.pem.as_bytes()).unwrap().digest;
-    tokio::time::timeout(POLL_INTERVAL * 2 + Duration::from_secs(2), async {
+    tokio::time::timeout(DEFAULT_POLL_INTERVAL * 2 + Duration::from_secs(2), async {
         while manager.state.read().unwrap().bundle.digest != expected {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
