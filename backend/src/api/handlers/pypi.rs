@@ -26423,7 +26423,8 @@ mod legacy_json_xmlrpc_route_tests {
             "union, deduped, sorted: {browsed}"
         );
         assert!(!browsed.contains("ak-hidden"), "{browsed}");
-        assert_eq!(status6, StatusCode::NOT_FOUND);
+        // #6494: anonymous with no readable member is challenged
+        assert_eq!(status6, StatusCode::UNAUTHORIZED);
     }
 
     /// P1: a Remote repository answers `browse` / `list_packages` with a

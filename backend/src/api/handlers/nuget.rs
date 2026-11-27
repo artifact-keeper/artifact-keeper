@@ -154,7 +154,9 @@ async fn effective_local_repo_locations_for_caller(
         return Ok(vec![(repo.id, repo.storage_location())]);
     }
     let members = proxy_helpers::fetch_virtual_members(db, repo.id).await?;
-    let members = proxy_helpers::try_authorize_virtual_members(db, auth, repo.id, members).await?;
+    let members =
+        proxy_helpers::try_authorize_virtual_members_or_challenge(db, auth, repo.id, members)
+            .await?;
     Ok(members
         .iter()
         .filter(|m| m.repo_type != RepositoryType::Remote)

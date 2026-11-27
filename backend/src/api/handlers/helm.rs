@@ -796,8 +796,10 @@ async fn download_chart_via_index(
         // error rather than being flattened into the empty set, which the
         // caller would answer with a definitive "Chart not found" (#3321).
         // A denied member is simply skipped, indistinguishable from a miss.
-        let members =
-            proxy_helpers::try_authorize_virtual_members(&state.db, auth, repo.id, members).await?;
+        let members = proxy_helpers::try_authorize_virtual_members_or_challenge(
+            &state.db, auth, repo.id, members,
+        )
+        .await?;
         // #5810: the virtual's member-fallback policy.
         let fallback = proxy_helpers::virtual_member_fallback(&state.db, repo.id).await;
         // #6417: whether a member could not answer (an upstream 5xx, a

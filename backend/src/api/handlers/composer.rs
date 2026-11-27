@@ -4847,6 +4847,9 @@ mod metadata_db_tests {
         // member exists but holds a DIFFERENT package
         insert_artifact(&vf.pool, member_id, "other/pkg", "1.0.0", "0011", None).await;
         add_member(&vf.pool, vf.repo_id, member_id, 0).await;
+        // Public, so the anonymous caller reads it and the miss is a miss, not
+        // the #6494 challenge for a virtual whose members are all hidden
+        tdh::publish_repo(&vf.pool, member_id).await;
 
         let app = vf.router_anon(super::router());
         let req = tdh::get(format!("/{}/p2/missing/pkg.json", vf.repo_key));

@@ -1064,7 +1064,8 @@ mod tests {
         let received = upstream.received_requests().await.unwrap_or_default();
         remote.teardown().await;
         fx.teardown().await;
-        assert_eq!(err.status(), StatusCode::NOT_FOUND);
+        // #6494: anonymous is challenged rather than told nothing exists
+        assert_eq!(err.status(), StatusCode::UNAUTHORIZED);
         assert!(
             received.is_empty(),
             "unauthorized member must not be forwarded upstream"

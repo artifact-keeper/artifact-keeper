@@ -2369,7 +2369,7 @@ async fn download(
                 // it.
                 let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
                 let had_members = !members.is_empty();
-                let members = proxy_helpers::try_authorize_virtual_members(
+                let members = proxy_helpers::try_authorize_virtual_members_or_challenge(
                     &state.db,
                     auth.as_ref(),
                     repo.id,
@@ -8946,23 +8946,19 @@ mod age_gate_tests {
     /// arm both in body text and in content type (`text/plain` against the JSON
     /// error envelope), so an anonymous caller could distinguish "this virtual
     /// is empty" from "this virtual has members you may not see" — which is the
-    /// oracle #3452 closed. Both arms must answer
-    /// [`proxy_helpers::NO_ACCESSIBLE_MEMBERS_MSG`] through
-    /// `no_accessible_members_response`.
+    /// oracle #3452 closed. Since #6494 the anonymous caller of a virtual whose
+    /// members it may not read gets the 401 challenge instead, so Maven-style
+    /// clients send credentials, and only the empty virtual keeps the shared
+    /// 404.
     #[tokio::test]
     async fn test_virtual_download_hides_unreadable_members_behind_the_shared_404_3480() {
-        let expected_body = format!(
-            "{{\"code\":\"NOT_FOUND\",\"message\":\"{}\"}}",
-            proxy_helpers::NO_ACCESSIBLE_MEMBERS_MSG
-        );
-
         // A virtual whose only member is private and gated. The anonymous
         // caller may read none of it.
         let Some(mut private_rig) = VirtualRig::new(true).await else {
             return;
         };
         let _private = private_rig.add_remote(1, true, false).await;
-        let (private_status, private_bytes, private_headers) = private_rig
+        let (private_status, _, private_headers) = private_rig
             .get(private_rig.download_uri("hidden-crate", "1.0.0"))
             .await;
 
@@ -8972,34 +8968,33 @@ mod age_gate_tests {
             private_rig.teardown().await;
             return;
         };
-        let (empty_status, empty_bytes, empty_headers) = empty_rig
+        let (empty_status, empty_bytes, _) = empty_rig
             .get(empty_rig.download_uri("hidden-crate", "1.0.0"))
             .await;
 
         private_rig.teardown().await;
         empty_rig.teardown().await;
 
-        let content_type = |headers: &HeaderMap| {
-            headers
-                .get(CONTENT_TYPE)
-                .and_then(|v| v.to_str().ok())
-                .map(|v| v.to_string())
-        };
         assert_eq!(empty_status, StatusCode::NOT_FOUND);
-        assert_eq!(String::from_utf8_lossy(&empty_bytes), expected_body);
         assert_eq!(
-            (
-                private_status,
-                String::from_utf8_lossy(&private_bytes).to_string(),
-                content_type(&private_headers)
-            ),
-            (
-                empty_status,
-                String::from_utf8_lossy(&empty_bytes).to_string(),
-                content_type(&empty_headers)
-            ),
-            "a caller who may read no member must not be able to tell that \
-             the virtual has members at all"
+            String::from_utf8_lossy(&empty_bytes),
+            format!(
+                "{{\"code\":\"NOT_FOUND\",\"message\":\"{}\"}}",
+                proxy_helpers::NO_ACCESSIBLE_MEMBERS_MSG
+            )
+        );
+        assert_eq!(
+            private_status,
+            StatusCode::UNAUTHORIZED,
+            "#6494: an anonymous caller of a virtual whose members are all \
+             private is challenged"
+        );
+        assert!(
+            private_headers
+                .get_all("www-authenticate")
+                .iter()
+                .any(|v| v == "Basic realm=\"artifact-keeper\""),
+            "the challenge carries Basic: {private_headers:?}"
         );
     }
 
