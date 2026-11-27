@@ -798,7 +798,7 @@ pub(crate) async fn render_packages_index(
     component: &str,
     arch: &str,
 ) -> Result<String, StatusCode> {
-    let entries = fetch_package_entries(db, repo_id, component, arch)
+    let entries = fetch_package_entries(db, &[repo_id], component, arch)
         .await
         .map_err(|r| r.status())?;
     Ok(build_packages_text(&entries))
@@ -807,23 +807,26 @@ pub(crate) async fn render_packages_index(
 /// Fetch all package entries for a given repo, component, and architecture.
 async fn fetch_package_entries(
     db: &PgPool,
-    repo_id: uuid::Uuid,
+    repo_ids: &[uuid::Uuid],
     component: &str,
     arch: &str,
 ) -> Result<Vec<PackageEntry>, Response> {
+    // `repo_ids` is in priority order: a pool path two members share lists the
+    // first member's copy, the one the virtual download walk serves
     let artifacts: Vec<DebianArtifactRow> = sqlx::query_as(
         r#"
-        SELECT a.path, a.size_bytes, a.checksum_sha256,
+        SELECT DISTINCT ON (a.name, a.version, a.path)
+               a.path, a.size_bytes, a.checksum_sha256,
                a.checksum_sha1, a.checksum_md5, am.metadata
         FROM artifacts a
+        JOIN unnest($1::uuid[]) WITH ORDINALITY AS src(id, ord) ON src.id = a.repository_id
         LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
-        WHERE a.repository_id = $1
-          AND a.is_deleted = false
+        WHERE a.is_deleted = false
           AND a.path LIKE 'pool/' || $2 || '/%' ESCAPE '\'
-        ORDER BY a.name, a.version, a.path
+        ORDER BY a.name, a.version, a.path, src.ord
         "#,
     )
-    .bind(repo_id)
+    .bind(repo_ids)
     .bind(super::escape_like_literal(component))
     .fetch_all(db)
     .await
@@ -1054,18 +1057,25 @@ fn take_first_line(s: &str) -> String {
 async fn release_publish_timestamp(
     db: &PgPool,
     repo_id: uuid::Uuid,
+    source_repo_ids: &[uuid::Uuid],
 ) -> Result<chrono::DateTime<chrono::Utc>, Response> {
+    // A Virtual's index is built from its members, so their artifacts and the
+    // moment each joined move its `Date:` too
     let stamp: Option<(Option<chrono::DateTime<chrono::Utc>>,)> = sqlx::query_as(
         r#"
         SELECT GREATEST(
                  (SELECT MAX(GREATEST(a.created_at, a.updated_at))
                     FROM artifacts a
-                   WHERE a.repository_id = $1),
+                   WHERE a.repository_id = ANY($2)),
+                 (SELECT MAX(r.created_at) FROM repositories r WHERE r.id = ANY($2)),
+                 (SELECT MAX(m.created_at) FROM virtual_repo_members m
+                   WHERE m.virtual_repo_id = $1),
                  (SELECT r.created_at FROM repositories r WHERE r.id = $1)
                )
         "#,
     )
     .bind(repo_id)
+    .bind(source_repo_ids)
     .fetch_optional(db)
     .await
     .map_err(crate::api::handlers::db_err)?;
@@ -1184,16 +1194,18 @@ fn render_release_document(input: &ReleaseRenderInput<'_>) -> String {
 async fn generate_release_content(
     state: &SharedState,
     repo_id: uuid::Uuid,
+    source_repo_ids: &[uuid::Uuid],
     distribution: &str,
 ) -> Result<String, Response> {
-    let (components, architectures) = discover_release_layout(&state.db, repo_id).await?;
+    let (components, architectures) = discover_release_layout(&state.db, source_repo_ids).await?;
     let component_str = components.iter().cloned().collect::<Vec<_>>().join(" ");
     let arch_str = architectures.iter().cloned().collect::<Vec<_>>().join(" ");
 
     let mut release_files = Vec::new();
     for component in &components {
         for arch in &architectures {
-            let entries = fetch_package_entries(&state.db, repo_id, component, arch).await?;
+            let entries =
+                fetch_package_entries(&state.db, source_repo_ids, component, arch).await?;
             let packages_text = build_packages_text(&entries);
             let packages_bytes = packages_text.into_bytes();
             let packages_path = format!("{}/binary-{}/Packages", component, arch);
@@ -1229,7 +1241,7 @@ async fn generate_release_content(
     // `release_publish_timestamp`. Both reads propagate their errors so a
     // transient DB fault fails this request instead of silently rendering a
     // document that differs from the sibling `Release`/`Release.gpg` render.
-    let published_at = release_publish_timestamp(&state.db, repo_id).await?;
+    let published_at = release_publish_timestamp(&state.db, repo_id, source_repo_ids).await?;
 
     let (origin, label, version, description) =
         fetch_apt_release_metadata(&state.db, repo_id).await?;
@@ -1249,19 +1261,19 @@ async fn generate_release_content(
 
 async fn discover_release_layout(
     db: &PgPool,
-    repo_id: uuid::Uuid,
+    repo_ids: &[uuid::Uuid],
 ) -> Result<(BTreeSet<String>, BTreeSet<String>), Response> {
     let artifacts: Vec<(String, Option<serde_json::Value>)> = sqlx::query_as(
         r#"
         SELECT a.path, am.metadata
         FROM artifacts a
         LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
-        WHERE a.repository_id = $1
+        WHERE a.repository_id = ANY($1)
           AND a.is_deleted = false
           AND a.path LIKE 'pool/%'
         "#,
     )
-    .bind(repo_id)
+    .bind(repo_ids)
     .fetch_all(db)
     .await
     .map_err(crate::api::handlers::db_err)?;
@@ -2762,12 +2774,41 @@ fn proxy_err_status_and_message(e: &crate::error::AppError) -> (StatusCode, Stri
 /// and Release.gpg handlers). Returns the text and the repo for signing.
 async fn local_release_content(
     state: &SharedState,
+    auth: Option<&AuthExtension>,
     repo_key: &str,
     distribution: &str,
 ) -> Result<(String, RepoInfo), Response> {
     let repo = resolve_debian_repo(&state.db, repo_key).await?;
-    let release = generate_release_content(state, repo.id, distribution).await?;
+    let sources = index_source_repos(state, auth, &repo).await?;
+    let release = generate_release_content(state, repo.id, &sources, distribution).await?;
     Ok((release, repo))
+}
+
+/// The repositories a locally generated index is built from. A Virtual holds
+/// no artifacts of its own, so its index is the union of the Local and Staging
+/// members the caller may read, in priority order (#6548). A Virtual with none
+/// answers 404 rather than signing an empty index
+async fn index_source_repos(
+    state: &SharedState,
+    auth: Option<&AuthExtension>,
+    repo: &RepoInfo,
+) -> Result<Vec<uuid::Uuid>, Response> {
+    if repo.repo_type != RepositoryType::Virtual {
+        return Ok(vec![repo.id]);
+    }
+    let members = proxy_helpers::authorized_virtual_members(&state.db, auth, repo.id).await?;
+    if members.is_empty() {
+        return Err(proxy_helpers::no_accessible_members_response());
+    }
+    let hosted: Vec<uuid::Uuid> = members
+        .into_iter()
+        .filter(|m| m.repo_type != RepositoryType::Remote)
+        .map(|m| m.id)
+        .collect();
+    if hosted.is_empty() {
+        return Err((StatusCode::NOT_FOUND, "Not found").into_response());
+    }
+    Ok(hosted)
 }
 
 async fn release_file(
@@ -2795,7 +2836,8 @@ async fn release_file(
         return Err(suggest_flat_layout_on_failure(&state, &repo, &repo_key, resp).await);
     }
 
-    let (release, _) = local_release_content(&state, &repo_key, &distribution).await?;
+    let (release, _) =
+        local_release_content(&state, auth.as_ref(), &repo_key, &distribution).await?;
 
     Ok(Response::builder()
         .status(StatusCode::OK)
@@ -2831,7 +2873,8 @@ async fn in_release_file(
         return Err(suggest_flat_layout_on_failure(&state, &repo, &repo_key, resp).await);
     }
 
-    let (release, repo) = local_release_content(&state, &repo_key, &distribution).await?;
+    let (release, repo) =
+        local_release_content(&state, auth.as_ref(), &repo_key, &distribution).await?;
 
     let signing_svc = SigningService::new(state.db.clone(), &state.config.jwt_secret)
         .with_signature_expiry(state.config.signature_expiry_seconds);
@@ -2897,7 +2940,8 @@ async fn release_gpg(
         .dists("Release.gpg", "application/pgp-signature", &repo)
         .await?;
 
-    let (release, repo) = local_release_content(&state, &repo_key, &distribution).await?;
+    let (release, repo) =
+        local_release_content(&state, auth.as_ref(), &repo_key, &distribution).await?;
 
     let signing_svc = SigningService::new(state.db.clone(), &state.config.jwt_secret)
         .with_signature_expiry(state.config.signature_expiry_seconds);
@@ -3020,7 +3064,8 @@ async fn packages_index(
 
     let arch = strip_binary_arch_prefix(&binary_arch);
 
-    let entries = fetch_package_entries(&state.db, repo.id, &component, arch).await?;
+    let sources = index_source_repos(&state, auth.as_ref(), &repo).await?;
+    let entries = fetch_package_entries(&state.db, &sources, &component, arch).await?;
     let text = build_packages_text(&entries);
 
     Ok(Response::builder()
@@ -3049,7 +3094,8 @@ async fn packages_index_gz(
 
     let arch = strip_binary_arch_prefix(&binary_arch);
 
-    let entries = fetch_package_entries(&state.db, repo.id, &component, arch).await?;
+    let sources = index_source_repos(&state, auth.as_ref(), &repo).await?;
+    let entries = fetch_package_entries(&state.db, &sources, &component, arch).await?;
     let text = build_packages_text(&entries);
 
     let compressed = gzip_compress(text.as_bytes()).map_err(|e| {
@@ -3086,7 +3132,8 @@ async fn packages_index_xz(
 
     let arch = strip_binary_arch_prefix(&binary_arch);
 
-    let entries = fetch_package_entries(&state.db, repo.id, &component, arch).await?;
+    let sources = index_source_repos(&state, auth.as_ref(), &repo).await?;
+    let entries = fetch_package_entries(&state.db, &sources, &component, arch).await?;
 
     let compressed = build_packages_xz(&entries).map_err(|e| {
         (
@@ -8020,6 +8067,155 @@ mod virtual_dists_cap_tests {
         cleanup_members(pool, virtual_id, &[member_id]).await;
     }
 
+    async fn insert_local_debian_member(pool: &sqlx::PgPool, storage_path: &str) -> Uuid {
+        let member_id = Uuid::new_v4();
+        let member_key = format!("dbg-loc-{}", member_id.simple());
+        sqlx::query(
+            "INSERT INTO repositories (id, key, name, storage_path, repo_type, format) \
+             VALUES ($1, $2, $3, $4, 'local'::repository_type, 'debian'::repository_format)",
+        )
+        .bind(member_id)
+        .bind(&member_key)
+        .bind(&member_key)
+        .bind(storage_path)
+        .execute(pool)
+        .await
+        .expect("insert local member");
+        member_id
+    }
+
+    async fn insert_deb(pool: &sqlx::PgPool, repo_id: Uuid, path: &str, sha: char) {
+        let filename = path.rsplit('/').next().unwrap();
+        sqlx::query(
+            "INSERT INTO artifacts (repository_id, path, name, version, size_bytes, \
+             checksum_sha256, content_type, storage_key) \
+             VALUES ($1, $2, $3, '1.0', 10, repeat($4, 64), $5, $2)",
+        )
+        .bind(repo_id)
+        .bind(path)
+        .bind(filename.split('_').next().unwrap())
+        .bind(sha.to_string())
+        .bind(DEBIAN_BINARY_CONTENT_TYPE)
+        .execute(pool)
+        .await
+        .expect("insert deb");
+    }
+
+    async fn anon_get(state: &SharedState, key: &str, path: &str) -> (StatusCode, String) {
+        let (status, body) = tdh::send(
+            tdh::router_anon(super::router(), state.clone()),
+            tdh::get(format!("/{key}/dists/{DIST}/{path}")),
+        )
+        .await;
+        (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    /// #6548: a Virtual whose members are all Local served an empty Packages
+    /// index (and a Release vouching for it), built from the Virtual's own
+    /// artifact rows. It now lists every readable Local member's packages, the
+    /// first member's copy of a shared pool path, and drops a member the caller
+    /// cannot read
+    #[tokio::test]
+    async fn local_only_virtual_serves_its_members_packages_6548() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let tmp = std::env::temp_dir().join(format!("dbg-6548-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let root = tmp.to_str().unwrap();
+        let state = tdh::build_state(pool.clone(), root);
+
+        let a = insert_local_debian_member(&pool, root).await;
+        let b = insert_local_debian_member(&pool, root).await;
+        let hidden = insert_local_debian_member(&pool, root).await;
+        insert_deb(
+            &pool,
+            a,
+            "pool/main/a/alpha6548/alpha6548_1.0_amd64.deb",
+            'a',
+        )
+        .await;
+        insert_deb(
+            &pool,
+            a,
+            "pool/main/s/shared6548/shared6548_1.0_amd64.deb",
+            'a',
+        )
+        .await;
+        insert_deb(&pool, b, "pool/main/b/beta6548/beta6548_1.0_amd64.deb", 'b').await;
+        insert_deb(
+            &pool,
+            b,
+            "pool/main/s/shared6548/shared6548_1.0_amd64.deb",
+            'b',
+        )
+        .await;
+        insert_deb(
+            &pool,
+            hidden,
+            "pool/main/h/hidden6548/hidden6548_1.0_amd64.deb",
+            'c',
+        )
+        .await;
+        let (virtual_id, virtual_key) =
+            insert_virtual_debian(&pool, root, &[(a, 1), (b, 2), (hidden, 3)]).await;
+        sqlx::query("UPDATE repositories SET is_public = false WHERE id = $1")
+            .bind(hidden)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let packages_path = "main/binary-amd64/Packages";
+        let (status, packages) = anon_get(&state, &virtual_key, packages_path).await;
+        let (_, release) = anon_get(&state, &virtual_key, "Release").await;
+
+        let (empty_id, empty_key) = insert_virtual_debian(&pool, root, &[]).await;
+        let (empty_status, empty_body) = anon_get(&state, &empty_key, packages_path).await;
+
+        cleanup_members(&pool, virtual_id, &[a, b, hidden]).await;
+        cleanup_members(&pool, empty_id, &[]).await;
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(packages.contains("Package: alpha6548"), "{packages}");
+        assert!(packages.contains("Package: beta6548"), "{packages}");
+        assert!(
+            !packages.contains("hidden6548"),
+            "unreadable member leaked: {packages}"
+        );
+        assert_eq!(
+            packages.matches("Package: shared6548").count(),
+            1,
+            "{packages}"
+        );
+        assert!(
+            packages.contains(&format!("SHA256: {}", "a".repeat(64))),
+            "{packages}"
+        );
+        assert_eq!(
+            packages.matches(&"b".repeat(64)).count(),
+            1,
+            "only beta is B's: {packages}"
+        );
+        let digest = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(packages.as_bytes()));
+        assert!(
+            release.contains(&format!(
+                "{digest} {} main/binary-amd64/Packages",
+                packages.len()
+            )),
+            "Release must vouch for the served index: {release}"
+        );
+        assert_eq!(
+            empty_status,
+            StatusCode::NOT_FOUND,
+            "no member must not sign an empty index"
+        );
+        assert!(
+            empty_body.contains(proxy_helpers::NO_ACCESSIBLE_MEMBERS_MSG),
+            "{empty_body}"
+        );
+    }
+
     async fn cleanup_members(pool: &sqlx::PgPool, virtual_id: Uuid, members: &[Uuid]) {
         let _ = sqlx::query("DELETE FROM repository_config WHERE repository_id = ANY($1)")
             .bind(members)
@@ -9101,13 +9297,13 @@ mod apt_release_metadata_db_tests {
         let (repo_id, dir) = insert_hosted_debian(&pool).await;
         let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
 
-        let served = generate_release_content(&state, repo_id, "stable")
+        let served = generate_release_content(&state, repo_id, &[repo_id], "stable")
             .await
             .map_err(|_| "generate_release_content failed")
             .expect("render Release");
         // Cross a real second boundary between the served and signed renders.
         tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
-        let signed = generate_release_content(&state, repo_id, "stable")
+        let signed = generate_release_content(&state, repo_id, &[repo_id], "stable")
             .await
             .map_err(|_| "generate_release_content failed")
             .expect("render Release");
@@ -9140,7 +9336,7 @@ mod apt_release_metadata_db_tests {
                 .await
                 .expect("read repo created_at");
 
-        let stamp = release_publish_timestamp(&pool, repo_id)
+        let stamp = release_publish_timestamp(&pool, repo_id, &[repo_id])
             .await
             .map_err(|_| "release_publish_timestamp failed")
             .expect("publish timestamp");
@@ -9172,7 +9368,7 @@ mod apt_release_metadata_db_tests {
             .connect_lazy("postgres://invalid:invalid@127.0.0.1:1/none")
             .expect("lazy pool");
 
-        let result = release_publish_timestamp(&dead, Uuid::new_v4()).await;
+        let result = release_publish_timestamp(&dead, Uuid::new_v4(), &[]).await;
 
         assert!(
             result.is_err(),
@@ -9219,7 +9415,7 @@ mod apt_release_metadata_db_tests {
             "build-time floor must postdate the backdated fixture"
         );
 
-        let stamp = release_publish_timestamp(&pool, repo_id)
+        let stamp = release_publish_timestamp(&pool, repo_id, &[repo_id])
             .await
             .map_err(|_| "release_publish_timestamp failed")
             .expect("publish timestamp");
@@ -9235,12 +9431,12 @@ mod apt_release_metadata_db_tests {
         // compile-time constant, not a clock read, so two renders across a
         // second boundary are still byte-identical and stamp the floor.
         let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
-        let served = generate_release_content(&state, repo_id, "stable")
+        let served = generate_release_content(&state, repo_id, &[repo_id], "stable")
             .await
             .map_err(|_| "generate_release_content failed")
             .expect("render Release");
         tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
-        let signed = generate_release_content(&state, repo_id, "stable")
+        let signed = generate_release_content(&state, repo_id, &[repo_id], "stable")
             .await
             .map_err(|_| "generate_release_content failed")
             .expect("render Release");
@@ -11722,20 +11918,27 @@ mod signing_key_capability_tests {
         MARKER
     }
 
-    /// Insert a Remote Debian repository and return its id.
-    async fn insert_remote_member(f: &tdh::Fixture, upstream_url: &str) -> Uuid {
+    /// Insert a Debian member of the Virtual fixture, Remote with an upstream
+    /// or Local without, and return its id.
+    async fn insert_member(f: &tdh::Fixture, upstream_url: Option<&str>) -> Uuid {
         let id = Uuid::new_v4();
         let key = format!("deb-5198-mem-{}", id.simple());
+        let repo_type = if upstream_url.is_some() {
+            "remote"
+        } else {
+            "local"
+        };
         sqlx::query(
             "INSERT INTO repositories \
              (id, key, name, storage_path, repo_type, format, upstream_url, is_public) \
-             VALUES ($1, $2, $2, $3, 'remote'::repository_type, 'debian'::repository_format, \
+             VALUES ($1, $2, $2, $3, $5::repository_type, 'debian'::repository_format, \
              $4, true)",
         )
         .bind(id)
         .bind(&key)
         .bind(&*f.storage_dir.to_string_lossy())
         .bind(upstream_url)
+        .bind(repo_type)
         .execute(&f.pool)
         .await
         .expect("insert remote member");
@@ -11801,8 +12004,10 @@ mod signing_key_capability_tests {
         f.teardown().await;
     }
 
-    /// A Virtual repo with nothing upstream to serve signs its own `Release`
-    /// with its own key, so it reaches the same path as a hosted repo.
+    /// A Virtual repo with nothing upstream to serve signs the index of its
+    /// Local members with its own key, so it reaches the same path as a hosted
+    /// repo. With no member to build an index from it answers 404 and signs
+    /// nothing (#6548)
     #[tokio::test]
     async fn virtual_repo_signing_locally_with_rsa_key_is_conflict_5198() {
         let Some(f) = tdh::Fixture::setup("virtual", "debian").await else {
@@ -11810,17 +12015,23 @@ mod signing_key_capability_tests {
         };
         let key_id = bind_new_key(&f, f.repo_id, "rsa").await;
 
-        // No members at all, and no proxy service.
-        assert_all_conflict(&f.state, &f.repo_key).await;
+        // No members at all, and no proxy service: no index to sign
+        for path in &OPENPGP_ROUTES[..2] {
+            let (status, body) = anon_get(&f.state, &f.repo_key, path).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{path}: {body}");
+        }
 
-        // A Remote member that does not have the dist: the walk falls through.
+        // A Remote member that does not have the dist: the walk falls through
+        // to the Local member's index.
         let server = MockServer::start().await;
-        let member = insert_remote_member(&f, &server.uri()).await;
+        let remote = insert_member(&f, Some(&server.uri())).await;
+        let local = insert_member(&f, None).await;
         let (state, _cache) = tdh::rewire_remote_proxy(&f, &server.uri()).await;
         assert_all_conflict(&state, &f.repo_key).await;
 
         delete_key(&f, f.repo_id, key_id).await;
-        tdh::cleanup_member_repo(&f.pool, member, &f.storage_dir).await;
+        tdh::cleanup_member_repo(&f.pool, remote, &f.storage_dir).await;
+        tdh::cleanup_member_repo(&f.pool, local, &f.storage_dir).await;
         f.teardown().await;
     }
 
@@ -11835,7 +12046,7 @@ mod signing_key_capability_tests {
         let key_id = bind_new_key(&f, f.repo_id, "rsa").await;
         let server = MockServer::start().await;
         let marker = mount_upstream_release(&server).await;
-        let member = insert_remote_member(&f, &server.uri()).await;
+        let member = insert_member(&f, Some(&server.uri())).await;
         let (state, _cache) = tdh::rewire_remote_proxy(&f, &server.uri()).await;
 
         for path in ["dists/stable/InRelease", "dists/stable/Release.gpg"] {
