@@ -55,6 +55,9 @@ pub struct UploadSession {
     pub package_description: Option<String>,
     pub package_metadata: Option<serde_json::Value>,
     pub is_replication: bool,
+    /// The source's CEP-47 indexing time a trusted peer replication carried
+    /// (#6527), written onto the artifact row at completion.
+    pub indexed_at: Option<chrono::DateTime<chrono::Utc>>,
     pub content_type: String,
     pub total_size: i64,
     pub chunk_size: i32,
@@ -323,6 +326,8 @@ pub struct CreateSessionParams<'a> {
     pub package_description: Option<&'a str>,
     pub package_metadata: Option<&'a serde_json::Value>,
     pub is_replication: bool,
+    /// See [`UploadSession::indexed_at`]; only a trusted replication sets it.
+    pub indexed_at: Option<chrono::DateTime<chrono::Utc>>,
     pub total_size: i64,
     /// Maximum permitted `total_size` (`config.max_upload_size_bytes`); `0`
     /// disables the cap. Bounds the eager per-chunk row loop below.
@@ -389,10 +394,10 @@ impl UploadService {
                  artifact_metadata, artifact_metadata_properties, package_description,
                  package_metadata, is_replication, content_type, total_size, chunk_size,
                  total_chunks, checksum_sha256, temp_file_path, staged_in_storage,
-                 staging_storage_backend, staging_storage_path)
+                 staging_storage_backend, staging_storage_path, indexed_at)
             SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
                    $14, $15, $16, $17, $18, $19, TRUE,
-                   r.storage_backend, r.storage_path
+                   r.storage_backend, r.storage_path, $20
             FROM repositories r
             WHERE r.id = $3
             RETURNING *
@@ -417,6 +422,7 @@ impl UploadService {
         .bind(total_chunks)
         .bind(p.checksum_sha256)
         .bind(&staging)
+        .bind(p.indexed_at)
         .fetch_one(&mut *tx)
         .await?;
 
@@ -2363,6 +2369,7 @@ mod tests {
             package_description: None,
             package_metadata: None,
             is_replication: false,
+            indexed_at: None,
             content_type: "application/octet-stream".into(),
             total_size: 1024,
             chunk_size: DEFAULT_CHUNK_SIZE,
@@ -2402,6 +2409,7 @@ mod tests {
             package_description: None,
             package_metadata: None,
             is_replication: false,
+            indexed_at: None,
             content_type: "application/octet-stream".into(),
             total_size: 100,
             chunk_size: DEFAULT_CHUNK_SIZE,
@@ -2834,6 +2842,7 @@ mod tests {
             package_description: None,
             package_metadata: None,
             is_replication: false,
+            indexed_at: None,
             total_size,
             max_upload_size: 0,
             chunk_size: None,
@@ -3618,6 +3627,7 @@ mod tests {
             package_description: None,
             package_metadata: None,
             is_replication: false,
+            indexed_at: None,
             total_size: payload.len() as i64,
             max_upload_size: 0,
             chunk_size: Some(MIN_CHUNK_SIZE as i32),
@@ -4161,6 +4171,7 @@ mod streamed_assembly_live {
             package_description: None,
             package_metadata: None,
             is_replication: false,
+            indexed_at: None,
             content_type: "application/octet-stream".into(),
             total_size,
             chunk_size: DEFAULT_CHUNK_SIZE,

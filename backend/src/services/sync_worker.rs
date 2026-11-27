@@ -720,6 +720,70 @@ struct PeerHeartbeatRow {
     api_key: String,
 }
 
+/// How long a push of a conda package its scan policy still refuses waits
+/// before it is evaluated again (#6527).
+const PENDING_PUSH_RETRY_SECS: f64 = 300.0;
+
+/// Date a pending hosted conda package for its push (#6527): when it is
+/// listable now (no active hold, no scan-policy refusal, evaluated without a
+/// cache), stamp it as its first listing would and return the time. `None`
+/// when it is still refused, or the stamp failed; the push then waits.
+async fn date_pending_for_push(
+    db: &PgPool,
+    task: &Claimed<TaskRow>,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    let artifact_id = task.artifact_id?;
+    let repository_id = task.repository_id?;
+    let row: Option<(Option<String>, Option<chrono::DateTime<chrono::Utc>>)> =
+        sqlx::query_as("SELECT quarantine_status, quarantine_until FROM artifacts WHERE id = $1")
+            .bind(artifact_id)
+            .fetch_optional(db)
+            .await
+            .ok()
+            .flatten();
+    let (status, until) = row?;
+    let candidate = crate::services::quarantine_service::ListingCandidate {
+        artifact_id,
+        quarantine_status: status.as_deref(),
+        quarantine_until: until,
+    };
+    let refused = crate::services::quarantine_service::listing_refusals_fresh(
+        db,
+        repository_id,
+        &[candidate],
+    )
+    .await
+    .ok()?;
+    if refused.contains(&artifact_id) {
+        return None;
+    }
+    match crate::services::index_time::stamp_first_listed(db, &[artifact_id], true).await {
+        Ok(stamped) => stamped.get(&artifact_id).copied(),
+        Err(e) => {
+            crate::services::index_time::record_stamp_failure("replication", &e);
+            None
+        }
+    }
+}
+
+/// Hand a claimed push back for [`PENDING_PUSH_RETRY_SECS`] without spending
+/// a retry: the package is not listable yet, which is not a transfer failure.
+async fn defer_pending_push(db: &PgPool, task: &Claimed<TaskRow>) {
+    let result = sqlx::query(
+        "UPDATE sync_tasks SET status = 'pending', started_at = NULL, claimed_by = NULL, \
+                claim_token = NULL, claim_expires_at = NOW() + make_interval(secs => $3) \
+          WHERE id = $1 AND claim_token = $2",
+    )
+    .bind(task.id)
+    .bind(task.claim_token())
+    .bind(PENDING_PUSH_RETRY_SECS)
+    .execute(db)
+    .await;
+    if let Err(e) = result {
+        tracing::warn!(task_id = %task.id, error = %e, "could not defer the push of an unlisted conda package");
+    }
+}
+
 /// Lightweight projection of a pending sync task joined with the artifact.
 #[derive(Debug, Clone, sqlx::FromRow)]
 #[allow(dead_code)]
@@ -747,6 +811,13 @@ struct TaskRow {
     repository_storage_path: String,
     content_type: String,
     checksum_sha256: String,
+    /// When the source row entered its index (CEP 47 `indexed_timestamp`,
+    /// #6527): `index_time::REPLICATED_INDEXED_AT_SQL`. `None` while the
+    /// source has not listed it yet, or for a delete.
+    artifact_indexed_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The source row was never listed yet (#6527): a hosted conda package
+    /// still held or refused. Its push waits until it is listable.
+    artifact_index_pending: bool,
     task_type: String,
     replication_filter: Option<serde_json::Value>,
     retry_count: i32,
@@ -911,6 +982,17 @@ async fn claim_pending_sync_tasks(
                   ))
                   OR (st.task_type <> 'delete' AND a.is_deleted = false)
               )
+              -- #6527: a hosted conda package not yet listed and still held
+              -- (quarantine or rejection) is not pushed: the peer would serve
+              -- it with its own receipt time while the source still holds it.
+              -- It is claimed once the hold lapses or is released, and
+              -- execute_transfer dates it on the source first.
+              AND NOT (
+                  st.task_type <> 'delete'
+                  AND COALESCE(a.index_pending, false)
+                  AND COALESCE(a.quarantine_status IN ('quarantined', 'rejected'), false)
+                  AND (a.quarantine_until IS NULL OR a.quarantine_until > NOW())
+              )
               AND (
                   st.task_type = 'delete'
                   OR NOT EXISTS (
@@ -1009,6 +1091,11 @@ async fn claim_pending_sync_tasks(
             COALESCE(r.storage_path, '') AS repository_storage_path,
             COALESCE(a.content_type, '') AS content_type,
             COALESCE(a.checksum_sha256, '') AS checksum_sha256,
+            -- #6527: the source's indexing time, kept by the receiving peer
+            -- (index_time::REPLICATED_INDEXED_AT_SQL).
+            CASE WHEN a.index_pending THEN NULL
+                 ELSE COALESCE(a.indexed_at, a.created_at) END AS artifact_indexed_at,
+            COALESCE(a.index_pending, false) AS artifact_index_pending,
             c.task_type,
             prs.replication_filter,
             c.retry_count,
@@ -1389,6 +1476,34 @@ async fn execute_transfer(
     peer_api_key: &str,
     retry_policy: SyncRetryPolicy,
 ) -> Result<(), String> {
+    // #6527: a hosted conda package the source never listed is dated here,
+    // by the same rule an index build uses, before it is pushed, so the peer
+    // keeps the source's time. One still refused waits.
+    let dated;
+    let task: &Claimed<TaskRow> = if task.task_type != "delete" && task.artifact_index_pending {
+        match date_pending_for_push(db, task).await {
+            Some(at) => {
+                dated = Claimed::from_claim_row(
+                    TaskRow {
+                        artifact_indexed_at: Some(at),
+                        artifact_index_pending: false,
+                        ..(**task).clone()
+                    },
+                    task.claim_token(),
+                    task.claimed_by().to_string(),
+                    task.claim_expires_at(),
+                );
+                &dated
+            }
+            None => {
+                defer_pending_push(db, task).await;
+                return Ok(());
+            }
+        }
+    } else {
+        task
+    };
+
     // 1. Increment active_transfers (the claim already marked the task
     //    in_progress and stamped the claim columns).
     sqlx::query(
@@ -3149,6 +3264,10 @@ fn build_chunked_upload_session_body(task: &TaskRow, chunk_size: i32) -> serde_j
         "checksum_sha256": task.checksum_sha256,
         "chunk_size": chunk_size,
         "content_type": task.content_type,
+        // #6527: optional; a receiver that does not know it ignores it.
+        "indexed_at": task
+            .artifact_indexed_at
+            .map(crate::services::index_time::format_replicated),
     })
 }
 
@@ -3160,7 +3279,7 @@ fn build_chunked_upload_session_body(task: &TaskRow, chunk_size: i32) -> serde_j
 /// re-verifies against the streamed bytes. A missing artifact version is sent as
 /// an empty string, matching the direct-upload contract.
 fn replication_put_headers(task: &TaskRow, peer_api_key: &str) -> Vec<(&'static str, String)> {
-    vec![
+    let mut headers = vec![
         ("Authorization", format!("Bearer {}", peer_api_key)),
         (
             REPLICATION_REQUEST_HEADER,
@@ -3174,7 +3293,15 @@ fn replication_put_headers(task: &TaskRow, peer_api_key: &str) -> Vec<(&'static 
         ),
         ("X-Artifact-Path", task.artifact_path.clone()),
         (CHECKSUM_SHA256_HEADER, task.checksum_sha256.clone()),
-    ]
+    ];
+    // #6527: optional, so a receiver of any version accepts the PUT.
+    if let Some(at) = task.artifact_indexed_at {
+        headers.push((
+            crate::services::index_time::INDEXED_AT_HEADER,
+            crate::services::index_time::format_replicated(at),
+        ));
+    }
+    headers
 }
 
 /// Extract the resumable upload session id from a peer's init response body.
@@ -3624,6 +3751,8 @@ mod tests {
             repository_storage_path: String::new(),
             content_type: "application/octet-stream".to_string(),
             checksum_sha256: "source-sha256".to_string(),
+            artifact_indexed_at: None,
+            artifact_index_pending: false,
             task_type: "push".to_string(),
             replication_filter: None,
             retry_count: 0,

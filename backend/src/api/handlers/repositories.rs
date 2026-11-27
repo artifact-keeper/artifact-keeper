@@ -12766,6 +12766,23 @@ async fn persist_generic_staged_upload(
     // whether or not the upload succeeded.
     staged.discard().await;
     let artifact = artifact.map_err(|e| e.into_response())?;
+    // #6527: a trusted peer's replication PUT carries when the source row
+    // entered its index; keep it so both peers serve the same CEP-47
+    // `indexed_timestamp`. Best-effort: the upload is committed, and without
+    // it the row keeps its own time, as before.
+    if let Some(at) = crate::services::index_time::header_value(headers)
+        .filter(|_| super::trusted_peer_replication(auth, headers))
+    {
+        let adopted = match state.db.acquire().await {
+            Ok(mut conn) => {
+                crate::services::index_time::adopt_replicated(&mut conn, artifact.id, at).await
+            }
+            Err(e) => Err(e),
+        };
+        if let Err(e) = adopted {
+            tracing::warn!(artifact_id = %artifact.id, error = %e, "replicated indexing time not kept");
+        }
+    }
     audit_generic_mcp_publish(&state.db, repo, auth.user_id, artifact.id, &artifact.path);
     let context = super::upload::format_finalize::FinalizeContext {
         repository_id: repo.id,

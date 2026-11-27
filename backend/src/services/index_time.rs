@@ -28,9 +28,15 @@
 
 use std::collections::HashMap;
 
-use chrono::{DateTime, Utc};
+use axum::http::HeaderMap;
+use chrono::{DateTime, SecondsFormat, Utc};
 use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
+
+/// Header a peer replication PUT carries the source row's [`served`] time in
+/// (RFC 3339). Optional: a peer that does not send it, or does not read it,
+/// falls back to the receiving row's own time (#6527).
+pub const INDEXED_AT_HEADER: &str = "X-Artifact-Indexed-At";
 
 /// The time a listed row is served with: its stamp, or for a row from before
 /// migration 426, its creation time (CEP 47 lets a server seed artifacts that
@@ -38,6 +44,12 @@ use uuid::Uuid;
 pub fn served(indexed_at: Option<DateTime<Utc>>, created_at: DateTime<Utc>) -> DateTime<Utc> {
     indexed_at.unwrap_or(created_at)
 }
+
+/// The SQL expression for the time a replication sends for the row aliased
+/// `a`: its [`served`] time, or NULL while it was never listed on the source
+/// (the receiving peer then stamps its own).
+pub const REPLICATED_INDEXED_AT_SQL: &str =
+    "CASE WHEN a.index_pending THEN NULL ELSE COALESCE(a.indexed_at, a.created_at) END";
 
 /// `SET` assignments for a trash restore, which shows a row again with the
 /// same bytes it had: a row that was already listed keeps its `indexed_at`
@@ -51,6 +63,22 @@ pub const RELIST_SET_SQL: &str = "index_pending = indexed_at IS NULL AND EXISTS 
             AND ir.format::text IN ('conda', 'conda_native') \
             AND ir.repo_type::text IN ('local', 'staging')) \
          AND (artifacts.path LIKE '%.conda' OR artifacts.path LIKE '%.tar.bz2')";
+
+/// Format `at` for [`INDEXED_AT_HEADER`] and the replication session body:
+/// microseconds, the precision Postgres stores, so both peers hold the same
+/// value.
+pub fn format_replicated(at: DateTime<Utc>) -> String {
+    at.to_rfc3339_opts(SecondsFormat::Micros, true)
+}
+
+/// Read [`INDEXED_AT_HEADER`]. An absent or unparseable value is `None`.
+pub fn header_value(headers: &HeaderMap) -> Option<DateTime<Utc>> {
+    headers
+        .get(INDEXED_AT_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| DateTime::parse_from_rfc3339(v.trim()).ok())
+        .map(|v| v.with_timezone(&Utc))
+}
 
 /// How long a first-listing stamp waits for a row another build is stamping.
 /// A build that cannot get it in time serves without the row this once.
@@ -166,6 +194,28 @@ pub async fn settle_written_row(
     Ok(())
 }
 
+/// Write the indexing time a trusted peer replication carried onto the row it
+/// committed (#6527), so both peers serve the same `indexed_timestamp`. The
+/// row is no longer pending: the source already listed it. A value in the
+/// future (a peer's clock ahead) is clamped to this server's now.
+pub async fn adopt_replicated(
+    conn: &mut PgConnection,
+    artifact_id: Uuid,
+    at: DateTime<Utc>,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "UPDATE artifacts SET indexed_at = LEAST($2, clock_timestamp()), index_pending = false \
+          WHERE id = $1",
+    )
+    .bind(artifact_id)
+    .bind(at)
+    .execute(&mut *conn)
+    .await?;
+    // `indexed_at` is not a column the conda dirty-mark trigger watches, and
+    // a stored shard or a cached repodata render may already hold the row.
+    mark_conda_rows_dirty(conn, &[artifact_id]).await
+}
+
 /// Delay before [`remark_after_failure`] marks the rows again.
 const REMARK_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
 
@@ -243,5 +293,21 @@ mod tests {
         let listed = Utc.timestamp_millis_opt(1_700_000_600_000).unwrap();
         assert_eq!(served(Some(listed), created), listed);
         assert_eq!(served(None, created), created);
+    }
+
+    #[test]
+    fn header_round_trips_at_microsecond_precision() {
+        let at = Utc.timestamp_micros(1_700_000_000_123_456).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(INDEXED_AT_HEADER, format_replicated(at).parse().unwrap());
+        assert_eq!(header_value(&headers), Some(at));
+    }
+
+    #[test]
+    fn header_absent_or_garbage_is_none() {
+        assert_eq!(header_value(&HeaderMap::new()), None);
+        let mut headers = HeaderMap::new();
+        headers.insert(INDEXED_AT_HEADER, "yesterday".parse().unwrap());
+        assert_eq!(header_value(&headers), None);
     }
 }
