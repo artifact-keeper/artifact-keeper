@@ -1286,14 +1286,14 @@ jobs:
       # Every image is gated with `if: always()` so one blocking image does not
       # hide another's CRITICAL/HIGH findings.
 
-      # REPORT-ONLY CRATES (#6180). Since the binary embeds its dependency
-      # graph, Trivy sees its ~700 Rust crates; before that it saw none. For
-      # one release their findings go to the Security tab through the SARIF
-      # pass above (which does scan the binary) and do not block, while they
-      # are triaged and a .trivyignore policy for crates is agreed. Rust
-      # advisories already block merges through ci.yml's `cargo audit`.
-      # Remove `skip-files` to make crate findings blocking. Only this one
-      # file is skipped: the Go binaries and the RPMs stay gated.
+      # CRATE FINDINGS ARE BLOCKING (#6180). Since the binary embeds its
+      # dependency graph, Trivy sees its ~700 Rust crates; before that it saw
+      # none. One publish ran report-only first: Docker Publish run 45849075661
+      # on sha-63e77105 (2026-11-26) uploaded the backend SARIF with zero
+      # findings against the binary. `.trivyignore` now records the crate
+      # policy (reason, owner or issue, expiry; no current exceptions), so the
+      # backend binary is no longer skipped here. Rust advisories also block
+      # merges through ci.yml's `cargo audit`.
       - name: Trivy gate - Backend
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # 0.36.0
         if: always()
@@ -1303,7 +1303,6 @@ jobs:
           severity: 'CRITICAL,HIGH'
           ignore-unfixed: true
           trivyignores: '.trivyignore'
-          skip-files: '/usr/local/bin/artifact-keeper'
           exit-code: '1'
           skip-setup-trivy: true
           cache: 'false'
