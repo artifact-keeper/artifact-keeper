@@ -36,6 +36,10 @@
 //!   CopyObject (default: 1800). Control-plane calls (head/list/delete/exists)
 //!   keep a short [`S3_CONTROL_TIMEOUT`] so a wedged endpoint still fails fast.
 //!   Set to 0 to disable the bulk timeout entirely.
+//! - S3_READ_TIMEOUT_SECS: How long an object read (get, range, stream) may
+//!   receive nothing before it is retried on a new connection (default: 10).
+//!   Restarts on every byte, so it never caps a long download. Set to 0 to
+//!   disable it (#5230).
 //! - S3_MAX_SINGLE_COPY_BYTES: Largest object copied with one server-side
 //!   CopyObject (default: 5 GiB, AWS's cap). Larger sources are copied via
 //!   multipart UploadPartCopy in slices of this size. Clamped into
@@ -111,6 +115,13 @@ const S3_CONTROL_TIMEOUT: Duration = Duration::from_secs(30);
 /// impossible. 30 minutes matches the ceiling the GCS backend already uses for
 /// its streaming client (`gcs.rs`), keeping a cliff without capping transfers.
 const S3_DEFAULT_BULK_TIMEOUT_SECS: u64 = 1800;
+/// Default read-inactivity timeout, in seconds, of the client that reads
+/// objects (#5230). It restarts on every byte received, so it never caps a
+/// long download: it ends a request that has received nothing for this long,
+/// a pooled connection the far side dropped without a reset, which used to
+/// wait out the operating system's own timeout (30 to 50 s) on a cache hit.
+/// `object_store` retries the timed-out read on a fresh connection
+const S3_DEFAULT_READ_TIMEOUT_SECS: u64 = 10;
 /// S3 caps a multipart upload at 10,000 parts. Default and upper clamp of the
 /// configurable part budget ([`S3Config::max_parts`]); some S3-compatible
 /// providers cap an upload lower.
@@ -856,6 +867,11 @@ pub struct S3Config {
     /// `0` disables the bulk timeout. Default:
     /// [`S3_DEFAULT_BULK_TIMEOUT_SECS`] (#3180).
     pub bulk_timeout_secs: u64,
+    /// Read-inactivity timeout, in seconds, of object reads: get, get_range
+    /// and get_stream. Writes and server-side copies keep the bulk client,
+    /// where a store may send nothing until a long copy is done. `0` disables
+    /// it. Default: [`S3_DEFAULT_READ_TIMEOUT_SECS`] (#5230).
+    pub read_timeout_secs: u64,
     /// Overall HTTP request timeout, in seconds, for control-plane calls:
     /// head/exists/list/delete/multipart-create. Small fixed-cost round trips,
     /// so this stays short to fail fast on a wedged endpoint. `0` disables it.
@@ -964,6 +980,10 @@ impl S3Config {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(S3_DEFAULT_BULK_TIMEOUT_SECS);
+        let read_timeout_secs: u64 = std::env::var("S3_READ_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(S3_DEFAULT_READ_TIMEOUT_SECS);
         let control_timeout_secs: u64 = std::env::var("S3_CONTROL_TIMEOUT_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -996,6 +1016,7 @@ impl S3Config {
             pool_max_idle_per_host,
             pool_idle_timeout_secs,
             bulk_timeout_secs,
+            read_timeout_secs,
             control_timeout_secs,
             max_single_copy_bytes,
             max_parts,
@@ -1067,6 +1088,7 @@ impl S3Config {
             pool_max_idle_per_host: 256,
             pool_idle_timeout_secs: 90,
             bulk_timeout_secs: S3_DEFAULT_BULK_TIMEOUT_SECS,
+            read_timeout_secs: S3_DEFAULT_READ_TIMEOUT_SECS,
             control_timeout_secs: S3_CONTROL_TIMEOUT.as_secs(),
             max_single_copy_bytes: S3_MAX_SINGLE_COPY_SIZE,
             max_parts: S3_MULTIPART_MAX_PARTS,
@@ -1139,6 +1161,12 @@ impl S3Config {
     /// Override the bulk-transfer request timeout (seconds). `0` disables it.
     pub fn with_bulk_timeout_secs(mut self, timeout_secs: u64) -> Self {
         self.bulk_timeout_secs = timeout_secs;
+        self
+    }
+
+    /// Override the object-read inactivity timeout (seconds). `0` disables it.
+    pub fn with_read_timeout_secs(mut self, timeout_secs: u64) -> Self {
+        self.read_timeout_secs = timeout_secs;
         self
     }
 
@@ -1643,9 +1671,12 @@ pub struct S3Backend {
     store: AmazonS3,
     /// Bulk-transfer client (#3180). Same credentials and endpoint as
     /// [`Self::store`], but with a request timeout sized for multi-GB object
-    /// payloads instead of the control-plane cliff. Used only by `get`/`put`,
-    /// `get_stream`/`put_stream`, and `copy`.
+    /// payloads instead of the control-plane cliff. Used by `put`,
+    /// `put_stream` and `copy`.
     bulk_store: AmazonS3,
+    /// [`Self::bulk_store`] with a read-inactivity timeout, for `get`,
+    /// `get_range` and `get_stream` (#5230).
+    read_store: AmazonS3,
     /// Bucket name, kept for the `x-amz-copy-source` header of hand-rolled
     /// `UploadPartCopy` requests (#3164).
     bucket: String,
@@ -1725,7 +1756,14 @@ impl S3Backend {
     ) -> Result<AmazonS3> {
         let timeout = (config.control_timeout_secs > 0)
             .then(|| Duration::from_secs(config.control_timeout_secs));
-        Self::build_store_with_timeout(config, access_key, secret_key, timeout, S3Plane::Control)
+        Self::build_store_with_timeout(
+            config,
+            access_key,
+            secret_key,
+            timeout,
+            None,
+            S3Plane::Control,
+        )
     }
 
     /// Build the bulk-transfer store used for object payload movement:
@@ -1742,7 +1780,29 @@ impl S3Backend {
     ) -> Result<AmazonS3> {
         let timeout =
             (config.bulk_timeout_secs > 0).then(|| Duration::from_secs(config.bulk_timeout_secs));
-        Self::build_store_with_timeout(config, access_key, secret_key, timeout, S3Plane::Bulk)
+        Self::build_store_with_timeout(config, access_key, secret_key, timeout, None, S3Plane::Bulk)
+    }
+
+    /// [`Self::build_bulk_store`] for object reads only, with the
+    /// read-inactivity timeout of [`S3Config::read_timeout_secs`] (#5230).
+    /// Its own connection pool, so a write or copy never waits on it
+    fn build_read_store(
+        config: &S3Config,
+        access_key: Option<&str>,
+        secret_key: Option<&str>,
+    ) -> Result<AmazonS3> {
+        let timeout =
+            (config.bulk_timeout_secs > 0).then(|| Duration::from_secs(config.bulk_timeout_secs));
+        let read_timeout =
+            (config.read_timeout_secs > 0).then(|| Duration::from_secs(config.read_timeout_secs));
+        Self::build_store_with_timeout(
+            config,
+            access_key,
+            secret_key,
+            timeout,
+            read_timeout,
+            S3Plane::Bulk,
+        )
     }
 
     /// Clamp the configured single-copy ceiling into what the S3 API can
@@ -1796,6 +1856,7 @@ impl S3Backend {
         access_key: Option<&str>,
         secret_key: Option<&str>,
         timeout: Option<Duration>,
+        read_timeout: Option<Duration>,
         plane: S3Plane,
     ) -> Result<AmazonS3> {
         let mut client_opts = object_store::ClientOptions::new()
@@ -1816,6 +1877,9 @@ impl S3Backend {
             Some(t) => client_opts.with_timeout(t),
             None => client_opts.with_timeout_disabled(),
         };
+        if let Some(t) = read_timeout {
+            client_opts = client_opts.with_read_timeout(t);
+        }
 
         if config
             .endpoint
@@ -2127,6 +2191,7 @@ impl S3Backend {
 
         let store = Self::build_store(&config, None, None)?;
         let bulk_store = Self::build_bulk_store(&config, None, None)?;
+        let read_store = Self::build_read_store(&config, None, None)?;
 
         let signing_store = Self::build_signing_store(&config)?;
 
@@ -2177,6 +2242,7 @@ impl S3Backend {
         Ok(Self {
             store,
             bulk_store,
+            read_store,
             bucket: config.bucket.clone(),
             region: config.region.clone(),
             bulk_timeout: (config.bulk_timeout_secs > 0)
@@ -2275,7 +2341,7 @@ impl S3Backend {
         );
 
         let path: ObjectPath = fallback_full_key.into();
-        match self.bulk_store.get(&path).await {
+        match self.read_store.get(&path).await {
             Ok(result) => {
                 // STREAMING-EXEMPT: storage-internal object_store GetResult::bytes() full-body read — same exempt category as the S3/Azure/GCS get() fallbacks that back the streaming get impl; not one of the 3 clippy-gated shapes but tracked under #1608
                 let bytes = result.bytes().await.map_err(|e| {
@@ -2325,7 +2391,7 @@ impl S3Backend {
         );
 
         let path: ObjectPath = fallback_full_key.into();
-        match self.bulk_store.get_range(&path, range).await {
+        match self.read_store.get_range(&path, range).await {
             Ok(bytes) => {
                 tracing::info!(
                     key = %key,
@@ -2440,7 +2506,7 @@ impl super::StorageBackend for S3Backend {
         let full_key = self.full_key(key);
         let path: ObjectPath = full_key.into();
 
-        match self.bulk_store.get(&path).await {
+        match self.read_store.get(&path).await {
             Ok(result) => {
                 // STREAMING-EXEMPT: storage-internal object_store GetResult::bytes() full-body read — same exempt category as the S3/Azure/GCS get() fallbacks that back the streaming get impl; not one of the 3 clippy-gated shapes but tracked under #1608
                 let bytes = result.bytes().await.map_err(|e| {
@@ -2676,7 +2742,7 @@ impl super::StorageBackend for S3Backend {
         let path: ObjectPath = full_key.into();
         let key_owned = key.to_string();
 
-        let result = match self.bulk_store.get(&path).await {
+        let result = match self.read_store.get(&path).await {
             Ok(result) => result,
             Err(object_store::Error::NotFound { .. }) => {
                 // #2927: mirror `get()` / `get_range()` (and the GCS/Azure
@@ -2731,7 +2797,7 @@ impl super::StorageBackend for S3Backend {
         let full_key = self.full_key(key);
         let path: ObjectPath = full_key.into();
 
-        match self.bulk_store.get_range(&path, range.clone()).await {
+        match self.read_store.get_range(&path, range.clone()).await {
             Ok(bytes) => {
                 tracing::debug!(
                     key = %key,
@@ -6208,9 +6274,13 @@ mod tests {
         let bulk_store =
             S3Backend::build_bulk_store(&config, Some("AKIAIOSFODNN7EXAMPLE"), Some("secret"))
                 .expect("build mock bulk store");
+        let read_store =
+            S3Backend::build_read_store(&config, Some("AKIAIOSFODNN7EXAMPLE"), Some("secret"))
+                .expect("build mock read store");
         S3Backend {
             store,
             bulk_store,
+            read_store,
             bucket: config.bucket.clone(),
             region: config.region.clone(),
             bulk_timeout: Some(Duration::from_secs(S3_DEFAULT_BULK_TIMEOUT_SECS)),
@@ -6241,6 +6311,7 @@ mod tests {
         S3Backend {
             store: S3Backend::build_store(config, creds.0, creds.1).expect("store"),
             bulk_store: S3Backend::build_bulk_store(config, creds.0, creds.1).expect("bulk store"),
+            read_store: S3Backend::build_read_store(config, creds.0, creds.1).expect("read store"),
             bucket: config.bucket.clone(),
             region: config.region.clone(),
             bulk_timeout: Some(Duration::from_secs(S3_DEFAULT_BULK_TIMEOUT_SECS)),
@@ -6259,6 +6330,67 @@ mod tests {
             copy_length_fallback_latched: AtomicBool::new(false),
             disable_multi_delete: false,
         }
+    }
+
+    /// #5230: a cache hit whose pooled connection the far side dropped without
+    /// a reset waited out the operating system's timeout, 30 to 50 s. The
+    /// stand-in store accepts the first connection and never answers it, and
+    /// serves the object on the next one. The read store gives up on the
+    /// silent connection after its read timeout and the retry gets the bytes
+    #[tokio::test]
+    async fn test_get_retries_a_silent_connection_after_the_read_timeout_5230() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fake s3");
+        let addr = listener.local_addr().expect("fake s3 addr");
+        let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = accepted.clone();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for stream in listener.incoming().take(2) {
+                let Ok(mut stream) = stream else { return };
+                if seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    held.push(stream);
+                    continue;
+                }
+                use std::io::{Read, Write};
+                let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nETag: \"e5230\"\r\n\
+                      Last-Modified: Tue, 01 Jan 2030 00:00:00 GMT\r\n\
+                      Content-Type: application/octet-stream\r\n\r\nhello",
+                );
+                let _ = stream.flush();
+            }
+            std::thread::sleep(Duration::from_secs(30));
+            drop(held);
+        });
+
+        // The read timeout is short, the retry budget is not, as in production
+        // (`STORAGE_BULK_RETRY_TIMEOUT_SECS` defaults to 180 s)
+        let config = outage_config(&format!("http://{addr}"))
+            .with_storage_timeouts(crate::storage::StorageTimeouts {
+                connect: Duration::from_secs(1),
+                operation: Duration::from_secs(1),
+                bulk_retry: Duration::from_secs(10),
+            })
+            .with_read_timeout_secs(1);
+        let backend = outage_backend(&config);
+        let read = tokio::time::timeout(
+            Duration::from_secs(15),
+            crate::storage::StorageBackend::get(&backend, "cache/k"),
+        )
+        .await;
+
+        let bytes = read
+            .expect("the read must not wait out the silent connection")
+            .expect("the retry on a fresh connection serves the object");
+        assert_eq!(&bytes[..], b"hello");
+        assert_eq!(
+            accepted.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the first connection stayed silent, the second served"
+        );
     }
 
     fn outage_config(endpoint: &str) -> S3Config {
@@ -6954,6 +7086,8 @@ mod tests {
                 store: S3Backend::build_store(&config, Some("AKIA"), Some("secret")).unwrap(),
                 bulk_store: S3Backend::build_bulk_store(&config, Some("AKIA"), Some("secret"))
                     .unwrap(),
+                read_store: S3Backend::build_read_store(&config, Some("AKIA"), Some("secret"))
+                    .unwrap(),
                 bucket: config.bucket.clone(),
                 region: config.region.clone(),
                 bulk_timeout: (config.bulk_timeout_secs > 0)
@@ -7039,6 +7173,7 @@ mod tests {
         let backend = S3Backend {
             store: S3Backend::build_store(&config, Some("AKIA"), Some("secret")).unwrap(),
             bulk_store: S3Backend::build_bulk_store(&config, Some("AKIA"), Some("secret")).unwrap(),
+            read_store: S3Backend::build_read_store(&config, Some("AKIA"), Some("secret")).unwrap(),
             bucket: config.bucket.clone(),
             region: config.region.clone(),
             bulk_timeout: (config.bulk_timeout_secs > 0)
