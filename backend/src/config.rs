@@ -1567,6 +1567,20 @@ pub struct Config {
     pub rate_limit_enabled: bool,
     pub rate_limit_auth_per_window: u32,
     pub rate_limit_api_per_window: u32,
+    /// Per-principal request cap for native package-format routes and the OCI
+    /// registry, keyed by the authenticated user or API token owner. Anonymous
+    /// callers are covered by [`Self::rate_limit_registry_per_ip_per_window`]
+    /// instead. Deliberately generous by default so build fleets and CI caches
+    /// keep working; tune it to bound one token's request rate. Env var:
+    /// `RATE_LIMIT_REGISTRY_PER_MIN`. Default: 100000.
+    pub rate_limit_registry_per_window: u32,
+    /// Per-client-IP request cap for native package-format routes and the OCI
+    /// registry. Applied together with
+    /// [`Self::rate_limit_registry_per_window`] for authenticated callers, so a
+    /// shared token cannot bypass it by rotating source IPs, and on its own for
+    /// anonymous callers. Env var: `RATE_LIMIT_REGISTRY_PER_IP_PER_MIN`.
+    /// Default: 50000.
+    pub rate_limit_registry_per_ip_per_window: u32,
     pub rate_limit_search_per_window: u32,
     /// Per-IP requests-per-window cap on endpoints that mint presigned
     /// download URLs. Stricter than the API bucket because the presign
@@ -2081,6 +2095,8 @@ redacted_debug!(Config {
     show rate_limit_enabled,
     show rate_limit_auth_per_window,
     show rate_limit_api_per_window,
+    show rate_limit_registry_per_window,
+    show rate_limit_registry_per_ip_per_window,
     show rate_limit_search_per_window,
     show rate_limit_login_global_per_window,
     show rate_limit_login_per_window,
@@ -2257,6 +2273,8 @@ impl Default for Config {
             rate_limit_enabled: true,
             rate_limit_auth_per_window: 120,
             rate_limit_api_per_window: 10000,
+            rate_limit_registry_per_window: 100000,
+            rate_limit_registry_per_ip_per_window: 50000,
             rate_limit_search_per_window: 300,
             rate_limit_presign_per_window: 30,
             rate_limit_login_global_per_window: 8192,
@@ -2711,6 +2729,11 @@ impl Config {
             rate_limit_enabled: parse_opt_out_flag(env::var("RATE_LIMIT_ENABLED").ok().as_deref()),
             rate_limit_auth_per_window: env_parse("RATE_LIMIT_AUTH_PER_MIN", 120),
             rate_limit_api_per_window: env_parse("RATE_LIMIT_API_PER_MIN", 10000),
+            rate_limit_registry_per_window: env_parse("RATE_LIMIT_REGISTRY_PER_MIN", 100000),
+            rate_limit_registry_per_ip_per_window: env_parse(
+                "RATE_LIMIT_REGISTRY_PER_IP_PER_MIN",
+                50000,
+            ),
             rate_limit_search_per_window: env_parse("RATE_LIMIT_SEARCH_PER_MIN", 300),
             rate_limit_presign_per_window: env_parse("RATE_LIMIT_PRESIGN_PER_MIN", 30),
             rate_limit_login_global_per_window: env_parse(
@@ -3578,6 +3601,26 @@ mod tests {
             config.rate_limit_login_window_secs, 600,
             "RATE_LIMIT_LOGIN_WINDOW_SECS must override the login window length"
         );
+    }
+
+    #[test]
+    fn test_config_registry_rate_limit_env_override() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_principal = env::var("RATE_LIMIT_REGISTRY_PER_MIN").ok();
+        let saved_ip = env::var("RATE_LIMIT_REGISTRY_PER_IP_PER_MIN").ok();
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
+        env::set_var("RATE_LIMIT_REGISTRY_PER_MIN", "17");
+        env::set_var("RATE_LIMIT_REGISTRY_PER_IP_PER_MIN", "5");
+        let config = Config::from_env().expect("config should load");
+        restore_env("DATABASE_URL", saved_db);
+        restore_env("JWT_SECRET", saved_jwt);
+        restore_env("RATE_LIMIT_REGISTRY_PER_MIN", saved_principal);
+        restore_env("RATE_LIMIT_REGISTRY_PER_IP_PER_MIN", saved_ip);
+        assert_eq!(config.rate_limit_registry_per_window, 17);
+        assert_eq!(config.rate_limit_registry_per_ip_per_window, 5);
     }
 
     #[test]

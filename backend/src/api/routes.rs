@@ -24,8 +24,9 @@ use super::middleware::demo::demo_guard;
 use super::middleware::guest_access::{guest_access_guard, GuestAccessState};
 use super::middleware::nul_path::nul_path_guard;
 use super::middleware::rate_limit::{
-    login_rate_limit_middleware, rate_limit_by_ip_middleware, rate_limit_middleware, CidrRange,
-    LoginRateLimitAudit, LoginRateLimitState, RateLimitExemptions, RateLimitState, RateLimiter,
+    login_rate_limit_middleware, rate_limit_by_ip_middleware, rate_limit_middleware,
+    registry_rate_limit_middleware, CidrRange, LoginRateLimitAudit, LoginRateLimitState,
+    RateLimitExemptions, RateLimitState, RateLimiter, RegistryRateLimitState,
 };
 use super::middleware::setup::setup_guard;
 use super::middleware::tracing::correlation_id_with_proxies_middleware;
@@ -34,6 +35,19 @@ use super::middleware::upload_guard::{
 };
 use super::SharedState;
 use crate::services::auth_service::AuthService;
+
+/// Periodically drop expired keys from a limiter's in-memory map.
+fn spawn_rate_limiter_cleanup(limiters: Vec<Arc<RateLimiter>>) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            for limiter in &limiters {
+                limiter.cleanup_expired().await;
+            }
+        }
+    });
+}
 
 /// Create the main API router
 pub fn create_router(state: SharedState) -> Router {
@@ -75,6 +89,78 @@ pub fn create_router(state: SharedState) -> Router {
     // One in-flight upload budget per principal, shared by every upload
     // surface below (GHSA-9f9r-c4w8-rjv9).
     let upload_admission = UploadAdmission::new(state.config.upload_max_in_flight_per_principal);
+
+    // Rate-limit policy pieces are built before the format router so its
+    // limiter can share the exemption set and trusted-proxy policy with the
+    // management API and `/v2/token` (#6401). The OCI content limiter reuses
+    // the same policy from the router assembly below.
+    let rate_limit_exemptions = Arc::new(RateLimitExemptions::with_cidrs(
+        state.config.rate_limit_exempt_usernames.clone(),
+        state.config.rate_limit_exempt_service_accounts,
+        state.config.rate_limit_trusted_cidrs.clone(),
+    ));
+    let rate_limit_trusted_proxies = Arc::new(state.config.rate_limit_trusted_proxy_cidrs.clone());
+    let client_ip_config = Arc::new(client_ip::ClientIpConfig {
+        trusted_proxies: state.config.rate_limit_trusted_proxy_cidrs.clone(),
+        xff_trusted_for_authz: state.config.xff_trusted_for_authz,
+    });
+    let mut login_rate_limit_state = build_login_rate_limit_state(
+        &state.config,
+        &rate_limit_exemptions,
+        &rate_limit_trusted_proxies,
+    );
+    // #4677: a refused login leaves a `LOGIN_RATE_LIMITED` audit row (once
+    // per source IP per window) instead of no trace at all.
+    login_rate_limit_state.audit = Some(Arc::new(LoginRateLimitAudit::new(state.db.clone())));
+
+    // The `/v2/token` state has the larger per-(username, IP) bucket package
+    // clients need, and shares the login limiter's global backstop. LDAP
+    // Basic-auth passthrough (#3830) draws from THIS state: a directory bind
+    // must spend the same budget as the OCI credential exchange, and the
+    // format routes had no login budget before the passthrough.
+    let token_exchange_rate_limit_state =
+        build_token_exchange_rate_limit_state(&login_rate_limit_state, &state.config);
+    crate::services::ldap_basic_auth::install_rate_limit(token_exchange_rate_limit_state.clone());
+    // HTTP Basic `username:password` on the format routes and the management
+    // API (#5485): failed verifications are budgeted per (username, IP), and
+    // the timing pad draws on the login endpoint's per-IP failure budget.
+    crate::api::middleware::rate_limit::install_basic_password_budget(
+        build_basic_password_rate_limit_state(&login_rate_limit_state, &state.config),
+    );
+
+    // Dedicated request-rate buckets for native package routes and OCI (#6401).
+    // They are separate from the `/api/v1` bucket so a package-client burst
+    // cannot spend the management API budget, and from each other's limiter
+    // names so refusals remain attributable in the rejection metric.
+    let registry_principal_limiter = Arc::new(
+        RateLimiter::new(
+            state.config.rate_limit_registry_per_window,
+            state.config.rate_limit_window_secs,
+        )
+        .named("registry_principal"),
+    );
+    let registry_ip_limiter = Arc::new(
+        RateLimiter::new(
+            state.config.rate_limit_registry_per_ip_per_window,
+            state.config.rate_limit_window_secs,
+        )
+        .named("registry_ip"),
+    );
+    let registry_rate_limit_state = RegistryRateLimitState {
+        principal: Arc::clone(&registry_principal_limiter),
+        ip: Arc::clone(&registry_ip_limiter),
+        exemptions: Arc::clone(&rate_limit_exemptions),
+        enabled: state.config.rate_limit_enabled,
+        trusted_proxies: Arc::clone(&rate_limit_trusted_proxies),
+    };
+    let oci_registry_rate_limit_state = handlers::oci_v2::OciRegistryRateLimitState {
+        registry: registry_rate_limit_state.clone(),
+        shared: state.clone(),
+    };
+    spawn_rate_limiter_cleanup(vec![
+        Arc::clone(&registry_principal_limiter),
+        Arc::clone(&registry_ip_limiter),
+    ]);
 
     let format_routes = Router::new()
         .nest("/general", handlers::general::router())
@@ -160,6 +246,13 @@ pub fn create_router(state: SharedState) -> Router {
             upload_admission.clone(),
             per_principal_upload_admission,
         ))
+        // Registry request-rate limiter (#6401). Applied INSIDE the visibility
+        // layer (which is last/outermost) so the auth extension it populates is
+        // already present and authenticated callers key by principal.
+        .layer(middleware::from_fn_with_state(
+            registry_rate_limit_state.clone(),
+            registry_rate_limit_middleware,
+        ))
         .layer(middleware::from_fn_with_state(
             vis_state,
             repo_visibility_middleware,
@@ -202,45 +295,6 @@ pub fn create_router(state: SharedState) -> Router {
         router = router.merge(SwaggerUi::new("/swagger-ui").url("/api/v1/openapi.json", openapi));
     }
 
-    // Rate-limit policy pieces hoisted above the route assembly so the login
-    // limiter state can be shared with the OCI `/v2/token` credential
-    // exchange (#4020), which is mounted outside `api_v1_routes`: both
-    // surfaces verify user passwords, so they draw from the SAME limiter
-    // instances — a guess against one endpoint spends the other's budget too.
-    let rate_limit_exemptions = Arc::new(RateLimitExemptions::with_cidrs(
-        state.config.rate_limit_exempt_usernames.clone(),
-        state.config.rate_limit_exempt_service_accounts,
-        state.config.rate_limit_trusted_cidrs.clone(),
-    ));
-    let rate_limit_trusted_proxies = Arc::new(state.config.rate_limit_trusted_proxy_cidrs.clone());
-    let client_ip_config = Arc::new(client_ip::ClientIpConfig {
-        trusted_proxies: state.config.rate_limit_trusted_proxy_cidrs.clone(),
-        xff_trusted_for_authz: state.config.xff_trusted_for_authz,
-    });
-    let mut login_rate_limit_state = build_login_rate_limit_state(
-        &state.config,
-        &rate_limit_exemptions,
-        &rate_limit_trusted_proxies,
-    );
-    // #4677: a refused login leaves a `LOGIN_RATE_LIMITED` audit row (once
-    // per source IP per window) instead of no trace at all.
-    login_rate_limit_state.audit = Some(Arc::new(LoginRateLimitAudit::new(state.db.clone())));
-
-    // The `/v2/token` state has the larger per-(username, IP) bucket package
-    // clients need, and shares the login limiter's global backstop. LDAP
-    // Basic-auth passthrough (#3830) draws from THIS state: a directory bind
-    // must spend the same budget as the OCI credential exchange, and the
-    // format routes had no login budget before the passthrough.
-    let token_exchange_rate_limit_state =
-        build_token_exchange_rate_limit_state(&login_rate_limit_state, &state.config);
-    crate::services::ldap_basic_auth::install_rate_limit(token_exchange_rate_limit_state.clone());
-    // HTTP Basic `username:password` on the format routes and the management
-    // API (#5485): failed verifications are budgeted per (username, IP), and
-    // the timing pad draws on the login endpoint's per-IP failure budget.
-    crate::api::middleware::rate_limit::install_basic_password_budget(
-        build_basic_password_rate_limit_state(&login_rate_limit_state, &state.config),
-    );
-
     let mut router = router
         // API v1 routes
         .nest(
@@ -262,7 +316,13 @@ pub fn create_router(state: SharedState) -> Router {
             )),
         )
         // Docker Registry V2 API (OCI Distribution Spec)
-        .route("/v2/", handlers::oci_v2::version_check_handler())
+        .route(
+            "/v2/",
+            handlers::oci_v2::version_check_handler().layer(middleware::from_fn_with_state(
+                oci_registry_rate_limit_state.clone(),
+                handlers::oci_v2::oci_registry_rate_limit_middleware,
+            )),
+        )
         // `/v2/token` shares the login limiter's global backstop and failed-
         // verify pad budget (#4020) but has its own, larger per-(username, IP)
         // bucket: an OCI client re-exchanges credentials for every scope it
@@ -271,6 +331,13 @@ pub fn create_router(state: SharedState) -> Router {
         .nest(
             "/v2",
             handlers::oci_v2::router(Some(token_exchange_rate_limit_state))
+                // Inner rate-limit layer so the quota pre-check's verified OCI
+                // credential can be reused instead of verifying a Basic
+                // password twice (#6401, #5485).
+                .layer(middleware::from_fn_with_state(
+                    oci_registry_rate_limit_state,
+                    handlers::oci_v2::oci_registry_rate_limit_middleware,
+                ))
                 .layer(middleware::from_fn_with_state(
                     state.clone(),
                     crate::services::quota::http::upload_admission,
@@ -1935,6 +2002,8 @@ mod tests {
         for name in [
             "auth",
             "api",
+            "registry_principal",
+            "registry_ip",
             "search",
             "presign",
             "password_change",
@@ -1950,6 +2019,34 @@ mod tests {
     }
 
     const ROUTES_RS_SRC: &str = include_str!("routes.rs");
+
+    /// The registry limiter must sit inside the visibility/auth layer:
+    /// Tower applies the last `.layer()` first, so a source-order regression
+    /// would key package routes by IP and collapse all users behind one egress
+    /// address (#6401).
+    #[test]
+    fn registry_limiter_runs_after_visibility_auth() {
+        let limiter = ROUTES_RS_SRC
+            .find("registry_rate_limit_middleware")
+            .expect("format routes must apply the registry limiter");
+        let visibility = ROUTES_RS_SRC[limiter..]
+            .find("repo_visibility_middleware")
+            .expect("visibility auth must wrap the registry limiter");
+        assert!(visibility > 0);
+    }
+
+    /// The OCI limiter must sit inside the quota pre-check so the credential
+    /// the pre-check verified can be reused by both limiter and handler (#6401).
+    #[test]
+    fn oci_registry_limiter_runs_inside_quota_precheck() {
+        let limiter = ROUTES_RS_SRC
+            .find("oci_registry_rate_limit_middleware")
+            .expect("the OCI nest must apply the registry limiter");
+        let quota = ROUTES_RS_SRC[limiter..]
+            .find("quota::http::upload_admission")
+            .expect("quota admission must wrap the OCI limiter");
+        assert!(quota > 0);
+    }
 
     fn plugin_test_state(plugins_enabled: bool) -> SharedState {
         let pool = PgPool::connect_lazy("postgres://fake:fake@127.0.0.1:1/fake")

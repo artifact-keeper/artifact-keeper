@@ -15,11 +15,12 @@ use std::time::Duration;
 
 use axum::body::{to_bytes, Body, HttpBody};
 use axum::extract::rejection::{BytesRejection, QueryRejection};
-use axum::extract::{DefaultBodyLimit, Extension, Path, Query, State};
+use axum::extract::{DefaultBodyLimit, Extension, Path, Query, Request, State};
 use axum::http::header::{
     AUTHORIZATION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, LOCATION, RANGE,
 };
 use axum::http::{HeaderMap, Method, StatusCode};
+use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
@@ -43,9 +44,12 @@ use crate::api::handlers::proxy_helpers;
 use crate::api::handlers::queue_push_sync_tasks_for_upload;
 // The bearer challenge is built in the middleware half so this module and
 // `guest_access_guard` emit byte-identical `WWW-Authenticate` values (#3854).
-use crate::api::middleware::auth::{verify_basic_password, BasicPasswordOutcome};
+use crate::api::middleware::auth::{verify_basic_password, AuthExtension, BasicPasswordOutcome};
 use crate::api::middleware::oci_errors::{www_authenticate_header, OCI_TOKEN_SERVICE};
-use crate::api::middleware::rate_limit::LoginRateLimitState;
+use crate::api::middleware::rate_limit::{
+    enforce_registry_rate_limit, full_request_path, rate_limiting_active, LoginRateLimitState,
+    RegistryRateLimitState,
+};
 use crate::api::SharedState;
 use crate::error::AppError;
 use crate::models::repository::{RepositoryFormat, RepositoryType};
@@ -783,9 +787,16 @@ pub(crate) async fn run_with_preverified<F: std::future::Future>(
 /// The verification [`check_write_repository`] made for this request, when
 /// it verified the same `Authorization` value.
 fn preverified_result(headers: &HeaderMap) -> Option<OciAuthResult> {
+    preverified_for_request(headers).map(|preverified| preverified.result)
+}
+
+/// The full preverified credential, so the rate-limit layer can reuse the
+/// quota pre-check's verification instead of verifying a Basic password twice.
+fn preverified_for_request(headers: &HeaderMap) -> Option<PreverifiedOci> {
     PREVERIFIED_OCI
-        .try_with(|p| {
-            (headers.get(AUTHORIZATION) == Some(&p.authorization)).then(|| p.result.clone())
+        .try_with(|preverified| {
+            (headers.get(AUTHORIZATION) == Some(&preverified.authorization))
+                .then(|| preverified.clone())
         })
         .ok()
         .flatten()
@@ -16217,6 +16228,112 @@ async fn catch_all(
 }
 
 // ---------------------------------------------------------------------------
+// Request-rate limiting (#6401)
+// ---------------------------------------------------------------------------
+
+/// State for the OCI request-rate layer. The limiter policy is shared with the
+/// native package routes; `shared` is needed to turn a verified credential
+/// into a principal for the per-user bucket.
+#[derive(Clone)]
+pub(crate) struct OciRegistryRateLimitState {
+    pub(crate) registry: RegistryRateLimitState,
+    pub(crate) shared: SharedState,
+}
+
+/// `/v2/token` already has its own credential-exchange limiter; charging the
+/// content limiter there would spend a fresh token's first request budget.
+fn oci_rate_limit_bypassed(path: &str) -> bool {
+    path == "/v2/token"
+}
+
+/// The version check has bespoke credential handling that does not reuse
+/// [`preverified_result`], so pre-verifying here would verify a Basic password
+/// twice. It is still rate limited, but by client IP only.
+fn oci_preverify_skipped(path: &str) -> bool {
+    path == "/v2" || path == "/v2/"
+}
+
+/// Build the principal used by the registry limiter from a verified OCI
+/// credential. `Claims` has no service-account flag, so the exemption lookup
+/// reads it from the user row only when that exemption is actually enabled.
+async fn registry_auth_from_claims(
+    state: &OciRegistryRateLimitState,
+    claims: crate::services::auth_service::Claims,
+) -> AuthExtension {
+    let mut auth = AuthExtension::from(claims.clone());
+    if state.registry.exemptions.exempt_service_accounts {
+        if let Ok(is_service_account) =
+            sqlx::query_scalar::<_, bool>("SELECT is_service_account FROM users WHERE id = $1")
+                .bind(claims.sub)
+                .fetch_one(&state.shared.db)
+                .await
+        {
+            auth.is_service_account = is_service_account;
+        }
+    }
+    auth
+}
+
+/// `/v2` authenticates in handlers rather than in auth middleware, so this
+/// layer verifies the credential once and scopes the result through
+/// [`PREVERIFIED_OCI`]. Handlers then reuse it; a Basic password is never
+/// bcrypt-verified twice for one request. When the quota pre-check already
+/// verified the credential, its preverified result is reused instead.
+pub(crate) async fn oci_registry_rate_limit_middleware(
+    State(state): State<OciRegistryRateLimitState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let path = full_request_path(&request);
+    if !rate_limiting_active(state.registry.enabled) || oci_rate_limit_bypassed(&path) {
+        return next.run(request).await;
+    }
+
+    let headers = request.headers().clone();
+    let skip_preverify = oci_preverify_skipped(&path);
+    let preverified = if skip_preverify {
+        None
+    } else {
+        preverified_for_request(&headers)
+    };
+
+    let mut auth = None;
+    if let Some((claims, _)) = preverified
+        .as_ref()
+        .and_then(|preverified| preverified.result.as_ref().ok())
+    {
+        auth = Some(registry_auth_from_claims(&state, claims.clone()).await);
+    }
+
+    let mut newly_preverified = None;
+    if auth.is_none()
+        && preverified.is_none()
+        && !skip_preverify
+        && headers.contains_key(AUTHORIZATION)
+        && !is_anonymous_token(&headers)
+    {
+        let authorization = headers
+            .get(AUTHORIZATION)
+            .cloned()
+            .expect("Authorization header was checked above");
+        let result = verify_oci_credential(&state.shared.db, &state.shared.config, &headers).await;
+        if let Ok((claims, _)) = result.as_ref() {
+            auth = Some(registry_auth_from_claims(&state, claims.clone()).await);
+        }
+        newly_preverified = Some(PreverifiedOci {
+            authorization,
+            result,
+        });
+    }
+
+    let limited = enforce_registry_rate_limit(state.registry, auth, request, next);
+    match newly_preverified.or(preverified) {
+        Some(preverified) => PREVERIFIED_OCI.scope(preverified, limited).await,
+        None => limited.await,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Router
 // ---------------------------------------------------------------------------
 
@@ -16346,6 +16463,189 @@ mod tests {
         let parsed: TokenQuery =
             serde_urlencoded::from_str(q).expect("repeated ?scope= must not error");
         assert_eq!(parsed.service.as_deref(), Some("artifact-keeper"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Registry request-rate limiting (#6401)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn oci_rate_limit_bypass_paths_are_narrow() {
+        assert!(oci_rate_limit_bypassed("/v2/token"));
+        assert!(!oci_rate_limit_bypassed("/v2/repo/blobs/sha256:abc"));
+        assert!(!oci_rate_limit_bypassed("/v2/"));
+        assert!(oci_preverify_skipped("/v2/"));
+        assert!(!oci_preverify_skipped("/v2/repo/manifests/latest"));
+    }
+
+    fn rate_limit_test_state(
+        enabled: bool,
+    ) -> (
+        OciRegistryRateLimitState,
+        crate::services::auth_service::Claims,
+    ) {
+        let pool = crate::api::handlers::test_db_helpers::lazy_pool();
+        let shared = crate::api::handlers::test_db_helpers::build_state(pool, "/tmp/ak-oci-rl");
+        let registry = RegistryRateLimitState {
+            principal: Arc::new(
+                crate::api::middleware::rate_limit::RateLimiter::new(1, 60)
+                    .named("registry_principal"),
+            ),
+            ip: Arc::new(
+                crate::api::middleware::rate_limit::RateLimiter::new(1, 60).named("registry_ip"),
+            ),
+            exemptions: Arc::new(
+                crate::api::middleware::rate_limit::RateLimitExemptions::new(Vec::new(), false),
+            ),
+            enabled,
+            trusted_proxies: Arc::new(Vec::new()),
+        };
+        (
+            OciRegistryRateLimitState { registry, shared },
+            claims_with_scan_scope(None),
+        )
+    }
+
+    #[tokio::test]
+    async fn registry_auth_from_verified_claims_uses_the_user_id() {
+        let (state, claims) = rate_limit_test_state(true);
+        let expected = claims.sub;
+        let auth = registry_auth_from_claims(&state, claims).await;
+        assert_eq!(auth.user_id, expected);
+        assert_eq!(auth.username, "_ak_scanner");
+    }
+
+    #[tokio::test]
+    async fn preverified_credential_is_reused_for_the_same_authorization() {
+        let (_, claims) = rate_limit_test_state(true);
+        let authorization = HeaderValue::from_static("Bearer token-value");
+        let result = Ok((claims.clone(), None));
+        let headers = HeaderMap::new();
+        assert!(preverified_for_request(&headers).is_none());
+
+        PREVERIFIED_OCI
+            .scope(
+                PreverifiedOci {
+                    authorization: authorization.clone(),
+                    result,
+                },
+                async {
+                    let mut matching = HeaderMap::new();
+                    matching.insert(AUTHORIZATION, authorization);
+                    let preverified = preverified_for_request(&matching)
+                        .expect("matching Authorization must reuse the verification");
+                    let reused = preverified
+                        .result
+                        .expect("the fixture credential verifies")
+                        .0;
+                    assert_eq!(reused.sub, claims.sub);
+                },
+            )
+            .await;
+    }
+
+    #[tokio::test]
+    async fn oci_limiter_bypasses_token_exchange_and_master_switch() {
+        use tower::ServiceExt;
+        let (enabled_state, _) = rate_limit_test_state(true);
+        let token_app = Router::new().nest(
+            "/v2",
+            Router::new().route("/token", get(|| async { "ok" })).layer(
+                axum::middleware::from_fn_with_state(
+                    enabled_state,
+                    oci_registry_rate_limit_middleware,
+                ),
+            ),
+        );
+        for _ in 0..3 {
+            let response = token_app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/v2/token")
+                        .header("x-forwarded-for", "203.0.113.7")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        let (disabled_state, _) = rate_limit_test_state(false);
+        let disabled_app = Router::new()
+            .route("/v2/repo/blobs/sha256:abc", get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn_with_state(
+                disabled_state,
+                oci_registry_rate_limit_middleware,
+            ));
+        for _ in 0..3 {
+            let response = disabled_app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/v2/repo/blobs/sha256:abc")
+                        .header("x-forwarded-for", "203.0.113.7")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+    }
+
+    #[tokio::test]
+    async fn oci_limiter_uses_full_path_inside_nested_router() {
+        use tower::ServiceExt;
+        let (state, _) = rate_limit_test_state(true);
+        let app = Router::new().nest(
+            "/v2",
+            Router::new()
+                .route("/token", get(|| async { "ok" }))
+                .route("/repo/blobs/sha256:abc", get(|| async { "ok" }))
+                .layer(axum::middleware::from_fn_with_state(
+                    state,
+                    oci_registry_rate_limit_middleware,
+                )),
+        );
+
+        // The nested router sees `/token`, so token-exchange bypass must read
+        // the full path from `OriginalUri` or these requests would spend the
+        // content bucket (#6401).
+        for _ in 0..3 {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/v2/token")
+                        .header("x-forwarded-for", "203.0.113.7")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        let blob = || {
+            Request::builder()
+                .uri("/v2/repo/blobs/sha256:abc")
+                .header("x-forwarded-for", "203.0.113.7")
+                .body(Body::empty())
+                .unwrap()
+        };
+        assert_eq!(
+            app.clone().oneshot(blob()).await.unwrap().status(),
+            StatusCode::OK
+        );
+        let refused = app.clone().oneshot(blob()).await.unwrap();
+        assert_eq!(refused.status(), StatusCode::TOO_MANY_REQUESTS);
+        let body = axum::body::to_bytes(refused.into_body(), 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["errors"][0]["code"], "TOOMANYREQUESTS");
     }
 
     // -----------------------------------------------------------------------

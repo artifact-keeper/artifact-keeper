@@ -5562,6 +5562,8 @@ mod tests {
                 rate_limit_enabled: true,
                 rate_limit_auth_per_window: 120,
                 rate_limit_api_per_window: 5000,
+                rate_limit_registry_per_window: 100000,
+                rate_limit_registry_per_ip_per_window: 50000,
                 rate_limit_search_per_window: 300,
                 rate_limit_presign_per_window: 30,
 

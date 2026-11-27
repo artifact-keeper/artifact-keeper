@@ -55,6 +55,8 @@ listener.
 | `login_global` | the global backstop shared by login and `/v2/token` |
 | `auth` | the public `/api/v1/auth` routes (refresh, logout, ...) and TOTP verification |
 | `api` | authenticated `/api/v1` routes |
+| `registry_principal` | native package-format and `/v2` routes, per authenticated principal (#6401) |
+| `registry_ip` | native package-format and `/v2` routes, per client IP (#6401) |
 | `search` | search routes |
 | `presign` | routes that mint presigned download URLs, per source IP |
 | `password_change` | self-service password change, per user |
