@@ -1160,12 +1160,15 @@ pub async fn approve_promotion(
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
-    // #3939: the approved copy is a new artifact in the target repository,
-    // inserted with raw SQL, so this path emits its `artifact.uploaded` the
-    // same way the direct promote routes do.
-    state
-        .event_bus
-        .emit_artifact_uploaded(new_artifact_id, target_repo.id, Some(auth.user_id));
+    super::promotion::announce_promoted_copy(
+        &state,
+        new_artifact_id,
+        target_repo.id,
+        &artifact.path,
+        artifact.size_bytes,
+        auth.user_id,
+    )
+    .await;
 
     tracing::info!(
         approval_id = %approval_id,

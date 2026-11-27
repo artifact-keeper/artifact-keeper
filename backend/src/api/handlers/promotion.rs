@@ -1157,6 +1157,26 @@ async fn insert_promoted_artifact_row(
     Ok(tx.commit().await?)
 }
 
+/// A promotion copy is a new artifact in the target repository, written with
+/// raw SQL rather than through `finalize_upload`, so each promote path
+/// announces it like an upload: the target's `artifact.uploaded` (#3939) and a
+/// push to the target's subscribed push/mirror peers (#6549). For a Docker/OCI
+/// manifest the sync worker sends the blob closure with it (#4790).
+pub(crate) async fn announce_promoted_copy(
+    state: &SharedState,
+    new_artifact_id: Uuid,
+    target_repo_id: Uuid,
+    path: &str,
+    size_bytes: i64,
+    promoted_by: Uuid,
+) {
+    state
+        .event_bus
+        .emit_artifact_uploaded(new_artifact_id, target_repo_id, Some(promoted_by));
+    super::queue_push_sync_tasks_now(&state.db, target_repo_id, new_artifact_id, path, size_bytes)
+        .await;
+}
+
 /// One row of the promotion audit trail. A struct rather than a parameter list
 /// because the row carries five ids that are all `Uuid` and would otherwise be
 /// positional at the call site.
@@ -1592,12 +1612,15 @@ pub async fn promote_artifact(
     )
     .await;
 
-    // #3939: the copy is a new artifact in the target repository, written
-    // with raw SQL rather than through `finalize_upload`, so the promotion
-    // emits the target repository's `artifact.uploaded` itself.
-    state
-        .event_bus
-        .emit_artifact_uploaded(new_artifact_id, target_repo.id, Some(auth.user_id));
+    announce_promoted_copy(
+        &state,
+        new_artifact_id,
+        target_repo.id,
+        &artifact.path,
+        artifact.size_bytes,
+        auth.user_id,
+    )
+    .await;
 
     tracing::info!(
         source_repo = %repo_key,
@@ -2085,10 +2108,15 @@ pub async fn promote_artifacts_bulk(
         )
         .await;
 
-        // #3939: same per-copy event as the single-promote path.
-        state
-            .event_bus
-            .emit_artifact_uploaded(new_artifact_id, target_repo.id, Some(auth.user_id));
+        announce_promoted_copy(
+            &state,
+            new_artifact_id,
+            target_repo.id,
+            &artifact.path,
+            artifact.size_bytes,
+            auth.user_id,
+        )
+        .await;
 
         promoted += 1;
         let resp = PromotionResponse {
@@ -5324,6 +5352,88 @@ mod tests {
             }
 
             cleanup(&pool, &[src, tgt], user).await;
+        }
+
+        /// #6549: a copy arriving by promotion is pushed to the target's
+        /// subscribed peers right away, on both promote routes, like an upload.
+        #[tokio::test]
+        async fn test_promote_queues_push_to_subscribed_peers_6549() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let sdir = std::env::temp_dir().join(format!("pr6549-s-{}", Uuid::new_v4()));
+            let tdir = std::env::temp_dir().join(format!("pr6549-t-{}", Uuid::new_v4()));
+            let src_key = make_repo_key(&pool, "c6549-s", &sdir).await;
+            let tgt_key = make_repo_key(&pool, "c6549-t", &tdir).await;
+            let src = repo_id_for_key(&pool, &src_key).await;
+            let tgt = repo_id_for_key(&pool, &tgt_key).await;
+            let user = make_admin(&pool, "c6549").await;
+            let peer = tdh::subscribe_push_peer(&pool, tgt, "promote-6549").await;
+            let state = tdh::build_state(pool.clone(), sdir.to_str().unwrap());
+            let storage = storage_for(&state, &pool, src).await;
+
+            let single = make_artifact(&pool, src, &storage, "c6549a").await;
+            let res = promote_artifact(
+                State(state.clone()),
+                Extension(admin_ext(user)),
+                Path((src_key.clone(), single)),
+                Json(PromoteArtifactRequest {
+                    target_repository: Some(tgt_key.clone()),
+                    skip_policy_check: true,
+                    notes: None,
+                }),
+            )
+            .await
+            .expect("single promote");
+            assert!(res.0.promoted, "{:?}", res.0.message);
+
+            let bulk = make_artifact(&pool, src, &storage, "c6549b").await;
+            let res = promote_artifacts_bulk(
+                State(state.clone()),
+                Extension(admin_ext(user)),
+                Path(src_key.clone()),
+                Json(BulkPromoteRequest {
+                    target_repository: Some(tgt_key.clone()),
+                    artifact_ids: vec![bulk],
+                    skip_policy_check: true,
+                    notes: None,
+                }),
+            )
+            .await
+            .expect("bulk promote");
+            assert_eq!(res.0.promoted, 1, "{:?}", res.0.results);
+
+            let mut expected: Vec<String> =
+                sqlx::query_scalar("SELECT path FROM artifacts WHERE id = ANY($1)")
+                    .bind(vec![single, bulk])
+                    .fetch_all(&pool)
+                    .await
+                    .expect("source paths");
+            expected.sort();
+            let queued = tdh::queued_push_paths(&pool, peer, tgt).await;
+            tdh::delete_push_peer(&pool, peer).await;
+            cleanup(&pool, &[src, tgt], user).await;
+            assert_eq!(
+                queued, expected,
+                "both promoted copies must be queued for the peer"
+            );
+        }
+
+        /// #6549: the approval execute path is the third promote route and
+        /// announces its copy through the same helper.
+        #[test]
+        fn every_promote_route_announces_its_copy_6549() {
+            let promotion = include_str!("promotion.rs");
+            for handler in [
+                "pub async fn promote_artifact(",
+                "pub async fn promote_artifacts_bulk(",
+            ] {
+                let body = handler_source_body(promotion, handler);
+                assert!(body.contains("announce_promoted_copy("), "{handler}");
+            }
+            let approval = include_str!("approval.rs");
+            let body = handler_source_body(approval, "pub async fn approve_promotion(");
+            assert!(body.contains("announce_promoted_copy("));
         }
 
         /// #5153 finding 5: `promote:artifacts` does not include deciding for the
