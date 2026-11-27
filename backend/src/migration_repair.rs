@@ -940,6 +940,36 @@ async fn is_fresh_database(conn: &mut sqlx::PgConnection) -> Result<bool> {
     Ok(!any_applied)
 }
 
+/// The `_sqlx_migrations` ledger repairs. They run on every start, with
+/// `SKIP_MIGRATIONS=true` too, so migrations applied out of band still find
+/// a ledger they can move on from (#2686). Each is a no-op on a healthy or
+/// fresh database.
+pub async fn repair_migration_ledger(db: &PgPool) -> Result<()> {
+    repair_legacy_073_checksum(db).await?;
+    repair_release_1_1_9_divergence(db).await?;
+    repair_release_1_5_x_divergence(db).await?;
+    Ok(())
+}
+
+/// Repair the ledger, then apply every pending migration in
+/// [`crate::MIGRATOR`] under the migration lock ([`run_startup_migrations`],
+/// so `MIGRATIONS_IGNORE_MISSING` is decided the same way). Used by server
+/// startup and by `artifact-keeper db-migrate`.
+///
+/// Some migrations (a `CREATE INDEX` on a populated `artifacts` table, a
+/// backfill `UPDATE`) outlast the per-query `statement_timeout` operators
+/// often set as an app-query safeguard (10 s on many AWS RDS tunings).
+/// [`crate::db::with_migration_session`] raises the timeouts on a connection
+/// that is closed afterwards instead of going back to the pool, so they never
+/// reach normal app queries (#6319).
+pub async fn apply_schema_migrations(db: &PgPool) -> Result<()> {
+    repair_migration_ledger(db).await?;
+    crate::db::with_migration_session(db, |conn| {
+        Box::pin(async move { run_startup_migrations(conn, &crate::MIGRATOR).await })
+    })
+    .await
+}
+
 #[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod tests {
@@ -2307,6 +2337,62 @@ mod tests {
                 .await
                 .expect("ledger");
         assert_eq!(pending, 0);
+        drop_scratch_database(&admin_url, pool, &db).await;
+    }
+
+    /// `(count, max version)` of the successful rows in `_sqlx_migrations`.
+    async fn ledger_summary(pool: &PgPool) -> (i64, Option<i64>) {
+        sqlx::query_as("SELECT count(*), max(version) FROM _sqlx_migrations WHERE success")
+            .fetch_one(pool)
+            .await
+            .expect("ledger")
+    }
+
+    /// #6194: `db-migrate` brings a fresh database to the latest migration,
+    /// and the server path run afterwards finds nothing left to apply.
+    #[tokio::test]
+    async fn db_migrate_reaches_latest_and_startup_is_a_no_op_after_it() {
+        let Some((admin_url, db, pool)) = setup_scratch_database("issue6194_db_migrate").await
+        else {
+            return;
+        };
+        let up: Vec<i64> = crate::MIGRATOR
+            .iter()
+            .filter(|m| !m.migration_type.is_down_migration())
+            .map(|m| m.version)
+            .collect();
+        let latest = (up.len() as i64, up.iter().copied().max());
+
+        crate::cli::db_migrate::run(&with_database(&admin_url, &db))
+            .await
+            .expect("db-migrate");
+        assert_eq!(ledger_summary(&pool).await, latest);
+        let applied_at = installed_on(&pool, latest.1.expect("migrations")).await;
+
+        apply_schema_migrations(&pool).await.expect("second run");
+        assert_eq!(ledger_summary(&pool).await, latest);
+        assert_eq!(
+            installed_on(&pool, latest.1.expect("migrations")).await,
+            applied_at,
+            "the second run must not re-apply anything"
+        );
+        assert!(invalid_indexes(&pool).await.is_empty());
+        drop_scratch_database(&admin_url, pool, &db).await;
+    }
+
+    /// The `SKIP_MIGRATIONS=true` path: the ledger repairs run and no-op on a
+    /// fresh database, and nothing is migrated.
+    #[tokio::test]
+    async fn repair_migration_ledger_alone_migrates_nothing() {
+        let Some((admin_url, db, pool)) = setup_scratch_database("issue6194_skip").await else {
+            return;
+        };
+        repair_migration_ledger(&pool).await.expect("repairs");
+        let ledger: bool = sqlx::query_scalar("SELECT to_regclass('_sqlx_migrations') IS NOT NULL")
+            .fetch_one(&pool)
+            .await
+            .expect("ledger");
+        assert!(!ledger, "repairs must not create the ledger");
         drop_scratch_database(&admin_url, pool, &db).await;
     }
 }

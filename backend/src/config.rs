@@ -399,6 +399,18 @@ fn parse_opt_out_flag(value: Option<&str>) -> bool {
     )
 }
 
+/// `DATABASE_TCP_KEEPALIVES` (#4549): on unless set to `false`, `0`, `no` or
+/// `off`. Read by [`Config::from_env`] and by `artifact-keeper db-migrate`,
+/// whose session holds the migration lock for as long as a migration runs.
+pub(crate) fn database_tcp_keepalives_from_env() -> bool {
+    !matches!(
+        env::var("DATABASE_TCP_KEEPALIVES")
+            .map(|v| v.trim().to_ascii_lowercase())
+            .as_deref(),
+        Ok("false" | "0" | "no" | "off")
+    )
+}
+
 /// Parse the `TOTP_POLICY` env pin (#2805).
 ///
 /// `None` (unset, or set to something unrecognized) means "no pin": the stored
@@ -2687,12 +2699,7 @@ impl Config {
             .min(100),
             database_idle_timeout_secs: env_parse("DATABASE_IDLE_TIMEOUT_SECS", 600),
             database_max_lifetime_secs: env_parse("DATABASE_MAX_LIFETIME_SECS", 1800),
-            database_tcp_keepalives: !matches!(
-                env::var("DATABASE_TCP_KEEPALIVES")
-                    .map(|v| v.trim().to_ascii_lowercase())
-                    .as_deref(),
-                Ok("false" | "0" | "no" | "off")
-            ),
+            database_tcp_keepalives: database_tcp_keepalives_from_env(),
             auth_max_concurrency: env_parse("AUTH_MAX_CONCURRENCY", default_auth_max_concurrency()),
             global_max_concurrency: env_parse("GLOBAL_MAX_CONCURRENCY", 512_usize),
             global_request_timeout_secs: env_parse("GLOBAL_REQUEST_TIMEOUT_SECS", 120_u64),
