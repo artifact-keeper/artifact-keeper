@@ -132,6 +132,58 @@ evicts the cached repository record. Without that, a repository narrowed from
 60-second cache TTL expired — a stale-*authorization* window, not merely a
 stale-metadata one.
 
+### Registry-mirror modes on `/v2`
+
+An anonymous `/v2` read of a key naming no repository answers the same `401`
+challenge as a private repository (#3730), so a pull without credentials does
+not tell the two apart. Two opt-in server settings answer keys naming no
+repository from a Remote instead, and with a **public** Remote an anonymous
+caller then can tell them apart again: a missing key gets the Remote's
+`200`/`404`, a private repository the challenge. Both are off by default; turn
+them on only where the mirror's key space is meant to be upstream's.
+
+- `AK_DEFAULT_DOCKER_MIRROR_REPO=<key>` (Docker-mirror mode): a read whose
+  first path segment names no repository is served by that repository, which
+  is what dockerd's `registry-mirrors` needs.
+- `AK_OCI_NS_MIRROR_ROUTING=true` (containerd mirror routing, off by default):
+  a read whose first path segment names no repository and that carries
+  containerd's `?ns=<registry>` is served by the one OCI Remote whose upstream
+  URL is that registry. A registry that no Remote proxies, or several do, is
+  answered as a key naming no repository. With Docker-mirror mode also on,
+  `ns=docker.io` keeps going to `AK_DEFAULT_DOCKER_MIRROR_REPO`.
+
+Neither applies to writes. With `AK_OCI_NS_MIRROR_ROUTING` off, `ns` routes
+nothing, with one exception that only narrows: under Docker-mirror mode a read
+whose `ns` names a registry other than docker.io is answered as a key naming no
+repository instead of being served the Docker Hub mirror's image.
+
+`AK_OCI_NS_MIRROR_ROUTING` is needed when containerd nodes use one Artifact
+Keeper host as the mirror for several registries without a per-registry path.
+containerd then sends a pull of `quay.io/prometheus/node-exporter` as
+`/v2/prometheus/node-exporter/manifests/<tag>?ns=quay.io`, and only `ns` says
+which Remote should serve it:
+
+```toml
+# /etc/containerd/certs.d/quay.io/hosts.toml (one such file per registry)
+server = "https://quay.io"
+
+[host."https://ak.example.com"]
+  capabilities = ["pull", "resolve"]
+```
+
+```yaml
+# k3s / RKE2: /etc/rancher/k3s/registries.yaml
+mirrors:
+  docker.io:
+    endpoint: ["https://ak.example.com"]
+  quay.io:
+    endpoint: ["https://ak.example.com"]
+```
+
+Without the setting, the same nodes need a host per registry that names the
+Remote's key in the path (`[host."https://ak.example.com/v2/quay-remote"]` with
+`override_path = true`).
+
 ## Reading through a virtual repository
 
 A virtual repository has no access of its own to hand out. Its members are

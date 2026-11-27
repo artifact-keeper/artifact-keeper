@@ -379,7 +379,7 @@ fn parse_optional_repo_key(value: Option<&str>) -> Option<String> {
 /// `false`. Used for safety-critical opt-ins like blob GC where the
 /// default MUST be off and only an explicit, recognized affirmative
 /// enables it. Pure so the truth table is unit-testable without env.
-fn parse_opt_in_flag(value: Option<&str>) -> bool {
+pub(crate) fn parse_opt_in_flag(value: Option<&str>) -> bool {
     matches!(
         value.map(|v| v.trim().to_lowercase()).as_deref(),
         Some("true" | "1")
