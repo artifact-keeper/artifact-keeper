@@ -1008,6 +1008,7 @@ pub async fn approve_promotion(
         source_repo.id,
         &target_repo.storage_backend,
         &artifact.storage_key,
+        &artifact.checksum_sha256,
     )
     .await?;
 

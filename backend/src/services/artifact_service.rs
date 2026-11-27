@@ -3643,6 +3643,18 @@ pub async fn guard_foreign_storage_key_excluding(
     allowed_owners: &[Uuid],
     storage_key: &str,
 ) -> Result<()> {
+    guard_foreign_storage_key_unless_same_bytes(db, allowed_owners, storage_key, None).await
+}
+
+/// [`guard_foreign_storage_key_excluding`] that also lets through an owner
+/// whose row at the key records `same_sha256`: rewriting an object with the
+/// bytes it already holds overwrites nothing.
+async fn guard_foreign_storage_key_unless_same_bytes(
+    db: &PgPool,
+    allowed_owners: &[Uuid],
+    storage_key: &str,
+    same_sha256: Option<&str>,
+) -> Result<()> {
     // Runtime-checked query (no compile-time sqlx cache needed): return the
     // owning repository id of any repository outside the allow-list holding a
     // row at this exact key — live or soft-deleted (the physical object
@@ -3650,10 +3662,12 @@ pub async fn guard_foreign_storage_key_excluding(
     let foreign: Option<Uuid> = sqlx::query_scalar(
         "SELECT repository_id FROM artifacts \
          WHERE storage_key = $1 AND repository_id <> ALL($2) \
+           AND ($3::TEXT IS NULL OR checksum_sha256 IS DISTINCT FROM $3) \
          LIMIT 1",
     )
     .bind(storage_key)
     .bind(allowed_owners)
+    .bind(same_sha256)
     .fetch_optional(db)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
@@ -3703,19 +3717,24 @@ pub async fn guard_foreign_storage_key_for_backend(
 /// 409'd every promotion within a shared-namespace (cloud) backend.
 ///
 /// This variant exempts both ends of the promotion and keeps the guard's real
-/// job intact: a *third* repository owning the key still blocks the write.
+/// job intact: a *third* repository owning the key with other bytes still
+/// blocks the write. A third repository holding the same bytes does not: on a
+/// chain `dev -> stage -> prod` the first hop leaves `dev` owning the key, and
+/// the `stage -> prod` copy rewrites it with what it already holds (#6546).
 pub async fn guard_foreign_storage_key_for_promotion(
     db: &PgPool,
     target_repo_id: Uuid,
     source_repo_id: Uuid,
     storage_backend: &str,
     storage_key: &str,
+    checksum_sha256: &str,
 ) -> Result<()> {
     if crate::storage::backend_is_repo_isolated(storage_backend) {
         return Ok(());
     }
     let allowed = promotion_storage_key_owner_exemptions(target_repo_id, source_repo_id);
-    guard_foreign_storage_key_excluding(db, &allowed, storage_key).await
+    guard_foreign_storage_key_unless_same_bytes(db, &allowed, storage_key, Some(checksum_sha256))
+        .await
 }
 
 /// Best-effort recorder for a completed local-artifact download (#2365).
@@ -3963,6 +3982,9 @@ mod tests {
 
     /// Insert a minimal live artifact row at `storage_key` for `repo_id`.
     #[cfg(test)]
+    /// The checksum [`seed_artifact`] records.
+    static ZERO_SHA: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| "0".repeat(64));
+
     async fn seed_artifact(pool: &PgPool, repo_id: Uuid, path: &str, storage_key: &str) {
         sqlx::query(
             "INSERT INTO artifacts \
@@ -3972,7 +3994,7 @@ mod tests {
         .bind(repo_id)
         .bind(path)
         .bind(path)
-        .bind("0".repeat(64))
+        .bind(&*ZERO_SHA)
         .bind(storage_key)
         .execute(pool)
         .await
@@ -5304,9 +5326,16 @@ mod tests {
         assert!(matches!(err, AppError::Conflict(_)), "got {err:?}");
 
         // Fixed behaviour: the promotion-aware guard lets the copy through.
-        guard_foreign_storage_key_for_promotion(&pool, target_repo, source_repo, "s3", &key)
-            .await
-            .expect("promotion from the key's owner must be allowed (#3266)");
+        guard_foreign_storage_key_for_promotion(
+            &pool,
+            target_repo,
+            source_repo,
+            "s3",
+            &key,
+            &ZERO_SHA,
+        )
+        .await
+        .expect("promotion from the key's owner must be allowed (#3266)");
     }
 
     #[tokio::test]
@@ -5323,11 +5352,56 @@ mod tests {
         // owner must still veto the write (#2511 is not weakened by #3266).
         seed_artifact(&pool, source_repo, "payload.bin", &key).await;
         seed_artifact(&pool, third_party, "other/payload.bin", &key).await;
+        sqlx::query("UPDATE artifacts SET checksum_sha256 = $1 WHERE repository_id = $2")
+            .bind("1".repeat(64))
+            .bind(third_party)
+            .execute(&pool)
+            .await
+            .expect("third party holds other bytes");
 
-        let err =
-            guard_foreign_storage_key_for_promotion(&pool, target_repo, source_repo, "s3", &key)
-                .await
-                .expect_err("a third-party owner must still block the promotion");
+        let err = guard_foreign_storage_key_for_promotion(
+            &pool,
+            target_repo,
+            source_repo,
+            "s3",
+            &key,
+            &ZERO_SHA,
+        )
+        .await
+        .expect_err("a third-party owner must still block the promotion");
+        assert!(matches!(err, AppError::Conflict(_)), "got {err:?}");
+    }
+
+    /// #6546: on a chain `dev -> stage -> prod` the first hop leaves `dev`
+    /// owning the key, so the second hop's guard sees a third repository. It
+    /// holds the bytes being copied, which overwrites nothing.
+    #[tokio::test]
+    async fn test_promotion_guard_allows_a_chain_hop_over_the_same_bytes_6546() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (dev, _, _) = tdh::create_repo(&pool, "staging", "docker").await;
+        let (stage, _, _) = tdh::create_repo(&pool, "local", "docker").await;
+        let (prod, _, _) = tdh::create_repo(&pool, "local", "docker").await;
+        let key = format!("oci-manifests/sha256:{}", "6546".repeat(16));
+        seed_artifact(&pool, dev, "v2/app/manifests/1.0", &key).await;
+        seed_artifact(&pool, stage, "v2/app/manifests/1.0", &key).await;
+
+        guard_foreign_storage_key_for_promotion(&pool, prod, stage, "s3", &key, &ZERO_SHA)
+            .await
+            .expect("the second hop rewrites the bytes dev already holds");
+
+        let err = guard_foreign_storage_key_for_promotion(
+            &pool,
+            prod,
+            stage,
+            "s3",
+            &key,
+            &"2".repeat(64),
+        )
+        .await
+        .expect_err("other bytes over dev's object must still be refused");
         assert!(matches!(err, AppError::Conflict(_)), "got {err:?}");
     }
 

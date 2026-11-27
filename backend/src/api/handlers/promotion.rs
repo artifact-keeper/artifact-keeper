@@ -1483,6 +1483,7 @@ pub async fn promote_artifact(
         source_repo.id,
         &target_repo.storage_backend,
         &artifact.storage_key,
+        &artifact.checksum_sha256,
     )
     .await?;
 
@@ -1935,6 +1936,7 @@ pub async fn promote_artifacts_bulk(
             source_repo.id,
             &target_repo.storage_backend,
             &artifact.storage_key,
+            &artifact.checksum_sha256,
         )
         .await
         {
