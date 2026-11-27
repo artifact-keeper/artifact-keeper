@@ -103,9 +103,13 @@ inline proxy scan), and it has an upstream to replace a corrupt copy from
 - The new bytes are spooled in the upload staging directory
   (`AK_UPLOAD_STAGING_DIR`, default `<STORAGE_PATH>/.incoming`) while they are
   checked, so a repair needs free space there for one copy of the blob.
-- A `HEAD`, a range for part of the object and a presigned redirect
-  (`PRESIGNED_DOWNLOADS_ENABLED`) read no whole object here, so they do not
-  detect corruption and do not start a repair.
+- A `HEAD` and a range for part of the object read no whole object here, so
+  they do not detect corruption and do not start a repair. A presigned redirect
+  (`PRESIGNED_DOWNLOADS_ENABLED`) also reads no bytes in the request, but at
+  most once every 24 hours it claims a background check for that blob (#5217).
+  The check hashes the stored object without delaying the redirect; on a
+  mismatch it runs the same upstream repair, so the client's retry is served
+  good bytes. Hosted repositories have no upstream and are not checked.
 
 Hosted (local and staging) repositories have no upstream and keep the `502`.
 

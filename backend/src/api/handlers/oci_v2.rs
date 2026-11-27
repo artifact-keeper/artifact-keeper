@@ -7428,6 +7428,11 @@ const BLOB_REPAIR_SPOOL_PREFIX: &str = "oci-blob-repair-";
 /// A spool older than this was left by a process that died mid-repair.
 const BLOB_REPAIR_SPOOL_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
+/// How often a presigned pull may start a background integrity check for one
+/// blob (#5217). A presigned redirect reads no bytes in the request, so the
+/// check is claimed at most once per interval rather than on every pull.
+const PRESIGNED_REPAIR_CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+
 /// The corrupt stored blob of a Remote repository, and where to refetch it
 /// (#5169). Owned so a repair can outlive the pull that found the corruption.
 #[derive(Clone)]
@@ -7606,7 +7611,8 @@ impl BlobRepairClaim {
         let mut running = BLOB_REPAIRS_RUNNING
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        running.insert(key.clone()).then_some(Self(key))
+        // Lazy: `then_some` would drop an unused claim while the mutex is held.
+        running.insert(key.clone()).then(|| Self(key))
     }
 }
 
@@ -7619,6 +7625,116 @@ impl Drop for BlobRepairClaim {
     }
 }
 
+/// Atomically take this blob's periodic background check. The timestamp is
+/// written with the claim, so concurrent presigned pulls on any replica start
+/// at most one read per interval (#5217).
+async fn claim_presigned_repair_check(db: &PgPool, blob_id: Uuid) -> crate::error::Result<bool> {
+    let claimed = sqlx::query_scalar::<_, bool>(
+        "UPDATE oci_blobs SET presign_repair_checked_at = NOW() \
+         WHERE id = $1 AND (presign_repair_checked_at IS NULL \
+             OR presign_repair_checked_at < NOW() - make_interval(secs => $2)) \
+         RETURNING TRUE",
+    )
+    .bind(blob_id)
+    .bind(PRESIGNED_REPAIR_CHECK_INTERVAL.as_secs_f64())
+    .fetch_optional(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+    Ok(claimed == Some(true))
+}
+
+/// Resolve the row behind a redirect that was just issued, using a raw query so
+/// the existing checked-query cache stays unchanged. The storage key is part
+/// of the match: a row replaced between the lookup and the redirect must not
+/// have this check attributed to it (#5217).
+async fn stored_blob_id(
+    db: &PgPool,
+    repository_id: Uuid,
+    digest: &str,
+    storage_key: &str,
+) -> Option<Uuid> {
+    match sqlx::query_scalar::<_, Uuid>(
+        "SELECT id FROM oci_blobs \
+         WHERE repository_id = $1 AND digest = $2 AND storage_key = $3",
+    )
+    .bind(repository_id)
+    .bind(digest)
+    .bind(storage_key)
+    .fetch_optional(db)
+    .await
+    {
+        Ok(id) => id,
+        Err(e) => {
+            warn!(repository_id = %repository_id, digest = %digest, "Presigned repair check could not resolve the blob row: {}", e);
+            None
+        }
+    }
+}
+
+/// Start the bounded background check a presigned pull cannot do inline
+/// (#5217). The redirect is returned without waiting for this: a Remote blob
+/// is hashed once per interval, and only a mismatch starts the ordinary
+/// upstream repair, so the client's retry finds good bytes. Hosted blobs and
+/// Remotes with no upstream have nothing to repair and are not claimed.
+fn schedule_presigned_repair_check(
+    state: &SharedState,
+    repo: &OciRepoInfo,
+    storage: Arc<dyn crate::storage::StorageBackend>,
+    blob_id: Uuid,
+    storage_key: &str,
+    digest: &str,
+    size_bytes: i64,
+) {
+    let Some(repair) = BlobRepair::for_remote(repo, storage_key, digest, size_bytes.max(0) as u64)
+    else {
+        return;
+    };
+    let Some(claim) = BlobRepairClaim::take(repair.repo_id, &repair.digest) else {
+        return;
+    };
+    let state = state.clone();
+    tokio::spawn(async move {
+        let _claim = claim;
+        let claimed = match claim_presigned_repair_check(&state.db, blob_id).await {
+            Ok(claimed) => claimed,
+            Err(e) => {
+                warn!(repo = %repair.repo_key, digest = %repair.digest, "Presigned repair check claim failed: {}", e);
+                return;
+            }
+        };
+        if !claimed {
+            return;
+        }
+        let stream = match storage.get_stream(&repair.storage_key).await {
+            Ok(stream) => stream,
+            Err(e) => {
+                warn!(repo = %repair.repo_key, digest = %repair.digest, storage_key = %repair.storage_key, "Presigned repair check could not read the stored blob: {}", e);
+                return;
+            }
+        };
+        let (actual_hex, actual_len) = match crate::storage::verify::hash_stream(stream).await {
+            Ok(hash) => hash,
+            Err(e) => {
+                warn!(repo = %repair.repo_key, digest = %repair.digest, storage_key = %repair.storage_key, "Presigned repair check could not hash the stored blob: {}", e);
+                return;
+            }
+        };
+        let actual = hex::decode(&actual_hex).unwrap_or_default();
+        if crate::storage::verify::verdict(
+            &repair.expected_sha256,
+            Some(repair.size_bytes),
+            &actual,
+            actual_len,
+        ) == crate::storage::verify::IntegrityVerdict::Intact
+        {
+            return;
+        }
+        warn!(repo = %repair.repo_key, digest = %repair.digest, storage_key = %repair.storage_key, "Presigned blob failed the background integrity check; repairing from upstream");
+        crate::services::metrics_service::record_stored_object_integrity_failure("presigned");
+        repair.run_logged(&state).await;
+    });
+}
+
 /// [`serve_stored_blob`], for a Remote treating corruption as a cache miss
 /// (#5169): a blob that fails verification before the headers is refetched,
 /// and when the new bytes hash to the digest the corrupt object is overwritten
@@ -7629,8 +7745,10 @@ impl Drop for BlobRepairClaim {
 /// A larger blob is only found corrupt after its `200` went out, so that pull
 /// is aborted as on a hosted repository and the repair runs behind it, for the
 /// retry. Hosted repositories have no upstream and keep the plain serve. A
-/// sub-range is not verified, so it cannot start a repair; HEAD and a presigned
-/// redirect read nothing here and cannot either.
+/// sub-range is not verified, so it cannot start a repair. HEAD reads nothing
+/// here. A presigned redirect also reads nothing in the request, but schedules
+/// [`schedule_presigned_repair_check`] so the retry benefits from a repair
+/// (#5217).
 #[allow(clippy::too_many_arguments)]
 async fn serve_stored_blob_or_repair(
     state: &SharedState,
@@ -7784,6 +7902,21 @@ async fn handle_get_blob(
             )
             .await
             {
+                if repo.repo_type == RepositoryType::Remote {
+                    if let Some(blob_id) =
+                        stored_blob_id(&state.db, repo.id, &lookup_digest, &b.storage_key).await
+                    {
+                        schedule_presigned_repair_check(
+                            state,
+                            &repo,
+                            storage.clone(),
+                            blob_id,
+                            &b.storage_key,
+                            digest,
+                            b.size_bytes,
+                        );
+                    }
+                }
                 return redirect;
             }
             // Stream the blob straight from the backend instead of buffering the
@@ -7868,6 +8001,19 @@ async fn handle_get_blob(
                     )
                     .await
                     {
+                        if let Some(blob_id) =
+                            stored_blob_id(&state.db, member.id, digest, &storage_key).await
+                        {
+                            schedule_presigned_repair_check(
+                                state,
+                                &oci_repo_info_from_member(&member, &repo.image),
+                                storage.clone(),
+                                blob_id,
+                                &storage_key,
+                                digest,
+                                size_bytes,
+                            );
+                        }
                         return redirect;
                     }
                     // Stream rather than buffer the resolved member blob. (#1528)
@@ -21337,6 +21483,7 @@ mod blob_pull_streaming_tests {
 mod remote_blob_repair_tests {
     use super::*;
     use crate::api::handlers::test_db_helpers as tdh;
+    use crate::storage::{PresignedUrl, PresignedUrlSource, StorageBackend};
     use axum::body::Body;
     use axum::http::Request;
     use tower::ServiceExt;
@@ -21344,6 +21491,56 @@ mod remote_blob_repair_tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     const GOOD: &[u8] = b"the layer the upstream registry publishes";
+    const PRESIGN_BACKEND: &str = "oci-presign-test";
+
+    /// Filesystem storage that can sign URLs, so the real blob GET takes its
+    /// presigned-redirect branch while the bytes stay on disk for verification.
+    struct SigningStorage {
+        inner: crate::storage::filesystem::FilesystemStorage,
+    }
+
+    #[async_trait::async_trait]
+    impl StorageBackend for SigningStorage {
+        async fn put(&self, key: &str, content: Bytes) -> crate::error::Result<()> {
+            self.inner.put(key, content).await
+        }
+
+        async fn get(&self, key: &str) -> crate::error::Result<Bytes> {
+            self.inner.get(key).await
+        }
+
+        async fn put_stream(
+            &self,
+            key: &str,
+            stream: futures::stream::BoxStream<'static, crate::error::Result<Bytes>>,
+        ) -> crate::error::Result<crate::storage::PutStreamResult> {
+            self.inner.put_stream(key, stream).await
+        }
+
+        async fn exists(&self, key: &str) -> crate::error::Result<bool> {
+            self.inner.exists(key).await
+        }
+
+        async fn delete(&self, key: &str) -> crate::error::Result<()> {
+            self.inner.delete(key).await
+        }
+
+        fn supports_redirect(&self) -> bool {
+            true
+        }
+
+        async fn get_presigned_url(
+            &self,
+            _key: &str,
+            expires_in: Duration,
+        ) -> crate::error::Result<Option<PresignedUrl>> {
+            Ok(Some(PresignedUrl {
+                url: "https://storage.example.test/signed?X-Amz-Signature=test".to_string(),
+                expires_in,
+                source: PresignedUrlSource::S3,
+            }))
+        }
+    }
 
     /// A repository wired to a wiremock upstream, holding (once `seed` ran) a
     /// stored object that does not hash to its digest.
@@ -21425,6 +21622,41 @@ mod remote_blob_repair_tests {
             self.storage().get(&self.key).await.expect("read object")
         }
 
+        async fn check_timestamp(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+            sqlx::query_scalar(
+                "SELECT presign_repair_checked_at FROM oci_blobs \
+                 WHERE repository_id = $1 AND digest = $2",
+            )
+            .bind(self.fx.repo_id)
+            .bind(&self.digest)
+            .fetch_one(&self.fx.pool)
+            .await
+            .expect("read check timestamp")
+        }
+
+        /// Route the repository to a signable backend and enable presigned
+        /// redirects, without giving up the filesystem bytes the repair writes.
+        async fn presigned_state(&self) -> SharedState {
+            sqlx::query("UPDATE repositories SET storage_backend = $1 WHERE id = $2")
+                .bind(PRESIGN_BACKEND)
+                .bind(self.fx.repo_id)
+                .execute(&self.fx.pool)
+                .await
+                .expect("route repository to signing storage");
+            let backend: Arc<dyn StorageBackend> = Arc::new(SigningStorage {
+                inner: crate::storage::filesystem::FilesystemStorage::new(&self.fx.storage_dir),
+            });
+            let mut backends = std::collections::HashMap::new();
+            backends.insert(PRESIGN_BACKEND.to_string(), backend);
+            let mut app = (*self.state).clone();
+            app.config.presigned_downloads_enabled = true;
+            app.storage_registry = Arc::new(crate::storage::StorageRegistry::new(
+                backends,
+                PRESIGN_BACKEND.to_string(),
+            ));
+            Arc::new(app)
+        }
+
         fn upstream_path(&self) -> String {
             format!("/v2/myimage/blobs/{}", self.digest)
         }
@@ -21462,6 +21694,22 @@ mod remote_blob_repair_tests {
             self.pull_from("GET", &self.fx.repo_key, range).await
         }
 
+        async fn pull_with_state(&self, state: SharedState) -> axum::response::Response {
+            let req = Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/{}/myimage/blobs/{}",
+                    self.fx.repo_key, self.digest
+                ))
+                .header(AUTHORIZATION, format!("Bearer {ANONYMOUS_TOKEN}"))
+                .body(Body::empty())
+                .unwrap();
+            tdh::router_anon(router(None), state)
+                .oneshot(req)
+                .await
+                .expect("oneshot")
+        }
+
         async fn assert_keeps_502(&self, what: &str) {
             let (status, body, _) = tdh::collect_response(self.pull(None).await).await;
             assert_eq!(status, StatusCode::BAD_GATEWAY, "{what}");
@@ -21482,6 +21730,16 @@ mod remote_blob_repair_tests {
         ResponseTemplate::new(200)
             .insert_header("content-type", "application/octet-stream")
             .set_body_bytes(bytes.to_vec())
+    }
+
+    async fn wait_for_object(t: &Corrupt, expected: &[u8]) -> bool {
+        for _ in 0..1200 {
+            if t.stored().await.as_ref() == expected {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        false
     }
 
     /// FAILS ON MAIN (502): the corrupt copy is the answer on every pull.
@@ -21641,6 +21899,60 @@ mod remote_blob_repair_tests {
             t.assert_keeps_502(repo_type).await;
             t.fx.teardown().await;
         }
+    }
+
+    /// FAILS ON MAIN: a presigned redirect handed out the corrupt object with
+    /// no check and no repair. Two redirects start at most one background
+    /// check, so the layer is not read on every pull (#5217).
+    #[tokio::test]
+    async fn presigned_remote_repairs_a_corrupt_blob_once_per_interval_5217() {
+        let Some(t) = Corrupt::new("remote", GOOD.to_vec()).await else {
+            return;
+        };
+        t.upstream(body_of(GOOD), 1).await;
+        let state = t.presigned_state().await;
+
+        assert_eq!(
+            t.pull_with_state(state.clone()).await.status(),
+            StatusCode::TEMPORARY_REDIRECT
+        );
+        assert_eq!(
+            t.pull_with_state(state).await.status(),
+            StatusCode::TEMPORARY_REDIRECT
+        );
+
+        assert!(
+            wait_for_object(&t, GOOD).await,
+            "the background check must repair the object for the retry"
+        );
+        let first_checked = t.check_timestamp().await.expect("the check was claimed");
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(t.check_timestamp().await, Some(first_checked));
+        t.fx.teardown().await;
+    }
+
+    /// A hosted repository has no upstream to repair from, so a presigned
+    /// redirect must not claim a background check for it (#5217).
+    #[tokio::test]
+    async fn presigned_hosted_blob_is_not_checked_or_repaired_5217() {
+        let Some(t) = Corrupt::new("local", GOOD.to_vec()).await else {
+            return;
+        };
+        t.upstream(body_of(GOOD), 0).await;
+        let state = t.presigned_state().await;
+
+        assert_eq!(
+            t.pull_with_state(state).await.status(),
+            StatusCode::TEMPORARY_REDIRECT
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        assert_eq!(&t.stored().await[..], &t.corrupt[..]);
+        assert!(
+            t.check_timestamp().await.is_none(),
+            "hosted blobs must not be claimed"
+        );
+        t.fx.teardown().await;
     }
 
     /// `bytes=0-` delivers every byte, so it is verified, repaired, and still
