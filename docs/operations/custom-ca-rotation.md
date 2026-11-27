@@ -13,9 +13,14 @@ not replace the operating system trust store.
 4. Look for `Activated custom CA revision` with the expected SHA-256 and
    certificate count in each backend's logs.
 
-The backend polls the configured path every **5 seconds** on a background
-thread. It reopens the path, so both atomic renames and Kubernetes projected
-volume symlink changes are detected. Identical bytes do not rebuild clients or
+Set `CUSTOM_CA_RELOAD_POLL_INTERVAL_SECS` to the polling interval in whole
+seconds. The default is **5 seconds**. Invalid values log a warning and use
+the default. Set it to `0` to disable polling while still loading the
+configured bundle on first use. With polling disabled, restart each backend
+replica to pick up file changes.
+
+The poller reopens the path, so it detects atomic renames and Kubernetes
+projected volume symlink changes. Identical bytes do not rebuild clients or
 repeat activation logs. Detection normally takes up to one poll interval,
 plus filesystem propagation, file I/O, and replacement-client construction.
 There is no hard wall-clock guarantee for an unresponsive network filesystem.
@@ -41,6 +46,9 @@ Callers must not retain request builders indefinitely across a trust rotation.
 A removed certificate stops authorizing subsequent requests only if no other
 enabled trust source or certificate chain authorizes that endpoint. Test
 removals with an isolated private CA absent from the default trust sources.
+To remove the only custom CA and return to default trust, unset
+`CUSTOM_CA_CERT_PATH` or publish an empty bundle, then restart each backend
+replica. An empty update to an active bundle retains the previous roots.
 
 ## Failed updates and startup
 
@@ -60,11 +68,14 @@ a changed failure category warns immediately. Alert on this warning: retaining
 old trust can delay removal of a compromised CA. Recovery to unchanged valid
 bytes is also logged.
 
-For compatibility, if no valid custom bundle has loaded yet, clients use only
-their default trust sources and report the load failure. The poller retries, so
-a bundle published after startup is picked up automatically. Deployments that
-require a private CA from the first request should publish/validate it before
-backend startup and gate readiness on connectivity to the required service.
+If no valid custom bundle has loaded yet, clients use their default trust
+sources and report the load failure. When polling is enabled, the worker
+retries so a bundle published after startup is picked up automatically. If
+the backend logs `Could not start custom CA reload worker`, it continues using
+the trust loaded on first use. Restart the affected replica to retry starting
+the worker. Deployments that require a private CA from the first request
+should publish and validate it before backend startup and gate readiness on
+connectivity to the required service.
 
 ## Mounts and other TLS consumers
 
@@ -73,8 +84,8 @@ exposes updates. Kubernetes ConfigMap/Secret `subPath` mounts do not receive
 projected updates. A single-file Docker bind mount may continue exposing the
 old file after host-side replacement; check the backend-visible bytes.
 
-The file path is captured when a client is built. Changing the environment
-variable itself requires restart/redeployment. Each backend replica observes
+The file path is captured when a client is built. Changing the configured path
+or poll interval requires a backend restart. Each backend replica observes
 its own filesystem and activates independently.
 
 This mechanism covers the shared outbound **HTTP** clients. LDAP, SMTP,
