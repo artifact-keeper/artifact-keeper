@@ -310,6 +310,12 @@ feed and the npm `/-/` and audit passthroughs, the Go sumdb pass-through of
 a Hosted repository, the AWS token exchange). A Go Remote's checksum database
 fetches go through the proxy service and are recorded (#5344).
 
+## Build records
+
+| Action | Resource | Fires when | `details` |
+| --- | --- | --- | --- |
+| `BUILD_DELETED` | `build` | `DELETE /api/v1/builds/{id}` or `POST /api/v1/builds/delete` removes a build record, one row per build. Outcome `success`. Only the record and its attached artifact list go, the artifacts in repositories stay | `name`, `build_number`, `bulk` |
+
 ## Compatibility policy
 
 Within `schema_version: 1`:
