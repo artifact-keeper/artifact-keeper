@@ -7326,7 +7326,9 @@ impl ProxyService {
                 if policy.action.is_fail_closed()
                     && s.row.verdict == crate::services::proxy_scan_service::VERDICT_CLEAN =>
             {
-                scanner.cve_scanner_version().await
+                scanner
+                    .cve_scanner_version_for(s.row.scanner_version.as_deref())
+                    .await
             }
             _ => None,
         };

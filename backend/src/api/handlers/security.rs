@@ -1706,10 +1706,26 @@ async fn trigger_scan(
     // Use the same enumeration the scan worker uses (virtual repos resolve to
     // their member repos recursively) so the reported count always matches
     // what actually gets enqueued (#2228).
-    let count: i64 = scanner
-        .repository_scan_artifact_ids(repository_id)
-        .await?
-        .len() as i64;
+    let artifact_ids = scanner.repository_scan_artifact_ids(repository_id).await?;
+    let count = artifact_ids.len() as i64;
+
+    if state.config.scan_queue_enabled {
+        crate::services::scan_queue::ScanQueue::new(state.db.clone())
+            .enqueue_hosted_rescans(
+                &artifact_ids,
+                bypass_dedup,
+                crate::services::scan_queue::PRIORITY_HOSTED,
+            )
+            .await?;
+        return Ok(Json(TriggerScanResponse {
+            message: crate::services::scanner_service::build_repository_scan_message(
+                repository_id,
+                count,
+            ),
+            artifacts_queued: count as u32,
+            scan_result_ids: Vec::new(),
+        }));
+    }
 
     tokio::spawn(async move {
         if let Err(e) = scanner
@@ -10484,6 +10500,125 @@ mod tests {
             ),
         }
 
+        fx.teardown().await;
+    }
+
+    /// With the scan queue on, a repository rescan queues one job per artifact
+    /// for the workers and scans nothing in this process, so an API pod without
+    /// grype never runs one.
+    #[tokio::test]
+    async fn repository_rescan_goes_to_the_scan_queue_queued() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use std::sync::Arc;
+
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let mut ids = Vec::new();
+        for n in 0..2 {
+            let id = Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO artifacts (id, repository_id, path, name, size_bytes, \
+                 checksum_sha256, content_type, storage_key) \
+                 VALUES ($1, $2, $3, $3, 1, $4, 'application/octet-stream', $3)",
+            )
+            .bind(id)
+            .bind(fx.repo_id)
+            .bind(format!("rescan/{n}.bin"))
+            .bind(format!("{:0>64}", n))
+            .execute(&fx.pool)
+            .await
+            .expect("seed artifact");
+            ids.push(id);
+        }
+
+        let scanner = Arc::new(crate::services::scanner_service::ScannerService::new(
+            fx.pool.clone(),
+            Arc::new(crate::services::scanner_service::AdvisoryClient::new(None)),
+            Arc::new(crate::services::scan_result_service::ScanResultService::new(fx.pool.clone())),
+            Arc::new(crate::services::scan_config_service::ScanConfigService::new(fx.pool.clone())),
+            None,
+            None,
+            false,
+            false,
+            fx.state.storage.clone(),
+            fx.state.storage_registry.clone(),
+            fx.storage_dir.to_string_lossy().into_owned(),
+            "/tmp/scan".to_string(),
+            None,
+            "standard".to_string(),
+            Arc::new(crate::services::auth_service::AuthService::new(
+                fx.pool.clone(),
+                Arc::new(crate::config::Config::test_config()),
+            )),
+            None,
+            300,
+        ));
+        let mut config = fx.state.config.clone();
+        config.scan_queue_enabled = true;
+        config.scan_worker_enabled = false;
+        let mut state_inner = crate::api::AppState::new(
+            config,
+            fx.pool.clone(),
+            fx.state.storage.clone(),
+            fx.state.storage_registry.clone(),
+        );
+        state_inner.set_scanner_service(scanner);
+        let state: SharedState = Arc::new(state_inner);
+
+        let response = trigger_scan(
+            State(state),
+            Extension(AuthExtension {
+                user_id: fx.user_id,
+                username: fx.username.clone(),
+                email: format!("{}@test.local", fx.username),
+                is_admin: true,
+                is_api_token: false,
+                is_service_account: false,
+                scopes: None,
+                allowed_repo_ids: crate::models::access_scope::AccessScope::Admin,
+                iat_ms: None,
+            }),
+            Json(TriggerScanRequest {
+                artifact_id: None,
+                repository_id: Some(fx.repo_id),
+                bypass_dedup: Some(true),
+            }),
+        )
+        .await
+        .expect("repository rescan");
+        assert_eq!(response.0.artifacts_queued, 2);
+
+        let jobs: Vec<(Uuid, String, bool)> = sqlx::query_as(
+            "SELECT artifact_id, kind, bypass_dedup FROM scan_queue \
+             WHERE artifact_id = ANY($1) ORDER BY artifact_id",
+        )
+        .bind(&ids)
+        .fetch_all(&fx.pool)
+        .await
+        .expect("jobs");
+        ids.sort();
+        assert_eq!(
+            jobs,
+            ids.iter()
+                .map(|id| (*id, "hosted_artifact".to_string(), true))
+                .collect::<Vec<_>>(),
+            "one forced hosted_artifact job per artifact"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let scanned: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM scan_results WHERE artifact_id = ANY($1)")
+                .bind(&ids)
+                .fetch_one(&fx.pool)
+                .await
+                .expect("scan rows");
+        assert_eq!(scanned, 0, "nothing may be scanned in the API process");
+
+        sqlx::query("DELETE FROM scan_queue WHERE artifact_id = ANY($1)")
+            .bind(&ids)
+            .execute(&fx.pool)
+            .await
+            .expect("cleanup jobs");
         fx.teardown().await;
     }
 

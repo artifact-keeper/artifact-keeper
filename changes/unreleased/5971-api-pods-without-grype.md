@@ -1,0 +1,7 @@
+---
+section: Added
+issues: [#5971]
+---
+- **The API pods can run without grype when the scan queue is on** (#5971). A backend without `grype` on its `PATH` never starts it: a scan that needs it fails with that reason (never clean), and the version and vulnerability-database probes report nothing. Such an instance compares stored proxy verdicts against the CVE scanner versions of the live scan workers instead: each worker records its version on every sweep (new table `scan_worker_scanner_versions`, migration 438), a verdict graded by any live worker is reused, and a version no worker reported for four sweeps (two minutes) stops counting, so with every worker down the stored verdicts fall back to the TTL alone, as for an unknown version. At startup the backend logs an error when grype is missing and the queue is off or the instance is a scan worker.
+
+  Upgrade note: with `SCAN_QUEUE_ENABLED`, a repository rescan (`POST /api/v1/security/scan` with `repository_id`) and `POST /api/v1/admin/rescan-for-inventory` now queue one `hosted_artifact` job per artifact for the workers instead of scanning in the API process, also on an instance that has grype. A rescan asked for while that artifact's job is already running is dropped (`bypass_dedup` included), the running scan's result stands. Proxy scans the queue cannot carry yet (OCI images, catalog rescans, OS package pins, `fail_closed` fills that are not cached) still run in process: without grype they fail closed, and a `fail_open` OCI pull is served `pending` and never scanned.
