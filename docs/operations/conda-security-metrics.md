@@ -10,6 +10,7 @@ counter, so they can be graphed and alerted on (#4711). All labels are bounded:
 | `ak_conda_attestation_total` | counter | `repository`, `outcome` | One per CEP-27 attestation decision; see the outcomes below. |
 | `ak_conda_install_script_findings_total` | counter | `repository`, `kind` | Install scripts found in an uploaded package's payload. `kind` is the hook: `pre-link`, `post-link` or `pre-unlink`. The recipe's archived copy of a script in `info/` is the same script and counts once. |
 | `ak_conda_allowlist_dropped_total` | counter | `repository`, `member` | Records a virtual channel's package allowlist kept out of a merged `repodata.json`, `run_exports.json`, `channeldata.json` or shard index. `repository` is the virtual, `member` the member that offered them: a remote member, or a hosted one when the list's scope is `all_members` (the default since #5055). |
+| `ak_conda_future_timestamp_total` | counter | `repository`, `action` | A hosted upload whose builder `timestamp` is later than now plus `CONDA_FUTURE_TIMESTAMP_SKEW_SECS` (default 600). `action` is `flagged` (accepted with an `X-Conda-Timestamp-Warning` header and a `package.future_timestamp` block in the audit row; the default) or `rejected` (refused 400 under `CONDA_FUTURE_TIMESTAMP=reject`). `CONDA_FUTURE_TIMESTAMP=off` turns the check off. |
 | `ak_virtual_member_metadata_failures_total` | counter | `format`, `virtual_repo`, `member`, `reason` | A virtual member that could not contribute to a merged index (`format="conda"` for conda channels). |
 
 `outcome` on `ak_conda_attestation_total`:
@@ -34,6 +35,9 @@ Examples:
   `sum by (repository) (increase(ak_conda_attestation_total{outcome="rejected"}[1h]))`
 - Any unverified attestation stored under the opt-out:
   `increase(ak_conda_attestation_total{outcome="failed"}[15m]) > 0`
+- Future-dated builder timestamps (a misconfigured build clock, or an attempt
+  to skew clients that fall back to `timestamp` for cooldowns):
+  `sum by (repository) (increase(ak_conda_future_timestamp_total[1h])) > 0`
 - Packages with link-time hooks being published:
   `sum by (repository, kind) (rate(ak_conda_install_script_findings_total[1h]))`
 - A member whose allowlist drops jump (an upstream adding packages, or an

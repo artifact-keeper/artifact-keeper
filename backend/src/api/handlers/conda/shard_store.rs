@@ -43,7 +43,7 @@ use uuid::Uuid;
 
 use super::{
     artifacts_for_subdir, build_shard, encode_shard, group_artifacts_by_name, is_conda_package,
-    is_withdrawn, shard_address, CondaArtifact, CondaArtifactRow,
+    is_withdrawn, shard_address, CondaArtifact, CondaArtifactRow, CONDA_ARTIFACT_ROW_COLUMNS,
 };
 
 /// Advisory-lock class (`classid`) of the per-repository materialisation
@@ -422,7 +422,7 @@ async fn materialise_with(
         }
         total += dirty.len();
         batches += 1;
-        rebuild_keys(&mut tx, repo_id, &dirty).await?;
+        rebuild_keys(db, &mut tx, repo_id, &dirty).await?;
         tx.commit().await?;
     }
 }
@@ -431,6 +431,7 @@ async fn materialise_with(
 /// shards whose bytes changed, drop the marks seen, bump the touched
 /// subdirs' revisions, refresh the hold expiry and announce the change.
 async fn rebuild_keys(
+    db: &PgPool,
     tx: &mut Transaction<'_, Postgres>,
     repo_id: Uuid,
     keys: &[DirtyKey],
@@ -444,7 +445,8 @@ async fn rebuild_keys(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
-    let rows = rows_for_names(tx, repo_id, &names).await?;
+    let mut rows = rows_for_names(tx, repo_id, &names).await?;
+    stamp_visible_pending(db, tx, repo_id, &mut rows, now).await?;
     let built = build_key_shards(&rows, keys, now);
 
     for (subdir, name) in built.removed {
@@ -527,6 +529,64 @@ async fn rebuild_keys(
     Ok(())
 }
 
+/// Stamp the rows of `rows` a stored shard is about to list for the first
+/// time (#6525): pending and not held at `now`. Only when no scan policy
+/// applies to `repo_id`: stored shards carry no policy decision, so with a
+/// policy a pending row may be one it refuses. Such a row stays pending and
+/// out of the stored shard ([`build_key_shards`]); the policy-filtered
+/// listing, which serves the repository meanwhile, stamps it once the policy
+/// allows it and marks the shard for rebuild. The policy check reads the
+/// table (no cache) and runs only when there is a pending row, so the
+/// steady state costs nothing.
+///
+/// The stamp is its own short transaction on `db`
+/// ([`index_time::stamp_first_listed`]), so the rows are not locked for the
+/// rest of this rebuild. If it fails the rows stay pending, so this rebuild
+/// leaves them out, and they are marked again shortly after
+/// ([`index_time::remark_after_failure`]), so a later read rebuilds and
+/// stamps them.
+///
+/// [`index_time::remark_after_failure`]: crate::services::index_time::remark_after_failure
+///
+/// [`index_time::stamp_first_listed`]: crate::services::index_time::stamp_first_listed
+async fn stamp_visible_pending(
+    db: &PgPool,
+    tx: &mut Transaction<'_, Postgres>,
+    repo_id: Uuid,
+    rows: &mut [CondaArtifactRow],
+    now: DateTime<Utc>,
+) -> sqlx::Result<()> {
+    let visible_pending = |r: &CondaArtifactRow| {
+        r.index_pending && !is_withdrawn(r.quarantine_status.as_deref(), r.quarantine_until, now)
+    };
+    let pending: Vec<Uuid> = rows
+        .iter()
+        .filter(|r| visible_pending(r))
+        .map(|r| r.id)
+        .collect();
+    if pending.is_empty() {
+        return Ok(());
+    }
+    if crate::services::quarantine_service::scan_policy_applies_on(tx, repo_id).await? {
+        return Ok(());
+    }
+    match crate::services::index_time::stamp_first_listed(db, &pending, false).await {
+        Ok(stamped) => {
+            for row in rows.iter_mut() {
+                if let Some(at) = stamped.get(&row.id) {
+                    row.indexed_at = Some(*at);
+                    row.index_pending = false;
+                }
+            }
+        }
+        Err(e) => {
+            crate::services::index_time::record_stamp_failure("shard_store", &e);
+            crate::services::index_time::remark_after_failure(db, &pending);
+        }
+    }
+    Ok(())
+}
+
 /// Live rows (any visibility) of `repo_id` that can belong to the shard of
 /// one of the package names `names` (as the keys spell them), newest first.
 ///
@@ -553,10 +613,8 @@ async fn rows_for_names(
         .into_iter()
         .map(|n| serde_json::json!({ "name": n }))
         .collect();
-    sqlx::query_as::<_, CondaArtifactRow>(
-        "SELECT a.id, a.path, a.name, a.version, a.size_bytes, a.checksum_sha256, \
-                a.storage_key, am.metadata, a.quarantine_status, a.quarantine_until, \
-                a.created_at \
+    let sql = format!(
+        "SELECT {CONDA_ARTIFACT_ROW_COLUMNS} \
            FROM artifacts a \
            LEFT JOIN artifact_metadata am ON am.artifact_id = a.id \
           WHERE a.id IN ( \
@@ -569,13 +627,14 @@ async fn rows_for_names(
                     JOIN artifact_metadata m ON m.metadata @> q.doc \
                     JOIN artifacts r ON r.id = m.artifact_id \
                    WHERE r.repository_id = $1 AND r.is_deleted = false) \
-          ORDER BY a.created_at DESC",
-    )
-    .bind(repo_id)
-    .bind(&lowered)
-    .bind(&by_metadata)
-    .fetch_all(&mut **tx)
-    .await
+          ORDER BY a.created_at DESC"
+    );
+    sqlx::query_as::<_, CondaArtifactRow>(sqlx::AssertSqlSafe(sql))
+        .bind(repo_id)
+        .bind(&lowered)
+        .bind(&by_metadata)
+        .fetch_all(&mut **tx)
+        .await
 }
 
 /// What a rebuild writes: per key either a shard (`None` when the name has
@@ -596,9 +655,14 @@ fn build_key_shards(rows: &[CondaArtifactRow], keys: &[DirtyKey], now: DateTime<
         .map(|(s, n, _)| (s.as_str(), n.as_str()))
         .collect();
     let all: Vec<CondaArtifact> = rows.iter().map(row_to_artifact).collect();
+    // A row still pending (#6525) was not stamped because a scan policy may
+    // refuse it ([`stamp_visible_pending`]): it stays out until it is.
     let visible: HashSet<uuid::Uuid> = rows
         .iter()
-        .filter(|r| !is_withdrawn(r.quarantine_status.as_deref(), r.quarantine_until, now))
+        .filter(|r| {
+            !r.index_pending
+                && !is_withdrawn(r.quarantine_status.as_deref(), r.quarantine_until, now)
+        })
         .map(|r| r.id)
         .collect();
     let mut out = BuiltKeys::default();
@@ -644,17 +708,7 @@ fn build_key_shards(rows: &[CondaArtifactRow], keys: &[DirtyKey], now: DateTime<
 }
 
 fn row_to_artifact(r: &CondaArtifactRow) -> CondaArtifact {
-    CondaArtifact {
-        id: r.id,
-        path: r.path.clone(),
-        name: r.name.clone(),
-        version: r.version.clone(),
-        size_bytes: r.size_bytes,
-        checksum_sha256: r.checksum_sha256.clone(),
-        storage_key: r.storage_key.clone(),
-        metadata: r.metadata.clone(),
-        indexed_at: Some(r.created_at),
-    }
+    r.to_artifact()
 }
 
 /// The stored shard index of `(repo_id, subdir)`: package name to address.
@@ -801,7 +855,7 @@ pub(crate) async fn backfill_batch_sized(
     .fetch_all(&mut *tx)
     .await?;
     if !dirty.is_empty() {
-        rebuild_keys(&mut tx, repo_id, &dirty).await?;
+        rebuild_keys(db, &mut tx, repo_id, &dirty).await?;
     }
     sqlx::query(
         "UPDATE conda_channel_state SET backfill_cursor = $2, updated_at = NOW() \
@@ -926,15 +980,17 @@ pub(crate) async fn member_rows_for_names(
         let rows = rows_for_names(&mut tx, *repo_id, names)
             .await
             .map_err(|e| db_unavailable("reading member rows", e))?;
+        // A member merged from stored shards has no scan policy (the caller
+        // checked), so what its holds leave visible is listed (#6525).
+        let mut rows: Vec<CondaArtifactRow> = rows
+            .into_iter()
+            .filter(|r| !is_withdrawn(r.quarantine_status.as_deref(), r.quarantine_until, now))
+            .collect();
         tx.commit()
             .await
             .map_err(|e| db_unavailable("reading member rows", e))?;
-        out.push(
-            rows.iter()
-                .filter(|r| !is_withdrawn(r.quarantine_status.as_deref(), r.quarantine_until, now))
-                .map(row_to_artifact)
-                .collect(),
-        );
+        super::stamp_listed_rows(db, &mut rows, true, "member_merge").await;
+        out.push(rows.iter().map(row_to_artifact).collect());
     }
     Ok(out)
 }

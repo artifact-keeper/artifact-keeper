@@ -401,14 +401,19 @@ impl TrashService {
         }
 
         // The deleted_at trigger (migration 261) clears deleted_at, and the
-        // usage-ledger trigger (migration 182) re-charges the bytes.
-        sqlx::query(
-            "UPDATE artifacts SET is_deleted = false, updated_at = NOW() \
+        // usage-ledger trigger (migration 182) re-charges the bytes. A hosted
+        // conda package re-enters its index now, not at its upload time, so
+        // its CEP-47 `indexed_timestamp` is re-stamped at its next listing
+        // (#6525, `index_time::RELIST_SET_SQL`).
+        let restore_sql = format!(
+            "UPDATE artifacts SET is_deleted = false, updated_at = NOW(), {} \
              WHERE id = $1 AND is_deleted = true",
-        )
-        .bind(id)
-        .execute(&mut *tx)
-        .await?;
+            crate::services::index_time::RELIST_SET_SQL
+        );
+        sqlx::query(sqlx::AssertSqlSafe(restore_sql))
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
 
         // A delete task queued while the artifact was trashed (possibly for a
         // peer that was offline at the time) must not take the restored

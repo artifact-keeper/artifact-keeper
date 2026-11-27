@@ -1124,9 +1124,15 @@ struct CondaArtifact {
     checksum_sha256: String,
     storage_key: String,
     metadata: Option<serde_json::Value>,
-    /// When the package entered this channel's index: the row's `created_at`,
-    /// written once at upload and never rewritten, so every rebuild of the
-    /// repodata reports the same value (CEP-47 `indexed_timestamp`).
+    /// When the package entered this channel's index (CEP-47
+    /// `indexed_timestamp`): the row's `indexed_at`, stamped the first time a
+    /// build listed it and never rewritten, or `created_at` for a row from
+    /// before migration 426 (#6525, [`index_time::served`]). So every rebuild
+    /// and every encoding reports the same value, and a package that was held,
+    /// policy-blocked or trashed reports when it became visible, not when it
+    /// was uploaded.
+    ///
+    /// [`index_time::served`]: crate::services::index_time::served
     indexed_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
@@ -1146,6 +1152,83 @@ struct CondaArtifactRow {
     quarantine_status: Option<String>,
     quarantine_until: Option<chrono::DateTime<chrono::Utc>>,
     created_at: chrono::DateTime<chrono::Utc>,
+    /// `artifacts.indexed_at` (#6525): NULL until first listed, and on rows
+    /// from before migration 426.
+    indexed_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// `artifacts.index_pending` (#6525): not listed yet; the build that
+    /// first lists the row stamps it ([`stamp_listed_rows`]).
+    index_pending: bool,
+}
+
+/// The columns of [`CondaArtifactRow`], for the queries that read one (`a` is
+/// `artifacts`, `am` its `artifact_metadata`).
+const CONDA_ARTIFACT_ROW_COLUMNS: &str =
+    "a.id, a.path, a.name, a.version, a.size_bytes, a.checksum_sha256, \
+     a.storage_key, am.metadata, a.quarantine_status, a.quarantine_until, \
+     a.created_at, a.indexed_at, a.index_pending";
+
+impl CondaArtifactRow {
+    /// The listed artifact; `indexed_at` is [`index_time::served`].
+    ///
+    /// [`index_time::served`]: crate::services::index_time::served
+    fn to_artifact(&self) -> CondaArtifact {
+        CondaArtifact {
+            id: self.id,
+            path: self.path.clone(),
+            name: self.name.clone(),
+            version: self.version.clone(),
+            size_bytes: self.size_bytes,
+            checksum_sha256: self.checksum_sha256.clone(),
+            storage_key: self.storage_key.clone(),
+            metadata: self.metadata.clone(),
+            indexed_at: Some(crate::services::index_time::served(
+                self.indexed_at,
+                self.created_at,
+            )),
+        }
+    }
+}
+
+/// Stamp the pending rows among `rows`, every one of which the caller is
+/// about to list (it already left out the held and refused ones), and carry
+/// the stamps into `rows` (#6525). A build with no pending row runs nothing,
+/// so the steady state costs no statement beyond the listing query.
+///
+/// Never fails the request: when the stamp cannot be written (a lock held
+/// past its timeout, the database refusing writes) the pending rows are left
+/// out of this build, counted under `site`, and their shards are marked so
+/// the next read rebuilds and stamps them. Serving them unstamped would hand
+/// a client their upload time, the very value #6525 replaces.
+async fn stamp_listed_rows(
+    db: &sqlx::PgPool,
+    rows: &mut Vec<CondaArtifactRow>,
+    mark_dirty: bool,
+    site: &'static str,
+) {
+    let pending: Vec<uuid::Uuid> = rows
+        .iter()
+        .filter(|r| r.index_pending)
+        .map(|r| r.id)
+        .collect();
+    if pending.is_empty() {
+        return;
+    }
+    match crate::services::index_time::stamp_first_listed(db, &pending, mark_dirty).await {
+        Ok(stamped) => {
+            // A row deleted since it was read has no stamp; it is left out,
+            // as the next build would.
+            rows.retain(|r| !r.index_pending || stamped.contains_key(&r.id));
+            for row in rows.iter_mut().filter(|r| r.index_pending) {
+                row.indexed_at = stamped.get(&row.id).copied();
+                row.index_pending = false;
+            }
+        }
+        Err(e) => {
+            crate::services::index_time::record_stamp_failure(site, &e);
+            rows.retain(|r| !r.index_pending);
+            crate::services::index_time::remark_after_failure(db, &pending);
+        }
+    }
 }
 
 /// Whether an artifact is withdrawn from the channel: the exact predicate the
@@ -1239,24 +1322,21 @@ async fn list_conda_artifacts_at(
     repo_id: uuid::Uuid,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<Vec<CondaArtifact>, Response> {
-    let rows = sqlx::query_as::<_, CondaArtifactRow>(
-        r#"
-        SELECT a.id, a.path, a.name, a.version, a.size_bytes, a.checksum_sha256,
-               a.storage_key, am.metadata, a.quarantine_status, a.quarantine_until,
-               a.created_at
-        FROM artifacts a
-        LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
-        WHERE a.repository_id = $1 AND a.is_deleted = false
-        ORDER BY a.created_at DESC
-        "#,
-    )
-    .bind(repo_id)
-    .fetch_all(db)
-    .await
-    .map_err(|e| {
-        tracing::error!("Database error listing conda artifacts: {}", e);
-        (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
-    })?;
+    let sql = format!(
+        "SELECT {CONDA_ARTIFACT_ROW_COLUMNS} \
+           FROM artifacts a \
+           LEFT JOIN artifact_metadata am ON am.artifact_id = a.id \
+          WHERE a.repository_id = $1 AND a.is_deleted = false \
+          ORDER BY a.created_at DESC"
+    );
+    let rows = sqlx::query_as::<_, CondaArtifactRow>(sqlx::AssertSqlSafe(sql))
+        .bind(repo_id)
+        .fetch_all(db)
+        .await
+        .map_err(|e| {
+            tracing::error!("Database error listing conda artifacts: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
+        })?;
 
     // #4059: every repodata variant (repodata.json, current_repodata, the
     // bz2/zst/sig encodings, JLAP, CEP-16 shards, run_exports, channeldata)
@@ -1269,21 +1349,15 @@ async fn list_conda_artifacts_at(
     // #4288 item 1 / #4978 item 6: and nothing a scan policy blocks.
     let ids: Vec<uuid::Uuid> = rows.iter().map(|r| r.id).collect();
     let refused = policy_refused(db, repo_id, &ids).await?;
-    Ok(rows
+    let mut rows: Vec<CondaArtifactRow> = rows
         .into_iter()
         .filter(|r| !refused.contains(&r.id))
-        .map(|r| CondaArtifact {
-            id: r.id,
-            path: r.path,
-            name: r.name,
-            version: r.version,
-            size_bytes: r.size_bytes,
-            checksum_sha256: r.checksum_sha256,
-            storage_key: r.storage_key,
-            metadata: r.metadata,
-            indexed_at: Some(r.created_at),
-        })
-        .collect())
+        .collect();
+    // #6525: what is left is listed; a row listed for the first time is
+    // stamped now. This listing is the only build that decides the scan
+    // policy, so its stamp also marks the row's stored shard for rebuild.
+    stamp_listed_rows(db, &mut rows, true, "listing").await;
+    Ok(rows.iter().map(CondaArtifactRow::to_artifact).collect())
 }
 
 /// Filter artifacts that belong to a given subdir based on metadata or path prefix.
@@ -10336,6 +10410,108 @@ fn resolve_upload_subdir(
     }
 }
 
+/// What a hosted upload does with a package whose builder `timestamp`
+/// (`info/index.json`) lies in the future (#6529). CEP 47: a channel server
+/// SHOULD reject or flag it, since a client without `indexed_timestamp`
+/// falls back to that builder-controlled value for its cooldown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FutureTimestampAction {
+    /// No check.
+    Off,
+    /// Accept, and record it: a warning header on the 201, the
+    /// `ak_conda_future_timestamp_total{action="flagged"}` metric, a
+    /// `future_timestamp` block in the upload's audit details and a log line.
+    /// The default, so existing publishers keep working.
+    Warn,
+    /// Refuse with 400 (and count `action="rejected"`).
+    Reject,
+}
+
+/// `CONDA_FUTURE_TIMESTAMP` (`warn` | `reject` | `off`) and
+/// `CONDA_FUTURE_TIMESTAMP_SKEW_SECS` (allowed clock skew, default 600 s).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FutureTimestampPolicy {
+    action: FutureTimestampAction,
+    skew_secs: i64,
+}
+
+/// Default allowed clock skew between a build machine and this server.
+const FUTURE_TIMESTAMP_DEFAULT_SKEW_SECS: i64 = 600;
+
+impl FutureTimestampPolicy {
+    fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Self {
+        let action = match get("CONDA_FUTURE_TIMESTAMP")
+            .map(|v| v.trim().to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("reject") => FutureTimestampAction::Reject,
+            Some("off") | Some("false") | Some("0") => FutureTimestampAction::Off,
+            _ => FutureTimestampAction::Warn,
+        };
+        let skew_secs = get("CONDA_FUTURE_TIMESTAMP_SKEW_SECS")
+            .and_then(|v| v.trim().parse::<i64>().ok())
+            .unwrap_or(FUTURE_TIMESTAMP_DEFAULT_SKEW_SECS)
+            .clamp(0, 366 * 24 * 3600);
+        Self { action, skew_secs }
+    }
+
+    fn get() -> Self {
+        static POLICY: std::sync::OnceLock<FutureTimestampPolicy> = std::sync::OnceLock::new();
+        *POLICY.get_or_init(|| Self::from_lookup(|k| std::env::var(k).ok()))
+    }
+}
+
+/// A conda `timestamp` in Unix milliseconds. conda-build writes
+/// milliseconds; old packages carry seconds, which conda itself tells apart
+/// the same way (a value below 10^11 cannot be a millisecond time after 1973).
+fn builder_timestamp_millis(ts: u64) -> i64 {
+    let ts = i64::try_from(ts).unwrap_or(i64::MAX);
+    if ts < 100_000_000_000 {
+        ts.saturating_mul(1000)
+    } else {
+        ts
+    }
+}
+
+/// The builder `timestamp` of `info/index.json` as an integer. Some build
+/// tools write it as a JSON float; a negative or non-finite value is none.
+fn builder_timestamp_value(v: &serde_json::Value) -> Option<u64> {
+    v.as_u64().or_else(|| {
+        v.as_f64()
+            .filter(|f| f.is_finite() && *f >= 0.0)
+            .map(|f| f as u64)
+    })
+}
+
+/// How far (ms) the builder `timestamp` lies past `now` plus the allowed
+/// skew, or `None` when it does not (or the package has none).
+fn future_timestamp_excess(
+    timestamp: Option<u64>,
+    now: chrono::DateTime<chrono::Utc>,
+    skew_secs: i64,
+) -> Option<i64> {
+    let ts = builder_timestamp_millis(timestamp?);
+    let limit = now
+        .timestamp_millis()
+        .saturating_add(skew_secs.saturating_mul(1000));
+    (ts > limit).then(|| ts - now.timestamp_millis())
+}
+
+/// Response header naming a flagged future builder `timestamp` (#6529).
+const FUTURE_TIMESTAMP_WARNING_HEADER: &str = "X-Conda-Timestamp-Warning";
+
+/// The message a flagged or refused future `timestamp` reports.
+fn future_timestamp_message(ts: u64, ahead_ms: i64, skew_secs: i64) -> String {
+    let at = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(builder_timestamp_millis(ts))
+        .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+        .unwrap_or_else(|| ts.to_string());
+    format!(
+        "package timestamp {at} is {}s in the future (allowed clock skew {skew_secs}s); \
+         check the build machine's clock",
+        ahead_ms / 1000
+    )
+}
+
 async fn store_conda_package(
     state: &SharedState,
     repo: &RepoInfo,
@@ -10393,6 +10569,39 @@ async fn store_conda_package(
     // Validate package structure before storing (under `ingest_permit`).
     validate_conda_package(&content, filename)
         .map_err(|e| (StatusCode::BAD_REQUEST, e).into_response())?;
+
+    // #6529 (CEP 47 timestamp validation): a builder `timestamp` past the
+    // allowed clock skew is flagged (default) or refused before anything is
+    // stored.
+    let future_policy = FutureTimestampPolicy::get();
+    let builder_timestamp = extracted
+        .as_ref()
+        .and_then(|m| m.get("timestamp"))
+        .and_then(builder_timestamp_value);
+    let future_timestamp = match future_policy.action {
+        FutureTimestampAction::Off => None,
+        _ => future_timestamp_excess(
+            builder_timestamp,
+            chrono::Utc::now(),
+            future_policy.skew_secs,
+        )
+        .zip(builder_timestamp)
+        .map(|(ahead_ms, ts)| (ts, ahead_ms)),
+    };
+    if let Some((ts, ahead_ms)) = future_timestamp {
+        let message = future_timestamp_message(ts, ahead_ms, future_policy.skew_secs);
+        if future_policy.action == FutureTimestampAction::Reject {
+            crate::services::metrics_service::record_conda_future_timestamp(&repo.key, "rejected");
+            tracing::warn!(repository = %repo.key, filename, %message, "conda upload refused: future timestamp");
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("Conda upload refused: {message}"),
+            )
+                .into_response());
+        }
+        crate::services::metrics_service::record_conda_future_timestamp(&repo.key, "flagged");
+        tracing::warn!(repository = %repo.key, filename, %message, "conda upload accepted with a future timestamp");
+    }
 
     // The install scripts, still under `ingest_permit`, so this best-effort
     // analysis neither queues for a second slot nor is skipped during a
@@ -10473,6 +10682,11 @@ async fn store_conda_package(
         "application/x-tar"
     };
 
+    // The upload hold the repository asks for, applied in the insert's
+    // transaction below (#6525).
+    let hold_until =
+        crate::services::quarantine_service::upload_hold_until(&state.db, repo.id).await;
+
     // Insert artifact record
     let mut tx = super::publish_quota::begin_admitted_publish(
         &state.db,
@@ -10506,13 +10720,20 @@ async fn store_conda_package(
         tracing::error!("Database error inserting artifact: {}", e);
         (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
     })?;
+    // #6525: the upload hold and the indexing time are decided in the row's
+    // own transaction, so no build can list (and date) the package in the
+    // instant between the commit and the hold: held or under a scan policy it
+    // waits for its first listing, otherwise it is indexed at its creation.
+    crate::services::index_time::settle_written_row(&mut tx, artifact_id, hold_until)
+        .await
+        .map_err(|e| {
+            tracing::error!("Database error inserting artifact: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
+        })?;
     tx.commit().await.map_err(|e| {
         tracing::error!("Database error committing artifact: {}", e);
         (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
     })?;
-
-    crate::services::quarantine_service::apply_upload_hold_hosted(&state.db, repo.id, artifact_id)
-        .await;
 
     // #4041/#4042: the identity the advisory path queries with. `pkg:conda/<name>`
     // on its own matches nothing — OSV and the GitHub Advisory Database have no
@@ -10651,19 +10872,39 @@ async fn store_conda_package(
             digest: Some(format!("sha256:{computed_sha256}")),
             uploaded_by: Some(user_id),
         },
-        conda_audit_package(
-            Some(&pkg_name),
-            Some(&pkg_version),
-            Some(&build_string),
-            subdir,
-            filename,
-        ),
+        {
+            let mut package = conda_audit_package(
+                Some(&pkg_name),
+                Some(&pkg_version),
+                Some(&build_string),
+                subdir,
+                filename,
+            );
+            if let (Some((ts, ahead_ms)), Some(map)) = (future_timestamp, package.as_object_mut()) {
+                map.insert(
+                    "future_timestamp".to_string(),
+                    serde_json::json!({
+                        "timestamp_ms": builder_timestamp_millis(ts),
+                        "ahead_ms": ahead_ms,
+                        "allowed_skew_secs": future_policy.skew_secs,
+                    }),
+                );
+            }
+            package
+        },
     )
     .await;
 
-    Ok(Response::builder()
+    let mut response = Response::builder()
         .status(StatusCode::CREATED)
-        .header(CONTENT_TYPE, "application/json")
+        .header(CONTENT_TYPE, "application/json");
+    if let Some((ts, ahead_ms)) = future_timestamp {
+        response = response.header(
+            FUTURE_TIMESTAMP_WARNING_HEADER,
+            future_timestamp_message(ts, ahead_ms, future_policy.skew_secs),
+        );
+    }
+    Ok(response
         .body(Body::from(
             build_conda_upload_response(
                 &pkg_name,
@@ -14114,8 +14355,99 @@ mod tests {
         assert!(!entry["depends"].as_array().unwrap().is_empty());
     }
 
-    /// CEP-47: the server-set `indexed_timestamp` is the row's creation time
-    /// in milliseconds, and absent when the row carries none.
+    /// #6529: the builder `timestamp` is compared in milliseconds, seconds
+    /// values (old packages) normalised first.
+    #[test]
+    fn future_timestamp_excess_6529() {
+        let now =
+            chrono::DateTime::<chrono::Utc>::from_timestamp_millis(1_800_000_000_000).unwrap();
+        let skew = 600;
+        assert_eq!(future_timestamp_excess(None, now, skew), None);
+        // Now, and inside the skew: fine.
+        assert_eq!(
+            future_timestamp_excess(Some(1_800_000_000_000), now, skew),
+            None
+        );
+        assert_eq!(
+            future_timestamp_excess(Some(1_800_000_000_000 + 599_000), now, skew),
+            None
+        );
+        // A day ahead, in ms and in seconds.
+        let day = 86_400_000_i64;
+        assert_eq!(
+            future_timestamp_excess(Some((1_800_000_000_000 + day) as u64), now, skew),
+            Some(day)
+        );
+        assert_eq!(
+            future_timestamp_excess(Some(1_800_000_000 + 86_400), now, skew),
+            Some(day)
+        );
+        // A past timestamp in seconds is not mistaken for 1970 ms.
+        assert_eq!(
+            future_timestamp_excess(Some(1_600_000_000), now, skew),
+            None
+        );
+        // No skew: one ms ahead is flagged.
+        assert_eq!(
+            future_timestamp_excess(Some(1_800_000_000_001), now, 0),
+            Some(1)
+        );
+        // A float timestamp is read too; garbage is not a timestamp.
+        assert_eq!(
+            builder_timestamp_value(&serde_json::json!(1_800_086_400_000.0_f64)),
+            Some(1_800_086_400_000)
+        );
+        assert_eq!(builder_timestamp_value(&serde_json::json!(-1.0)), None);
+        assert_eq!(builder_timestamp_value(&serde_json::json!("x")), None);
+    }
+
+    /// #6529: warn is the default; reject and off are opt-in; the skew
+    /// defaults to 10 minutes.
+    #[test]
+    fn future_timestamp_policy_from_env_6529() {
+        let policy = |pairs: &'static [(&'static str, &'static str)]| {
+            FutureTimestampPolicy::from_lookup(|k| {
+                pairs
+                    .iter()
+                    .find(|(n, _)| *n == k)
+                    .map(|(_, v)| v.to_string())
+            })
+        };
+        assert_eq!(
+            policy(&[]),
+            FutureTimestampPolicy {
+                action: FutureTimestampAction::Warn,
+                skew_secs: 600
+            }
+        );
+        assert_eq!(
+            policy(&[("CONDA_FUTURE_TIMESTAMP", "REJECT")]).action,
+            FutureTimestampAction::Reject
+        );
+        assert_eq!(
+            policy(&[("CONDA_FUTURE_TIMESTAMP", "off")]).action,
+            FutureTimestampAction::Off
+        );
+        assert_eq!(
+            policy(&[("CONDA_FUTURE_TIMESTAMP", "bogus")]).action,
+            FutureTimestampAction::Warn
+        );
+        assert_eq!(
+            policy(&[("CONDA_FUTURE_TIMESTAMP_SKEW_SECS", "30")]).skew_secs,
+            30
+        );
+        assert_eq!(
+            policy(&[("CONDA_FUTURE_TIMESTAMP_SKEW_SECS", "-5")]).skew_secs,
+            0
+        );
+        assert_eq!(
+            policy(&[("CONDA_FUTURE_TIMESTAMP_SKEW_SECS", "x")]).skew_secs,
+            600
+        );
+    }
+
+    /// CEP-47: the server-set `indexed_timestamp` is the artifact's indexing
+    /// time in milliseconds, and absent when the artifact carries none.
     #[test]
     fn test_build_artifact_entry_indexed_timestamp() {
         let mut a = make_conda_artifact("pkg", "noarch/pkg-1.0-0.conda", None);

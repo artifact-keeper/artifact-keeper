@@ -456,6 +456,14 @@ pub async fn set_quarantine(
     Ok(result.rows_affected() > 0)
 }
 
+/// The expiry of the upload hold `repository_id` asks for now, or `None` when
+/// its quarantine is off. For a writer that applies the hold in its own
+/// transaction (`index_time::settle_written_row`, #6525).
+pub async fn upload_hold_until(db: &PgPool, repository_id: Uuid) -> Option<DateTime<Utc>> {
+    let config = resolve_config(db, repository_id).await;
+    should_quarantine(&config).then(|| quarantine_until(&config, Utc::now()))
+}
+
 /// Apply the upload-time quarantine hold to a freshly-uploaded artifact.
 ///
 /// Resolves the repository's quarantine config and, when enabled, marks the
@@ -1229,6 +1237,19 @@ async fn scan_policy_applies(db: &PgPool, repository_id: Uuid) -> Result<bool> {
         .fetch_one(db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))
+}
+
+/// Whether an enabled scan policy applies to `repository_id`, read now on
+/// `conn` with no cache: for a decision written into stored state (the conda
+/// shard store's first-listing stamp, #6525) rather than one a TTL bounds.
+pub async fn scan_policy_applies_on(
+    conn: &mut sqlx::PgConnection,
+    repository_id: Uuid,
+) -> sqlx::Result<bool> {
+    sqlx::query_scalar(SCAN_POLICY_APPLIES_SQL)
+        .bind(repository_id)
+        .fetch_one(conn)
+        .await
 }
 
 const SCAN_POLICY_APPLIES_SQL: &str = "SELECT EXISTS (SELECT 1 FROM scan_policies \

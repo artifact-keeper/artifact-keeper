@@ -1,0 +1,7 @@
+---
+section: Fixed
+issues: [#6525]
+---
+- **A conda package's CEP 47 `indexed_timestamp` is now the time it became visible in the channel, not its upload time** (#6525). A package held by the upload quarantine, refused by a scan policy or restored from the trash appeared with its upload time, so a client cooldown such as pixi or conda `exclude-newer` let it through on its first fetch: a package held for 7 days passed a 7-day cooldown at once. The new `artifacts.indexed_at` column (migration 426) records when the package entered the index: its upload time when it is visible at once, as before, and otherwise the time of the first index build that lists it, after the hold is released or lapses, after the scan policy stops refusing it, or after the restore. `repodata.json`, its `.bz2`/`.zst` encodings, `current_repodata.json`, JLAP and the CEP-16 shards all serve that value, and it never changes after that. Packages uploaded before this release keep the value they were served with (their upload time), as CEP 47 allows.
+
+  The value is read with the listing query, so a repodata or shard build runs no extra statement once a package has been listed. Migration 426 adds two columns to `artifacts` (a nullable timestamp and a boolean with a constant default) and one to `upload_sessions`, catalogue-only with no table rewrite and no backfill. Migration 428 builds the partial index `idx_artifacts_index_pending` concurrently, so it blocks no reads or writes.

@@ -94,6 +94,12 @@ pub struct CreateSessionRequest {
     /// is opened as usual (#3427).
     #[serde(default)]
     pub skip_if_present: bool,
+    /// Peer replication only (#6527): when the source artifact entered its
+    /// index (CEP 47 `indexed_timestamp`), RFC 3339. A trusted peer's value
+    /// is kept on the replicated row so both peers serve the same time;
+    /// anyone else's is ignored.
+    #[serde(default)]
+    pub indexed_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -341,6 +347,7 @@ async fn create_session(
         package_description: replication_metadata.package_description,
         package_metadata: replication_metadata.package_metadata,
         is_replication,
+        indexed_at: replication_metadata.indexed_at,
         total_size: req.total_size,
         max_upload_size: state.config.max_upload_size_bytes,
         chunk_size: req.chunk_size,
@@ -1252,6 +1259,23 @@ async fn complete_session_commit(
     // commit (or an ambiguous commit error): a retry would then hit the
     // immutability gate on the path this session already wrote.
     //
+    // #6525: a hosted conda package's upload hold, applied in the row's own
+    // transaction below. Only read for a conda repository.
+    let conda_hold_until = if matches!(
+        repo.format,
+        crate::models::repository::RepositoryFormat::Conda
+            | crate::models::repository::RepositoryFormat::CondaNative
+    ) {
+        Some(
+            crate::services::quarantine_service::upload_hold_until(
+                &state.db,
+                session.repository_id,
+            )
+            .await,
+        )
+    } else {
+        None
+    };
     // #4980: the transaction opens behind the storage GC commit guard, so the
     // object written or deduplicated above cannot be collected before this
     // row commits. Both refusals are retryable and release the lease: while a
@@ -1384,7 +1408,11 @@ async fn complete_session_commit(
             ON CONFLICT (repository_id, path) DO UPDATE SET
                 name = $3, version = $4, size_bytes = $5, checksum_sha256 = $6,
                 content_type = $7, storage_key = $8, uploaded_by = $9,
-                updated_at = NOW(), is_deleted = false
+                updated_at = NOW(), is_deleted = false,
+                indexed_at = CASE
+                    WHEN LOWER(artifacts.checksum_sha256) = LOWER(EXCLUDED.checksum_sha256)
+                    THEN artifacts.indexed_at END,
+                index_pending = false
             WHERE (artifacts.is_deleted
                 OR $10
                 OR artifacts.version IS DISTINCT FROM EXCLUDED.version
@@ -1450,6 +1478,28 @@ async fn complete_session_commit(
             &mut tx, &repo, &old_key,
         )
         .await
+        {
+            drop(tx);
+            return Err(release_after_precommit_failure(&state.db, &session, e).await);
+        }
+    }
+    // #6525: a hosted conda package's hold and indexing time, decided with
+    // the row, as on the conda upload route.
+    if let Some(hold_until) = conda_hold_until {
+        if let Err(e) =
+            crate::services::index_time::settle_written_row(&mut tx, artifact_id, hold_until).await
+        {
+            drop(tx);
+            return Err(release_after_precommit_failure(&state.db, &session, e).await);
+        }
+    }
+    // #6527: a trusted peer's replication carries when the source row entered
+    // its index; keep it, in the row's own transaction, so this peer serves
+    // the same CEP-47 `indexed_timestamp` (an untrusted session's value was
+    // dropped with its other replication fields).
+    if let Some(at) = session.indexed_at {
+        if let Err(e) =
+            crate::services::index_time::adopt_replicated(&mut tx, artifact_id, at).await
         {
             drop(tx);
             return Err(release_after_precommit_failure(&state.db, &session, e).await);
@@ -2446,6 +2496,7 @@ fn without_untrusted_replication_metadata(
         session.artifact_metadata_properties = None;
         session.package_description = None;
         session.package_metadata = None;
+        session.indexed_at = None;
     }
     session
 }
@@ -2625,6 +2676,7 @@ struct ReplicationSessionMetadata<'a> {
     artifact_metadata_properties: Option<&'a serde_json::Value>,
     package_description: Option<&'a str>,
     package_metadata: Option<&'a serde_json::Value>,
+    indexed_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 fn replication_session_metadata_from_request(
@@ -2638,6 +2690,7 @@ fn replication_session_metadata_from_request(
             artifact_metadata_properties: None,
             package_description: None,
             package_metadata: None,
+            indexed_at: None,
         };
     }
 
@@ -2647,6 +2700,7 @@ fn replication_session_metadata_from_request(
         artifact_metadata_properties: req.artifact_metadata_properties.as_ref(),
         package_description: req.package_description.as_deref(),
         package_metadata: req.package_metadata.as_ref(),
+        indexed_at: req.indexed_at,
     }
 }
 
@@ -3123,6 +3177,7 @@ mod tests {
             package_description: None,
             package_metadata: None,
             is_replication: false,
+            indexed_at: None,
             content_type: "application/octet-stream".to_string(),
             total_size: 1,
             chunk_size: 1_048_576,
@@ -3435,6 +3490,7 @@ mod tests {
             chunk_size: None,
             content_type: None,
             skip_if_present: false,
+            indexed_at: None,
         }
     }
 
@@ -4008,6 +4064,7 @@ mod tests {
             chunk_size: None,
             content_type: None,
             skip_if_present: false,
+            indexed_at: None,
         };
         let debug = format!("{:?}", req);
         assert!(debug.contains("CreateSessionRequest"));
