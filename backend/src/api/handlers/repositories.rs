@@ -1100,6 +1100,11 @@ pub struct CreateRepositoryRequest {
     /// uploads to Generic/Mlmodel repos append immutable revisions instead
     /// of overwriting. Defaults to false (current behavior preserved).
     pub versioning_enabled: Option<bool>,
+    /// Which Maven versions a local or staging Maven or Gradle repository
+    /// accepts (#5872): `mixed` (both, the default), `release` or `snapshot`.
+    /// A deploy, upload, promotion, replication or migration import of the
+    /// other kind is refused with 400
+    pub version_policy: Option<crate::models::repository::MavenVersionPolicy>,
     /// Override the default storage backend for this repository.
     /// When omitted, the server's configured default is used.
     /// Non-admin users may only use the default backend.
@@ -1485,6 +1490,12 @@ pub struct UpdateRepositoryRequest {
     /// When provided, enables/disables first-class artifact versioning for
     /// this Generic/Mlmodel repository (#2367). When omitted, unchanged.
     pub versioning_enabled: Option<bool>,
+    /// Which Maven versions a local or staging Maven or Gradle repository
+    /// accepts (#5872): `mixed` (both), `release` or `snapshot`.
+    /// A deploy, upload, promotion, replication or migration import of the
+    /// other kind is refused with 400
+    /// When omitted, unchanged
+    pub version_policy: Option<crate::models::repository::MavenVersionPolicy>,
     /// Update the Cargo index upstream URL (stored in `repository_config`).
     /// When provided, upserts the `index_upstream_url` key for this repository.
     pub index_upstream_url: Option<String>,
@@ -1822,6 +1833,10 @@ pub struct RepositoryResponse {
     /// read back from `repository_config`. `None` when unset.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub custom_user_agent: Option<String>,
+    /// The Maven version policy of a Maven or Gradle repository (#5872),
+    /// absent for other formats
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version_policy: Option<crate::models::repository::MavenVersionPolicy>,
     /// Custom Origin field for Debian/APT Release files (default: "artifact-keeper").
     #[serde(skip_serializing_if = "Option::is_none")]
     pub apt_origin: Option<String>,
@@ -2352,6 +2367,7 @@ fn repo_to_response(
         virtual_member_fallback: None,
         composer_upstream_search: None,
         custom_user_agent: None,
+        version_policy: None,
         apt_origin: None,
         apt_label: None,
         apt_release_version: None,
@@ -2457,6 +2473,21 @@ async fn with_custom_user_agent(
         response.custom_user_agent = Some(ua);
     }
     response
+}
+
+/// Populate `RepositoryResponse.version_policy` for a Maven or Gradle
+/// repository (#5872)
+async fn with_version_policy(
+    db: &sqlx::PgPool,
+    repo_id: Uuid,
+    format: &RepositoryFormat,
+    mut response: RepositoryResponse,
+) -> Result<RepositoryResponse> {
+    if crate::services::maven_version_policy::applies_to_format(format.as_key()) {
+        response.version_policy =
+            Some(crate::services::maven_version_policy::load(db, repo_id).await?);
+    }
+    Ok(response)
 }
 
 /// Populate `RepositoryResponse` APT release fields (`apt_origin`,
@@ -4748,6 +4779,9 @@ pub async fn list_repositories(
 
     let depth_settings = rpm_layout::settings(&state.db, &repo_ids).await?;
     let mut repodata_modes = rpm_repodata_builder::modes(&state.db, &repo_ids).await?;
+    // #5872: the Maven and Gradle repositories' version policy, one query
+    let version_policies =
+        crate::services::maven_version_policy::load_many(&state.db, &repo_ids).await?;
     let items: Vec<RepositoryResponse> = repos
         .into_iter()
         .map(|r| {
@@ -4764,6 +4798,7 @@ pub async fn list_repositories(
                 resp.repodata_depth_editable = editable;
             }
             resp.repodata_mode = repodata_modes.remove(&resp.id);
+            resp.version_policy = version_policies.get(&resp.id).copied();
             if resp.repo_type == RepositoryType::Virtual.as_str() {
                 resp.virtual_metadata_partial =
                     Some(partial_opt_in.get(&resp.id).copied().unwrap_or(false));
@@ -4877,7 +4912,7 @@ async fn update_repository_route(
     security(("bearer_auth" = [])),
     responses(
         (status = 200, description = "Repository created", body = RepositoryResponse),
-        (status = 400, description = "Invalid repository configuration, repodata_depth outside 0..1023, or a key using another project's `<project.key>-` prefix"),
+        (status = 400, description = "Invalid repository configuration, repodata_depth outside 0..1023, a version_policy other than mixed on a repository that is not a local or staging Maven or Gradle repository, or a key using another project's `<project.key>-` prefix"),
         (status = 401, description = "Authentication required"),
         (status = 403, description = "Insufficient permissions: needs global admin, system repository admin, or project admin of the requested project_id"),
         (status = 409, description = "Repository key already exists or concurrent layout change; retry"),
@@ -4982,6 +5017,18 @@ pub async fn create_repository(
     // repository behind, mirroring the `custom_user_agent` guard above.
     if let Some(ref gpg_key) = payload.trusted_gpg_key {
         validate_trusted_gpg_key(gpg_key)?;
+    }
+
+    // #5872: a version policy the repository cannot carry is refused before
+    // the row exists
+    if let Some(policy) = payload.version_policy {
+        if !crate::services::maven_version_policy::accepts_policy(
+            policy,
+            format.as_key(),
+            repo_type.is_hosted(),
+        ) {
+            return Err(crate::services::maven_version_policy::not_applicable());
+        }
     }
 
     // apt_* Release metadata (#2489): validate up-front — before the repository
@@ -5287,6 +5334,10 @@ pub async fn create_repository(
         }
     }
 
+    if let Some(policy) = payload.version_policy {
+        crate::services::maven_version_policy::store(&state.db, repo.id, policy).await?;
+    }
+
     // Persist npm scope policy (#2424). Validation already ran up-front; the
     // shared helper re-validates and writes only the provided keys. An
     // inactive payload on a repo the policy is not configurable on was
@@ -5533,6 +5584,7 @@ pub async fn create_repository(
     )
     .await?;
     let response = with_oci_trusted_realms(&state.db, repo_id, &repo_type_out, response).await?;
+    let response = with_version_policy(&state.db, repo_id, &repo_format_out, response).await?;
     // Reflect the trusted GPG key state (#2568) so the create response
     // round-trips with a subsequent GET. Only the boolean is exposed.
     let response = with_row_presence_fields(&state.db, repo_id, response).await;
@@ -5596,6 +5648,7 @@ pub async fn get_repository(
     let response = with_quarantine_settings(&state.db, repo_id, response).await;
     let response = with_virtual_settings(&state.db, repo_id, response).await;
     let response = with_custom_user_agent(&state.db, repo_id, response).await;
+    let response = with_version_policy(&state.db, repo_id, &repo_format, response).await?;
     let response = if is_apt_hosted {
         with_apt_settings(&state.db, repo_id, response).await
     } else {
@@ -6484,6 +6537,17 @@ fn validate_update_config_fields(
         payload.npm_allow_unscoped,
         payload.npm_allowed_name_patterns.as_deref(),
     )?;
+    // #5872: the same rule as on create, so a refused policy leaves the
+    // other fields of the update unwritten
+    if let Some(policy) = payload.version_policy {
+        if !crate::services::maven_version_policy::accepts_policy(
+            policy,
+            format.as_key(),
+            repo_type.is_hosted(),
+        ) {
+            return Err(crate::services::maven_version_policy::not_applicable());
+        }
+    }
     // Quarantine and `virtual_metadata_partial`: the same rules as on create
     // (#3647, #5324).
     SharedRepoConfigSettings::from(payload).validate(repo_type)?;
@@ -6554,7 +6618,7 @@ async fn may_rename_repository(
     security(("bearer_auth" = [])),
     responses(
         (status = 200, description = "Repository updated", body = RepositoryResponse),
-        (status = 400, description = "Invalid repository configuration, repodata_depth outside 0..1023, or a renamed/reassigned key using another project's `<project.key>-` prefix"),
+        (status = 400, description = "Invalid repository configuration, repodata_depth outside 0..1023, a version_policy other than mixed on a repository that is not a local or staging Maven or Gradle repository, or a renamed/reassigned key using another project's `<project.key>-` prefix"),
         (status = 401, description = "Authentication required"),
         (status = 403, description = "Insufficient permissions: needs repository admin, plus project admin of the destination project when changing project_id, or of the current project when clearing it with null, and admin (or project admin of the project the repository ends up in) to change the key"),
         (status = 404, description = "Repository not found"),
@@ -6893,6 +6957,10 @@ pub async fn update_repository(
         upsert_repo_config(&state.db, repo.id, "pypi_upstream_index_path", index_path).await?;
     }
 
+    if let Some(policy) = payload.version_policy {
+        crate::services::maven_version_policy::store(&state.db, repo.id, policy).await?;
+    }
+
     // npm scope policy (#2424): validate the target is an npm Remote repo, then
     // persist only the provided keys via the shared helper. An inactive payload
     // (empty lists, allow_unscoped false) against a repo the policy is not
@@ -7054,7 +7122,8 @@ pub async fn update_repository(
         repo.repo_type.is_hosted() && matches!(repo.format, RepositoryFormat::Debian);
     let response = repo_to_display_response(repo, storage_used);
     let response = with_quarantine_settings(&state.db, repo_id, response).await;
-    let mut response = with_virtual_settings(&state.db, repo_id, response).await;
+    let response = with_virtual_settings(&state.db, repo_id, response).await;
+    let mut response = with_version_policy(&state.db, repo_id, &repo_format, response).await?;
     if let Some(ref ua) = payload.custom_user_agent {
         response.custom_user_agent = if ua.is_empty() {
             None
@@ -11557,7 +11626,7 @@ pub async fn list_artifact_versions(
         // strict generated SDKs treat every successful upload as an error.
         (status = 201, description = "Artifact uploaded", body = ArtifactResponse,
             headers(("ETag" = String, description = "Strong entity tag of the stored artifact: its quoted SHA-256"))),
-        (status = 400, description = "Invalid artifact path, the repository is virtual (direct uploads are not accepted), or a malformed `If-Match` / `If-None-Match`", body = crate::api::openapi::ErrorResponse),
+        (status = 400, description = "Invalid artifact path, the repository is virtual (direct uploads are not accepted), the repository's Maven version policy refuses the path, or a malformed `If-Match` / `If-None-Match`", body = crate::api::openapi::ErrorResponse),
         (status = 401, description = "Authentication required"),
         (status = 403, description = "Not authorized to write to this repository", body = crate::api::openapi::ErrorResponse),
         (status = 404, description = "Repository not found"),
@@ -11613,6 +11682,19 @@ pub async fn upload_artifact(
             );
         }
     }
+
+    // #5872: the path is known before the body is read, so a version the
+    // Maven policy refuses is answered without staging a byte.
+    // `persist_generic_staged_upload` checks again for the multipart routes.
+    crate::services::maven_version_policy::check_write(
+        &state.db,
+        repo.id,
+        &key,
+        repo.format.as_key(),
+        &path,
+    )
+    .await
+    .map_err(|e| e.into_response())?;
 
     // Stream the request body into staging, computing SHA-256/SHA-1/MD5 in a
     // single pass — the whole artifact is never buffered in memory (#2517).
@@ -12500,6 +12582,17 @@ async fn persist_generic_staged_upload(
     staged: GenericStagedBody,
     digests: crate::services::artifact_service::ContentDigests,
 ) -> std::result::Result<Response, Response> {
+    // #5872: the generic upload is also how a peer replicates into this
+    // repository, so the Maven version policy is held here too
+    crate::services::maven_version_policy::check_write(
+        &state.db,
+        repo.id,
+        &key,
+        repo.format.as_key(),
+        &path,
+    )
+    .await
+    .map_err(|e| e.into_response())?;
     // Verify declared checksums against the digests computed while staging —
     // same semantics as the old `verify_checksums(&body, ...)`, but with no
     // extra pass over the body.
@@ -16617,6 +16710,7 @@ async fn load_routing_rules(db: &sqlx::PgPool, repo_id: Uuid) -> Vec<RoutingRule
     ),
     components(schemas(
         crate::models::repository::RepositoryVisibility,
+        crate::models::repository::MavenVersionPolicy,
         delete_job::RepositoryDeleteJobResponse,
         ListRepositoriesQuery,
         CreateRepositoryRequest,
@@ -20397,6 +20491,7 @@ mod tests {
             virtual_member_fallback: None,
             composer_upstream_search: None,
             custom_user_agent: None,
+            version_policy: None,
             project_id: None,
             apt_origin: None,
             apt_label: None,
@@ -20463,6 +20558,7 @@ mod tests {
             virtual_member_fallback: None,
             composer_upstream_search: None,
             custom_user_agent: None,
+            version_policy: None,
             project_id: None,
             apt_origin: None,
             apt_label: None,
@@ -21916,6 +22012,7 @@ mod tests {
             virtual_member_fallback: None,
             composer_upstream_search: None,
             custom_user_agent: None,
+            version_policy: None,
             project_id: None,
             apt_origin: None,
             apt_label: None,
@@ -24608,6 +24705,198 @@ mod tests {
             .bind(&backend)
             .execute(&pool)
             .await;
+    }
+
+    /// #5872: the version policy is set on create, read back on GET, changed
+    /// by an update, returned on the listing, and refused on a repository
+    /// that cannot carry it, before any row exists
+    #[tokio::test]
+    async fn version_policy_round_trips_through_the_api_5872_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::models::repository::MavenVersionPolicy;
+        use axum::extract::{Extension, Path, State};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let storage_dir = std::env::temp_dir().join(format!("ak-5872-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let admin = admin_auth(user_id, &username);
+        let maven_key = format!("maven-5872-{}", Uuid::new_v4().simple());
+        let npm_key = format!("npm-5872-{}", Uuid::new_v4().simple());
+
+        let created = create_repository(
+            State(state.clone()),
+            Extension(Some(admin.clone())),
+            make_create_request(
+                &maven_key,
+                "maven releases",
+                "maven",
+                serde_json::json!({"repo_type": "local", "version_policy": "release"}),
+            ),
+        )
+        .await
+        .map(|Json(r)| r.version_policy);
+        let fetched = get_repository(
+            State(state.clone()),
+            Extension(Some(admin.clone())),
+            Path(maven_key.clone()),
+        )
+        .await
+        .map(|Json(r)| r.version_policy);
+        let update: UpdateRepositoryRequest =
+            serde_json::from_value(serde_json::json!({"version_policy": "snapshot"}))
+                .expect("update request");
+        let updated = update_repository(
+            State(state.clone()),
+            Extension(Some(admin.clone())),
+            Path(maven_key.clone()),
+            Json(update),
+        )
+        .await
+        .map(|Json(r)| r.version_policy);
+        let listed = list_repositories(
+            State(state.clone()),
+            Extension(Some(admin.clone())),
+            Query(ListRepositoriesQuery {
+                page: Some(1),
+                per_page: Some(100),
+                format: None,
+                repo_type: None,
+                q: Some(maven_key.clone()),
+                project: None,
+            }),
+        )
+        .await
+        .map(|Json(l)| {
+            l.items
+                .into_iter()
+                .find(|r| r.key == maven_key)
+                .and_then(|r| r.version_policy)
+        });
+        let refused = create_repository(
+            State(state.clone()),
+            Extension(Some(admin.clone())),
+            make_create_request(
+                &npm_key,
+                "npm with a maven policy",
+                "npm",
+                serde_json::json!({"repo_type": "local", "version_policy": "release"}),
+            ),
+        )
+        .await;
+        let npm_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM repositories WHERE key = $1")
+            .bind(&npm_key)
+            .fetch_one(&pool)
+            .await
+            .expect("count npm rows");
+
+        let _ = sqlx::query("DELETE FROM repositories WHERE key = ANY($1)")
+            .bind(vec![maven_key.clone(), npm_key.clone()])
+            .execute(&pool)
+            .await;
+        tdh::cleanup_user(&pool, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+
+        assert_eq!(created.ok(), Some(Some(MavenVersionPolicy::Release)));
+        assert_eq!(fetched.ok(), Some(Some(MavenVersionPolicy::Release)));
+        assert_eq!(updated.ok(), Some(Some(MavenVersionPolicy::Snapshot)));
+        assert_eq!(
+            listed.ok(),
+            Some(Some(MavenVersionPolicy::Snapshot)),
+            "the listing returns the policy too"
+        );
+        assert!(
+            matches!(refused, Err(AppError::Validation(_))),
+            "a policy on an npm repository is a 400"
+        );
+        assert_eq!(npm_rows, 0, "the refused create leaves no row behind");
+    }
+
+    /// #5872: the generic artifact upload, which peer replication pushes
+    /// through below its chunked threshold, holds the Maven version policy
+    #[tokio::test]
+    async fn generic_upload_honours_version_policy_5872_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::extract::{Extension, Path, State};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "local", "maven").await;
+        sqlx::query("UPDATE repositories SET version_policy = 'release' WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .expect("set version_policy");
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let put = |path: &'static str| {
+            let state = state.clone();
+            let auth = admin_auth(user_id, &username);
+            let key = key.clone();
+            async move {
+                upload_artifact(
+                    State(state),
+                    Extension(Some(auth)),
+                    Path((key, path.to_string())),
+                    HeaderMap::new(),
+                    Body::from(Bytes::from_static(b"BYTES")),
+                )
+                .await
+                .map(|r| r.status())
+                .map_err(|r| r.status())
+            }
+        };
+        let snapshot = put("com/acme/lib/1.0-SNAPSHOT/lib-1.0-20260101.120000-1.jar").await;
+        // A body that fails when read: the refusal must come before staging
+        let unread = upload_artifact(
+            State(state.clone()),
+            Extension(Some(admin_auth(user_id, &username))),
+            Path((
+                key.clone(),
+                "com/acme/lib/1.0-SNAPSHOT/lib-1.0-20260101.120000-2.jar".to_string(),
+            )),
+            HeaderMap::new(),
+            Body::from_stream(futures::stream::once(async {
+                Err::<Bytes, std::io::Error>(std::io::Error::other("body must not be read"))
+            })),
+        )
+        .await
+        .expect_err("a refused path is an error");
+        let unread = (
+            unread.status(),
+            String::from_utf8_lossy(
+                &axum::body::to_bytes(unread.into_body(), usize::MAX)
+                    .await
+                    .expect("read body"),
+            )
+            .to_string(),
+        );
+        let release = put("com/acme/lib/1.0/lib-1.0.jar").await;
+        let rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM artifacts WHERE repository_id = $1")
+                .bind(repo_id)
+                .fetch_one(&pool)
+                .await
+                .expect("count artifacts");
+        tdh::cleanup_member_repo(&pool, repo_id, &dir).await;
+        tdh::cleanup_user(&pool, user_id).await;
+
+        assert_eq!(snapshot, Err(StatusCode::BAD_REQUEST));
+        assert_eq!(unread.0, StatusCode::BAD_REQUEST, "{}", unread.1);
+        assert!(
+            unread.1.contains("accepts release versions only"),
+            "refused before staging: {}",
+            unread.1
+        );
+        assert!(
+            release.as_ref().is_ok_and(|s| s.is_success()),
+            "{release:?}"
+        );
+        assert_eq!(rows, 1, "only the release is stored");
     }
 
     /// #3923: on a deployment whose default backend has no proxy-cache arm
@@ -36696,7 +36985,7 @@ mod tests {
         let check = |repo_type: RepositoryType, format: RepositoryFormat, json: &str| {
             validate_update_config_fields(&repo_type, &format, &req(json))
         };
-        use RepositoryFormat::{Debian, Generic};
+        use RepositoryFormat::{Debian, Generic, Gradle, Maven};
         use RepositoryType::{Local, Remote, Staging, Virtual};
 
         // Accepted where they apply.
@@ -36720,6 +37009,9 @@ mod tests {
                 r#"{"quarantine_enabled":true,"quarantine_duration_minutes":0}"#,
             ),
             (Virtual, Generic, r#"{"quarantine_enabled":false}"#),
+            (Local, Maven, r#"{"version_policy":"release"}"#),
+            (Staging, Gradle, r#"{"version_policy":"snapshot"}"#),
+            (Remote, Maven, r#"{"version_policy":"mixed"}"#),
         ] {
             assert!(
                 check(repo_type, format, json).is_ok(),
@@ -36743,6 +37035,9 @@ mod tests {
             (Local, Generic, r#"{"quarantine_duration_minutes":-1}"#),
             (Virtual, Generic, r#"{"quarantine_enabled":true}"#),
             (Local, Generic, r#"{"npm_allowed_scopes":["@acme"]}"#),
+            (Local, Generic, r#"{"version_policy":"release"}"#),
+            (Remote, Maven, r#"{"version_policy":"snapshot"}"#),
+            (Virtual, Gradle, r#"{"version_policy":"release"}"#),
         ] {
             assert!(
                 matches!(check(repo_type, format, json), Err(AppError::Validation(_))),
@@ -36813,6 +37108,8 @@ mod tests {
             r#""debian":{"components":["main"]}"#,
             r#""curation_default_action":"block""#,
             r#""quota_bytes":-1"#,
+            // #5872: a Maven version policy on a Generic repository
+            r#""version_policy":"release""#,
         ];
         let cases = generic_cases
             .iter()
@@ -38216,6 +38513,7 @@ mod tests {
             virtual_member_fallback: None,
             composer_upstream_search: None,
             custom_user_agent: None,
+            version_policy: None,
             project_id: None,
             apt_origin: None,
             apt_label: None,

@@ -2653,6 +2653,8 @@ pub(crate) fn failure_scope_for_peer_response(status: u16, body: &str) -> Failur
             body.contains("checksum mismatch")
                 || body.contains("already exists and is immutable")
                 || body.contains("cannot delete an immutable/released artifact")
+                || body.contains("accepts release versions only")
+                || body.contains("accepts snapshot versions only")
         }
         403 | 413 | 507 => {
             body.contains("storage quota exceeded")
@@ -6276,6 +6278,26 @@ mod tests {
     // -----------------------------------------------------------------------
     // #4921: protobuf commit pushes and item-scoped failures
     // -----------------------------------------------------------------------
+
+    /// #5872: a peer whose Maven version policy refuses this version refuses
+    /// the item, the other versions still replicate to it
+    #[test]
+    fn peer_response_scope_version_policy_is_item_5872() {
+        for kind in ["release", "snapshot"] {
+            let body = format!(
+                r#"{{"code":"VALIDATION_ERROR","message":"Repository 'libs' accepts {kind} versions only"}}"#
+            );
+            assert_eq!(
+                failure_scope_for_peer_response(400, &body),
+                FailureScope::Item,
+                "{kind}"
+            );
+        }
+        assert_eq!(
+            failure_scope_for_peer_response(400, r#"{"message":"bad request"}"#),
+            FailureScope::Peer
+        );
+    }
 
     #[test]
     fn peer_response_scope_separates_item_rejections_4921() {

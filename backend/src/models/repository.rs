@@ -344,6 +344,41 @@ macro_rules! impl_repo_type_eq {
 
 impl_repo_type_eq!(str, &str, String);
 
+/// Which Maven versions a hosted Maven or Gradle repository accepts (#5872),
+/// Nexus' version policy. `Mixed` is the behaviour before the policy existed
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum MavenVersionPolicy {
+    /// Release and SNAPSHOT versions
+    #[default]
+    Mixed,
+    /// Release versions only
+    Release,
+    /// SNAPSHOT versions only
+    Snapshot,
+}
+
+impl MavenVersionPolicy {
+    /// The value stored in `repositories.version_policy`
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Mixed => "mixed",
+            Self::Release => "release",
+            Self::Snapshot => "snapshot",
+        }
+    }
+
+    /// Parse a stored value, `None` for anything else
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "mixed" => Some(Self::Mixed),
+            "release" => Some(Self::Release),
+            "snapshot" => Some(Self::Snapshot),
+            _ => None,
+        }
+    }
+}
+
 /// Baseline read audience of a repository.
 ///
 /// This is the visibility axis, and it is orthogonal to the grant axis

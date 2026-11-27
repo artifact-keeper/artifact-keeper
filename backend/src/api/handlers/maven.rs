@@ -219,6 +219,18 @@ async fn delete_stored_metadata_document(
     }
 }
 
+/// The 400 for a deploy the repository's version policy refuses (#5872), with
+/// the reason as the HTTP status line too: `mvn deploy` prints the status
+/// line, not the body, like the quota refusals' reason phrase
+fn version_policy_refusal(reason: String) -> Response {
+    let phrase = hyper::ext::ReasonPhrase::try_from(reason.clone().into_bytes()).ok();
+    let mut response = AppError::Validation(reason).into_response();
+    if let Some(phrase) = phrase {
+        response.extensions_mut().insert(phrase);
+    }
+    response
+}
+
 /// The version-level `maven-metadata.xml` path of a file deleted from a
 /// `-SNAPSHOT` version directory
 /// (`g/a/1.0-SNAPSHOT/a-1.0-20260101.120000-2.jar` ->
@@ -5507,15 +5519,25 @@ async fn upload(
 
     // Reject direct uploads to promotion-only repositories (non-admins). Such
     // repos accept artifacts only via the promotion path, not direct push.
-    let promotion_only = sqlx::query_scalar!(
-        "SELECT promotion_only FROM repositories WHERE id = $1",
+    // The same row read also gives the #5872 version policy.
+    let (promotion_only, version_policy) = sqlx::query!(
+        "SELECT promotion_only, version_policy FROM repositories WHERE id = $1",
         repo.id
     )
     .fetch_optional(&state.db)
     .await
     .map_err(|e| proxy_helpers::internal_error("Database", e))?
-    .unwrap_or(false);
+    .map(|row| (row.promotion_only, row.version_policy))
+    .unwrap_or_default();
     proxy_helpers::reject_direct_upload_if_promotion_only(promotion_only, auth.is_admin)?;
+
+    // #5872: a version the repository's policy refuses is answered before any
+    // byte is staged
+    if let Some(reason) =
+        crate::services::maven_version_policy::refusal_stored(&version_policy, &repo_key, &path)
+    {
+        return Err(version_policy_refusal(reason));
+    }
 
     // #2624: on shared cloud namespaces new objects are written under a
     // repository-scoped key (`maven/{repository_id}/{path}`) so the physical
@@ -10690,6 +10712,129 @@ mod tests {
         assert_eq!(after_get, 1, "the virtual GET must record one download");
         assert_eq!(head_status, StatusCode::OK);
         assert_eq!(after_head, 1, "a HEAD through the virtual must not record");
+    }
+
+    /// #5872: a deploy the repository's version policy does not accept is
+    /// refused with 400 naming the policy, artifact, POM, checksum and
+    /// version-level metadata alike. Group and artifact level
+    /// `maven-metadata.xml` is accepted under every policy
+    #[tokio::test]
+    async fn test_upload_honours_version_policy_5872() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::http::StatusCode;
+
+        let Some(fx) = tdh::Fixture::setup("local", "maven").await else {
+            return;
+        };
+        let snap_dir = "org/example/pol5872/lib/2.0-SNAPSHOT";
+        let rel_dir = "org/example/pol5872/lib/2.0";
+        let snapshot_refused = [
+            format!("{snap_dir}/lib-2.0-20260101.120000-1.jar"),
+            format!("{snap_dir}/lib-2.0-20260101.120000-1.pom"),
+            format!("{snap_dir}/lib-2.0-20260101.120000-1.jar.sha1"),
+            format!("{snap_dir}/maven-metadata.xml"),
+        ];
+        let release_refused = [
+            format!("{rel_dir}/lib-2.0.jar"),
+            format!("{rel_dir}/lib-2.0.pom"),
+            format!("{rel_dir}/lib-2.0.jar.sha1"),
+        ];
+        let ga_metadata = "org/example/pol5872/lib/maven-metadata.xml".to_string();
+        let release_accepted = [format!("{rel_dir}/lib-2.0.jar"), ga_metadata.clone()];
+        let snapshot_accepted = [
+            format!("{snap_dir}/lib-2.0-20260101.120000-1.jar"),
+            format!("{snap_dir}/maven-metadata.xml"),
+            ga_metadata,
+        ];
+        let set_policy = |policy: &'static str| {
+            let pool = fx.pool.clone();
+            let repo_id = fx.repo_id;
+            async move {
+                sqlx::query("UPDATE repositories SET version_policy = $1 WHERE id = $2")
+                    .bind(policy)
+                    .bind(repo_id)
+                    .execute(&pool)
+                    .await
+                    .expect("set version_policy");
+            }
+        };
+        let put_all = |paths: Vec<String>| {
+            let router = fx.router_with_auth(super::router());
+            let repo_key = fx.repo_key.clone();
+            async move {
+                let mut out = Vec::new();
+                for path in paths {
+                    let (status, body) = tdh::send(
+                        router.clone(),
+                        tdh::put(format!("/{repo_key}/{path}"), Bytes::from(path.clone())),
+                    )
+                    .await;
+                    out.push((path, status, String::from_utf8_lossy(&body).to_string()));
+                }
+                out
+            }
+        };
+
+        set_policy("release").await;
+        // `mvn deploy` prints the status line, so the reason is there too
+        let reason = {
+            use tower::ServiceExt;
+            let response = fx
+                .router_with_auth(super::router())
+                .oneshot(tdh::put(
+                    format!("/{}/{}", fx.repo_key, snapshot_refused[0]),
+                    Bytes::from_static(b"jar"),
+                ))
+                .await
+                .expect("oneshot");
+            (
+                response.status(),
+                response
+                    .extensions()
+                    .get::<hyper::ext::ReasonPhrase>()
+                    .map(|r| String::from_utf8_lossy(r.as_bytes()).into_owned()),
+            )
+        };
+        let expected_reason = format!("Repository '{}' accepts release versions only", fx.repo_key);
+        let release_repo = put_all(
+            snapshot_refused
+                .iter()
+                .chain(release_accepted.iter())
+                .cloned()
+                .collect(),
+        )
+        .await;
+        sqlx::query("DELETE FROM artifacts WHERE repository_id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("reset artifacts");
+        set_policy("snapshot").await;
+        let snapshot_repo = put_all(
+            release_refused
+                .iter()
+                .chain(snapshot_accepted.iter())
+                .cloned()
+                .collect(),
+        )
+        .await;
+        fx.teardown().await;
+
+        let refused = |kind: &str, results: &[(String, StatusCode, String)], n: usize| {
+            for (path, status, body) in &results[..n] {
+                assert_eq!(*status, StatusCode::BAD_REQUEST, "{path}: {body}");
+                assert!(
+                    body.contains(&format!("accepts {kind} versions only")),
+                    "{path}: {body}"
+                );
+            }
+            for (path, status, body) in &results[n..] {
+                assert!(status.is_success(), "{path}: {status} {body}");
+            }
+        };
+        assert_eq!(reason, (StatusCode::BAD_REQUEST, Some(expected_reason)));
+        refused("release", &release_repo, snapshot_refused.len());
+        refused("snapshot", &snapshot_repo, release_refused.len());
     }
 
     /// #4286: every read of a hosted Maven artifact, direct or through a
