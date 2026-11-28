@@ -1605,6 +1605,11 @@ mod tests {
     // the issue inside this module; the comment is here to warn anyone
     // adding new tests that bypass `build_readyz_response`.
 
+    /// Serialises the tests that contend for the process-wide CPU profile
+    /// lock. Taking that lock directly inside a test would make the tests
+    /// order-dependent under `--test-threads` > 1.
+    static CPU_PROFILE_TEST_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+
     #[test]
     fn cpu_profile_duration_is_bounded() {
         assert_eq!(
@@ -1632,7 +1637,8 @@ mod tests {
 
     #[tokio::test]
     async fn cpu_profile_allows_one_capture_at_a_time() {
-        let _permit = CPU_PROFILE_LOCK.try_lock().unwrap();
+        let _test_guard = CPU_PROFILE_TEST_LOCK.lock().await;
+        let _permit = CPU_PROFILE_LOCK.lock().await;
         let response = cpu_profile(axum::extract::Query(HashMap::new()))
             .await
             .into_response();
@@ -1642,6 +1648,7 @@ mod tests {
     #[cfg(all(feature = "profiling", not(target_os = "windows")))]
     #[tokio::test]
     async fn cpu_profile_returns_pprof_data() {
+        let _test_guard = CPU_PROFILE_TEST_LOCK.lock().await;
         let params = HashMap::from([("duration".to_string(), "1".to_string())]);
         let response = cpu_profile(axum::extract::Query(params))
             .await
@@ -1659,6 +1666,7 @@ mod tests {
     #[cfg(not(all(feature = "profiling", not(target_os = "windows"))))]
     #[tokio::test]
     async fn cpu_profile_reports_disabled_feature() {
+        let _test_guard = CPU_PROFILE_TEST_LOCK.lock().await;
         let response = cpu_profile(axum::extract::Query(HashMap::new()))
             .await
             .into_response();
