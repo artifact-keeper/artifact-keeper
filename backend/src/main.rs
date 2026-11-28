@@ -211,6 +211,8 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     tracing::info!("Global allocator: system");
     #[cfg(feature = "profiling")]
     tracing::info!("Jemalloc profiling enabled - set _RJEM_MALLOC_CONF=prof:true to activate");
+    #[cfg(all(feature = "profiling", not(target_os = "windows")))]
+    tracing::info!("CPU profiling endpoint enabled at /api/v1/admin/cpu-profile");
 
     tracing::info!(
         version = artifact_keeper_backend::build_info::VERSION,

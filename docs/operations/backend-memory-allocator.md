@@ -72,8 +72,9 @@ Other images and builds:
   ```sh
   cargo build --release --features jemalloc
   ```
-  `--features profiling` implies `jemalloc` and adds heap profiling; see
-  `backend/src/main.rs`.
+  `--features profiling` implies `jemalloc` and adds heap profiling and an
+  admin-only CPU profile endpoint; see `backend/src/main.rs` and [CPU
+  profiling](cpu-profiling.md).
 * **arm64.** jemalloc fixes its page size when it is compiled, and refuses to
   start on a kernel with larger pages (`<jemalloc>: Unsupported system page
   size`). The Dockerfile builds it for 64 KiB pages on aarch64, which also

@@ -2813,6 +2813,21 @@ mod raw_error_body_class_tests {
             "operator config",
         ),
         ("health.rs", "Failed to dump profile", "operator config"),
+        (
+            "health.rs",
+            "Failed to encode CPU profile",
+            "operator config",
+        ),
+        (
+            "health.rs",
+            "Failed to start CPU profiler",
+            "operator config",
+        ),
+        (
+            "health.rs",
+            "Failed to build CPU profile",
+            "operator config",
+        ),
         ("health.rs", "Failed to read profile", "operator config"),
         ("migration.rs", "Failed to create client", "operator config"),
         (

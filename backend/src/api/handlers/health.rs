@@ -1415,6 +1415,137 @@ pub async fn heap_profile(
     }
 }
 
+const DEFAULT_CPU_PROFILE_DURATION_SECS: u64 = 10;
+const MAX_CPU_PROFILE_DURATION_SECS: u64 = 60;
+
+fn parse_cpu_profile_duration(params: &HashMap<String, String>) -> Result<u64, &'static str> {
+    let Some(raw) = params.get("duration") else {
+        return Ok(DEFAULT_CPU_PROFILE_DURATION_SECS);
+    };
+    let duration = raw
+        .parse::<u64>()
+        .map_err(|_| "duration must be an integer number of seconds")?;
+    if (1..=MAX_CPU_PROFILE_DURATION_SECS).contains(&duration) {
+        Ok(duration)
+    } else {
+        Err("duration must be between 1 and 60 seconds")
+    }
+}
+
+static CPU_PROFILE_LOCK: Mutex<()> = Mutex::const_new(());
+
+#[cfg(all(feature = "profiling", not(target_os = "windows")))]
+fn capture_cpu_profile(duration_secs: u64) -> Result<Vec<u8>, String> {
+    use pprof::protos::Message;
+
+    let guard = pprof::ProfilerGuardBuilder::default()
+        .frequency(99)
+        .blocklist(&["libc", "libgcc", "pthread", "vdso"])
+        .build()
+        .map_err(|e| format!("Failed to start CPU profiler: {e}"))?;
+
+    std::thread::sleep(Duration::from_secs(duration_secs));
+
+    let report = guard
+        .report()
+        .build()
+        .map_err(|e| format!("Failed to build CPU profile: {e}"))?;
+    let profile = report
+        .pprof()
+        .map_err(|e| format!("Failed to encode CPU profile: {e}"))?;
+    let mut bytes = Vec::new();
+    profile
+        .encode(&mut bytes)
+        .map_err(|e| format!("Failed to encode CPU profile: {e}"))?;
+    Ok(bytes)
+}
+
+#[cfg(not(all(feature = "profiling", not(target_os = "windows"))))]
+fn capture_cpu_profile(_duration_secs: u64) -> Result<Vec<u8>, String> {
+    Err("CPU profiling is not enabled in this build".to_string())
+}
+
+async fn cpu_profile_with_capture(
+    params: HashMap<String, String>,
+    capture: fn(u64) -> Result<Vec<u8>, String>,
+) -> axum::response::Response {
+    let duration_secs = match parse_cpu_profile_duration(&params) {
+        Ok(duration) => duration,
+        Err(message) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                [(axum::http::header::CONTENT_TYPE, "text/plain")],
+                message,
+            )
+                .into_response()
+        }
+    };
+
+    let permit = match CPU_PROFILE_LOCK.try_lock() {
+        Ok(permit) => permit,
+        Err(_) => {
+            return (
+                StatusCode::CONFLICT,
+                [(axum::http::header::CONTENT_TYPE, "text/plain")],
+                "A CPU profile is already running",
+            )
+                .into_response()
+        }
+    };
+
+    // Keep the guard with the sampler, not with this future: if the client
+    // disconnects while the handler is awaiting the blocking task, dropping
+    // the JoinHandle must not let a second profile start before this one ends.
+    let bytes = match tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        capture(duration_secs)
+    })
+    .await
+    {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(message)) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                [(axum::http::header::CONTENT_TYPE, "text/plain")],
+                message,
+            )
+                .into_response()
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                [(axum::http::header::CONTENT_TYPE, "text/plain")],
+                format!("CPU profile task failed: {e}"),
+            )
+                .into_response()
+        }
+    };
+
+    (
+        StatusCode::OK,
+        [
+            (axum::http::header::CONTENT_TYPE, "application/octet-stream"),
+            (
+                axum::http::header::CONTENT_DISPOSITION,
+                "attachment; filename=\"cpu.pb\"",
+            ),
+        ],
+        bytes,
+    )
+        .into_response()
+}
+
+/// Capture a CPU profile (only available with `--features profiling`).
+///
+/// The optional `duration` query parameter is the number of seconds to sample,
+/// from 1 to 60 (default 10). Only one profile can run at a time. The response
+/// is a pprof-compatible protobuf; analyze it with `go tool pprof cpu.pb`.
+pub async fn cpu_profile(
+    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    cpu_profile_with_capture(params, capture_cpu_profile).await
+}
+
 /// Memory statistics from jemalloc (available with `--features profiling`).
 ///
 /// Returns a JSON object with allocated, active, resident, mapped, and
@@ -1480,6 +1611,119 @@ mod tests {
     // rather than constructing a setup CheckStatus by hand, which avoids
     // the issue inside this module; the comment is here to warn anyone
     // adding new tests that bypass `build_readyz_response`.
+
+    /// Serialises the tests that contend for the process-wide CPU profile
+    /// lock. Taking that lock directly inside a test would make the tests
+    /// order-dependent under `--test-threads` > 1.
+    static CPU_PROFILE_TEST_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+
+    #[test]
+    fn cpu_profile_duration_is_bounded() {
+        assert_eq!(
+            parse_cpu_profile_duration(&HashMap::new()),
+            Ok(DEFAULT_CPU_PROFILE_DURATION_SECS)
+        );
+        for (raw, expected) in [("1", 1), ("30", 30), ("60", MAX_CPU_PROFILE_DURATION_SECS)] {
+            let params = HashMap::from([("duration".to_string(), raw.to_string())]);
+            assert_eq!(parse_cpu_profile_duration(&params), Ok(expected));
+        }
+        for raw in ["0", "61", "-1", "abc", ""] {
+            let params = HashMap::from([("duration".to_string(), raw.to_string())]);
+            assert!(parse_cpu_profile_duration(&params).is_err(), "{raw}");
+        }
+    }
+
+    #[tokio::test]
+    async fn cpu_profile_rejects_invalid_duration_before_starting() {
+        let params = HashMap::from([("duration".to_string(), "61".to_string())]);
+        let response = cpu_profile(axum::extract::Query(params))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn cpu_profile_allows_one_capture_at_a_time() {
+        let _test_guard = CPU_PROFILE_TEST_LOCK.lock().await;
+        let _permit = CPU_PROFILE_LOCK.lock().await;
+        let response = cpu_profile(axum::extract::Query(HashMap::new()))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    #[cfg(all(feature = "profiling", not(target_os = "windows")))]
+    #[tokio::test]
+    async fn cpu_profile_returns_pprof_data() {
+        let _test_guard = CPU_PROFILE_TEST_LOCK.lock().await;
+        let params = HashMap::from([("duration".to_string(), "1".to_string())]);
+        let response = cpu_profile(axum::extract::Query(params))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .unwrap(),
+            "application/octet-stream"
+        );
+    }
+
+    #[cfg(not(all(feature = "profiling", not(target_os = "windows"))))]
+    #[tokio::test]
+    async fn cpu_profile_reports_disabled_feature() {
+        let _test_guard = CPU_PROFILE_TEST_LOCK.lock().await;
+        let response = cpu_profile(axum::extract::Query(HashMap::new()))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    fn successful_cpu_capture(_duration_secs: u64) -> Result<Vec<u8>, String> {
+        Ok(vec![1, 2, 3, 4])
+    }
+
+    fn panicking_cpu_capture(_duration_secs: u64) -> Result<Vec<u8>, String> {
+        panic!("simulated sampler panic")
+    }
+
+    #[tokio::test]
+    async fn cpu_profile_returns_captured_bytes() {
+        let _test_guard = CPU_PROFILE_TEST_LOCK.lock().await;
+        let response = cpu_profile_with_capture(HashMap::new(), successful_cpu_capture).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .unwrap(),
+            "application/octet-stream"
+        );
+        #[allow(clippy::disallowed_methods)]
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(body.as_ref(), &[1, 2, 3, 4]);
+    }
+
+    #[tokio::test]
+    async fn cpu_profile_reports_join_failure() {
+        let _test_guard = CPU_PROFILE_TEST_LOCK.lock().await;
+        let response = cpu_profile_with_capture(HashMap::new(), panicking_cpu_capture).await;
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        #[allow(clippy::disallowed_methods)]
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&body).contains("CPU profile task failed"),
+            "unexpected body: {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
 
     fn no_dependencies() -> ReadyzDependencies {
         ReadyzDependencies {
