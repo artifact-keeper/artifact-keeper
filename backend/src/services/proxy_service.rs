@@ -27714,13 +27714,14 @@ mod tests {
         let Some(pool) = tdh::try_pool().await else {
             return;
         };
+        let fetch_deadline = Duration::from_secs(2);
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/stalled-5617"))
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_bytes(b"late".as_ref())
-                    .set_delay(Duration::from_secs(4)),
+                    .set_delay(fetch_deadline * 2 + Duration::from_secs(1)),
             )
             .mount(&server)
             .await;
@@ -27735,7 +27736,7 @@ mod tests {
             .with_upstream_settings(crate::config::ProxyUpstreamSettings {
                 connect_secs: 5,
                 read_secs: 60,
-                fetch_deadline_secs: 1,
+                fetch_deadline_secs: fetch_deadline.as_secs(),
                 ..Default::default()
             }),
         );
@@ -27745,10 +27746,29 @@ mod tests {
             let (proxy, repo) = (Arc::clone(&proxy), repo.clone());
             tokio::spawn(async move { proxy.fetch_artifact(&repo, "stalled-5617").await })
         };
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        let started = std::time::Instant::now();
+        // #6491: wait for the leader to own the fill and reach the upstream
+        // instead of assuming a spawned task ran within a fixed sleep. A slow
+        // runner used to let the "follower" win the election and become the
+        // leader the assertions were written about.
+        let leader_request_at = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let reached = server
+                    .received_requests()
+                    .await
+                    .expect("recording")
+                    .iter()
+                    .any(|request| request.url.path() == "/stalled-5617");
+                if reached {
+                    return std::time::Instant::now();
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the leader reaches the upstream");
+
         let follower = proxy.fetch_artifact(&repo, "stalled-5617").await;
-        let follower_secs = started.elapsed();
+        let follower_returned_at = std::time::Instant::now();
         let leader = leader.await.expect("leader task");
         let hits_after_both = server.received_requests().await.unwrap_or_default().len();
 
@@ -27769,9 +27789,10 @@ mod tests {
             hits_after_both, 1,
             "the follower did not ask the upstream again"
         );
+        let follower_wait = follower_returned_at.duration_since(leader_request_at);
         assert!(
-            follower_secs < Duration::from_millis(1500),
-            "the follower answered with the leader, not after a second deadline: {follower_secs:?}"
+            follower_wait < fetch_deadline + Duration::from_millis(500),
+            "the follower answered with the leader, not after a second deadline: {follower_wait:?}"
         );
         assert_eq!(hits_after_late, 2, "a later request fetches again");
     }
