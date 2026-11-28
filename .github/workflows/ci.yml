@@ -2374,6 +2374,20 @@ jobs:
       - name: Check CHANGELOG has an open [Unreleased] section and valid fragments
         run: ./scripts/ci/check-changelog-unreleased.sh
 
+      # #6363 found six `ci(...)` PRs in the 1.12.2 range that touched shipped
+      # paths and reached the cut without a citation: the subject reads CI-only,
+      # but check 5's exemption is path-based. Warn at PR time, using the same
+      # path set as check 5, before making this blocking (#6476). Advisory: the
+      # step never fails, including when it cannot read the base ref.
+      - name: 'Warn when a ci: PR changes non-CI paths without a fragment'
+        if: ${{ github.event_name == 'pull_request' }}
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: bash scripts/ci/warn-ci-changelog-fragment.sh "origin/${GITHUB_BASE_REF}"
+
+      - name: 'Check the ci: PR changelog warning catches what it must'
+        run: bash scripts/ci/test-warn-ci-changelog-fragment.sh
+
       - name: Check the CHANGELOG gate catches what it must
         run: bash scripts/ci/test-check-changelog-unreleased.sh
 
