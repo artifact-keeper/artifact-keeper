@@ -986,7 +986,9 @@ pub fn set_user_gauge(total_users: i64) {
 }
 
 /// Peer ids with a published consecutive-failure gauge (#6565). Remembering
-/// them lets a refresh zero the gauge of a peer that was unregistered.
+/// them lets a refresh zero the gauge of a peer that was unregistered, so its
+/// last value is not mistaken for a current failure count. The exporter keeps
+/// that zeroed series until the process restarts.
 static PEER_FAILURE_GAUGE_PEERS: OnceLock<Mutex<HashSet<uuid::Uuid>>> = OnceLock::new();
 
 fn set_peer_consecutive_failures_gauge(peer_id: uuid::Uuid, failures: i32) {
