@@ -188,8 +188,8 @@ impl Drop for OpenConnectionGuard {
 
 /// Count one request refused with 429 by a rate limiter (#4676). `limiter` is
 /// the limiter's fixed name (`login`, `login_global`, `token`, `auth`, `api`,
-/// `search`, `presign`, `password_change`, `upload`, `proxy_rescan`), never a
-/// key, user or address.
+/// `registry_principal`, `registry_ip`, `search`, `presign`,
+/// `password_change`, `upload`, `proxy_rescan`), never a key, user or address.
 pub fn record_rate_limit_rejection(limiter: &'static str) {
     counter!("ak_rate_limit_rejections_total", "limiter" => limiter).increment(1);
 }

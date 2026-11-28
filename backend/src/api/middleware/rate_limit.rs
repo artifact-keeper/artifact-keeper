@@ -16,6 +16,7 @@ use axum::{
 };
 
 use super::auth::AuthExtension;
+use super::oci_errors::{is_oci_v2_path, oci_denied_response};
 
 /// Maximum login request body we will buffer to peek the `username` for
 /// per-account rate-limit keying. Login payloads are tiny (`{"username":...,
@@ -167,6 +168,20 @@ pub struct RateLimitState {
     /// the leftmost token is attacker-controlled (GHSA-8jm4-4x6c-6787). Every
     /// hop of a multi-proxy chain must be covered by these ranges; any token
     /// not covered is treated as the client.
+    pub trusted_proxies: Arc<Vec<CidrRange>>,
+}
+
+/// State for the native package-format and OCI request-rate limiter (#6401).
+///
+/// Two buckets are checked together for authenticated callers: one keyed by
+/// the verified principal and one by the resolved client IP. Anonymous callers
+/// have no principal bucket and are charged only against the IP bucket.
+#[derive(Debug, Clone)]
+pub struct RegistryRateLimitState {
+    pub principal: Arc<RateLimiter>,
+    pub ip: Arc<RateLimiter>,
+    pub exemptions: Arc<RateLimitExemptions>,
+    pub enabled: bool,
     pub trusted_proxies: Arc<Vec<CidrRange>>,
 }
 
@@ -528,6 +543,97 @@ pub async fn rate_limit_by_ip_middleware(
     }
 }
 
+/// Full request path, including the prefix stripped by `Router::nest`.
+pub(crate) fn full_request_path(request: &Request) -> String {
+    request
+        .extensions()
+        .get::<axum::extract::OriginalUri>()
+        .map(|uri| uri.0.path().to_string())
+        .unwrap_or_else(|| request.uri().path().to_string())
+}
+
+/// Request-rate limiter for native package-format routes and the OCI registry
+/// (#6401).
+///
+/// Unlike [`rate_limit_middleware`], this layer checks a per-principal bucket
+/// AND a per-client-IP bucket. Checking both bounds a shared token that is
+/// fanned out across many source IPs, while the IP bucket still bounds
+/// anonymous clients that have no principal at all. When the second bucket
+/// refuses, the first bucket's reservation is refunded so a refusal cannot
+/// spend both budgets and starve a different client.
+pub async fn registry_rate_limit_middleware(
+    State(state): State<RegistryRateLimitState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let auth = auth_from_request(&request);
+    enforce_registry_rate_limit(state, auth, request, next).await
+}
+
+/// Core of [`registry_rate_limit_middleware`], also used by the OCI layer after
+/// it has verified the principal out of the request's Authorization header.
+pub(crate) async fn enforce_registry_rate_limit(
+    state: RegistryRateLimitState,
+    auth: Option<AuthExtension>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if !rate_limiting_active(state.enabled) {
+        return next.run(request).await;
+    }
+
+    if let Some(tag) = check_rate_limit_exemptions(
+        &state.exemptions,
+        auth.as_ref(),
+        &request,
+        &state.trusted_proxies,
+    ) {
+        return tag_exempt(next.run(request).await, tag);
+    }
+
+    let ip_key = extract_client_ip(&request, &state.trusted_proxies);
+    let oci = is_oci_v2_path(&full_request_path(&request));
+
+    let Some(principal_key) = auth.map(|auth| format!("user:{}", auth.user_id)) else {
+        return match state.ip.check_rate_limit(&ip_key).await {
+            Ok(remaining) => tag_allowed(next.run(request).await, state.ip.max_requests, remaining),
+            Err(retry_after) => {
+                tracing::debug!(key = %ip_key, retry_after, "registry IP rate limit exceeded");
+                registry_too_many_requests(retry_after, &state.ip, oci)
+            }
+        };
+    };
+
+    let principal_remaining = match state.principal.check_rate_limit(&principal_key).await {
+        Ok(remaining) => remaining,
+        Err(retry_after) => {
+            tracing::debug!(key = %principal_key, retry_after, "registry principal rate limit exceeded");
+            return registry_too_many_requests(retry_after, &state.principal, oci);
+        }
+    };
+
+    let ip_remaining = match state.ip.check_rate_limit(&ip_key).await {
+        Ok(remaining) => remaining,
+        Err(retry_after) => {
+            // The principal bucket was reserved before the IP bucket was
+            // checked; give that unit back so one refused request does not
+            // consume both budgets.
+            state.principal.refund_attempt(&principal_key);
+            tracing::debug!(key = %ip_key, retry_after, "registry IP rate limit exceeded");
+            return registry_too_many_requests(retry_after, &state.ip, oci);
+        }
+    };
+
+    // Report the tighter of the two buckets; both were checked, so the client
+    // should see the one that will bind first on its next request.
+    let (limiter, remaining) = if ip_remaining <= principal_remaining {
+        (state.ip.as_ref(), ip_remaining)
+    } else {
+        (state.principal.as_ref(), principal_remaining)
+    };
+    tag_allowed(next.run(request).await, limiter.max_requests, remaining)
+}
+
 /// State for the login-only rate-limit middleware.
 ///
 /// Wraps the standard [`RateLimitState`] (the shared auth limiter, exemptions,
@@ -871,11 +977,7 @@ async fn run_login_with_key(
     // The full request path (`OriginalUri` survives `nest`), for the
     // refusal's audit row: `/api/v1/auth/login` and `/v2/token` share this
     // limiter.
-    let path = request
-        .extensions()
-        .get::<axum::extract::OriginalUri>()
-        .map(|uri| uri.0.path().to_string())
-        .unwrap_or_else(|| request.uri().path().to_string());
+    let path = full_request_path(&request);
     let method = request.method().to_string();
     let refused = |limiter: LoginLimiter, window: Duration, retry_after: u64| RefusedLogin {
         limiter,
@@ -1139,13 +1241,31 @@ fn token_form_body_too_large() -> Response {
 /// Build a 429 response with `Retry-After` and `X-RateLimit-*` headers, and
 /// count the refusal against `limiter`'s name (#4676).
 fn too_many_requests(retry_after: u64, limiter: &RateLimiter) -> Response {
+    rate_limit_refusal(retry_after, limiter, false)
+}
+
+/// A registry refusal in the request's native envelope: OCI's
+/// `TOOMANYREQUESTS` error body on `/v2`, plain text elsewhere (#6401).
+fn registry_too_many_requests(retry_after: u64, limiter: &RateLimiter, oci: bool) -> Response {
+    rate_limit_refusal(retry_after, limiter, oci)
+}
+
+fn rate_limit_refusal(retry_after: u64, limiter: &RateLimiter, oci: bool) -> Response {
     crate::services::metrics_service::record_rate_limit_rejection(limiter.name);
     let max_requests = limiter.max_requests;
-    let mut response = (
-        StatusCode::TOO_MANY_REQUESTS,
-        "Rate limit exceeded. Please try again later.",
-    )
-        .into_response();
+    let mut response = if oci {
+        oci_denied_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            "TOOMANYREQUESTS",
+            "Rate limit exceeded. Please try again later.",
+        )
+    } else {
+        (
+            StatusCode::TOO_MANY_REQUESTS,
+            "Rate limit exceeded. Please try again later.",
+        )
+            .into_response()
+    };
     let headers = response.headers_mut();
     if let Ok(value) = HeaderValue::from_str(&retry_after.to_string()) {
         headers.insert("Retry-After", value);
@@ -2438,6 +2558,190 @@ mod tests {
         );
     }
 
+    fn registry_state(
+        principal_cap: u32,
+        ip_cap: u32,
+        exemptions: RateLimitExemptions,
+        enabled: bool,
+    ) -> RegistryRateLimitState {
+        RegistryRateLimitState {
+            principal: Arc::new(RateLimiter::new(principal_cap, 60).named("registry_principal")),
+            ip: Arc::new(RateLimiter::new(ip_cap, 60).named("registry_ip")),
+            exemptions: Arc::new(exemptions),
+            enabled,
+            trusted_proxies: Arc::new(Vec::new()),
+        }
+    }
+
+    fn registry_app(state: RegistryRateLimitState) -> axum::Router {
+        axum::Router::new()
+            .fallback(|| async { "ok" })
+            .layer(axum::middleware::from_fn_with_state(
+                state,
+                registry_rate_limit_middleware,
+            ))
+    }
+
+    async fn registry_request(app: &axum::Router, seed: &str, ip: &str, uri: &str) -> Response {
+        use tower::ServiceExt;
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header("x-forwarded-for", ip)
+                    .header("x-test-user", seed)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn registry_limiter_keys_principals_independently_behind_one_ip() {
+        use axum::routing::get;
+        let app = axum::Router::new()
+            .route("/", get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn_with_state(
+                registry_state(1, 10, RateLimitExemptions::new(Vec::new(), false), true),
+                registry_rate_limit_middleware,
+            ))
+            .layer(axum::middleware::from_fn(inject_auth));
+
+        assert_eq!(
+            registry_request(&app, "alice", "203.0.113.7", "/")
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        let refused = registry_request(&app, "alice", "203.0.113.7", "/").await;
+        assert_eq!(refused.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            refused.headers().get("X-RateLimit-Limit").unwrap(),
+            "1",
+            "the principal bucket must be the binding bucket"
+        );
+        assert!(refused.headers().contains_key("Retry-After"));
+        assert_eq!(
+            registry_request(&app, "bob", "203.0.113.7", "/")
+                .await
+                .status(),
+            StatusCode::OK,
+            "a second principal behind the same IP must have its own bucket"
+        );
+    }
+
+    #[tokio::test]
+    async fn registry_ip_refusal_refunds_the_principal_reservation() {
+        use axum::routing::get;
+        let app = axum::Router::new()
+            .route("/", get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn_with_state(
+                registry_state(2, 1, RateLimitExemptions::new(Vec::new(), false), true),
+                registry_rate_limit_middleware,
+            ))
+            .layer(axum::middleware::from_fn(inject_auth));
+
+        assert_eq!(
+            registry_request(&app, "alice", "203.0.113.7", "/")
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        let refused = registry_request(&app, "bob", "203.0.113.7", "/").await;
+        assert_eq!(refused.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(refused.headers().get("X-RateLimit-Limit").unwrap(), "1");
+
+        // Without the refund, Bob's rejected request would have spent the
+        // second and final principal unit, and Alice's next request from a
+        // fresh IP would be refused even though her own bucket should allow it.
+        assert_eq!(
+            registry_request(&app, "alice", "198.51.100.9", "/")
+                .await
+                .status(),
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn registry_limiter_uses_the_oci_error_envelope() {
+        let app = registry_app(registry_state(
+            10,
+            1,
+            RateLimitExemptions::new(Vec::new(), false),
+            true,
+        ));
+        assert_eq!(
+            registry_request(&app, "anon", "203.0.113.7", "/v2/repo/blobs/sha256:abc")
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        let refused =
+            registry_request(&app, "anon", "203.0.113.7", "/v2/repo/blobs/sha256:abc").await;
+        assert_eq!(refused.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            refused
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .unwrap(),
+            "application/json"
+        );
+        assert!(refused.headers().contains_key("Retry-After"));
+        let body = axum::body::to_bytes(refused.into_body(), 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["errors"][0]["code"], "TOOMANYREQUESTS");
+    }
+
+    #[tokio::test]
+    async fn registry_limiter_honors_master_switch_and_exemptions() {
+        use tower::ServiceExt;
+        let app = registry_app(registry_state(
+            1,
+            1,
+            RateLimitExemptions::new(Vec::new(), false),
+            false,
+        ));
+        for _ in 0..3 {
+            assert_eq!(
+                registry_request(&app, "anon", "203.0.113.7", "/pypi/simple/")
+                    .await
+                    .status(),
+                StatusCode::OK
+            );
+        }
+
+        let app = registry_app(registry_state(
+            1,
+            1,
+            RateLimitExemptions::new(vec!["ci-bot".to_string()], false),
+            true,
+        ));
+        let mut exempt = auth_for_seed("ci-bot");
+        exempt.username = "ci-bot".to_string();
+        for _ in 0..3 {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/npm/pkg")
+                        .header("x-forwarded-for", "203.0.113.7")
+                        .extension(exempt.clone())
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.headers().get("X-RateLimit-Exempt").unwrap(),
+                "true"
+            );
+        }
+    }
+
     #[test]
     fn test_presign_keying_separates_buckets_by_ip() {
         let req1 = axum::extract::Request::builder()
@@ -2469,37 +2773,37 @@ mod tests {
     // pin both halves of that contract so a future re-order can't silently
     // collapse all callers behind a shared egress IP into one bucket again.
 
-    /// Middleware that injects a fixed `AuthExtension` (a stand-in for
-    /// `optional_auth_middleware` resolving a token to a user). Used to model
-    /// the auth layer in the ordering tests below.
-    async fn inject_auth(mut request: Request, next: Next) -> Response {
-        // The user id is derived from a request header so each test can simulate
-        // a distinct authenticated principal sharing one source IP.
-        let uid_seed = request
-            .headers()
-            .get("x-test-user")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("0")
-            .to_string();
-        // Stable per-seed UUID so repeated requests from the same simulated user
-        // hash to the same rate-limit key. Built deterministically from the seed
-        // bytes (no extra uuid features needed).
+    /// Stable per-seed principal for the middleware tests below. A seed maps
+    /// deterministically to one UUID so repeated requests key the same bucket.
+    fn auth_for_seed(seed: &str) -> AuthExtension {
         let mut bytes = [0u8; 16];
-        for (i, b) in uid_seed.bytes().enumerate().take(16) {
+        for (i, b) in seed.bytes().enumerate().take(16) {
             bytes[i] = b;
         }
-        let user_id = uuid::Uuid::from_bytes(bytes);
-        request.extensions_mut().insert(AuthExtension {
-            user_id,
-            username: format!("user-{uid_seed}"),
-            email: format!("user-{uid_seed}@test"),
+        AuthExtension {
+            user_id: uuid::Uuid::from_bytes(bytes),
+            username: format!("user-{seed}"),
+            email: format!("user-{seed}@test"),
             is_admin: false,
             is_api_token: false,
             is_service_account: false,
             scopes: None,
             allowed_repo_ids: crate::models::access_scope::AccessScope::Admin,
             iat_ms: None,
-        });
+        }
+    }
+
+    /// Middleware that injects a fixed `AuthExtension` (a stand-in for
+    /// `optional_auth_middleware` resolving a token to a user). Used to model
+    /// the auth layer in the ordering tests below.
+    async fn inject_auth(mut request: Request, next: Next) -> Response {
+        let uid_seed = request
+            .headers()
+            .get("x-test-user")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("0")
+            .to_string();
+        request.extensions_mut().insert(auth_for_seed(&uid_seed));
         next.run(request).await
     }
 
