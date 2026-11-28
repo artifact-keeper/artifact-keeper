@@ -1592,18 +1592,15 @@ async fn validate_restore_layouts(
     lock: bool,
 ) -> Result<()> {
     if lock {
+        // Take the layout locks before this transaction owns any rows, so a
+        // short-lived artifact writer can finish instead of failing the restore.
         for id in layouts.keys() {
-            let acquired: bool = sqlx::query_scalar(
-                "SELECT pg_try_advisory_xact_lock(hashtextextended('rpm-depth:' || $1::text, 0))",
+            sqlx::query(
+                "SELECT pg_advisory_xact_lock(hashtextextended('rpm-depth:' || $1::text, 0))",
             )
             .bind(id)
-            .fetch_one(&mut *conn)
+            .execute(&mut *conn)
             .await?;
-            if !acquired {
-                return Err(AppError::Conflict(
-                    "Repository layout is being changed; retry the operation".into(),
-                ));
-            }
         }
     }
     let ids: Vec<Uuid> = layouts.keys().copied().collect();
