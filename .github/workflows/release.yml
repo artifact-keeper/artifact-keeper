@@ -923,7 +923,7 @@ jobs:
       #   cargo-audit      reads the embedded graph back out, so the claim is
       #                    checked here rather than asserted in a doc
       - name: Install SBOM tooling
-        uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
+        uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
         with:
           # Exact versions (#6178): the ones v1.12.3 resolved from @latest.
           # Keep them equal to release-cli-caches.yml's.
@@ -1056,7 +1056,7 @@ jobs:
         run: ./scripts/ci/assert-binary-sbom.sh
 
       - name: Upload artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: ${{ matrix.name }}
           path: |
@@ -1431,7 +1431,7 @@ jobs:
       # job that cannot be rehearsed without cutting a tag, so it should not
       # also be the place a silent CLI bump lands.
       - name: Install cosign
-        uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+        uses: sigstore/cosign-installer@881c63bd87e38389154debd8331404ce7ca8a3ab # v4.1.4
         with:
           cosign-release: v3.1.3
 

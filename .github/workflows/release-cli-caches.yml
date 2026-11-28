@@ -190,7 +190,7 @@ jobs:
           shared-key: cli-${{ matrix.target }}
 
       - name: Install SBOM tooling
-        uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
+        uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
         with:
           # Exact versions, equal to release.yml's (#6178).
           tool: cargo-auditable@0.7.7,cargo-cyclonedx@0.5.10,cargo-audit@0.23.0
