@@ -2241,6 +2241,15 @@ async fn update_gauge_metrics(db: &PgPool) -> crate::error::Result<()> {
     metrics_service::set_user_gauge(stats.users);
     metrics_service::set_db_pool_gauges(db);
 
+    // #6565: the signal behind "this peer keeps failing" is already stored;
+    // publish it per peer without adding a status value or a migration.
+    let peers: Vec<(uuid::Uuid, i32)> =
+        sqlx::query_as("SELECT id, consecutive_failures FROM peer_instances")
+            .fetch_all(db)
+            .await
+            .map_err(|e| crate::error::AppError::Database(e.to_string()))?;
+    metrics_service::sync_peer_consecutive_failures_gauges(&peers);
+
     Ok(())
 }
 

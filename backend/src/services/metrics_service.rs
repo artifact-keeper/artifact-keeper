@@ -10,7 +10,8 @@
 //! [`install_otel_recorder`]). The handle returned by [`init_metrics`] keeps
 //! rendering the Prometheus half.
 
-use std::sync::Mutex;
+use std::collections::HashSet;
+use std::sync::{Mutex, OnceLock};
 
 use metrics::{counter, gauge, histogram};
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
@@ -984,6 +985,38 @@ pub fn set_user_gauge(total_users: i64) {
     gauge!("ak_users_total").set(total_users as f64);
 }
 
+/// Peer ids with a published consecutive-failure gauge (#6565). Remembering
+/// them lets a refresh zero the gauge of a peer that was unregistered, so its
+/// last value is not mistaken for a current failure count. The exporter keeps
+/// that zeroed series until the process restarts.
+static PEER_FAILURE_GAUGE_PEERS: OnceLock<Mutex<HashSet<uuid::Uuid>>> = OnceLock::new();
+
+fn set_peer_consecutive_failures_gauge(peer_id: uuid::Uuid, failures: i32) {
+    gauge!(
+        "ak_peer_consecutive_failures",
+        "peer_id" => peer_id.to_string()
+    )
+    .set(failures.max(0) as f64);
+}
+
+/// Refresh the per-peer consecutive-failure gauges from current peer rows. The
+/// label keeps the signal per peer so operators can choose their own threshold
+/// without a new status value (#6565).
+pub fn sync_peer_consecutive_failures_gauges(values: &[(uuid::Uuid, i32)]) {
+    let mut known = PEER_FAILURE_GAUGE_PEERS
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let current: HashSet<uuid::Uuid> = values.iter().map(|(id, _)| *id).collect();
+    for id in known.difference(&current) {
+        set_peer_consecutive_failures_gauge(*id, 0);
+    }
+    for (id, failures) in values {
+        set_peer_consecutive_failures_gauge(*id, *failures);
+    }
+    *known = current;
+}
+
 /// Update database connection pool gauge metrics.
 pub fn set_db_pool_gauges(pool: &sqlx::PgPool) {
     let size = pool.size() as f64;
@@ -1622,6 +1655,31 @@ mod tests {
     #[test]
     fn test_set_user_gauge_does_not_panic() {
         set_user_gauge(25);
+    }
+
+    #[test]
+    fn test_peer_consecutive_failures_gauges_report_current_and_removed_peers() {
+        let active_peer = uuid::Uuid::new_v4();
+        let removed_peer = uuid::Uuid::new_v4();
+        sync_peer_consecutive_failures_gauges(&[(removed_peer, 3)]);
+        let rendered = render_with_production_recorder(|| {
+            sync_peer_consecutive_failures_gauges(&[(active_peer, 4)]);
+        });
+
+        assert!(
+            rendered.contains(&format!(
+                "ak_peer_consecutive_failures{{peer_id=\"{}\"}} 4",
+                active_peer
+            )),
+            "unexpected exposition: {rendered}"
+        );
+        assert!(
+            rendered.contains(&format!(
+                "ak_peer_consecutive_failures{{peer_id=\"{}\"}} 0",
+                removed_peer
+            )),
+            "unexpected exposition: {rendered}"
+        );
     }
 
     #[test]

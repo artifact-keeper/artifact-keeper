@@ -79,6 +79,12 @@ pub struct PeerInstanceResponse {
     #[serde(skip_serializing)]
     pub api_key: String,
     pub is_local: bool,
+    /// Consecutive failed probes or transfers recorded for this peer (#6565).
+    pub consecutive_failures: i32,
+    /// When the peer is in transfer backoff; `null` when it is not (#6565).
+    pub backoff_until: Option<chrono::DateTime<chrono::Utc>>,
+    /// Total failed transfers recorded for this peer (#6565).
+    pub transfer_failures_total: i32,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -336,6 +342,9 @@ pub async fn list_peers(
                 created_at: n.created_at,
                 api_key: n.api_key,
                 is_local: n.is_local,
+                consecutive_failures: n.consecutive_failures,
+                backoff_until: n.backoff_until,
+                transfer_failures_total: n.transfer_failures_total,
             }
         })
         .collect();
@@ -407,6 +416,9 @@ pub async fn register_peer(
         created_at: instance.created_at,
         api_key: instance.api_key,
         is_local: instance.is_local,
+        consecutive_failures: instance.consecutive_failures,
+        backoff_until: instance.backoff_until,
+        transfer_failures_total: instance.transfer_failures_total,
     }))
 }
 
@@ -455,6 +467,9 @@ pub async fn get_peer(
         created_at: instance.created_at,
         api_key: instance.api_key,
         is_local: instance.is_local,
+        consecutive_failures: instance.consecutive_failures,
+        backoff_until: instance.backoff_until,
+        transfer_failures_total: instance.transfer_failures_total,
     }))
 }
 
@@ -1089,6 +1104,9 @@ mod tests {
             created_at: chrono::Utc::now(),
             api_key: "secret-key-should-be-hidden".to_string(),
             is_local: false,
+            consecutive_failures: 0,
+            backoff_until: None,
+            transfer_failures_total: 0,
         };
         let json = serde_json::to_value(&resp).unwrap();
         // api_key should be skipped due to skip_serializing
@@ -1113,11 +1131,42 @@ mod tests {
             created_at: chrono::Utc::now(),
             api_key: "key".to_string(),
             is_local: true,
+            consecutive_failures: 0,
+            backoff_until: None,
+            transfer_failures_total: 0,
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["cache_usage_percent"], 75.0);
         assert_eq!(json["is_local"], true);
         assert_eq!(json["region"], "us-east-1");
+    }
+
+    #[test]
+    fn test_peer_instance_response_exposes_failure_signals_6565() {
+        let backoff = chrono::Utc::now() + chrono::Duration::seconds(30);
+        let resp = PeerInstanceResponse {
+            id: Uuid::nil(),
+            name: "failing-peer".to_string(),
+            endpoint_url: "https://example.com".to_string(),
+            status: "degraded".to_string(),
+            region: None,
+            cache_size_bytes: 1000,
+            cache_used_bytes: 250,
+            cache_usage_percent: 25.0,
+            last_heartbeat_at: None,
+            last_sync_at: None,
+            created_at: chrono::Utc::now(),
+            api_key: "key".to_string(),
+            is_local: false,
+            consecutive_failures: 4,
+            backoff_until: Some(backoff),
+            transfer_failures_total: 9,
+        };
+
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["consecutive_failures"], 4);
+        assert_eq!(json["backoff_until"], serde_json::json!(backoff));
+        assert_eq!(json["transfer_failures_total"], 9);
     }
 
     // -----------------------------------------------------------------------
