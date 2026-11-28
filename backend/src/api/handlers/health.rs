@@ -1485,7 +1485,7 @@ pub async fn cpu_profile(
         }
     };
 
-    let _permit = match CPU_PROFILE_LOCK.try_lock() {
+    let permit = match CPU_PROFILE_LOCK.try_lock() {
         Ok(permit) => permit,
         Err(_) => {
             return (
@@ -1497,7 +1497,14 @@ pub async fn cpu_profile(
         }
     };
 
-    let bytes = match tokio::task::spawn_blocking(move || capture_cpu_profile(duration_secs)).await
+    // Keep the guard with the sampler, not with this future: if the client
+    // disconnects while the handler is awaiting the blocking task, dropping
+    // the JoinHandle must not let a second profile start before this one ends.
+    let bytes = match tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        capture_cpu_profile(duration_secs)
+    })
+    .await
     {
         Ok(Ok(bytes)) => bytes,
         Ok(Err(message)) => {
