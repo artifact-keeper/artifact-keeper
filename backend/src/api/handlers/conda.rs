@@ -10754,7 +10754,7 @@ async fn store_conda_package(
             repo.upstream_url.as_deref().unwrap_or(repo.key.as_str()),
             extracted.as_ref(),
         ),
-        conda_identity::process_alias_map(),
+        &conda_identity::process_alias_map(),
     );
     if let Some(error) = &identity.purl_error {
         tracing::warn!(

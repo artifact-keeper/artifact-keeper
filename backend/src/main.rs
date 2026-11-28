@@ -1407,6 +1407,13 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         runtime_shutdown_token.clone(),
     );
 
+    // #5178: keep the conda->PyPI alias map current (file or optional URL)
+    // and warn when a loaded mapping passes its configured age. Does nothing
+    // when neither a refresh URL nor an age limit is configured.
+    artifact_keeper_backend::services::conda_identity::spawn_refresher(
+        runtime_shutdown_token.clone(),
+    );
+
     // Keep a handle for the gRPC server before the sync worker consumes db_pool
     let grpc_db_pool = db_pool.clone();
     let migration_db_pool = db_pool.clone();
