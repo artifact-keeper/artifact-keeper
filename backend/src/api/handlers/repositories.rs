@@ -4816,8 +4816,10 @@ fn versioning_noop_warning(format_key: &str, versioning_requested: bool) -> Opti
 }
 
 /// Wraps a create/update result with the [`versioning_noop_warning`] header
-/// and log line. The body and status are unchanged.
+/// and log line. The status, headers and body are unchanged.
 fn respond_with_versioning_warning(
+    status: StatusCode,
+    headers: HeaderMap,
     repo: RepositoryResponse,
     versioning_requested: bool,
 ) -> Response {
@@ -4830,7 +4832,7 @@ fn respond_with_versioning_warning(
              only generic and mlmodel uploads are versioned (#6063)"
         );
     }
-    let mut response = Json(repo).into_response();
+    let mut response = (status, headers, Json(repo)).into_response();
     if let Some(value) = warning.and_then(|v| header::HeaderValue::from_str(&v).ok()) {
         response.headers_mut().append(header::WARNING, value);
     }
@@ -4846,11 +4848,13 @@ async fn create_repository_route(
     auth: Extension<Option<AuthExtension>>,
     body: Bytes,
 ) -> Result<Response> {
-    let Json(repo) = create_repository(state, auth, body).await?;
+    let (status, headers, Json(repo)) = create_repository(state, auth, body).await?;
     // Create stores exactly what was sent (default false), so the echoed
     // value is the requested one.
     let requested = repo.versioning_enabled;
-    Ok(respond_with_versioning_warning(repo, requested))
+    Ok(respond_with_versioning_warning(
+        status, headers, repo, requested,
+    ))
 }
 
 /// HTTP route for [`update_repository`]; see [`create_repository_route`]. Only
@@ -4864,7 +4868,12 @@ async fn update_repository_route(
 ) -> Result<Response> {
     let requested = payload.versioning_enabled == Some(true);
     let Json(repo) = update_repository(state, auth, key, Json(payload)).await?;
-    Ok(respond_with_versioning_warning(repo, requested))
+    Ok(respond_with_versioning_warning(
+        StatusCode::OK,
+        HeaderMap::new(),
+        repo,
+        requested,
+    ))
 }
 
 /// Create a new repository
@@ -4876,7 +4885,7 @@ async fn update_repository_route(
     request_body = CreateRepositoryRequest,
     security(("bearer_auth" = [])),
     responses(
-        (status = 200, description = "Repository created", body = RepositoryResponse),
+        (status = 201, description = "Repository created", body = RepositoryResponse),
         (status = 400, description = "Invalid repository configuration, repodata_depth outside 0..1023, or a key using another project's `<project.key>-` prefix"),
         (status = 401, description = "Authentication required"),
         (status = 403, description = "Insufficient permissions: needs global admin, system repository admin, or project admin of the requested project_id"),
@@ -4888,7 +4897,7 @@ pub async fn create_repository(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     body: Bytes,
-) -> Result<Json<RepositoryResponse>> {
+) -> Result<(StatusCode, HeaderMap, Json<RepositoryResponse>)> {
     // #1438 (1b): authenticate BEFORE deserializing the body. The previous
     // `Json<CreateRepositoryRequest>` extractor ran first and rejected
     // unauth requests carrying a payload the schema didn't recognize with
@@ -5494,6 +5503,11 @@ pub async fn create_repository(
     } else {
         new_repository_storage(&repo_type_out)
     };
+    // Capture the `Location` target before `repo` is consumed by
+    // `repo_to_display_response` below. A create answers 201 and points clients
+    // at the new repository's GET endpoint (#5744).
+    let location = header::HeaderValue::from_str(&format!("/api/v1/repositories/{}", repo.key))
+        .map_err(|e| AppError::Internal(format!("invalid repository Location header: {e}")))?;
     let response = repo_to_display_response(repo, storage);
     // Echo the stored quarantine settings (#5324), read back exactly as GET
     // and PATCH do.
@@ -5540,7 +5554,9 @@ pub async fn create_repository(
     let response = with_repodata_depth(&state.db, response).await?;
     let repo_admin = mcp_caller_is_repo_admin(&state, Some(&auth), repo_id, &response.format).await;
     let response = with_mcp_caller(response, auth.is_admin, repo_admin);
-    Ok(Json(response))
+    let mut headers = HeaderMap::new();
+    headers.insert(header::LOCATION, location);
+    Ok((StatusCode::CREATED, headers, Json(response)))
 }
 
 /// Get repository details
@@ -24634,7 +24650,7 @@ mod tests {
         // Omitting the field (web UI, most API clients) must keep working: the
         // repository lands on the backend the proxy cache uses.
         let omitted_key = format!("pypi-remote-default-{}", Uuid::new_v4().simple());
-        let Json(omitted) = create_repository(
+        let (_, _, Json(omitted)) = create_repository(
             State(state.clone()),
             Extension(Some(admin.clone())),
             make_create_request(
@@ -24684,7 +24700,7 @@ mod tests {
         assert_eq!(orphan, 0, "a rejected create must not leave a row behind");
 
         let pinned_key = format!("pypi-remote-fs-{}", Uuid::new_v4().simple());
-        let Json(pinned) = create_repository(
+        let (_, _, Json(pinned)) = create_repository(
             State(state.clone()),
             Extension(Some(admin.clone())),
             make_create_request(
@@ -24704,7 +24720,7 @@ mod tests {
 
         // A hosted repository on the azure default is unaffected.
         let local_key = format!("pypi-local-az-{}", Uuid::new_v4().simple());
-        let Json(local) = create_repository(
+        let (_, _, Json(local)) = create_repository(
             State(state.clone()),
             Extension(Some(admin.clone())),
             make_create_request(
@@ -24755,7 +24771,7 @@ mod tests {
         // 1) The reported payload: untouched scope-policy form on a Virtual
         //    npm create (member_repos omitted = deferred population).
         let virt_key = format!("npm-virt-{}", Uuid::new_v4().simple());
-        let Json(created) = create_repository(
+        let (_, _, Json(created)) = create_repository(
             State(state.clone()),
             Extension(Some(admin.clone())),
             make_create_request(
@@ -24861,7 +24877,7 @@ mod tests {
         //    Remote create still validates AND persists — a fix that accepts
         //    (or skips) everything fails here.
         let remote_key = format!("npm-remote-{}", Uuid::new_v4().simple());
-        let Json(remote) = create_repository(
+        let (_, _, Json(remote)) = create_repository(
             State(state.clone()),
             Extension(Some(admin.clone())),
             make_create_request(
@@ -24966,7 +24982,7 @@ mod tests {
         };
 
         let virt_key = format!("npm-isolate-{}", Uuid::new_v4().simple());
-        let Json(created) = create_repository(
+        let (_, _, Json(created)) = create_repository(
             State(state.clone()),
             Extension(Some(admin.clone())),
             make_create_request(
@@ -25056,7 +25072,7 @@ mod tests {
         // 1) The reported bug: the untouched web-UI form on a LOCAL Debian
         //    create must succeed, and must not leave a dead config row.
         let local_key = format!("deb-local-{}", Uuid::new_v4().simple());
-        let Json(local) = create_repository(
+        let (_, _, Json(local)) = create_repository(
             State(state.clone()),
             Extension(Some(admin.clone())),
             make_create_request(
@@ -25115,7 +25131,7 @@ mod tests {
         // 3) Positive control: a real filter on a Debian Remote still validates
         //    AND persists.
         let remote_key = format!("deb-remote-{}", Uuid::new_v4().simple());
-        let Json(remote) = create_repository(
+        let (_, _, Json(remote)) = create_repository(
             State(state.clone()),
             Extension(Some(admin.clone())),
             make_create_request(
@@ -29283,7 +29299,12 @@ mod tests {
     fn versioning_warning_response_keeps_status_and_body() {
         let mut repo = make_repo(false);
         repo.versioning_enabled = true;
-        let warned = respond_with_versioning_warning(repo_to_response(repo.clone(), 0), true);
+        let warned = respond_with_versioning_warning(
+            StatusCode::OK,
+            HeaderMap::new(),
+            repo_to_response(repo.clone(), 0),
+            true,
+        );
         assert_eq!(warned.status(), StatusCode::OK);
         assert_eq!(
             warned.headers().get(header::WARNING).unwrap(),
@@ -29291,13 +29312,48 @@ mod tests {
         );
 
         repo.format = RepositoryFormat::Generic;
-        let control = respond_with_versioning_warning(repo_to_response(repo.clone(), 0), true);
+        let control = respond_with_versioning_warning(
+            StatusCode::OK,
+            HeaderMap::new(),
+            repo_to_response(repo.clone(), 0),
+            true,
+        );
         assert_eq!(control.status(), StatusCode::OK);
         assert!(control.headers().get(header::WARNING).is_none());
 
         repo.format = RepositoryFormat::Pypi;
-        let not_requested = respond_with_versioning_warning(repo_to_response(repo, 0), false);
+        let not_requested = respond_with_versioning_warning(
+            StatusCode::OK,
+            HeaderMap::new(),
+            repo_to_response(repo, 0),
+            false,
+        );
         assert!(not_requested.headers().get(header::WARNING).is_none());
+    }
+
+    #[test]
+    fn versioning_warning_response_keeps_create_status_and_location() {
+        let mut repo = make_repo(false);
+        repo.versioning_enabled = true;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::LOCATION,
+            header::HeaderValue::from_static("/api/v1/repositories/warned"),
+        );
+
+        let response = respond_with_versioning_warning(
+            StatusCode::CREATED,
+            headers,
+            repo_to_response(repo, 0),
+            true,
+        );
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(
+            response.headers().get(header::LOCATION).unwrap(),
+            "/api/v1/repositories/warned"
+        );
+        assert!(response.headers().contains_key(header::WARNING));
     }
 
     // -----------------------------------------------------------------------
@@ -34683,7 +34739,7 @@ mod tests {
         // Control: a create that does not ask for public succeeds under the
         // same policy.
         let private_key = format!("ph-3855-priv-{}", Uuid::new_v4().simple());
-        let Json(created) = create_repository(
+        let (_, _, Json(created)) = create_repository(
             State(state.clone()),
             Extension(Some(admin.clone())),
             make_create_request(
@@ -34722,7 +34778,7 @@ mod tests {
 
         // Seed a private repository through the handler-level create.
         let key = format!("ph-3855-upd-{}", Uuid::new_v4().simple());
-        let Json(created) = create_repository(
+        let (_, _, Json(created)) = create_repository(
             State(state.clone()),
             Extension(Some(admin.clone())),
             make_create_request(&key, "repo to flip", "generic", serde_json::json!({})),
@@ -34789,7 +34845,7 @@ mod tests {
         let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
         let admin = admin_auth(user_id, &username);
         let key = format!("ph-5251-{}", Uuid::new_v4().simple());
-        let Json(created) = create_repository(
+        let (_, _, Json(created)) = create_repository(
             State(state.clone()),
             Extension(Some(admin.clone())),
             make_create_request(&key, "plugins", "agentplugins", serde_json::json!({})),
@@ -34860,7 +34916,7 @@ mod tests {
 
         // Seed a private repository through the handler-level create.
         let key = format!("ph-1849-{}", Uuid::new_v4().simple());
-        let Json(created) = create_repository(
+        let (_, _, Json(created)) = create_repository(
             State(state.clone()),
             Extension(Some(admin)),
             make_create_request(&key, "ip gated repo", "generic", serde_json::json!({})),
@@ -34971,7 +35027,8 @@ mod tests {
         )
         .await;
 
-        let Json(resp) = result.expect("create_repository with enabled plugin format must succeed");
+        let (_, _, Json(resp)) =
+            result.expect("create_repository with enabled plugin format must succeed");
         assert_eq!(
             resp.format, "generic",
             "plugin-backed repo must be stored as Generic format"
@@ -34980,7 +35037,7 @@ mod tests {
         // A plain generic repository alongside it, to pin that the field is
         // omitted when no plugin key is in play (#3070).
         let plain_key = format!("plain-generic-{}", Uuid::new_v4().simple());
-        let Json(plain_resp) = create_repository(
+        let (_, _, Json(plain_resp)) = create_repository(
             State(state.clone()),
             Extension(Some(admin_auth(user_id, &username))),
             make_create_request(&plain_key, "plain", "generic", serde_json::json!({})),
@@ -35065,6 +35122,57 @@ mod tests {
             plain_json.get("format_key").is_none(),
             "a plain generic repository must omit format_key entirely"
         );
+    }
+
+    /// `POST /api/v1/repositories` answers `201 Created` and points clients at
+    /// the new repository's GET endpoint via `Location` (#5744). A client that
+    /// checked `status == 200` must be updated before upgrading, so this pins
+    /// the public contract through the real router.
+    #[tokio::test]
+    async fn test_create_repository_answers_201_with_location_5744() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let storage_dir = std::env::temp_dir().join(format!("create-201-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let app = tdh::router_with_auth(router(), state, admin_auth(user_id, &username));
+
+        let repo_key = format!("created-201-{}", Uuid::new_v4().simple());
+        let expected_location = format!("/api/v1/repositories/{repo_key}");
+        let req = tdh::request_from_peer(
+            "/",
+            serde_json::json!({
+                "key": repo_key.clone(), "name": repo_key, "format": "generic", "repo_type": "local"
+            }),
+            "203.0.113.74:5744",
+        );
+        let (status, body, headers) = tdh::send_with_headers(app, req).await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(
+            headers
+                .get(header::LOCATION)
+                .and_then(|value| value.to_str().ok()),
+            Some(expected_location.as_str()),
+            "a create must point at the new repository's GET endpoint"
+        );
+
+        let created: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        let repo_id: Uuid = created["id"]
+            .as_str()
+            .and_then(|s| s.parse().ok())
+            .expect("created repository id");
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
     }
 
     /// When the format string maps to a **disabled** `format_handlers` row,
@@ -35253,7 +35361,7 @@ mod tests {
         );
 
         let repo_key = format!("realm-remote-{}", Uuid::new_v4().simple());
-        let Json(created) = create_repository(
+        let (_, _, Json(created)) = create_repository(
             State(state.clone()),
             auth(),
             make_create_request(
@@ -35665,7 +35773,7 @@ mod tests {
         assert!(!exists, "a refused create must not leave a row");
 
         // Create with the override: accepted, reported and audited.
-        let Json(accepted) = create_repository(
+        let (_, _, Json(accepted)) = create_repository(
             State(state.clone()),
             auth(),
             remote(
@@ -35689,7 +35797,7 @@ mod tests {
 
         // Toggling is_public on a credentialed private repository is refused.
         let private_key = format!("pub-4662-p-{suffix}");
-        let Json(private) = create_repository(
+        let (_, _, Json(private)) = create_repository(
             State(state.clone()),
             auth(),
             remote(
@@ -35750,7 +35858,7 @@ mod tests {
         // A public repository without credentials: adding them through
         // PUT upstream-auth, or through userinfo in upstream_url, is refused.
         let open_key = format!("pub-4662-o-{suffix}");
-        let Json(open) = create_repository(
+        let (_, _, Json(open)) = create_repository(
             State(state.clone()),
             auth(),
             remote(&open_key, serde_json::json!({ "is_public": true })),
@@ -35944,7 +36052,7 @@ mod tests {
         assert!(!exists(public_key).await);
 
         // Typed, private: created with the credentials stored.
-        let Json(created) = create_repository(
+        let (_, _, Json(created)) = create_repository(
             State(state.clone()),
             auth(),
             remote(
@@ -36029,7 +36137,7 @@ mod tests {
             |r: &RepositoryResponse| (r.upstream_auth_type.clone(), r.upstream_auth_configured);
 
         let basic_key = format!("upauth-4851-b-{suffix}");
-        let Json(created) = create_repository(
+        let (_, _, Json(created)) = create_repository(
             State(state.clone()),
             auth(),
             remote(
@@ -36044,7 +36152,7 @@ mod tests {
         .await
         .expect("create a basic-auth remote");
         let none_key = format!("upauth-4851-n-{suffix}");
-        let Json(plain) = create_repository(
+        let (_, _, Json(plain)) = create_repository(
             State(state.clone()),
             auth(),
             remote(&none_key, serde_json::json!({})),
@@ -36260,7 +36368,7 @@ mod tests {
         };
 
         let repo_key = format!("upstream-4467-{}", Uuid::new_v4().simple());
-        let Json(created) = create_repository(
+        let (_, _, Json(created)) = create_repository(
             State(state.clone()),
             auth(),
             make_create_request(
@@ -36521,7 +36629,8 @@ mod tests {
             payload,
         )
         .await;
-        let Json(created) = result.expect("remote create with custom_user_agent must succeed");
+        let (_, _, Json(created)) =
+            result.expect("remote create with custom_user_agent must succeed");
         assert_eq!(
             created.custom_user_agent.as_deref(),
             Some("RoundTrip/1.0"),
@@ -37326,7 +37435,7 @@ mod tests {
 
         // Created strict.
         let strict_key = format!("v5810-{}", Uuid::new_v4().simple());
-        let Json(created) = create_repository(
+        let (_, _, Json(created)) = create_repository(
             State(state.clone()),
             admin(),
             make_create_request(
@@ -37652,7 +37761,7 @@ mod tests {
         let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
 
         let repo_key = format!("q5324-{}", Uuid::new_v4().simple());
-        let Json(created) = create_repository(
+        let (_, _, Json(created)) = create_repository(
             State(state.clone()),
             Extension(Some(admin_auth(user_id, &username))),
             make_create_request(
@@ -37869,7 +37978,7 @@ mod tests {
             .await;
             let case = format!("{field}={value} on {repo_type}");
             match (expect, result) {
-                (Stored(key, want), Ok(Json(created))) => {
+                (Stored(key, want), Ok((_, _, Json(created)))) => {
                     created_ids.push(created.id);
                     let stored: Option<String> = sqlx::query_scalar(
                         "SELECT value FROM repository_config \
@@ -37901,7 +38010,7 @@ mod tests {
                         ));
                     }
                 }
-                (Refused(_), Ok(Json(created))) => {
+                (Refused(_), Ok((_, _, Json(created)))) => {
                     created_ids.push(created.id);
                     failures.push(format!("{case}: accepted, must be refused"));
                 }
@@ -37949,7 +38058,7 @@ mod tests {
             }),
         );
 
-        let Json(created) = create_repository(
+        let (_, _, Json(created)) = create_repository(
             State(state.clone()),
             Extension(Some(admin_auth(user_id, &username))),
             payload,
@@ -38738,7 +38847,7 @@ mod tests {
         let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
 
         let repo_key = format!("hex-2641-{}", Uuid::new_v4().simple());
-        let created = create_repository(
+        let (_, _, created) = create_repository(
             State(state.clone()),
             Extension(Some(admin_auth(user_id, &username))),
             make_create_request(
@@ -38749,8 +38858,8 @@ mod tests {
             ),
         )
         .await
-        .expect("creating a hosted hex repo must succeed")
-        .0;
+        .expect("creating a hosted hex repo must succeed");
+        let created = created.0;
 
         let key_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM signing_keys \
@@ -38763,7 +38872,7 @@ mod tests {
 
         // A non-hex repo must NOT get one — the hook is format-scoped.
         let other_key = format!("gen-2641-{}", Uuid::new_v4().simple());
-        let other = create_repository(
+        let (_, _, other) = create_repository(
             State(state.clone()),
             Extension(Some(admin_auth(user_id, &username))),
             make_create_request(
@@ -38774,8 +38883,8 @@ mod tests {
             ),
         )
         .await
-        .expect("creating a generic repo must succeed")
-        .0;
+        .expect("creating a generic repo must succeed");
+        let other = other.0;
         let other_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM signing_keys WHERE repository_id = $1 AND name = 'hex-registry'",
         )
@@ -39321,7 +39430,12 @@ mod tests {
             "203.0.113.61:4762",
         );
         let (status, body) = tdh::send(app, req).await;
-        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
         let created: serde_json::Value = serde_json::from_slice(&body).expect("json body");
         let repo_id: Uuid = created["id"]
             .as_str()
@@ -39804,7 +39918,7 @@ mod tests {
         };
 
         let staging_key = format!("s5207-{}", Uuid::new_v4().simple());
-        let Json(created) = create_repository(
+        let (_, _, Json(created)) = create_repository(
             State(state.clone()),
             Extension(Some(admin_auth(admin, &admin_name))),
             make_create_request(
