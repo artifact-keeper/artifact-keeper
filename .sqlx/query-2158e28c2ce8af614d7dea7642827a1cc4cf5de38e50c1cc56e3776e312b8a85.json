@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            INSERT INTO scan_results (\n                artifact_id, repository_id, scan_type, status, started_at, completed_at,\n                findings_count, critical_count, high_count, medium_count, low_count, info_count,\n                scanner_version, checksum_sha256, source_scan_id, is_reused, pin_identity,\n                scan_completeness, scan_completeness_reason, inventory_status,\n                vuln_db_version, vuln_db_published_at\n            )\n            VALUES ($1, $2, $3, 'completed', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, true, $15,\n                    $16, $17, (SELECT inventory_status FROM scan_results WHERE id = $14),\n                    $18, $19)\n            RETURNING id, artifact_id, repository_id, scan_type, status,\n                      findings_count, critical_count, high_count, medium_count, low_count, info_count,\n                      scanner_version, error_message, started_at, completed_at, created_at,\n                      is_reused, source_scan_id, scan_completeness, scan_completeness_reason,\n                      vuln_db_version, vuln_db_published_at\n            ",
+  "query": "\n            SELECT id, artifact_id, repository_id, scan_type, status,\n                   findings_count, critical_count, high_count, medium_count, low_count, info_count,\n                   scanner_version, error_message, started_at, completed_at, created_at,\n                   is_reused, source_scan_id, scan_completeness, scan_completeness_reason,\n                      vuln_db_version, vuln_db_published_at, advisory_excluded\n            FROM scan_results\n            WHERE artifact_id = $1\n              AND checksum_sha256 = $2::bpchar\n              AND scan_type = $3\n              AND status = 'completed'\n              AND origin = 'local_scan'\n              AND completed_at > NOW() - (\n                  CASE WHEN findings_count = 0 THEN $5 ELSE $4 END || ' days'\n              )::interval\n            ORDER BY completed_at DESC\n            LIMIT 1\n            ",
   "describe": {
     "columns": [
       {
@@ -127,7 +127,7 @@
       {
         "ordinal": 11,
         "name": "scanner_version",
-        "type_info": "Varchar",
+        "type_info": "Text",
         "origin": {
           "Table": {
             "table": "scan_results",
@@ -226,7 +226,7 @@
       {
         "ordinal": 20,
         "name": "vuln_db_version",
-        "type_info": "Varchar",
+        "type_info": "Text",
         "origin": {
           "Table": {
             "table": "scan_results",
@@ -244,29 +244,26 @@
             "name": "vuln_db_published_at"
           }
         }
+      },
+      {
+        "ordinal": 22,
+        "name": "advisory_excluded",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "scan_results",
+            "name": "advisory_excluded"
+          }
+        }
       }
     ],
     "parameters": {
       "Left": [
         "Uuid",
-        "Uuid",
-        "Varchar",
-        "Timestamptz",
-        "Timestamptz",
-        "Int4",
-        "Int4",
-        "Int4",
-        "Int4",
-        "Int4",
-        "Int4",
-        "Varchar",
         "Bpchar",
-        "Uuid",
         "Text",
-        "Varchar",
         "Text",
-        "Varchar",
-        "Timestamptz"
+        "Text"
       ]
     },
     "nullable": [
@@ -291,8 +288,9 @@
       false,
       true,
       true,
-      true
+      true,
+      false
     ]
   },
-  "hash": "67689567540ea2a5c91f3aab4d9f5f79be09b7c4ad1d8e3e23313781b12d7dd0"
+  "hash": "2158e28c2ce8af614d7dea7642827a1cc4cf5de38e50c1cc56e3776e312b8a85"
 }
