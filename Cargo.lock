@@ -267,6 +267,7 @@ dependencies = [
  "flate2",
  "futures",
  "git2",
+ "globset",
  "hex",
  "hmac 0.12.1",
  "http",

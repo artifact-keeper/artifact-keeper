@@ -37,6 +37,7 @@ use std::collections::HashMap;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+use globset::Glob;
 use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
@@ -230,26 +231,89 @@ pub fn claim_value<'a>(claims: &'a serde_json::Value, key: &str) -> Option<&'a s
     }
 }
 
-/// Refuse a `claim_filters` key that starts with `/` but is not a valid JSON
-/// Pointer. `serde_json::Value::pointer` does not reject a stray `~` (it
-/// would look up a member literally named `~2bad`), so without this check a
-/// typo would save fine and then silently never match.
-fn validate_claim_filter_keys(claim_filters: &serde_json::Value) -> Result<()> {
+/// True when a string filter is a glob rather than a literal value.
+fn is_claim_glob(pattern: &str) -> bool {
+    pattern.contains('*') || pattern.contains('?')
+}
+
+/// Compile a claim-filter glob, if the pattern is one.
+///
+/// Patterns without `*` or `?` keep the original exact-equality path, so an
+/// existing filter containing a literal `[` or `{` is not reinterpreted.
+fn compile_claim_glob(pattern: &str) -> std::result::Result<Option<Glob>, globset::Error> {
+    if !is_claim_glob(pattern) {
+        return Ok(None);
+    }
+    Glob::new(pattern).map(Some)
+}
+
+/// Compare one configured filter value with the claim presented in a JWT.
+///
+/// Strings containing `*` or `?` are case-sensitive globs; everything else,
+/// including strings with other glob metacharacters, compares exactly. Arrays
+/// keep their any-of semantics and apply the same rule to each element.
+fn claim_matches(expected: &serde_json::Value, actual: &serde_json::Value) -> bool {
+    match (expected, actual) {
+        (serde_json::Value::String(pattern), serde_json::Value::String(value)) => {
+            match compile_claim_glob(pattern) {
+                Ok(Some(glob)) => glob.compile_matcher().is_match(value),
+                _ => pattern == value,
+            }
+        }
+        (serde_json::Value::Array(allowed), _) => allowed
+            .iter()
+            .any(|candidate| claim_matches(candidate, actual)),
+        _ => actual == expected,
+    }
+}
+
+/// Validate a `claim_filters` document when it is saved.
+///
+/// A key starting with `/` must be a valid JSON Pointer:
+/// `serde_json::Value::pointer` does not reject a stray `~` (it would look up
+/// a member literally named `~2bad`), so without this check a typo would save
+/// fine and then silently never match. Glob patterns are compiled here too,
+/// so a malformed pattern is refused with 400 instead of silently never
+/// matching at the next exchange.
+fn validate_claim_filters(claim_filters: &serde_json::Value) -> Result<()> {
     let Some(map) = claim_filters.as_object() else {
         return Ok(());
     };
-    for key in map.keys().filter(|k| k.starts_with('/')) {
-        let mut chars = key.chars();
-        while let Some(c) = chars.next() {
-            if c == '~' && !matches!(chars.next(), Some('0' | '1')) {
-                return Err(AppError::Validation(format!(
-                    "claim_filters key '{key}' is not a valid JSON Pointer: \
-                     '~' must be followed by '0' or '1'"
-                )));
+    for (key, expected) in map {
+        if key.starts_with('/') {
+            let mut chars = key.chars();
+            while let Some(c) = chars.next() {
+                if c == '~' && !matches!(chars.next(), Some('0' | '1')) {
+                    return Err(AppError::Validation(format!(
+                        "claim_filters key '{key}' is not a valid JSON Pointer: \
+                         '~' must be followed by '0' or '1'"
+                    )));
+                }
             }
         }
+        validate_claim_filter_pattern(key, expected)?;
     }
     Ok(())
+}
+
+fn validate_claim_filter_pattern(key: &str, expected: &serde_json::Value) -> Result<()> {
+    match expected {
+        serde_json::Value::String(pattern) => {
+            compile_claim_glob(pattern).map_err(|e| {
+                AppError::Validation(format!(
+                    "claim_filters value for '{key}' is not a valid glob: {e}"
+                ))
+            })?;
+            Ok(())
+        }
+        serde_json::Value::Array(allowed) => {
+            for candidate in allowed {
+                validate_claim_filter_pattern(key, candidate)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
 }
 
 /// A row from `ci_oidc_identity_mappings`.
@@ -259,9 +323,10 @@ pub struct CiOidcIdentityMapping {
     pub provider_id: Uuid,
     pub name: String,
     pub priority: i32,
-    /// JSONB claim-filter map.  Each key is a top-level claim name, or a JSON
-    /// Pointer into nested claims when it starts with `/`; the value is either
-    /// a single value (exact match) or an array (any-of match).
+    /// JSONB claim-filter map. Each key is a top-level claim name, or a JSON
+    /// Pointer into nested claims when it starts with `/`; the value is a
+    /// single value or an array (any-of match). String values containing
+    /// `*` or `?` are case-sensitive globs, all others compare exactly.
     pub claim_filters: serde_json::Value,
     /// Optional repository restriction for this mapping.
     /// `None` = unrestricted, `Some(vec![])` = deny all repos.
@@ -661,6 +726,9 @@ pub struct CiOidcToggleRequest {
 pub struct CreateCiOidcMappingRequest {
     pub name: String,
     pub priority: Option<i32>,
+    /// Claim name to required value. Strings containing `*` or `?` are
+    /// case-sensitive globs; other strings and non-string values compare
+    /// exactly. Arrays match any of their values.
     pub claim_filters: serde_json::Value,
     pub allowed_repo_ids: Option<Vec<Uuid>>,
     pub is_enabled: Option<bool>,
@@ -679,6 +747,9 @@ pub struct CreateCiOidcMappingRequest {
 pub struct UpdateCiOidcMappingRequest {
     pub name: Option<String>,
     pub priority: Option<i32>,
+    /// Claim name to required value. Strings containing `*` or `?` are
+    /// case-sensitive globs; other strings and non-string values compare
+    /// exactly. Arrays match any of their values.
     pub claim_filters: Option<serde_json::Value>,
     /// Repository restriction update. Three-way semantics (#4198): omit the
     /// field to leave the restriction unchanged; send `null` to clear it
@@ -1427,7 +1498,7 @@ impl CiOidcService {
         let username = service_account_username(mapping_id);
         let email = service_account_email(&username);
 
-        validate_claim_filter_keys(&req.claim_filters)?;
+        validate_claim_filters(&req.claim_filters)?;
         if let Some(ids) = &req.group_binding_ids {
             self.validate_group_binding_ids(ids).await?;
         }
@@ -1528,7 +1599,7 @@ impl CiOidcService {
     ) -> Result<(CiOidcMappingResponse, Option<GroupBindingReconcileReport>)> {
         let existing = self.fetch_mapping_row(provider_id, mapping_id).await?;
         if let Some(filters) = &req.claim_filters {
-            validate_claim_filter_keys(filters)?;
+            validate_claim_filters(filters)?;
         }
 
         let group_binding_ids = match req.group_binding_ids {
@@ -2306,8 +2377,9 @@ impl CiOidcService {
     /// Array values use any-of semantics:
     /// `"namespace_path": ["group-a", "group-b"]` passes if the claim equals
     /// either "group-a" or "group-b". A key with a leading `/` is a JSON
-    /// Pointer into nested claims (see [`claim_value`]); matching is exact
-    /// either way.
+    /// Pointer into nested claims (see [`claim_value`]). String values
+    /// containing `*` or `?` are case-sensitive globs; all other values
+    /// compare exactly, including on JSON Pointer keys.
     ///
     /// The error returned to the caller is deliberately generic — it does not
     /// name which claim failed so that mapping configuration is not leaked to
@@ -2324,13 +2396,7 @@ impl CiOidcService {
 
         for (key, expected) in map {
             let actual = claim_value(claims, key).unwrap_or(&serde_json::Value::Null);
-            let matches = match expected {
-                serde_json::Value::Array(allowed_values) => {
-                    allowed_values.iter().any(|v| v == actual)
-                }
-                _ => actual == expected,
-            };
-            if !matches {
+            if !claim_matches(expected, actual) {
                 tracing::debug!(
                     claim = %key,
                     "CI JWT claim did not match required value(s) for this mapping"
@@ -2498,6 +2564,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn claim_filters_match_string_globs() {
+        let ref_claims = json!({"ref": "refs/heads/main"});
+        assert!(matches(json!({"ref": "refs/heads/ma?n"}), &ref_claims));
+        assert!(!matches(json!({"ref": "refs/heads/ma??n"}), &ref_claims));
+        assert!(matches(json!({"ref": "refs/heads/*"}), &ref_claims));
+        assert!(!matches(json!({"ref": "refs/tags/*"}), &ref_claims));
+
+        let workflow = json!({
+            "job_workflow_ref":
+                "octo-org/shared-workflows/.github/workflows/deploy.yml@refs/tags/v1.2.3"
+        });
+        assert!(matches(
+            json!({"job_workflow_ref": "octo-org/shared-workflows/.github/workflows/*@refs/tags/*"}),
+            &workflow
+        ));
+        assert!(matches(
+            json!({"job_workflow_ref": [
+                "octo-org/other/*@refs/tags/*",
+                "octo-org/shared-workflows/*@refs/tags/v?.2.3"
+            ]}),
+            &workflow
+        ));
+        assert!(!matches(
+            json!({"job_workflow_ref": "octo-org/shared-workflows/*@refs/heads/*"}),
+            &workflow
+        ));
+
+        assert!(matches(
+            json!({"/kubernetes.io/namespace": "payments-*"}),
+            &k8s_claims("payments-prod", "api")
+        ));
+        assert!(!matches(
+            json!({"/kubernetes.io/namespace": "payments-*"}),
+            &k8s_claims("billing", "api")
+        ));
+    }
+
+    #[tokio::test]
+    async fn claim_filters_without_wildcards_stay_exact() {
+        let claims = json!({"ref": "[main]", "sub": "ci:example"});
+        assert!(matches(json!({"ref": "[main]"}), &claims));
+        assert!(!matches(json!({"ref": "[a-z]"}), &claims));
+        assert!(matches(
+            json!({"sub": "ci:exampl?"}),
+            &json!({"sub": "ci:example"})
+        ));
+        assert!(!matches(
+            json!({"sub": "ci:exampl?"}),
+            &json!({"sub": "ci:examples"})
+        ));
+    }
+
+    #[test]
+    fn validate_claim_filters_refuses_invalid_globs() {
+        for filters in [
+            json!({"job_workflow_ref": "octo-org/*[bad"}),
+            json!({"job_workflow_ref": ["octo-org/*", "octo-org/*[bad"]}),
+        ] {
+            let err = super::validate_claim_filters(&filters)
+                .expect_err("an unclosed character class in a glob must be refused");
+            assert!(err.to_string().contains("job_workflow_ref"), "{err}");
+            assert_eq!(
+                axum::response::IntoResponse::into_response(err).status(),
+                axum::http::StatusCode::BAD_REQUEST
+            );
+        }
+
+        for ok in [
+            json!({"job_workflow_ref": "octo-org/shared-workflows/*"}),
+            json!({"/kubernetes.io/namespace": "payments-?"}),
+            json!({"ref": ["refs/heads/*", "[main]"]}),
+        ] {
+            super::validate_claim_filters(&ok).expect("valid filters pass");
+        }
+    }
+
+    #[tokio::test]
     async fn check_claim_policy_rejects_non_object_policy() {
         let svc = test_service();
         let policy = json!("not-an-object");
@@ -2615,8 +2758,8 @@ mod tests {
     }
 
     #[test]
-    fn validate_claim_filter_keys_refuses_a_bad_escape_by_name() {
-        let err = super::validate_claim_filter_keys(&json!({"/kubernetes.io/~2bad": "x"}))
+    fn validate_claim_filters_refuses_a_bad_escape_by_name() {
+        let err = super::validate_claim_filters(&json!({"/kubernetes.io/~2bad": "x"}))
             .expect_err("~2 is not an RFC 6901 escape");
         assert!(
             err.to_string().contains("/kubernetes.io/~2bad"),
@@ -2626,14 +2769,14 @@ mod tests {
             axum::response::IntoResponse::into_response(err).status(),
             axum::http::StatusCode::BAD_REQUEST
         );
-        assert!(super::validate_claim_filter_keys(&json!({"/trailing~": "x"})).is_err());
+        assert!(super::validate_claim_filters(&json!({"/trailing~": "x"})).is_err());
 
         for ok in [
             json!({"/kubernetes.io/namespace": "x", "/a~0b~1c": "y"}),
             json!({"not/a/pointer~2": "x"}),
             json!({"/": "x"}),
         ] {
-            super::validate_claim_filter_keys(&ok).expect("valid keys pass");
+            super::validate_claim_filters(&ok).expect("valid keys pass");
         }
     }
 

@@ -96,16 +96,24 @@ curl -sS -X POST "$AK/api/v1/admin/ci-oidc/$PROVIDER_ID/mappings" \
 ```
 
 - `claim_filters` is an object of claim name to required value. A string must
-  match exactly. An array matches any of its values. All keys must match. An
-  empty object `{}` matches every token from the issuer, so do not use it
-  outside a single-tenant issuer.
+  match exactly unless it contains `*` or `?`, which makes it a case-sensitive
+  glob: `*` matches any number of characters (including `/`) and `?` matches
+  exactly one. An array matches any of its values, globs included. All keys
+  must match. An empty object `{}` matches every token from the issuer, so do
+  not use it outside a single-tenant issuer.
 - A key that starts with `/` is a JSON Pointer (RFC 6901) into nested claims:
   `{"/kubernetes.io/namespace": "payments"}` matches the `namespace` member
-  of the `kubernetes.io` object. Matching is still exact, with no prefix or
-  glob matching. Escape a `/` inside a member name as `~1` and a `~` as `~0`.
-  A key without a leading `/` is always a top-level claim name, dots
-  included: `"kubernetes.io"` compares the whole object. A pointer with any
-  other `~` sequence is refused with `400` when the mapping is saved.
+  of the `kubernetes.io` object. Globs work here too:
+  `{"/kubernetes.io/namespace": "payments-*"}` matches `payments-prod` and
+  `payments-staging`. Escape a `/` inside a member name as `~1` and a `~` as
+  `~0`. A key without a leading `/` is always a top-level claim name, dots
+  included: `"kubernetes.io"` compares the whole object. A malformed pointer
+  or glob is refused with `400` when the mapping is created or updated.
+- A reusable GitHub Actions workflow can now be pinned to its shared workflow
+  without listing every tag:
+  `{"job_workflow_ref": "octo-org/shared-workflows/.github/workflows/*@refs/tags/*"}`.
+  Keep the rest of the filter as narrow as possible: this matches every tag of
+  that workflow, in every repository that calls it.
 - Prefer immutable claims. In GitLab, `project_id` survives a project rename or
   transfer and `project_path` does not. If a path is freed and reused by another
   project, a `project_path` filter admits that new project.
