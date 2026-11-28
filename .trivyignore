@@ -1,4 +1,4 @@
-# .trivyignore — residual CVEs in the BUNDLED scanner CLI binaries only.
+# .trivyignore — residual CVEs in the BUNDLED scanner CLI binaries and Rust crates.
 #
 # Scope and honesty notes (read before adding anything here):
 #
@@ -95,6 +95,30 @@
 # Trivy tracker: https://github.com/artifact-keeper/trivy — overrides.yaml is
 #   the live record of what we diverge from upstream on, and its
 #   upstream-watch workflow tracks new Aqua releases.
+
+# ---------------------------------------------------------------------------
+# Rust crates in /usr/local/bin/artifact-keeper (#6180).
+#
+# The backend binary now carries its `.dep-v0` graph, so the blocking Trivy
+# gate sees its roughly 700 Rust crates. One publish ran report-only first:
+# Docker Publish run 45849075661 on sha-63e77105 (2026-11-26) uploaded the
+# backend SARIF with ZERO findings against the binary. The gate is blocking
+# from this change on.
+#
+# There are deliberately NO crate exceptions listed. Every future entry MUST
+# carry all four parts:
+#   * the advisory token and crate on a live suppression line;
+#   * a reason based on measured reachability or a missing fixed version;
+#   * an owner or issue (`#N`) accountable for the exception; and
+#   * an `exp:YYYY-MM-DD` expiry, matching osv-scanner.toml.
+# On expiry the entry stops suppressing and the publish gate goes red on
+# purpose: re-measure, then bump the crate or write a new justified entry.
+# An advisory with a patched release belongs in Cargo.lock, not here — #6455
+# bumped block-buffer, event-listener and rustix for exactly that reason.
+#
+# Do not use this block for scan noise: the SARIF pass reports all severities
+# to the Security tab without gating, so an exception only ever hides a real
+# CRITICAL/HIGH finding from the publish gate.
 
 # ---------------------------------------------------------------------------
 # NO grype Go-stdlib block any more (#3352).
