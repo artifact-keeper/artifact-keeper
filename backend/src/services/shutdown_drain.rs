@@ -31,11 +31,12 @@
 //!    ingress. A second signal at any point forces an immediate exit.
 //! 3. **Close**: the HTTP, gRPC and metrics listeners stop accepting and the
 //!    in-flight requests finish, as before. Shutdown then waits for the
-//!    scheduler jobs still running here, until the end of the drain at the
-//!    latest, and releases the leases this process holds so another replica
-//!    picks those jobs up without waiting out their TTL. The lease of a job
-//!    still running at that point is not released: it lapses at its TTL, so
-//!    no other replica starts the job while this one may still be doing it.
+//!    scheduler jobs still running here, until [`SCHEDULER_JOB_WAIT_GRACE`]
+//!    after the end of the drain, and releases the leases this process holds
+//!    so another replica picks those jobs up without waiting out their TTL.
+//!    The lease of a job still running at that point is not released: it
+//!    lapses at its TTL, so no other replica starts the job while this one may
+//!    still be doing it.
 //!
 //! The drain must fit inside the platform's stop budget together with the
 //! longest request: Kubernetes' `terminationGracePeriodSeconds` (default 30)
@@ -63,6 +64,11 @@ pub const DEFAULT_DRAIN_SECS: u64 = 0;
 /// Upper bound, so a typo cannot hold a stopping process for hours.
 pub const MAX_DRAIN_SECS: u64 = 300;
 
+/// Extra time, from the stop signal, for scheduler jobs to stop after the
+/// listeners close (#6487). The drain deadline alone had already passed when
+/// the job wait started, so a running job kept its lease until the TTL.
+pub const SCHEDULER_JOB_WAIT_GRACE: Duration = Duration::from_secs(5);
+
 /// Gauge: 1 while this process is draining.
 pub const DRAINING_METRIC: &str = "ak_shutdown_draining";
 
@@ -71,10 +77,22 @@ static DRAINING: AtomicBool = AtomicBool::new(false);
 /// When the drain ends: the stop request plus `SHUTDOWN_DRAIN_SECS`.
 static DRAIN_DEADLINE: std::sync::OnceLock<tokio::time::Instant> = std::sync::OnceLock::new();
 
+/// When scheduler jobs must have stopped: the drain deadline plus
+/// [`SCHEDULER_JOB_WAIT_GRACE`] (#6487).
+static SCHEDULER_JOB_WAIT_DEADLINE: std::sync::OnceLock<tokio::time::Instant> =
+    std::sync::OnceLock::new();
+
 /// When the drain ends (the stop request plus the drain), once a stop was
-/// requested. Shutdown waits for running scheduler jobs until then.
+/// requested.
 pub fn drain_deadline() -> Option<tokio::time::Instant> {
     DRAIN_DEADLINE.get().copied()
+}
+
+/// The deadline for waiting on scheduler jobs during shutdown (#6487). It is
+/// set when the stop is requested, so the wait still has time left after the
+/// listeners have closed.
+pub fn scheduler_job_wait_deadline() -> Option<tokio::time::Instant> {
+    SCHEDULER_JOB_WAIT_DEADLINE.get().copied()
 }
 
 /// Whether a stop was requested and this process is draining or closing.
@@ -130,7 +148,9 @@ fn parse_drain(value: Option<&str>) -> Duration {
 /// signal is handled by the caller: it exits the process at once.)
 pub async fn drain_then_close(stop: CancellationToken, serve: CancellationToken, drain: Duration) {
     stop.cancelled().await;
-    let _ = DRAIN_DEADLINE.set(tokio::time::Instant::now() + drain);
+    let stopped_at = tokio::time::Instant::now();
+    let _ = DRAIN_DEADLINE.set(stopped_at + drain);
+    let _ = SCHEDULER_JOB_WAIT_DEADLINE.set(stopped_at + drain + SCHEDULER_JOB_WAIT_GRACE);
     begin();
     crate::services::cluster_work::stop_scheduler_jobs();
     if drain.is_zero() {
@@ -223,6 +243,36 @@ mod tests {
         drain_then_close(stop, serve.clone(), Duration::ZERO).await;
         assert!(serve.is_cancelled());
         assert!(is_draining());
+        reset_for_test();
+    }
+
+    /// #6487: the job wait must not inherit the drain deadline, which has
+    /// already passed by the time the listeners close.
+    #[tokio::test(start_paused = true)]
+    async fn scheduler_jobs_get_a_bounded_wait_after_the_listeners_close() {
+        reset_for_test();
+        let stop = CancellationToken::new();
+        let serve = CancellationToken::new();
+        let drain = Duration::from_secs(10);
+        let task = tokio::spawn(drain_then_close(stop.clone(), serve.clone(), drain));
+        stop.cancel();
+        tokio::time::sleep(Duration::from_millis(1)).await;
+
+        let drain_deadline = drain_deadline().expect("a stop sets the drain deadline");
+        let job_deadline = scheduler_job_wait_deadline().expect("a stop sets the job deadline");
+        assert_eq!(job_deadline - drain_deadline, SCHEDULER_JOB_WAIT_GRACE);
+
+        tokio::time::sleep(drain + Duration::from_millis(1)).await;
+        assert!(
+            serve.is_cancelled(),
+            "the listeners close at the drain deadline"
+        );
+        task.await.unwrap();
+        assert!(
+            scheduler_job_wait_deadline().expect("job deadline is still set")
+                > tokio::time::Instant::now(),
+            "the job wait has time left after the listeners close"
+        );
         reset_for_test();
     }
 }

@@ -8220,6 +8220,47 @@ mod tests {
         assert_eq!(body, "anonymous");
     }
 
+    /// #6487: the drain E2E tier holds a request with a lock on `users`
+    /// while it probes anonymous downloads. Pin that dependency here so an
+    /// auth change that makes the download path read `users` fails in the
+    /// backend suite before it breaks the tier for unrelated reasons.
+    #[tokio::test]
+    async fn anonymous_download_does_not_read_users() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, key, _dir) = tdh::create_repo(&pool, "local", "generic").await;
+        sqlx::query(
+            "UPDATE repositories SET visibility = 'public', is_public = true WHERE id = $1",
+        )
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .expect("publish repo");
+
+        let mut lock = pool.begin().await.expect("begin users lock");
+        sqlx::query("LOCK TABLE users IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *lock)
+            .await
+            .expect("lock users");
+        let request = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            download_get(download_probe_router(&pool), &key, &[]),
+        )
+        .await;
+        let _ = lock.rollback().await;
+        cleanup_download_fixture(&pool, repo_id, None).await;
+
+        let (status, challenges, body) = request.expect("anonymous download waited for users");
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert!(
+            challenges.is_empty(),
+            "no challenge on a public read: {challenges:?}"
+        );
+        assert_eq!(body, "anonymous");
+    }
+
     #[tokio::test]
     async fn test_4654_download_route_accepts_api_token_as_basic_password() {
         // The #2786 format-route contract now applies here: `any:<api_token>`

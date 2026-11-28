@@ -1809,18 +1809,18 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
 
     // #5921: hand the singleton jobs this process holds to the next replica
     // now rather than at their lease TTL. The jobs were told to stop when
-    // the drain began; wait for them until the drain's end, and leave the
-    // lease of any still running to lapse, so no other replica starts one
-    // while it may still run here.
+    // the drain began; wait for them until the bounded job-wait deadline set
+    // then (#6487), and leave the lease of any still running to lapse, so no
+    // other replica starts one while it may still run here.
     let still_running = artifact_keeper_backend::services::cluster_work::wait_for_scheduler_jobs(
-        artifact_keeper_backend::services::shutdown_drain::drain_deadline()
+        artifact_keeper_backend::services::shutdown_drain::scheduler_job_wait_deadline()
             .unwrap_or_else(tokio::time::Instant::now),
     )
     .await;
     if !still_running.is_empty() {
         tracing::warn!(
             running_scheduler_jobs = still_running.len(),
-            "shutdown: scheduler jobs still running at the end of the drain; their leases lapse at their TTL"
+            "shutdown: scheduler jobs still running at the end of the job wait; their leases lapse at their TTL"
         );
     }
     let released =

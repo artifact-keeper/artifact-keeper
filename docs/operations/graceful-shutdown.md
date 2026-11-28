@@ -57,19 +57,26 @@ during the drain is not stopped the moment it starts.
 
 **At the end**, after the last request, the process pauses any migration it
 was running (as before). It then waits for the scheduler jobs still running,
-until the end of the drain at the latest (with the default drain of `0` it
-does not wait), and releases the scheduler leases it still holds, so the next
-replica claims those jobs on its next tick instead of waiting out the lease
-TTL. The lease of a job still running at that point is kept: it lapses at
-its TTL, so no other replica starts the same job while this process may
-still be doing it, and the log says how many were left
-(`running_scheduler_jobs`).
+up to five seconds after the drain has ended (#6487), and releases the
+scheduler leases it still holds, so the next replica claims those jobs on its
+next tick instead of waiting out the lease TTL. The lease of a job still
+running at that point is kept: it lapses at its TTL, so no other replica
+starts the same job while this process may still be doing it, and the log
+says how many were left (`running_scheduler_jobs`).
 
 ## Configuration
 
 | Variable | Default | Meaning |
 |---|---|---|
 | `SHUTDOWN_DRAIN_SECS` | `0` | Seconds to keep serving after the stop signal, with readiness failing. `0` closes the listeners at once, as before 1.13.0. 5-10 s is recommended behind a load balancer. Capped at 300. `SHUTDOWN_DRAIN_SECONDS` is accepted as an alias. |
+
+With the Helm chart, set the drain through `backend.shutdown.drainSecs` or the
+exact `backend.env.SHUTDOWN_DRAIN_SECS` key (#6487). The chart derives
+`terminationGracePeriodSeconds` from those two values only: a drain supplied
+through `environmentSecrets`, `extraEnvFrom` or the `SHUTDOWN_DRAIN_SECONDS`
+alias is invisible to the chart. If you use one of those spellings, set
+`backend.shutdown.terminationGracePeriodSeconds` explicitly from the formula
+below.
 
 ## Choosing a value and the grace period
 
