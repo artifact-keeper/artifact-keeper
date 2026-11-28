@@ -167,6 +167,9 @@ semver = "1"
 toml = "1.1"
 serde_yaml = "0.9"
 regex = "1.11"
+# CI OIDC claim-filter globs (#6387): a linear-time DFA matcher, so a guarded
+# token exchange cannot be slowed by catastrophic backtracking.
+globset = "0.4"
 once_cell = "1"
 bzip2 = "0.6"
 zstd = "0.14"
