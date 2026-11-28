@@ -269,7 +269,7 @@ sigstore_protobuf_specs = "=0.5.2"
 [target.'cfg(not(windows))'.dependencies]
 # pprof-rs uses setitimer and Unix signals, so the CPU profile route is
 # unavailable on Windows even though the `profiling` feature can be enabled.
-pprof = { version = "0.15", default-features = false, features = ["protobuf", "prost-codec"], optional = true }
+pprof = { version = "0.15", default-features = false, features = ["prost-codec"], optional = true }
 tikv-jemallocator = { version = "0.6", optional = true }
 tikv-jemalloc-ctl = { version = "0.6", optional = true, features = ["stats"] }
 tikv-jemalloc-sys = { version = "0.6", optional = true }
