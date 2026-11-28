@@ -618,14 +618,19 @@ impl WarmService {
         limit: i64,
         lease: Duration,
     ) -> Result<Vec<ClaimedItem>> {
+        // MATERIALIZED keeps the limit on the locking read. Without it,
+        // PostgreSQL may pull the subquery into the outer UPDATE and claim
+        // every candidate, not just `limit`.
         sqlx::query_as(
-            "UPDATE conda_warm_items i SET status = 'in_progress', claimed_at = now(), \
-               attempts = i.attempts + 1 \
-             WHERE i.id IN ( \
+            "WITH candidates AS MATERIALIZED ( \
                SELECT id FROM conda_warm_items \
                WHERE job_id = $1 AND (status = 'pending' \
                  OR (status = 'in_progress' AND claimed_at < now() - make_interval(secs => $3))) \
-               ORDER BY id LIMIT $2 FOR UPDATE SKIP LOCKED) \
+               ORDER BY id LIMIT $2 FOR UPDATE SKIP LOCKED \
+             ) \
+             UPDATE conda_warm_items i SET status = 'in_progress', claimed_at = now(), \
+               attempts = i.attempts + 1 \
+             FROM candidates c WHERE i.id = c.id \
              RETURNING i.id, i.url, i.expected_sha256, i.attempts",
         )
         .bind(job_id)
@@ -636,7 +641,9 @@ impl WarmService {
         .map_err(|e| AppError::Database(e.to_string()))
     }
 
-    /// Record an item's final (or retry) state.
+    /// Record an item's final (or retry) state. `bytes` are added to any
+    /// bytes an earlier attempt already fetched, so a timed-out retry still
+    /// counts against the job's budget (#6488).
     pub async fn finish_item(
         &self,
         item_id: i64,
@@ -647,7 +654,8 @@ impl WarmService {
     ) -> Result<()> {
         sqlx::query(
             "UPDATE conda_warm_items SET status = $2, remote_repository_id = $3, \
-               bytes = $4, detail = $5, \
+               bytes = CASE WHEN $4 IS NULL THEN bytes ELSE COALESCE(bytes, 0) + $4 END, \
+               detail = $5, \
                finished_at = CASE WHEN $2 IN ('pending', 'in_progress') THEN NULL ELSE now() END, \
                claimed_at = CASE WHEN $2 = 'pending' THEN NULL ELSE claimed_at END \
              WHERE id = $1",
@@ -706,10 +714,12 @@ impl WarmService {
     }
 
     /// Bytes this job has fetched from upstream so far (its budget use).
+    /// Every item that reached upstream contributes, whatever its final
+    /// status (#6488); a cached entry's own size is never recorded in `bytes`.
     pub async fn bytes_fetched(&self, job_id: Uuid) -> Result<i64> {
         sqlx::query_scalar(
             "SELECT COALESCE(sum(bytes), 0)::bigint FROM conda_warm_items \
-             WHERE job_id = $1 AND status IN ('fetched', 'checksum_mismatch')",
+             WHERE job_id = $1",
         )
         .bind(job_id)
         .fetch_one(&self.db)
@@ -753,9 +763,7 @@ impl WarmService {
             } else {
                 p.done += n;
             }
-            if status == ItemStatus::Fetched.as_str() {
-                p.bytes_fetched += bytes.unwrap_or(0);
-            }
+            p.bytes_fetched += bytes.unwrap_or(0);
             p.counts.insert(status, n);
         }
         Ok(p)
@@ -1082,20 +1090,24 @@ packages:
         let resumed = svc.claim(all.job.id, 10, lease).await.expect("resume");
         assert_eq!(resumed.len(), 2);
         assert!(resumed.iter().all(|i| i.attempts == 2));
-        for (item, status) in resumed.iter().chain(second.iter()).zip([
-            ItemStatus::Fetched,
-            ItemStatus::Held,
-            ItemStatus::Cached,
+        for (item, (status, bytes)) in resumed.iter().chain(second.iter()).zip([
+            (ItemStatus::Fetched, Some(10)),
+            (ItemStatus::Held, Some(5)),
+            (ItemStatus::Cached, None),
         ]) {
-            svc.finish_item(item.id, status, None, Some(10), None)
+            svc.finish_item(item.id, status, None, bytes, None)
                 .await
                 .unwrap();
         }
+        // A second attempt's bytes are added, not overwritten.
+        svc.finish_item(resumed[0].id, ItemStatus::Fetched, None, Some(5), None)
+            .await
+            .unwrap();
         assert!(svc.complete_if_done(all.job.id).await.unwrap());
         let job = svc.get(fx.repo_id, all.job.id).await.unwrap();
         assert_eq!(job.status, "completed");
         let p = svc.progress(all.job.id).await.unwrap();
-        assert_eq!((p.done, p.remaining, p.bytes_fetched), (3, 0, 10));
+        assert_eq!((p.done, p.remaining, p.bytes_fetched), (3, 0, 20));
         assert_eq!(p.counts["held"], 1);
         let problems = svc.problems(all.job.id, 10).await.unwrap();
         assert_eq!(problems.len(), 1);
@@ -1111,9 +1123,14 @@ packages:
             !svc.cancel(fx.repo_id, next.job.id).await.unwrap(),
             "already cancelled"
         );
+        let limited = svc
+            .claim(next.job.id, 1, lease)
+            .await
+            .expect("limited claim");
+        assert_eq!(limited.len(), 1, "a claim takes at most `limit` rows");
         let active = svc.active_job_ids().await.unwrap();
         assert!(active.contains(&linux.job.id) && !active.contains(&next.job.id));
-        assert_eq!(svc.bytes_fetched(all.job.id).await.unwrap(), 10);
+        assert_eq!(svc.bytes_fetched(all.job.id).await.unwrap(), 20);
         // A spent budget (or a runner that gave up) ends the job; it is no
         // longer active, so a new request starts a new one.
         assert!(svc

@@ -53,6 +53,7 @@ use crate::services::conda_warm_service::{
     ClaimedItem, ItemStatus, JobStop, RemoteCandidate, Resolution, WarmConfig, WarmJob,
     WarmService, MAX_ATTEMPTS,
 };
+use crate::services::proxy_service::UpstreamByteMeter;
 use crate::services::repository_service::RepositoryService;
 
 /// Body of [`start_warm`].
@@ -572,8 +573,11 @@ async fn run_job(state: &SharedState, job_id: Uuid) -> Result<()> {
         remotes,
     };
     svc.mark_running(job_id).await?;
-    // The job's byte budget, counting what earlier runs already fetched.
-    let used = AtomicU64::new(svc.bytes_fetched(job_id).await?.max(0) as u64);
+    // The job's byte budget, counting what earlier runs already fetched. A
+    // fetch increments it as upstream bytes arrive, not after the item settles.
+    let used = Arc::new(AtomicU64::new(
+        svc.bytes_fetched(job_id).await?.max(0) as u64
+    ));
     let shutdown = shutdown_token().get().cloned().unwrap_or_default();
     let batch = (cfg.concurrency * 4) as i64;
     loop {
@@ -622,10 +626,7 @@ async fn run_job(state: &SharedState, job_id: Uuid) -> Result<()> {
                             (ItemStatus::Pending, None, None, Some("the job's byte budget is spent".to_string()))
                         } else {
                             let (status, remote, bytes, detail) =
-                                warm_item(state, ctx, &item, cfg.item_timeout).await;
-                            if matches!(status, ItemStatus::Fetched | ItemStatus::ChecksumMismatch) {
-                                used.fetch_add(bytes.unwrap_or(0).max(0) as u64, Ordering::Relaxed);
-                            }
+                                warm_item(state, ctx, &item, cfg.item_timeout, used).await;
                             (settle(status, item.attempts), remote, bytes, detail)
                         };
                     if !status.is_open() {
@@ -700,7 +701,22 @@ struct CachedEntry {
     held: bool,
     /// The sha256 its sidecar records; empty when it records none.
     sha256: String,
-    size: i64,
+}
+
+/// The upstream bytes one fetch actually consumed, as an item's recorded size.
+fn metered_bytes(meter: &UpstreamByteMeter) -> Option<i64> {
+    let bytes = meter.bytes();
+    (bytes > 0).then_some(bytes as i64)
+}
+
+/// Publish each attempt's bytes as soon as that attempt ends, rather than
+/// waiting for the item to settle (#6488).
+fn record_metered_fetch(meter: &UpstreamByteMeter, published: &mut u64) {
+    let total = meter.bytes();
+    if total > *published {
+        record_fetch(total - *published);
+        *published = total;
+    }
 }
 
 /// The side effects of warming one item, so the decisions in
@@ -724,13 +740,16 @@ trait WarmOps {
     async fn cached(&self, remote: &RemoteCandidate, cache_key: &str) -> Option<CachedEntry>;
     /// A process-wide fetch permit, after pacing. `None`: shutting down.
     async fn acquire(&self) -> Option<OwnedSemaphorePermit>;
-    /// Fetch through the Remote's download path (and drain the body).
+    /// Fetch through the Remote's download path (and drain the body). The
+    /// meter counts upstream bytes even when the status is not 2xx or the
+    /// deadline cuts the body short (#6488).
     async fn fetch(
         &self,
         remote: &RemoteCandidate,
         via_virtual: Option<Uuid>,
         subdir: &str,
         filename: &str,
+        meter: &UpstreamByteMeter,
     ) -> (StatusCode, Option<(String, u64)>);
     /// Wait up to `wait` for the fetched entry to be committed.
     async fn await_commit(
@@ -785,7 +804,6 @@ impl WarmOps for LiveOps<'_> {
         Some(CachedEntry {
             held: entry.quarantine_gate().is_err(),
             sha256: entry.checksum_sha256().to_string(),
-            size: entry.size_bytes(),
         })
     }
 
@@ -801,12 +819,16 @@ impl WarmOps for LiveOps<'_> {
         via_virtual: Option<Uuid>,
         subdir: &str,
         filename: &str,
+        meter: &UpstreamByteMeter,
     ) -> (StatusCode, Option<(String, u64)>) {
         let Some(repo) = self.remotes.iter().find(|r| r.id == remote.id) else {
             return (StatusCode::NOT_FOUND, None);
         };
-        conda::warm_remote_package(self.state, self.proxy, repo, via_virtual, subdir, filename)
-            .await
+        UpstreamByteMeter::scope(
+            meter.clone(),
+            conda::warm_remote_package(self.state, self.proxy, repo, via_virtual, subdir, filename),
+        )
+        .await
     }
 
     async fn await_commit(
@@ -837,6 +859,7 @@ async fn warm_item(
     ctx: &JobContext,
     item: &ClaimedItem,
     item_timeout: Duration,
+    job_bytes: &Arc<AtomicU64>,
 ) -> ItemOutcome {
     let Some(proxy) = state.proxy_service.as_deref() else {
         return (
@@ -851,7 +874,7 @@ async fn warm_item(
         proxy,
         remotes: &ctx.remotes,
     };
-    warm_item_with(&ops, &ctx.scope, item, item_timeout).await
+    warm_item_with(&ops, &ctx.scope, item, item_timeout, job_bytes).await
 }
 
 /// The decisions for one item: resolve it to the Remote(s) that serve it,
@@ -863,6 +886,7 @@ async fn warm_item_with<O: WarmOps>(
     scope: &Scope,
     item: &ClaimedItem,
     item_timeout: Duration,
+    job_bytes: &Arc<AtomicU64>,
 ) -> ItemOutcome {
     let Some(pkg) = parse_package_url(&item.url) else {
         return (
@@ -932,6 +956,10 @@ async fn warm_item_with<O: WarmOps>(
 
     let cache_key = conda::conda_package_cache_key(&pkg.subdir, &pkg.filename);
     let expected = item.expected_sha256.as_deref();
+    // One meter for the item: every attempt contributes to it, including a
+    // timed-out body and a non-2xx answer (#6488).
+    let meter = UpstreamByteMeter::new(Some(Arc::clone(job_bytes)));
+    let mut published_bytes = 0;
     let mut last_detail = None;
     for remote in ids
         .iter()
@@ -943,21 +971,28 @@ async fn warm_item_with<O: WarmOps>(
                 return (ItemStatus::Held, Some(remote.id), None, None);
             }
             match expected {
-                // Cached before this warm by a client's own pull, so it is
-                // reported, not removed.
+                // A mismatch the commit left behind (or a client cached
+                // earlier) is safe to remove now: this lookup proves the
+                // entry is fully present (#6488).
                 Some(want) if !entry.sha256.is_empty() && entry.sha256 != want => {
+                    let evicted = match ops.evict(remote, &cache_key).await {
+                        Ok(()) => "removed from the cache".to_string(),
+                        Err(e) => format!("could not be removed from the cache: {e}"),
+                    };
                     return (
                         ItemStatus::ChecksumMismatch,
                         Some(remote.id),
                         None,
                         Some(format!(
-                            "cached sha256 {}, the lockfile pins {want}",
+                            "cached sha256 {}, the lockfile pins {want}; {evicted}",
                             entry.sha256
                         )),
-                    )
+                    );
                 }
+                // The entry is already cached: its size is not bytes this job
+                // fetched, so it must not reach the budget (#6488).
                 _ if !entry.sha256.is_empty() => {
-                    return (ItemStatus::Cached, Some(remote.id), Some(entry.size), None)
+                    return (ItemStatus::Cached, Some(remote.id), None, None)
                 }
                 _ => {}
             }
@@ -975,17 +1010,19 @@ async fn warm_item_with<O: WarmOps>(
         let deadline = tokio::time::Instant::now() + item_timeout;
         let fetched = tokio::time::timeout_at(
             deadline,
-            ops.fetch(remote, via_virtual, &pkg.subdir, &pkg.filename),
+            ops.fetch(remote, via_virtual, &pkg.subdir, &pkg.filename, &meter),
         )
         .await;
         // The commit wait below holds no permit: it costs the upstream
         // nothing.
         drop(permit);
+        let bytes = metered_bytes(&meter);
         let Ok((status, served)) = fetched else {
+            record_metered_fetch(&meter, &mut published_bytes);
             return (
                 ItemStatus::Pending,
                 Some(remote.id),
-                None,
+                bytes,
                 Some(format!(
                     "no complete response from {} within {}s; retried",
                     remote.key,
@@ -993,56 +1030,47 @@ async fn warm_item_with<O: WarmOps>(
                 )),
             );
         };
-        if let Some((_, size)) = &served {
-            record_fetch(*size);
-        }
+        record_metered_fetch(&meter, &mut published_bytes);
         let commit_wait = deadline
             .saturating_duration_since(tokio::time::Instant::now())
             .clamp(MIN_COMMIT_WAIT, COMMIT_WAIT);
         match status.as_u16() {
             200..=299 => {
-                let (sha, size) = served.unwrap_or_default();
+                let (sha, _) = served.unwrap_or_default();
                 // The streaming tee commits after the body is drained; the
                 // item is warm only once the entry is there to serve.
                 let committed = ops.await_commit(remote, &cache_key, commit_wait).await;
                 if let Some(want) = expected.filter(|want| *want != sha) {
-                    // Not the pinned bytes: take them out of the cache, so
-                    // nothing the lock does not pin stays cached and a rerun
-                    // fetches again.
-                    let evicted = match ops.evict(remote, &cache_key).await {
-                        Ok(()) => "removed from the cache".to_string(),
-                        Err(e) => format!("could not be removed from the cache: {e}"),
+                    // Only evict once the commit is confirmed. If it is not,
+                    // the next lookup sees the mismatched entry and removes
+                    // it, so a late commit cannot escape the check (#6488).
+                    let evicted = match &committed {
+                        Ok(()) => match ops.evict(remote, &cache_key).await {
+                            Ok(()) => "removed from the cache".to_string(),
+                            Err(e) => format!("could not be removed from the cache: {e}"),
+                        },
+                        Err(_) => "commit not confirmed; removed on the next lookup".to_string(),
                     };
                     return (
                         ItemStatus::ChecksumMismatch,
                         Some(remote.id),
-                        Some(size as i64),
+                        bytes,
                         Some(format!(
                             "upstream sha256 {sha}, the lockfile pins {want}; {evicted}"
                         )),
                     );
                 }
                 return match committed {
-                    Ok(()) => (
-                        ItemStatus::Fetched,
-                        Some(remote.id),
-                        Some(size as i64),
-                        None,
-                    ),
-                    Err(why) => (
-                        ItemStatus::Failed,
-                        Some(remote.id),
-                        Some(size as i64),
-                        Some(why),
-                    ),
+                    Ok(()) => (ItemStatus::Fetched, Some(remote.id), bytes, None),
+                    Err(why) => (ItemStatus::Failed, Some(remote.id), bytes, Some(why)),
                 };
             }
-            409 => return (ItemStatus::Held, Some(remote.id), None, None),
+            409 => return (ItemStatus::Held, Some(remote.id), bytes, None),
             403 => {
                 return (
                     ItemStatus::Blocked,
                     Some(remote.id),
-                    None,
+                    bytes,
                     Some("refused by the repository's scan or origin policy".into()),
                 )
             }
@@ -1052,7 +1080,7 @@ async fn warm_item_with<O: WarmOps>(
                 return (
                     ItemStatus::Failed,
                     Some(remote.id),
-                    None,
+                    bytes,
                     Some("the file name is not a servable conda package path".into()),
                 )
             }
@@ -1060,7 +1088,7 @@ async fn warm_item_with<O: WarmOps>(
                 return (
                     ItemStatus::Pending,
                     Some(remote.id),
-                    None,
+                    bytes,
                     Some(format!("HTTP {code} from {}; retried", remote.key)),
                 )
             }
@@ -1127,12 +1155,14 @@ mod tests {
         cached: std::collections::HashMap<Uuid, CachedEntry>,
         fetch: std::collections::HashMap<Uuid, (StatusCode, Option<(String, u64)>)>,
         fetch_takes: Option<Duration>,
+        fetch_bytes: Option<u64>,
         commit: Option<std::result::Result<(), String>>,
         shutting_down: bool,
         permits: Option<Arc<Semaphore>>,
         fetched: Mutex<Vec<(Uuid, Option<Uuid>)>>,
         evicted: Mutex<Vec<(Uuid, String)>>,
         commit_saw_free_permit: Mutex<Option<bool>>,
+        events: Mutex<Vec<&'static str>>,
     }
 
     impl WarmOps for Fake {
@@ -1170,15 +1200,23 @@ mod tests {
             via_virtual: Option<Uuid>,
             _: &str,
             _: &str,
+            meter: &UpstreamByteMeter,
         ) -> (StatusCode, Option<(String, u64)>) {
             self.fetched.lock().unwrap().push((remote.id, via_virtual));
+            let outcome = self
+                .fetch
+                .get(&remote.id)
+                .cloned()
+                .unwrap_or((StatusCode::NOT_FOUND, None));
+            let bytes = self
+                .fetch_bytes
+                .or_else(|| outcome.1.as_ref().map(|(_, size)| *size))
+                .unwrap_or(0);
+            meter.add(bytes as usize);
             if let Some(d) = self.fetch_takes {
                 tokio::time::sleep(d).await;
             }
-            self.fetch
-                .get(&remote.id)
-                .cloned()
-                .unwrap_or((StatusCode::NOT_FOUND, None))
+            outcome
         }
         async fn await_commit(
             &self,
@@ -1186,6 +1224,7 @@ mod tests {
             _: &str,
             _: Duration,
         ) -> std::result::Result<(), String> {
+            self.events.lock().unwrap().push("commit");
             if let Some(sem) = &self.permits {
                 *self.commit_saw_free_permit.lock().unwrap() = Some(sem.available_permits() == 1);
             }
@@ -1196,6 +1235,7 @@ mod tests {
             remote: &RemoteCandidate,
             cache_key: &str,
         ) -> std::result::Result<(), String> {
+            self.events.lock().unwrap().push("evict");
             self.evicted
                 .lock()
                 .unwrap()
@@ -1254,8 +1294,12 @@ mod tests {
         (StatusCode::OK, Some((sha.to_string(), 42)))
     }
 
+    fn job_bytes() -> Arc<AtomicU64> {
+        Arc::new(AtomicU64::new(0))
+    }
+
     async fn run(fake: &Fake, scope: &Scope, sha: Option<&str>) -> ItemOutcome {
-        warm_item_with(fake, scope, &item(URL, sha, 1), T).await
+        warm_item_with(fake, scope, &item(URL, sha, 1), T, &job_bytes()).await
     }
 
     #[tokio::test]
@@ -1266,7 +1310,7 @@ mod tests {
             "https://elsewhere.example/ch/linux-64/a-1.0-0.conda",
             "https://ak.example/conda/fleet/linux-64/README.md",
         ] {
-            let out = warm_item_with(&fake, &s, &item(url, None, 1), T).await;
+            let out = warm_item_with(&fake, &s, &item(url, None, 1), T, &job_bytes()).await;
             assert_eq!(out.0, ItemStatus::NotRemote, "{url}");
         }
         // A URL on the route of the Virtual's hosted member.
@@ -1280,6 +1324,7 @@ mod tests {
                 1,
             ),
             T,
+            &job_bytes(),
         )
         .await;
         assert_eq!(out.0, ItemStatus::NotRemote);
@@ -1328,7 +1373,6 @@ mod tests {
                 CachedEntry {
                     held,
                     sha256: sha.into(),
-                    size: 7,
                 },
             )]
             .into(),
@@ -1339,13 +1383,15 @@ mod tests {
         assert_eq!(run(&held, &s, Some(SHA)).await.0, ItemStatus::Held);
         let same = entry(false, SHA);
         let out = run(&same, &s, Some(SHA)).await;
-        assert_eq!((out.0, out.2), (ItemStatus::Cached, Some(7)));
-        // A client's earlier pull cached other bytes: reported, not evicted.
+        assert_eq!((out.0, out.2), (ItemStatus::Cached, None));
+        // A mismatched entry left by a late commit (or a client's earlier
+        // pull) is removed once a lookup confirms it is present. A cached
+        // entry's own size never counts as fetched bytes.
         let other = entry(false, OTHER);
         let out = run(&other, &s, Some(SHA)).await;
-        assert_eq!(out.0, ItemStatus::ChecksumMismatch);
+        assert_eq!((out.0, out.2), (ItemStatus::ChecksumMismatch, None));
         assert!(out.3.unwrap().starts_with("cached sha256"));
-        assert!(other.evicted.lock().unwrap().is_empty());
+        assert_eq!(other.evicted.lock().unwrap().len(), 1);
         for f in [&held, &same, &other] {
             assert!(f.fetched.lock().unwrap().is_empty());
         }
@@ -1394,6 +1440,11 @@ mod tests {
                 conda::conda_package_cache_key("linux-64", "a-1.0-h0_0.conda")
             )]
         );
+        assert_eq!(
+            fake.events.lock().unwrap().as_slice(),
+            &["commit", "evict"],
+            "the mismatch is removed only after the commit is confirmed"
+        );
         // No pin: any bytes are the right ones.
         let unpinned = Fake {
             fetch: [(id, ok(OTHER))].into(),
@@ -1401,6 +1452,69 @@ mod tests {
         };
         assert_eq!(run(&unpinned, &s, None).await.0, ItemStatus::Fetched);
         assert!(unpinned.evicted.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_uncommitted_mismatch_is_not_evicted_early() {
+        let s = remote_scope();
+        let id = s.candidates[0].id;
+        let fake = Fake {
+            fetch: [(id, ok(OTHER))].into(),
+            commit: Some(Err("no commit yet".into())),
+            ..Fake::default()
+        };
+        let out = run(&fake, &s, Some(SHA)).await;
+        assert_eq!(out.0, ItemStatus::ChecksumMismatch);
+        assert!(out.3.unwrap().contains("next lookup"));
+        assert!(fake.evicted.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn every_upstream_byte_counts_toward_the_job_budget() {
+        let s = remote_scope();
+        let id = s.candidates[0].id;
+        let job_bytes = job_bytes();
+        let fake = Fake {
+            fetch: [(id, (StatusCode::FORBIDDEN, None))].into(),
+            fetch_bytes: Some(17),
+            ..Fake::default()
+        };
+        let out = warm_item_with(&fake, &s, &item(URL, Some(SHA), 1), T, &job_bytes).await;
+        assert_eq!((out.0, out.2), (ItemStatus::Blocked, Some(17)));
+        assert_eq!(job_bytes.load(Ordering::Relaxed), 17);
+
+        let retry_bytes = Arc::new(AtomicU64::new(0));
+        let fake = Fake {
+            fetch: [(id, (StatusCode::BAD_GATEWAY, None))].into(),
+            fetch_bytes: Some(9),
+            ..Fake::default()
+        };
+        let out = warm_item_with(&fake, &s, &item(URL, Some(SHA), 1), T, &retry_bytes).await;
+        assert_eq!((out.0, out.2), (ItemStatus::Pending, Some(9)));
+        assert_eq!(retry_bytes.load(Ordering::Relaxed), 9);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_timed_out_retry_counts_the_bytes_it_did_fetch() {
+        let s = remote_scope();
+        let id = s.candidates[0].id;
+        let job_bytes = job_bytes();
+        let fake = Fake {
+            fetch: [(id, ok(SHA))].into(),
+            fetch_bytes: Some(11),
+            fetch_takes: Some(Duration::from_secs(3_600)),
+            ..Fake::default()
+        };
+        let out = warm_item_with(
+            &fake,
+            &s,
+            &item(URL, Some(SHA), 1),
+            Duration::from_secs(5),
+            &job_bytes,
+        )
+        .await;
+        assert_eq!((out.0, out.2), (ItemStatus::Pending, Some(11)));
+        assert_eq!(job_bytes.load(Ordering::Relaxed), 11);
     }
 
     #[tokio::test]
@@ -1485,7 +1599,14 @@ mod tests {
             permits: Some(permits.clone()),
             ..Fake::default()
         };
-        let out = warm_item_with(&fake, &s, &item(URL, Some(SHA), 1), Duration::from_secs(5)).await;
+        let out = warm_item_with(
+            &fake,
+            &s,
+            &item(URL, Some(SHA), 1),
+            Duration::from_secs(5),
+            &job_bytes(),
+        )
+        .await;
         assert_eq!(out.0, ItemStatus::Pending);
         assert!(out.3.unwrap().contains("within 5s"));
         assert_eq!(permits.available_permits(), 1, "the permit is released");
@@ -1596,6 +1717,81 @@ mod tests {
             .await
             .unwrap();
         tdh::cleanup_member_repo(&fx.pool, virt, &vdir).await;
+        fx.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn live_ops_reads_and_evicts_a_real_cache_entry() {
+        let Some(fx) = tdh::Fixture::setup("remote", "conda").await else {
+            return;
+        };
+        let (server, _ssrf) = tdh::non_loopback_mock_server().await;
+        let filename = "a-1.0-h0_0.conda";
+        let path = format!("/linux-64/{filename}");
+        let body = b"warmed-conda-package".to_vec();
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(path.as_str()))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(body.clone()))
+            .mount(&server)
+            .await;
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(server.uri())
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .unwrap();
+
+        let scope = crate::services::proxy_cache_scope::ProxyCacheScope::unscoped();
+        let (proxy, _backend) = tdh::build_scoped_presign_proxy(fx.pool.clone(), scope);
+        let state = tdh::build_state_with_proxy(
+            fx.pool.clone(),
+            fx.storage_dir.to_str().unwrap(),
+            proxy.clone(),
+        );
+        let repo = RepositoryService::new(fx.pool.clone())
+            .get_by_id(fx.repo_id)
+            .await
+            .unwrap();
+        let candidate = RemoteCandidate {
+            id: repo.id,
+            key: repo.key.clone(),
+            upstream_url: repo.upstream_url.clone().unwrap(),
+        };
+        let remotes = [repo];
+        let ops = LiveOps {
+            state: &state,
+            proxy: &proxy,
+            remotes: &remotes,
+        };
+        let cache_key = conda::conda_package_cache_key("linux-64", filename);
+
+        assert!(ops.cached(&candidate, &cache_key).await.is_none());
+        let meter = UpstreamByteMeter::new(None);
+        let (status, served) = ops
+            .fetch(&candidate, None, "linux-64", filename, &meter)
+            .await;
+        assert!(status.is_success(), "{status}");
+        let (sha, size) = served.expect("a successful warm returns the served digest");
+        assert_eq!(size, body.len() as u64);
+        assert_eq!(meter.bytes(), body.len() as u64);
+
+        ops.await_commit(&candidate, &cache_key, Duration::from_secs(5))
+            .await
+            .expect("the warm fills the proxy cache");
+        let entry = ops
+            .cached(&candidate, &cache_key)
+            .await
+            .expect("LiveOps::cached sees the fetched entry");
+        assert!(!entry.held);
+        assert_eq!(entry.sha256, sha);
+
+        ops.evict(&candidate, &cache_key)
+            .await
+            .expect("LiveOps::evict invalidates the cache entry");
+        assert!(
+            ops.cached(&candidate, &cache_key).await.is_none(),
+            "the evicted entry is no longer fresh"
+        );
         fx.teardown().await;
     }
 

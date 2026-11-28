@@ -61,7 +61,7 @@ database errors), `total`, `done`, `remaining`,
 | `cached` | A fresh cache entry with the pinned sha256 was already there; not fetched. |
 | `held` | Inside the Remote's Package Age Policy hold. Cached under the hold and refused (409) to clients until the hold elapses or an admin releases it. |
 | `blocked` | Refused by the scan or origin policy (403). |
-| `checksum_mismatch` | The bytes differ from the sha256 the lock pins. Bytes this job fetched are removed from the cache again, so nothing the lock does not pin stays cached and a rerun fetches the file again. An entry a client cached earlier is reported, not removed. |
+| `checksum_mismatch` | The bytes differ from the sha256 the lock pins. The entry is removed from the cache once its commit is confirmed; if the commit was not confirmed in time, the next lookup removes it. Nothing the lock does not pin stays cached, and a rerun fetches the file again. |
 | `failed` | The upstream does not have it (404 from every Remote), or a fault (including the item deadline) persisted after 3 attempts. |
 | `not_remote` | No Remote of `{repo}` serves the URL. |
 | `not_allowed` | The Virtual's allowlist does not admit the package. |
@@ -95,8 +95,8 @@ policy, the stored verdict).
 | `CONDA_WARM_UPSTREAM_RPS` | 20 (max 1000) | Upstream fetches started per second per process. Entries already cached cost nothing. |
 | `CONDA_WARM_MAX_ITEMS` | 50,000 | Package files one job may warm (`400` beyond). |
 | `CONDA_WARM_ITEM_LEASE_SECS` | 600 (30 to 86,400) | How long a claimed item waits before another runner takes it over. |
-| `CONDA_WARM_ITEM_TIMEOUT_SECS` | 300 (10 to 3,600) | The most one package may take from its first upstream byte to its cache commit. A slow or trickling upstream gives up its fetch slot at this deadline and the item is retried. The commit wait holds no fetch slot. |
-| `CONDA_WARM_MAX_JOB_BYTES` | 107374182400 (100 GiB, at least 1 MiB) | The most bytes one job fetches from upstream. Checked before each fetch, so fetches already in flight may overshoot it. The job then ends as `budget_exceeded`, and what it did not fetch stays unfetched. |
+| `CONDA_WARM_ITEM_TIMEOUT_SECS` | 300 (10 to 3,600) | The most one package may take from its first upstream byte to its cache commit. A slow or trickling upstream gives up its fetch slot at this deadline, its body stops instead of draining in the background, and the item is retried. The commit wait holds no fetch slot. |
+| `CONDA_WARM_MAX_JOB_BYTES` | 107374182400 (100 GiB, at least 1 MiB) | The most bytes one job fetches from upstream. Every upstream byte counts, including a blocked answer, an over-cap failure and a timed-out retry; the size of an entry already cached does not. The running total is checked before each fetch, so fetches already in flight may overshoot it. The job then ends as `budget_exceeded`, and what it did not fetch stays unfetched. |
 
 There is at most one active job per (repository, environment, platform).
 Starting again after it completes creates a new job, whose items are `cached`

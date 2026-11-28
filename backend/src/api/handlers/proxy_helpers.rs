@@ -24,7 +24,7 @@ use crate::services::proxy_scan_service::CacheScanGate;
 pub(crate) use crate::services::proxy_service::CachedBody;
 pub use crate::services::proxy_service::StreamingFetchResult;
 use crate::services::proxy_service::{
-    DeferredCommitSlot, DirectUpstreamBody, FreshCacheEntry, ProxyService,
+    DeferredCommitSlot, DirectUpstreamBody, FreshCacheEntry, ProxyService, StreamingFillMode,
 };
 use crate::services::virtual_member_breaker::MemberBreaker;
 // Re-export the per-format buffered-metadata byte ceilings (#1608 Phase 4b /
@@ -2062,11 +2062,71 @@ pub async fn proxy_fetch_streaming_with_disposition_and_format(
     format: RepositoryFormat,
     is_head: bool,
 ) -> Result<Response, Response> {
+    proxy_fetch_streaming_with_disposition_and_format_inner(
+        proxy_service,
+        repo_id,
+        repo_key,
+        upstream_url,
+        path,
+        default_content_type,
+        content_disposition_filename,
+        format,
+        is_head,
+        StreamingFillMode::DetachOnDrop,
+    )
+    .await
+}
+
+/// The same helper for a caller that imposes its own deadline: a dropped body
+/// stops the upstream fill instead of draining it in the shared pool (#6488).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn proxy_fetch_streaming_with_disposition_and_format_with_mode(
+    proxy_service: &ProxyService,
+    repo_id: Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    path: &str,
+    default_content_type: &str,
+    content_disposition_filename: Option<&str>,
+    format: RepositoryFormat,
+    is_head: bool,
+    mode: StreamingFillMode,
+) -> Result<Response, Response> {
+    proxy_fetch_streaming_with_disposition_and_format_inner(
+        proxy_service,
+        repo_id,
+        repo_key,
+        upstream_url,
+        path,
+        default_content_type,
+        content_disposition_filename,
+        format,
+        is_head,
+        mode,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn proxy_fetch_streaming_with_disposition_and_format_inner(
+    proxy_service: &ProxyService,
+    repo_id: Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    path: &str,
+    default_content_type: &str,
+    content_disposition_filename: Option<&str>,
+    format: RepositoryFormat,
+    is_head: bool,
+    mode: StreamingFillMode,
+) -> Result<Response, Response> {
     let repo = build_remote_repo_with_format(repo_id, repo_key, upstream_url, format);
     let fetched = if is_head {
         proxy_service.head_artifact_streaming(&repo, path).await
     } else {
-        proxy_service.fetch_artifact_streaming(&repo, path).await
+        proxy_service
+            .fetch_artifact_streaming_with_cache_path_with_mode(&repo, path, path, mode)
+            .await
     };
     streaming_fetch_response(
         fetched,
