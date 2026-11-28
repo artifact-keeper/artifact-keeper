@@ -1658,33 +1658,25 @@ mod tests {
     }
 
     #[test]
-    fn test_peer_consecutive_failures_gauge_is_labelled_by_peer() {
-        let peer_id = uuid::Uuid::new_v4();
+    fn test_peer_consecutive_failures_gauges_report_current_and_removed_peers() {
+        let active_peer = uuid::Uuid::new_v4();
+        let removed_peer = uuid::Uuid::new_v4();
+        sync_peer_consecutive_failures_gauges(&[(removed_peer, 3)]);
         let rendered = render_with_production_recorder(|| {
-            sync_peer_consecutive_failures_gauges(&[(peer_id, 4)]);
+            sync_peer_consecutive_failures_gauges(&[(active_peer, 4)]);
         });
 
         assert!(
             rendered.contains(&format!(
                 "ak_peer_consecutive_failures{{peer_id=\"{}\"}} 4",
-                peer_id
+                active_peer
             )),
             "unexpected exposition: {rendered}"
         );
-    }
-
-    #[test]
-    fn test_peer_consecutive_failures_gauge_clears_removed_peers() {
-        let peer_id = uuid::Uuid::new_v4();
-        sync_peer_consecutive_failures_gauges(&[(peer_id, 3)]);
-        let rendered = render_with_production_recorder(|| {
-            sync_peer_consecutive_failures_gauges(&[]);
-        });
-
         assert!(
             rendered.contains(&format!(
                 "ak_peer_consecutive_failures{{peer_id=\"{}\"}} 0",
-                peer_id
+                removed_peer
             )),
             "unexpected exposition: {rendered}"
         );
