@@ -985,9 +985,8 @@ pub fn set_user_gauge(total_users: i64) {
     gauge!("ak_users_total").set(total_users as f64);
 }
 
-/// Peer ids with a published consecutive-failure gauge (#6510). Remembering
-/// them lets a refresh zero the gauge of a peer that was unregistered instead
-/// of leaving a stale series on `/metrics`.
+/// Peer ids with a published consecutive-failure gauge (#6565). Remembering
+/// them lets a refresh zero the gauge of a peer that was unregistered.
 static PEER_FAILURE_GAUGE_PEERS: OnceLock<Mutex<HashSet<uuid::Uuid>>> = OnceLock::new();
 
 fn set_peer_consecutive_failures_gauge(peer_id: uuid::Uuid, failures: i32) {
@@ -1000,7 +999,7 @@ fn set_peer_consecutive_failures_gauge(peer_id: uuid::Uuid, failures: i32) {
 
 /// Refresh the per-peer consecutive-failure gauges from current peer rows. The
 /// label keeps the signal per peer so operators can choose their own threshold
-/// without a new status value (#6510).
+/// without a new status value (#6565).
 pub fn sync_peer_consecutive_failures_gauges(values: &[(uuid::Uuid, i32)]) {
     let mut known = PEER_FAILURE_GAUGE_PEERS
         .get_or_init(|| Mutex::new(HashSet::new()))

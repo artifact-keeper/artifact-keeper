@@ -79,11 +79,11 @@ pub struct PeerInstanceResponse {
     #[serde(skip_serializing)]
     pub api_key: String,
     pub is_local: bool,
-    /// Consecutive failed probes or transfers recorded for this peer (#6510).
+    /// Consecutive failed probes or transfers recorded for this peer (#6565).
     pub consecutive_failures: i32,
-    /// When the peer is in transfer backoff; `null` when it is not (#6510).
+    /// When the peer is in transfer backoff; `null` when it is not (#6565).
     pub backoff_until: Option<chrono::DateTime<chrono::Utc>>,
-    /// Total failed transfers recorded for this peer (#6510).
+    /// Total failed transfers recorded for this peer (#6565).
     pub transfer_failures_total: i32,
 }
 
@@ -1142,7 +1142,7 @@ mod tests {
     }
 
     #[test]
-    fn test_peer_instance_response_exposes_failure_signals_6510() {
+    fn test_peer_instance_response_exposes_failure_signals_6565() {
         let backoff = chrono::Utc::now() + chrono::Duration::seconds(30);
         let resp = PeerInstanceResponse {
             id: Uuid::nil(),
